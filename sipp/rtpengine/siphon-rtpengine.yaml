@@ -1,0 +1,41 @@
+# siphon config for proxy + RTPEngine functional test
+#
+# Used with: sipp/docker-compose.yaml (rtpengine profile)
+# Script:    examples/proxy_rtpengine.py
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+advertised_address: "172.20.0.41"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.41"
+    - "127.0.0.1"
+
+script:
+  path: "examples/proxy_rtpengine.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+media:
+  rtpengine:
+    address: "172.20.0.40:22222"
+    timeout_ms: 2000
+
+log:
+  level: debug
+  format: pretty

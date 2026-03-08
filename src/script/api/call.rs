@@ -1,0 +1,683 @@
+//! PyO3 wrapper for B2BUA calls — the `Call` object passed to Python scripts.
+//!
+//! Scripts interact with this object via `@b2bua.on_invite`, `@b2bua.on_answer`,
+//! `@b2bua.on_failure`, and `@b2bua.on_bye` handlers.
+
+use std::sync::{Arc, Mutex};
+
+use pyo3::prelude::*;
+
+use crate::sip::message::SipMessage;
+use super::sip_uri::PySipUri;
+
+/// Per-call session timer override set by Python scripts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTimerOverride {
+    pub session_expires: u32,
+    pub min_se: u32,
+    pub refresher: String,
+}
+
+/// The action the script chose for this call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallAction {
+    /// No action taken yet.
+    None,
+    /// Reject the call with a status code and reason.
+    Reject { code: u16, reason: String },
+    /// Dial a single B-leg target.
+    Dial {
+        target: String,
+        timeout: u32,
+    },
+    /// Fork to multiple targets.
+    Fork {
+        targets: Vec<String>,
+        strategy: String,
+        timeout: u32,
+    },
+    /// Terminate the call (BYE both legs).
+    Terminate,
+    /// Accept a REFER (call transfer).
+    AcceptRefer,
+    /// Reject a REFER with a status code.
+    RejectRefer { code: u16, reason: String },
+}
+
+/// Which side initiated a BYE.
+#[pyclass(name = "ByeInitiator", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct PyByeInitiator {
+    /// "a" (caller) or "b" (callee).
+    #[pyo3(get)]
+    pub side: String,
+}
+
+/// Media handle — sub-object on `Call` for media anchoring.
+///
+/// Usage in Python:
+///   call.media.anchor()                    # anchor through RTPEngine
+///   call.media.anchor(engine="rtpengine")  # explicit engine name
+///   call.media.release()                   # release media anchor
+#[pyclass(name = "MediaHandle", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct PyMediaHandle {
+    anchored: bool,
+    engine: String,
+    profile: String,
+}
+
+impl Default for PyMediaHandle {
+    fn default() -> Self {
+        Self {
+            anchored: false,
+            engine: "rtpengine".to_string(),
+            profile: "srtp_to_rtp".to_string(),
+        }
+    }
+}
+
+impl PyMediaHandle {
+    /// Check if media is anchored (for the B2BUA core to read after script runs).
+    pub fn is_anchored(&self) -> bool {
+        self.anchored
+    }
+
+    /// Get the media engine name.
+    pub fn engine(&self) -> &str {
+        &self.engine
+    }
+
+    /// Get the RTP profile name.
+    pub fn profile_name(&self) -> &str {
+        &self.profile
+    }
+}
+
+#[pymethods]
+impl PyMediaHandle {
+    /// Anchor media through a media proxy.
+    #[pyo3(signature = (engine="rtpengine", profile="srtp_to_rtp"))]
+    fn anchor(&mut self, engine: &str, profile: &str) {
+        self.anchored = true;
+        self.engine = engine.to_string();
+        self.profile = profile.to_string();
+    }
+
+    /// Release the media anchor.
+    fn release(&mut self) {
+        self.anchored = false;
+    }
+
+    /// Whether media is currently anchored.
+    #[getter]
+    fn is_active(&self) -> bool {
+        self.anchored
+    }
+}
+
+/// Python-visible B2BUA call object.
+#[pyclass(name = "Call")]
+pub struct PyCall {
+    /// Unique call identifier (UUID).
+    id: String,
+    /// The original A-leg INVITE message.
+    message: Arc<Mutex<SipMessage>>,
+    /// Source IP of the A-leg.
+    source_ip: String,
+    /// Current call state.
+    state: String,
+    /// The action chosen by the script.
+    action: CallAction,
+    /// Media anchoring handle.
+    media_handle: PyMediaHandle,
+    /// Per-call session timer override (set by Python script).
+    session_timer_override: Option<SessionTimerOverride>,
+    /// Refer-To URI (set when the handler is on_refer).
+    refer_to_uri: Option<String>,
+    /// Replaces info from Refer-To (for attended transfer).
+    refer_replaces_info: Option<crate::sip::headers::refer::Replaces>,
+    /// Credentials for B-leg digest auth retry (set by Python script).
+    outbound_credentials: Option<(String, String)>,
+    /// SRS URI for SIPREC recording (set by Python script).
+    record_srs_uri: Option<String>,
+}
+
+impl PyCall {
+    pub fn new(
+        id: String,
+        message: Arc<Mutex<SipMessage>>,
+        source_ip: String,
+    ) -> Self {
+        Self {
+            id,
+            message,
+            source_ip,
+            state: "calling".to_string(),
+            action: CallAction::None,
+            media_handle: PyMediaHandle::default(),
+            session_timer_override: None,
+            refer_to_uri: None,
+            refer_replaces_info: None,
+            outbound_credentials: None,
+            record_srs_uri: None,
+        }
+    }
+
+    /// Get the action the script chose.
+    pub fn action(&self) -> &CallAction {
+        &self.action
+    }
+
+    /// Get the media handle (for the B2BUA core to check after script runs).
+    pub fn media_handle(&self) -> &PyMediaHandle {
+        &self.media_handle
+    }
+
+    /// Get the underlying SIP message.
+    pub fn message(&self) -> Arc<Mutex<SipMessage>> {
+        Arc::clone(&self.message)
+    }
+
+    /// Update the call state (called by the B2BUA core).
+    pub fn set_state(&mut self, state: &str) {
+        self.state = state.to_string();
+    }
+
+    /// Get the per-call session timer override (if set by the script).
+    pub fn session_timer_override(&self) -> Option<&SessionTimerOverride> {
+        self.session_timer_override.as_ref()
+    }
+
+    /// Get outbound credentials for B-leg auth retry (username, password).
+    pub fn outbound_credentials(&self) -> Option<(&str, &str)> {
+        self.outbound_credentials
+            .as_ref()
+            .map(|(user, password)| (user.as_str(), password.as_str()))
+    }
+
+    /// Get the SRS URI for SIPREC recording.
+    pub fn record_srs(&self) -> Option<&str> {
+        self.record_srs_uri.as_deref()
+    }
+
+    /// Set the Refer-To information (called by B2BUA core before firing on_refer).
+    pub fn set_refer_to(
+        &mut self,
+        uri: String,
+        replaces: Option<crate::sip::headers::refer::Replaces>,
+    ) {
+        self.refer_to_uri = Some(uri);
+        self.refer_replaces_info = replaces;
+    }
+}
+
+#[pymethods]
+impl PyCall {
+    /// Unique call identifier.
+    #[getter]
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Call state: "calling", "ringing", "answered", "terminated".
+    #[getter]
+    fn state(&self) -> &str {
+        &self.state
+    }
+
+    /// Source IP of the A-leg caller.
+    #[getter]
+    fn source_ip(&self) -> &str {
+        &self.source_ip
+    }
+
+    /// Media anchoring handle.
+    ///
+    /// Usage:
+    ///   call.media.anchor()
+    ///   call.media.anchor(engine="rtpengine", profile="wss_to_rtp")
+    ///   call.media.release()
+    #[getter]
+    fn media(&mut self) -> PyMediaHandle {
+        self.media_handle.clone()
+    }
+
+    /// Set media handle (called internally after Python modifies it).
+    #[setter]
+    fn set_media(&mut self, handle: &Bound<'_, PyMediaHandle>) {
+        self.media_handle = handle.borrow().clone();
+    }
+
+    /// From URI of the A-leg.
+    #[getter]
+    #[allow(clippy::wrong_self_convention)]
+    fn from_uri(&self) -> PyResult<Option<PySipUri>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        let from_raw = message.headers.get("From")
+            .or_else(|| message.headers.get("f"));
+        match from_raw {
+            Some(raw) => {
+                match crate::sip::headers::nameaddr::NameAddr::parse(raw) {
+                    Ok(nameaddr) => Ok(Some(PySipUri::new(nameaddr.uri))),
+                    Err(_) => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// To URI of the A-leg.
+    #[getter]
+    fn to_uri(&self) -> PyResult<Option<PySipUri>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        let to_raw = message.headers.get("To")
+            .or_else(|| message.headers.get("t"));
+        match to_raw {
+            Some(raw) => {
+                match crate::sip::headers::nameaddr::NameAddr::parse(raw) {
+                    Ok(nameaddr) => Ok(Some(PySipUri::new(nameaddr.uri))),
+                    Err(_) => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Request-URI of the A-leg INVITE.
+    #[getter]
+    fn ruri(&self) -> PyResult<Option<PySipUri>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        match &message.start_line {
+            crate::sip::message::StartLine::Request(request_line) => {
+                Ok(Some(PySipUri::new(request_line.request_uri.clone())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Call-ID header value.
+    #[getter]
+    fn call_id(&self) -> PyResult<Option<String>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        Ok(message.headers.get("Call-ID")
+            .or_else(|| message.headers.get("i"))
+            .map(|v| v.to_string()))
+    }
+
+    /// Get a header value by name.
+    fn get_header(&self, name: &str) -> PyResult<Option<String>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        Ok(message.headers.get(name).map(|v| v.to_string()))
+    }
+
+    /// Alias for get_header.
+    fn header(&self, name: &str) -> PyResult<Option<String>> {
+        self.get_header(name)
+    }
+
+    /// Check if a header exists.
+    fn has_header(&self, name: &str) -> PyResult<bool> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        Ok(message.headers.get(name).is_some())
+    }
+
+    /// Set a header value (for B-leg INVITE generation).
+    fn set_header(&self, name: &str, value: &str) -> PyResult<()> {
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        message.headers.set(name, value.to_string());
+        Ok(())
+    }
+
+    /// Remove a header.
+    fn remove_header(&self, name: &str) -> PyResult<()> {
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        message.headers.remove(name);
+        Ok(())
+    }
+
+    /// Remove all headers whose names start with a given prefix (case-insensitive).
+    fn remove_headers_matching(&self, prefix: &str) -> PyResult<()> {
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        let prefix_lower = prefix.to_lowercase();
+        let names_to_remove: Vec<String> = message.headers.names()
+            .iter()
+            .filter(|name| name.to_lowercase().starts_with(&prefix_lower))
+            .map(|name| name.to_string())
+            .collect();
+        for name in names_to_remove {
+            message.headers.remove(&name);
+        }
+        Ok(())
+    }
+
+    /// SDP body content, if present.
+    #[getter]
+    fn body(&self) -> PyResult<Option<Vec<u8>>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        if message.body.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(message.body.clone()))
+        }
+    }
+
+    /// Reject the call with a status code.
+    fn reject(&mut self, code: u16, reason: &str) {
+        self.action = CallAction::Reject {
+            code,
+            reason: reason.to_string(),
+        };
+    }
+
+    /// Dial a single target (simple B-leg).
+    #[pyo3(signature = (uri, timeout=30))]
+    fn dial(&mut self, uri: &str, timeout: u32) {
+        self.action = CallAction::Dial {
+            target: uri.to_string(),
+            timeout,
+        };
+    }
+
+    /// Fork to multiple targets.
+    #[pyo3(signature = (targets, strategy="parallel", timeout=30))]
+    fn fork(&mut self, targets: Vec<String>, strategy: &str, timeout: u32) {
+        self.action = CallAction::Fork {
+            targets,
+            strategy: strategy.to_string(),
+            timeout,
+        };
+    }
+
+    /// Terminate the call (send BYE to both legs).
+    fn terminate(&mut self) {
+        self.action = CallAction::Terminate;
+    }
+
+    /// Set per-call session timer parameters (overrides global config).
+    ///
+    /// Usage in Python:
+    ///   call.session_timer(expires=1800, min_se=90, refresher="b2bua")
+    #[pyo3(signature = (expires=1800, min_se=90, refresher="b2bua"))]
+    pub fn session_timer(&mut self, expires: u32, min_se: u32, refresher: &str) {
+        self.session_timer_override = Some(SessionTimerOverride {
+            session_expires: expires,
+            min_se,
+            refresher: refresher.to_string(),
+        });
+    }
+
+    /// The Refer-To URI (only set during @b2bua.on_refer handler).
+    #[getter]
+    fn refer_to(&self) -> Option<&str> {
+        self.refer_to_uri.as_deref()
+    }
+
+    /// Replaces info from the Refer-To header (for attended transfer).
+    ///
+    /// Returns a dict with keys: call_id, from_tag, to_tag, early_only.
+    /// Returns None if this is an unattended (blind) transfer.
+    #[getter]
+    fn refer_replaces(&self, python: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match &self.refer_replaces_info {
+            Some(replaces) => {
+                let dict = pyo3::types::PyDict::new(python);
+                dict.set_item("call_id", &replaces.call_id)?;
+                dict.set_item("from_tag", &replaces.from_tag)?;
+                dict.set_item("to_tag", &replaces.to_tag)?;
+                dict.set_item("early_only", replaces.early_only)?;
+                Ok(Some(dict.into_any().unbind()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Set outbound credentials for B-leg digest auth.
+    ///
+    /// When the B-leg returns 401/407, SIPhon will automatically retry
+    /// the INVITE with these credentials instead of firing on_failure.
+    ///
+    /// Usage in Python:
+    ///   call.set_credentials("alice", "secret123")
+    fn set_credentials(&mut self, username: &str, password: &str) {
+        self.outbound_credentials = Some((username.to_string(), password.to_string()));
+    }
+
+    /// Start SIPREC recording to a Session Recording Server.
+    ///
+    /// Usage in Python:
+    ///   call.record("sip:srs@recorder.example.com")
+    fn record(&mut self, srs_uri: &str) {
+        self.record_srs_uri = Some(srs_uri.to_string());
+    }
+
+    /// Stop SIPREC recording.
+    fn stop_recording(&mut self) {
+        self.record_srs_uri = None;
+    }
+
+    /// Accept the REFER and proceed with the transfer.
+    fn accept_refer(&mut self) {
+        self.action = CallAction::AcceptRefer;
+    }
+
+    /// Reject the REFER with a status code and reason.
+    fn reject_refer(&mut self, code: u16, reason: &str) {
+        self.action = CallAction::RejectRefer {
+            code,
+            reason: reason.to_string(),
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sip::builder::SipMessageBuilder;
+    use crate::sip::message::Method;
+    use crate::sip::uri::SipUri;
+
+    fn make_invite() -> SipMessage {
+        SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("example.com".to_string()).with_user("bob".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-test".to_string())
+            .from("<sip:alice@atlanta.com>;tag=abc".to_string())
+            .to("<sip:bob@example.com>".to_string())
+            .call_id("call-test-1".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn call_initial_state() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        assert_eq!(call.id, "test-id");
+        assert_eq!(call.state, "calling");
+        assert_eq!(call.action(), &CallAction::None);
+    }
+
+    #[test]
+    fn call_reject() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.reject(404, "Not Found");
+        assert_eq!(
+            call.action(),
+            &CallAction::Reject {
+                code: 404,
+                reason: "Not Found".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn call_dial() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.dial("sip:bob@10.0.0.2:5060", 30);
+        assert_eq!(
+            call.action(),
+            &CallAction::Dial {
+                target: "sip:bob@10.0.0.2:5060".to_string(),
+                timeout: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn call_fork() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.fork(
+            vec!["sip:bob@10.0.0.2".to_string(), "sip:bob@10.0.0.3".to_string()],
+            "parallel",
+            30,
+        );
+        assert_eq!(
+            call.action(),
+            &CallAction::Fork {
+                targets: vec!["sip:bob@10.0.0.2".to_string(), "sip:bob@10.0.0.3".to_string()],
+                strategy: "parallel".to_string(),
+                timeout: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn call_terminate() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.terminate();
+        assert_eq!(call.action(), &CallAction::Terminate);
+    }
+
+    #[test]
+    fn call_state_transition() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        assert_eq!(call.state, "calling");
+        call.set_state("ringing");
+        assert_eq!(call.state, "ringing");
+        call.set_state("answered");
+        assert_eq!(call.state, "answered");
+    }
+
+    #[test]
+    fn call_header_access() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        assert_eq!(call.get_header("Call-ID").unwrap(), Some("call-test-1".to_string()));
+        assert!(call.has_header("Via").unwrap());
+        assert!(!call.has_header("X-Custom").unwrap());
+    }
+
+    #[test]
+    fn call_session_timer_override() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        assert!(call.session_timer_override().is_none());
+
+        call.session_timer(3600, 120, "uas");
+        let override_config = call.session_timer_override().unwrap();
+        assert_eq!(override_config.session_expires, 3600);
+        assert_eq!(override_config.min_se, 120);
+        assert_eq!(override_config.refresher, "uas");
+    }
+
+    #[test]
+    fn call_accept_refer() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.accept_refer();
+        assert_eq!(call.action(), &CallAction::AcceptRefer);
+    }
+
+    #[test]
+    fn call_reject_refer() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.reject_refer(403, "Forbidden");
+        assert_eq!(
+            call.action(),
+            &CallAction::RejectRefer {
+                code: 403,
+                reason: "Forbidden".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn call_refer_to_initially_none() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        assert!(call.refer_to_uri.is_none());
+        assert!(call.refer_replaces_info.is_none());
+    }
+
+    #[test]
+    fn call_set_refer_to_blind() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.set_refer_to("sip:carol@example.com".to_string(), None);
+        assert_eq!(call.refer_to_uri.as_deref(), Some("sip:carol@example.com"));
+        assert!(call.refer_replaces_info.is_none());
+    }
+
+    #[test]
+    fn call_set_refer_to_attended() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let replaces = crate::sip::headers::refer::Replaces {
+            call_id: "other-call@host".to_string(),
+            from_tag: "ft".to_string(),
+            to_tag: "tt".to_string(),
+            early_only: false,
+        };
+        call.set_refer_to("sip:carol@example.com".to_string(), Some(replaces.clone()));
+        assert_eq!(call.refer_to_uri.as_deref(), Some("sip:carol@example.com"));
+        let stored = call.refer_replaces_info.as_ref().unwrap();
+        assert_eq!(stored.call_id, "other-call@host");
+        assert_eq!(stored.from_tag, "ft");
+        assert_eq!(stored.to_tag, "tt");
+    }
+
+    #[test]
+    fn call_set_and_remove_header() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.set_header("X-Custom", "test-value").unwrap();
+        assert_eq!(call.get_header("X-Custom").unwrap(), Some("test-value".to_string()));
+        call.remove_header("X-Custom").unwrap();
+        assert_eq!(call.get_header("X-Custom").unwrap(), None);
+    }
+}

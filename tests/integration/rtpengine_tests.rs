@@ -1,0 +1,356 @@
+//! Integration tests for RTPEngine module.
+//!
+//! Tests the full flow: SIP message with SDP → RTPEngine client → rewritten SDP.
+//! Uses mock UDP servers to simulate RTPEngine instances.
+
+use std::net::SocketAddr;
+
+use bytes::BytesMut;
+use tokio::net::UdpSocket;
+
+use siphon::rtpengine::bencode::{self, BencodeValue};
+use siphon::rtpengine::client::{RtpEngineClient, RtpEngineSet};
+use siphon::rtpengine::profile::{NgFlags, RtpProfile};
+use siphon::rtpengine::session::{MediaSession, MediaSessionStore};
+use siphon::sip::parser::parse_sip_message;
+
+/// Spawn a mock RTPEngine that rewrites SDP c-line and m-line port.
+async fn spawn_mock_rtpengine() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut buffer = BytesMut::zeroed(65535);
+        loop {
+            match socket.recv_from(&mut buffer).await {
+                Ok((size, source)) => {
+                    let data = &buffer[..size];
+                    let space = data.iter().position(|&b| b == b' ').unwrap();
+                    let cookie = std::str::from_utf8(&data[..space]).unwrap().to_string();
+
+                    let payload = &data[space + 1..];
+                    let command = bencode::decode_full_dict(payload).unwrap();
+                    let command_name = command.dict_get_str("command").unwrap_or("unknown");
+
+                    let response = match command_name {
+                        "ping" => BencodeValue::dict(vec![
+                            ("result", BencodeValue::string("pong")),
+                        ]),
+                        "offer" | "answer" => {
+                            // Rewrite SDP: replace c-line IP and m-line port.
+                            let rewritten_sdp = concat!(
+                                "v=0\r\n",
+                                "o=- 0 0 IN IP4 203.0.113.1\r\n",
+                                "s=-\r\n",
+                                "c=IN IP4 203.0.113.1\r\n",
+                                "t=0 0\r\n",
+                                "m=audio 30000 RTP/AVP 0 8 101\r\n",
+                                "a=rtpmap:0 PCMU/8000\r\n",
+                                "a=rtpmap:8 PCMA/8000\r\n",
+                                "a=rtpmap:101 telephone-event/8000\r\n",
+                            );
+                            BencodeValue::dict(vec![
+                                ("result", BencodeValue::string("ok")),
+                                ("sdp", BencodeValue::string(rewritten_sdp)),
+                            ])
+                        }
+                        "delete" => BencodeValue::dict(vec![
+                            ("result", BencodeValue::string("ok")),
+                        ]),
+                        "query" => BencodeValue::dict(vec![
+                            ("result", BencodeValue::string("ok")),
+                            ("totals", BencodeValue::dict(vec![
+                                ("RTP", BencodeValue::dict(vec![
+                                    ("packets", BencodeValue::from_integer(1000)),
+                                    ("bytes", BencodeValue::from_integer(160000)),
+                                ])),
+                            ])),
+                        ]),
+                        _ => BencodeValue::dict(vec![
+                            ("result", BencodeValue::string("error")),
+                            ("error-reason", BencodeValue::string("unknown command")),
+                        ]),
+                    };
+
+                    let encoded = bencode::encode(&response);
+                    let mut reply = Vec::new();
+                    reply.extend_from_slice(cookie.as_bytes());
+                    reply.push(b' ');
+                    reply.extend_from_slice(&encoded);
+                    let _ = socket.send_to(&reply, source).await;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    address
+}
+
+/// Build a sample INVITE with SDP body.
+fn make_invite_with_sdp() -> String {
+    let sdp = concat!(
+        "v=0\r\n",
+        "o=- 0 0 IN IP4 10.0.0.1\r\n",
+        "s=-\r\n",
+        "c=IN IP4 10.0.0.1\r\n",
+        "t=0 0\r\n",
+        "m=audio 8000 RTP/AVP 0 8 101\r\n",
+        "a=rtpmap:0 PCMU/8000\r\n",
+        "a=rtpmap:8 PCMA/8000\r\n",
+        "a=rtpmap:101 telephone-event/8000\r\n",
+    );
+    format!(
+        concat!(
+            "INVITE sip:bob@biloxi.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-test-1\r\n",
+            "From: <sip:alice@atlanta.com>;tag=from-tag-1\r\n",
+            "To: <sip:bob@biloxi.com>\r\n",
+            "Call-ID: call-rtpengine-test-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:alice@10.0.0.1:5060>\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Type: application/sdp\r\n",
+            "Content-Length: {}\r\n",
+            "\r\n",
+            "{}",
+        ),
+        sdp.len(),
+        sdp
+    )
+}
+
+/// Build a 200 OK response with SDP body.
+fn make_200ok_with_sdp() -> String {
+    let sdp = concat!(
+        "v=0\r\n",
+        "o=- 0 0 IN IP4 10.0.0.2\r\n",
+        "s=-\r\n",
+        "c=IN IP4 10.0.0.2\r\n",
+        "t=0 0\r\n",
+        "m=audio 9000 RTP/AVP 0 8\r\n",
+        "a=rtpmap:0 PCMU/8000\r\n",
+        "a=rtpmap:8 PCMA/8000\r\n",
+    );
+    format!(
+        concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-test-1\r\n",
+            "From: <sip:alice@atlanta.com>;tag=from-tag-1\r\n",
+            "To: <sip:bob@biloxi.com>;tag=to-tag-1\r\n",
+            "Call-ID: call-rtpengine-test-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:bob@10.0.0.2:5060>\r\n",
+            "Content-Type: application/sdp\r\n",
+            "Content-Length: {}\r\n",
+            "\r\n",
+            "{}",
+        ),
+        sdp.len(),
+        sdp
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn full_offer_answer_delete_flow() {
+    let mock_addr = spawn_mock_rtpengine().await;
+    let client = RtpEngineClient::new(mock_addr, 2000).await.unwrap();
+
+    // Offer — extract SDP from INVITE, send to RTPEngine.
+    let invite_raw = make_invite_with_sdp();
+    let invite = parse_sip_message(&invite_raw).unwrap().1;
+    let original_sdp = &invite.body;
+    assert!(!original_sdp.is_empty());
+
+    let offer_flags = RtpProfile::SrtpToRtp.offer_flags();
+    let rewritten_sdp = client
+        .offer("call-rtpengine-test-1", "from-tag-1", original_sdp, &offer_flags)
+        .await
+        .unwrap();
+
+    let rewritten_str = std::str::from_utf8(&rewritten_sdp).unwrap();
+    assert!(rewritten_str.contains("203.0.113.1"), "SDP should be rewritten to RTPEngine IP");
+    assert!(rewritten_str.contains("30000"), "SDP should have RTPEngine port");
+    assert!(!rewritten_str.contains("10.0.0.1"), "Original IP should be gone");
+
+    // Answer — extract SDP from 200 OK, send to RTPEngine.
+    let ok_raw = make_200ok_with_sdp();
+    let ok_msg = parse_sip_message(&ok_raw).unwrap().1;
+    let answer_sdp = &ok_msg.body;
+
+    let answer_flags = RtpProfile::SrtpToRtp.answer_flags();
+    let rewritten_answer = client
+        .answer("call-rtpengine-test-1", "from-tag-1", "to-tag-1", answer_sdp, &answer_flags)
+        .await
+        .unwrap();
+
+    let answer_str = std::str::from_utf8(&rewritten_answer).unwrap();
+    assert!(answer_str.contains("203.0.113.1"));
+
+    // Query — get session stats.
+    let stats = client
+        .query("call-rtpengine-test-1", "from-tag-1")
+        .await
+        .unwrap();
+    assert_eq!(stats.dict_get_str("result"), Some("ok"));
+
+    // Delete — tear down.
+    client
+        .delete("call-rtpengine-test-1", "from-tag-1")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn session_store_tracks_offer_and_answer() {
+    let store = MediaSessionStore::new();
+
+    // Offer creates a session.
+    store.insert(MediaSession {
+        call_id: "call-1".to_string(),
+        from_tag: "tag-a".to_string(),
+        to_tag: None,
+        profile: RtpProfile::SrtpToRtp,
+        created_at: std::time::Instant::now(),
+    });
+
+    let session = store.get("call-1").unwrap();
+    assert!(session.to_tag.is_none());
+
+    // Answer sets the to-tag.
+    store.set_to_tag("call-1", "tag-b".to_string());
+    let session = store.get("call-1").unwrap();
+    assert_eq!(session.to_tag.as_deref(), Some("tag-b"));
+
+    // Delete removes it.
+    store.remove("call-1");
+    assert!(store.get("call-1").is_none());
+}
+
+#[tokio::test]
+async fn multi_instance_weighted_round_robin() {
+    let addr1 = spawn_mock_rtpengine().await;
+    let addr2 = spawn_mock_rtpengine().await;
+
+    // Instance 1 has weight 3, instance 2 has weight 1.
+    let set = RtpEngineSet::new(vec![
+        (addr1, 2000, 3),
+        (addr2, 2000, 1),
+    ])
+    .await
+    .unwrap();
+
+    assert_eq!(set.instance_count(), 2);
+
+    // Ping all instances.
+    set.ping_all().await.unwrap();
+
+    // Multiple offers to different call-ids.
+    let flags = NgFlags::default();
+    for index in 0..10 {
+        let call_id = format!("call-weighted-{index}");
+        set.offer(&call_id, "tag-a", b"v=0\r\n", &flags)
+            .await
+            .unwrap();
+    }
+
+    // All should be tracked with affinity.
+    assert_eq!(set.active_sessions(), 10);
+
+    // Delete cleans up affinity.
+    for index in 0..10 {
+        let call_id = format!("call-weighted-{index}");
+        set.delete(&call_id, "tag-a").await.unwrap();
+    }
+    assert_eq!(set.active_sessions(), 0);
+}
+
+#[tokio::test]
+async fn profile_flags_produce_valid_bencode() {
+    // Verify that NgFlags for each profile produce valid bencode dictionaries.
+    for profile in &[
+        RtpProfile::SrtpToRtp,
+        RtpProfile::WsToRtp,
+        RtpProfile::WssToRtp,
+        RtpProfile::RtpPassthrough,
+    ] {
+        let offer_flags = profile.offer_flags();
+        let answer_flags = profile.answer_flags();
+
+        // Convert to bencode pairs and build a dict.
+        let offer_pairs = offer_flags.to_bencode_pairs();
+        let answer_pairs = answer_flags.to_bencode_pairs();
+
+        // Build full offer command dict.
+        let mut all_pairs = vec![
+            ("command", BencodeValue::string("offer")),
+            ("call-id", BencodeValue::string("test")),
+            ("from-tag", BencodeValue::string("tag")),
+            ("sdp", BencodeValue::string("v=0\r\n")),
+        ];
+        all_pairs.extend(offer_pairs);
+        let dict = BencodeValue::dict(all_pairs);
+
+        // Encode → decode roundtrip.
+        let encoded = bencode::encode(&dict);
+        let decoded = bencode::decode_full_dict(&encoded).unwrap();
+        assert_eq!(decoded.dict_get_str("command"), Some("offer"));
+
+        // Same for answer.
+        let mut answer_all = vec![
+            ("command", BencodeValue::string("answer")),
+            ("call-id", BencodeValue::string("test")),
+            ("from-tag", BencodeValue::string("tag")),
+            ("to-tag", BencodeValue::string("tag-b")),
+            ("sdp", BencodeValue::string("v=0\r\n")),
+        ];
+        answer_all.extend(answer_pairs);
+        let dict = BencodeValue::dict(answer_all);
+        let encoded = bencode::encode(&dict);
+        let decoded = bencode::decode_full_dict(&encoded).unwrap();
+        assert_eq!(decoded.dict_get_str("command"), Some("answer"));
+    }
+}
+
+#[tokio::test]
+async fn config_media_section_backward_compatible() {
+    use siphon::config::Config;
+
+    // Config without media section should parse fine.
+    let yaml = concat!(
+        "listen:\n",
+        "  udp:\n",
+        "    - \"0.0.0.0:5060\"\n",
+        "domain:\n",
+        "  local:\n",
+        "    - \"example.com\"\n",
+        "script:\n",
+        "  path: \"scripts/proxy_default.py\"\n",
+    );
+    let config = Config::from_str(yaml).unwrap();
+    assert!(config.media.is_none());
+
+    // Config with media section should parse with the RTPEngine addresses.
+    let yaml_with_media = concat!(
+        "listen:\n",
+        "  udp:\n",
+        "    - \"0.0.0.0:5060\"\n",
+        "domain:\n",
+        "  local:\n",
+        "    - \"example.com\"\n",
+        "script:\n",
+        "  path: \"scripts/proxy_default.py\"\n",
+        "media:\n",
+        "  rtpengine:\n",
+        "    address: \"127.0.0.1:22222\"\n",
+    );
+    let config = Config::from_str(yaml_with_media).unwrap();
+    let media = config.media.unwrap();
+    let instances = media.rtpengine.instances();
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0].address, "127.0.0.1:22222");
+}

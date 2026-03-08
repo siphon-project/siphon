@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="tube" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0ea5e9"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+    <linearGradient id="liquid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#818cf8" stop-opacity="0.3"/>
+    </linearGradient>
+    <linearGradient id="packet" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Left container (source) — taller, represents incoming SIP -->
+  <rect x="60" y="200" width="120" height="220" rx="10" stroke="url(#tube)" stroke-width="6" fill="none"/>
+  <!-- Liquid level in source -->
+  <rect x="63" y="260" width="114" height="157" rx="8" fill="url(#liquid)"/>
+
+  <!-- Right container (destination) — shorter, represents outbound -->
+  <rect x="332" y="280" width="120" height="140" rx="10" stroke="url(#tube)" stroke-width="6" fill="none"/>
+  <!-- Liquid level in destination -->
+  <rect x="335" y="340" width="114" height="77" rx="8" fill="url(#liquid)"/>
+
+  <!-- The siphon tube — goes up from left container, arches over, down into right -->
+  <path d="M 120 260
+           L 120 120
+           C 120 70, 170 50, 256 50
+           C 342 50, 392 70, 392 120
+           L 392 340"
+        stroke="url(#tube)" stroke-width="10" stroke-linecap="round" fill="none"/>
+
+  <!-- Inner tube line for depth -->
+  <path d="M 120 260
+           L 120 120
+           C 120 70, 170 50, 256 50
+           C 342 50, 392 70, 392 120
+           L 392 340"
+        stroke="url(#tube)" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.3" stroke-dasharray="0" transform="translate(8,0)"/>
+
+  <!-- SIP packets flowing through the tube — small rectangles like data packets -->
+  <rect x="112" y="190" width="16" height="10" rx="2" fill="url(#packet)" opacity="0.9">
+    <animateMotion dur="3s" repeatCount="indefinite" path="M 0,0 L 0,-130 C 0,-180 50,-200 136,-200 C 222,-200 272,-180 272,-130 L 272,150" rotate="auto"/>
+  </rect>
+  <rect x="112" y="190" width="16" height="10" rx="2" fill="url(#packet)" opacity="0.7">
+    <animateMotion dur="3s" repeatCount="indefinite" begin="1s" path="M 0,0 L 0,-130 C 0,-180 50,-200 136,-200 C 222,-200 272,-180 272,-130 L 272,150" rotate="auto"/>
+  </rect>
+  <rect x="112" y="190" width="16" height="10" rx="2" fill="url(#packet)" opacity="0.5">
+    <animateMotion dur="3s" repeatCount="indefinite" begin="2s" path="M 0,0 L 0,-130 C 0,-180 50,-200 136,-200 C 222,-200 272,-180 272,-130 L 272,150" rotate="auto"/>
+  </rect>
+
+  <!-- "SIP" label in left container -->
+  <text x="120" y="390" text-anchor="middle" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="28" font-weight="700" fill="#0ea5e9" opacity="0.8">SIP</text>
+
+  <!-- Arrow at tube exit showing flow direction -->
+  <polygon points="392,355 382,340 402,340" fill="url(#packet)" opacity="0.7"/>
+
+  <!-- Signal arcs at the top of the arch — representing signaling -->
+  <path d="M 238 38 C 228 25, 228 10, 238 0" stroke="#22d3ee" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.5"/>
+  <path d="M 256 32 L 256 8" stroke="#6366f1" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.6"/>
+  <path d="M 274 38 C 284 25, 284 10, 274 0" stroke="#818cf8" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.5"/>
+
+  <!-- Small phone/handset icon at the arch peak -->
+  <g transform="translate(244, 60) scale(0.5)" opacity="0.6">
+    <path d="M 0 10 C 0 0, 5 -5, 12 -5 L 12 5 C 8 5, 5 8, 5 12 Z" fill="#0ea5e9"/>
+    <path d="M 24 10 C 24 0, 19 -5, 12 -5 L 12 5 C 16 5, 19 8, 19 12 Z" fill="#6366f1"/>
+  </g>
+</svg>

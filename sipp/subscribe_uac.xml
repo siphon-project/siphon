@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  SUBSCRIBE UAC scenario (RFC 3265 presence):
+  1. Send SUBSCRIBE for presence -> expect 200 OK
+  2. Receive NOTIFY with presence state -> send 200 OK
+  3. Unsubscribe: SUBSCRIBE Expires:0 -> 200 OK
+  4. Receive final NOTIFY (terminated) -> 200 OK
+
+  Run: sipp -sf subscribe_uac.xml -s user <target>:<port>
+  Pair with subscribe_uas.xml on the remote side.
+-->
+<scenario name="SUBSCRIBE UAC (presence)">
+
+  <!-- Step 1: Send initial SUBSCRIBE -->
+  <send retrans="500">
+    <![CDATA[
+SUBSCRIBE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:watcher@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 SUBSCRIBE
+Contact: <sip:watcher@[local_ip]:[local_port];transport=[transport]>
+Event: presence
+Expires: 3600
+Accept: application/pidf+xml
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Expect 200 OK for SUBSCRIBE -->
+  <recv response="200" rtd="true" />
+
+  <!-- Receive initial NOTIFY (active subscription) -->
+  <recv request="NOTIFY" />
+
+  <!-- Respond 200 OK to NOTIFY -->
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="1000" />
+
+  <!-- Step 3: Unsubscribe (Expires: 0) -->
+  <send retrans="500">
+    <![CDATA[
+SUBSCRIBE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:watcher@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 SUBSCRIBE
+Contact: <sip:watcher@[local_ip]:[local_port];transport=[transport]>
+Event: presence
+Expires: 0
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Expect 200 OK for unsubscribe -->
+  <recv response="200" rtd="true" />
+
+  <!-- Receive final NOTIFY (terminated) -->
+  <recv request="NOTIFY" />
+
+  <!-- Respond 200 OK to final NOTIFY -->
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

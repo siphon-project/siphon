@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 220" fill="none">
+  <defs>
+    <linearGradient id="tube" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0ea5e9"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+    <linearGradient id="liquid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#818cf8" stop-opacity="0.3"/>
+    </linearGradient>
+    <linearGradient id="packet" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Logo mark scaled to fit -->
+  <g transform="translate(30, 15) scale(0.38)">
+    <!-- Left container -->
+    <rect x="60" y="200" width="120" height="220" rx="10" stroke="url(#tube)" stroke-width="6" fill="none"/>
+    <rect x="63" y="260" width="114" height="157" rx="8" fill="url(#liquid)"/>
+
+    <!-- Right container -->
+    <rect x="332" y="280" width="120" height="140" rx="10" stroke="url(#tube)" stroke-width="6" fill="none"/>
+    <rect x="335" y="340" width="114" height="77" rx="8" fill="url(#liquid)"/>
+
+    <!-- Siphon tube -->
+    <path d="M 120 260
+             L 120 120
+             C 120 70, 170 50, 256 50
+             C 342 50, 392 70, 392 120
+             L 392 340"
+          stroke="url(#tube)" stroke-width="10" stroke-linecap="round" fill="none"/>
+
+    <!-- SIP packets flowing -->
+    <rect x="112" y="190" width="16" height="10" rx="2" fill="url(#packet)" opacity="0.9">
+      <animateMotion dur="3s" repeatCount="indefinite" path="M 0,0 L 0,-130 C 0,-180 50,-200 136,-200 C 222,-200 272,-180 272,-130 L 272,150" rotate="auto"/>
+    </rect>
+    <rect x="112" y="190" width="16" height="10" rx="2" fill="url(#packet)" opacity="0.6">
+      <animateMotion dur="3s" repeatCount="indefinite" begin="1.5s" path="M 0,0 L 0,-130 C 0,-180 50,-200 136,-200 C 222,-200 272,-180 272,-130 L 272,150" rotate="auto"/>
+    </rect>
+
+    <!-- SIP label -->
+    <text x="120" y="390" text-anchor="middle" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="28" font-weight="700" fill="#0ea5e9" opacity="0.8">SIP</text>
+
+    <!-- Flow arrow -->
+    <polygon points="392,355 382,340 402,340" fill="url(#packet)" opacity="0.7"/>
+
+    <!-- Signal arcs at top -->
+    <path d="M 238 38 C 228 25, 228 10, 238 0" stroke="#22d3ee" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.5"/>
+    <path d="M 256 32 L 256 8" stroke="#6366f1" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.6"/>
+    <path d="M 274 38 C 284 25, 284 10, 274 0" stroke="#818cf8" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.5"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="250" y="115" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="76" font-weight="700" letter-spacing="-1">
+    <tspan fill="#0ea5e9">SIP</tspan><tspan fill="#6366f1">hon</tspan>
+  </text>
+
+  <!-- Tagline -->
+  <text x="253" y="152" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="18" fill="#94a3b8" font-weight="400" letter-spacing="0.5">
+    High-performance SIP platform in Rust
+  </text>
+</svg>

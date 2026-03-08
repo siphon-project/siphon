@@ -1,0 +1,51 @@
+# SIPhon IMS lab config — combined P-CSCF + S-CSCF for SIPp E2E testing
+#
+# Uses standard digest auth (not AKA) so plain SIPp can authenticate.
+# For IPsec/AKA testing, use sipp/ipsec/ with sipp_ipsec.
+#
+# Usage:
+#   docker compose -f sipp/docker-compose.yaml --profile ims build
+#   docker compose -f sipp/docker-compose.yaml --profile ims \
+#     up --abort-on-container-exit sipp-ims-uac
+#
+# Network:
+#   172.20.0.70  siphon-ims (this instance)
+#   172.20.0.72  bob UAS (receives INVITE)
+#   172.20.0.73  alice UAC (sends INVITE)
+
+listen:
+  udp:
+    - "0.0.0.0:6060"
+  tcp:
+    - "0.0.0.0:6060"
+
+advertised_address: "172.20.0.70"
+
+domain:
+  local:
+    - "ims.test"
+    - "172.20.0.70"
+
+script:
+  path: "examples/ims_scscf_lab.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "ims.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+transaction:
+  timeout_secs: 5
+  invite_timeout_secs: 30
+
+log:
+  level: debug
+  format: pretty

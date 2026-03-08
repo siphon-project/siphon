@@ -1,0 +1,420 @@
+# siphon.yaml — SIPhon reference configuration
+#
+# This is the canonical reference showing every supported and planned option.
+# Commented-out sections are planned (not yet parsed by the runtime).
+# Copy and uncomment what you need; delete everything else.
+#
+# Hot-reload: all sections except `listen` can be changed without restart.
+# (Transport listeners require a full restart to rebind.)
+
+# ---------------------------------------------------------------------------
+# Transport listeners
+# ---------------------------------------------------------------------------
+listen:
+  udp:
+    - "0.0.0.0:5060"    # Standard SIP (PSTN gateways, legacy UEs)
+    # - "[::]:5060"      # Dual-stack IPv6 (accepts both IPv4 and IPv6)
+    # - "[2001:db8::1]:5060"  # Specific IPv6 address
+  tcp:
+    - "0.0.0.0:5060"    # SIP over TCP (AS internal leg, modern UEs)
+    # - "[::]:5060"      # Dual-stack IPv6 over TCP
+  # tls:
+  #   - "0.0.0.0:5061"  # SIP over TLS — requires tls: cert/key block below
+  #   - "[::]:5061"      # IPv6 TLS
+  # ws:
+  #   - "0.0.0.0:80"    # SIP over WebSocket (RFC 7118, browser UEs)
+  # wss:
+  #   - "0.0.0.0:443"   # SIP over Secure WebSocket
+  #                      # WSS shares the TLS cert from the `tls:` block below.
+  #                      # It's a separate listener because the HTTP upgrade
+  #                      # handshake differs from raw SIP/TLS.
+
+# ---------------------------------------------------------------------------
+# Network identity
+# ---------------------------------------------------------------------------
+domain:
+  local:
+    - "example.com"     # SIP domain served by this instance
+    - "127.0.0.1"       # Local IP for loop detection
+
+# Public IP advertised in Via / Contact / SDP when binding 0.0.0.0 or [::].
+# Needed on cloud instances (EC2, GCE) where the bound IP is private.
+# advertised_address: "1.2.3.4"
+# advertised_address: "2001:db8::1"  # IPv6 public address
+
+# ---------------------------------------------------------------------------
+# TLS certificate (required when listen.tls or listen.wss is set)
+# ---------------------------------------------------------------------------
+# tls:
+#   certificate: "/etc/siphon/tls/example.com.crt"
+#   private_key:  "/etc/siphon/tls/example.com.key"
+#   method: "TLSv1_3"     # TLSv1_2 | TLSv1_3
+#   verify_client: false  # true for mTLS (e.g. SIP trunks with mutual auth)
+
+# ---------------------------------------------------------------------------
+# Python script
+# ---------------------------------------------------------------------------
+script:
+  path: "scripts/proxy_default.py"
+  reload: auto    # auto = inotify (change without restart) | sighup = signal only
+
+# ---------------------------------------------------------------------------
+# Registrar
+# ---------------------------------------------------------------------------
+registrar:
+  backend: memory   # memory | redis | postgres | python (custom hook)
+  default_expires: 3600   # seconds; used when client omits Expires header
+  max_expires: 7200        # reject/clamp registrations above this
+  # min_expires: 60        # reject with 423 Interval Too Brief if below this
+  # max_contacts: 1        # evict existing contacts if above limit (omit = unlimited)
+
+  # Redis persistence (backend: redis)
+  # Survives restarts; required when RTPEngine or dialog state also uses Redis.
+  # redis:
+  #   url: "redis://127.0.0.1:6379"
+  #   key_prefix: "siphon:reg:"   # namespace prefix (default: "siphon:reg:")
+  #   ttl_slack_secs: 30          # extra seconds beyond expires for race safety
+
+  # PostgreSQL persistence (backend: postgres)
+  # postgres:
+  #   url: "postgres://user:pass@localhost/siphon"
+  #   table: "registrar"
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+auth:
+  realm: "example.com"
+  backend: static   # static | http | database | diameter_cx
+
+  # Static credentials (dev / bring-up only)
+  users:
+    alice: "secret"
+    bob: "secret"
+
+  # REST credential lookup (backend: http)
+  # GET {url} with {username} substituted → returns password or HA1.
+  # http:
+  #   url: "http://127.0.0.1:8000/sip/auth/{username}"
+  #   timeout_ms: 2000
+  #   connect_timeout_ms: 500
+  #   ha1: true   # true = response body is pre-hashed HA1 hex string
+
+# ---------------------------------------------------------------------------
+# Security — rate limiting, scanner blocking, trust lists
+# ---------------------------------------------------------------------------
+# security:
+#   rate_limit:
+#     window_secs: 10
+#     max_requests: 30          # requests per source IP per window
+#     ban_duration_secs: 3600   # how long to block after exceeding limit
+#
+#   scanner_block:
+#     user_agents:              # drop requests before any processing
+#       - "sipvicious"
+#       - "friendly-scanner"
+#       - "VaxSip"
+#       - "sipcli"
+#
+#   trusted_cidrs:              # bypass rate limiting (AS, monitoring)
+#     - "10.0.0.0/8"
+#
+#   failed_auth_ban:            # block IP after N failed auth attempts
+#     threshold: 10
+#     ban_duration_secs: 300
+#
+#   apiban:                     # APIBAN community blocklist (apiban.org)
+#     api_key: "your-api-key"   # get a free key at apiban.org
+#     interval_secs: 300        # poll interval (default: 300 = 5 min)
+
+# ---------------------------------------------------------------------------
+# NAT traversal
+# ---------------------------------------------------------------------------
+# nat:
+#   force_rport: true       # always rewrite Via/Contact port from observed source
+#   fix_contact: true       # rewrite Contact URI host:port with observed source
+#   fix_register: true      # rewrite Contact on REGISTER with observed source
+#   keepalive:
+#     enabled: true
+#     interval_secs: 30     # send OPTIONS to each registered contact
+#     failure_threshold: 10 # deregister contact after N consecutive failures
+
+# ---------------------------------------------------------------------------
+# SIP transaction layer
+# ---------------------------------------------------------------------------
+# transaction:
+#   timeout_secs: 5        # non-INVITE transaction timeout (fr_timeout)
+#   invite_timeout_secs: 30  # INVITE transaction timeout (fr_inv_timeout)
+
+# ---------------------------------------------------------------------------
+# Session timers (RFC 4028) — B2BUA mode only
+# ---------------------------------------------------------------------------
+# session_timer:
+#   session_expires: 1800   # default Session-Expires value in seconds
+#   min_se: 90              # minimum acceptable Session-Expires (Min-SE header)
+#   refresher: uac          # who refreshes: uac (default) or uas
+#   enabled: true           # set to false to disable session timers
+
+# ---------------------------------------------------------------------------
+# Dialog state
+# ---------------------------------------------------------------------------
+# dialog:
+#   backend: memory   # memory | redis | postgres
+#   # redis:
+#   #   url: "redis://127.0.0.1:6379/0"
+
+# ---------------------------------------------------------------------------
+# Named cache connections (available to Python scripts via cache.fetch)
+#
+# In script: from siphon import cache
+#            result = await cache.fetch("myconn", "key")
+# ---------------------------------------------------------------------------
+# cache:
+#   - name: "cnam"
+#     url: "redis://127.0.0.1:6379"
+#     local_ttl_secs: 60       # optional in-process LRU in front of Redis
+#     local_max_entries: 10000
+
+# ---------------------------------------------------------------------------
+# Media (RTPEngine)
+# ---------------------------------------------------------------------------
+# Single instance:
+# media:
+#   rtpengine:
+#     address: "127.0.0.1:22222"   # NG control protocol (UDP)
+#     timeout_ms: 1000              # NG protocol response timeout
+#
+# Multiple instances (weighted round-robin):
+# media:
+#   rtpengine:
+#     instances:
+#       - address: "10.0.0.1:22222"
+#         weight: 2
+#       - address: "10.0.0.2:22222"
+#         weight: 1
+#         timeout_ms: 2000
+
+# ---------------------------------------------------------------------------
+# SIP tracing via HEP (Homer / captAgent)
+# ---------------------------------------------------------------------------
+# tracing:
+#   hep:
+#     endpoint: "127.0.0.1:9060"   # Address of the Homer/heplify-server collector
+#     version: 3                    # HEP protocol version (only v3 supported)
+#     transport: udp                # udp | tcp | tls
+#     agent_id: "siphon"            # Label in Homer — use per-role names
+#                                   # (siphon-registrar, siphon-sbc, etc.)
+#                                   # so multiple nodes appear separately
+#     # ca_cert: /etc/ssl/homer-ca.pem      # CA for TLS transport (default: system roots)
+#     # tls_server_name: homer.example.com  # SNI for TLS (default: endpoint host)
+
+# ---------------------------------------------------------------------------
+# Server identity headers
+# ---------------------------------------------------------------------------
+# server:
+#   server_header: "SIPhon/0.1.0"    # default: "SIPhon/<cargo version>"
+#   user_agent_header: "SIPhon/0.1.0" # default: "SIPhon/<cargo version>"
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+# metrics:
+#   prometheus:
+#     listen: "0.0.0.0:8888"
+#     path: "/metrics"
+
+# ---------------------------------------------------------------------------
+# Gateway dispatcher (named groups with load balancing + health probing)
+# ---------------------------------------------------------------------------
+# gateway:
+#   groups:
+#     - name: "carriers"
+#       algorithm: weighted       # round_robin | weighted (default) | hash
+#       probe:
+#         enabled: true           # SIP OPTIONS health probing
+#         interval_secs: 15       # probe every 15 seconds
+#         failure_threshold: 3    # mark down after 3 consecutive failures
+#       destinations:
+#         - uri: "sip:gw1.carrier.com:5060"
+#           address: "10.0.0.1:5060"
+#           transport: udp        # udp (default) | tcp | tls
+#           weight: 3             # higher = more traffic (weighted algorithm)
+#           priority: 1           # lower = higher priority (failover tiers)
+#           attrs:                # user-defined metadata for filtering
+#             region: "us-east"
+#             type: "pstn"
+#         - uri: "sip:gw2.carrier.com:5060"
+#           address: "10.0.0.2:5060"
+#           weight: 1
+#           priority: 2           # failover tier — only used when tier 1 is down
+#
+#     - name: "sbc-pool"
+#       algorithm: hash           # hash on call-id for sticky sessions
+#       destinations:
+#         - uri: "sip:sbc1.example.com:5060"
+#           address: "10.1.0.1:5060"
+#         - uri: "sip:sbc2.example.com:5060"
+#           address: "10.1.0.2:5060"
+#
+# Python usage:
+#   from siphon import gateway
+#   gw = gateway.select("carriers")                          # weighted
+#   gw = gateway.select("sbc-pool", key=request.call_id)    # hash sticky
+#   gw = gateway.select("carriers", attrs={"region": "us-east"})  # filter
+
+# ---------------------------------------------------------------------------
+# Call Detail Records (CDR) — billing and accounting
+# ---------------------------------------------------------------------------
+# CDRs are written asynchronously via a bounded channel (never blocks calls).
+# Each CDR is a JSON object with: timestamp, call_id, from_uri, to_uri, ruri,
+# method, response_code, timestamp_start/answer/end, duration_secs, source_ip,
+# destination_ip, transport, user_agent, auth_user, disconnect_initiator,
+# sip_reason, plus any extra fields added by scripts.
+#
+# File backend (JSON-lines):
+# cdr:
+#   enabled: true
+#   include_register: false       # generate CDRs for REGISTER events too
+#   channel_size: 10000           # async buffer (drop CDR if full)
+#   backend: file
+#   file:
+#     path: "/var/log/siphon/cdr.jsonl"
+#     rotate_size_mb: 100
+#
+# HTTP webhook (POST JSON to a collector):
+# cdr:
+#   enabled: true
+#   backend: http
+#   http:
+#     url: "https://collector.example.com/v1/cdr"
+#     auth_header: "Bearer tok123"
+#
+# UDP syslog:
+# cdr:
+#   enabled: true
+#   backend: syslog
+#   syslog:
+#     target: "10.0.0.5:514"
+#
+# Python usage:
+#   from siphon import cdr
+#   cdr.write(request, extra={"billing_id": "B-12345", "trunk": "carrier-a"})
+
+# ---------------------------------------------------------------------------
+# Lawful Intercept — ETSI X1/X2/X3 + SIPREC (RFC 7866)
+# ---------------------------------------------------------------------------
+# Implements the three ETSI LI interfaces:
+#   X1 (TS 103 221-1) — Admin: provision/modify/deactivate intercept targets
+#   X2 (TS 102 232-5) — IRI: real-time signaling events (ASN.1/BER over TCP/TLS)
+#   X3 (TS 102 232-1) — CC: media content (RTPEngine recording + encapsulation)
+#   SIPREC (RFC 7866) — SIP-based media recording to SRS
+#
+# LI is triggered per-call from the Python script:
+#   from siphon import li
+#   if li.is_target(request):            # check against X1-provisioned targets
+#       li.intercept(request)            # start IRI + CC for this call
+#   li.intercept(call)                   # B2BUA variant
+#
+# lawful_intercept:
+#   enabled: false                       # master switch (disabled by default)
+#   audit_log: "/var/log/siphon/li-audit.log"  # mandatory audit trail
+#
+#   # X1: ETSI TS 103 221-1 — admin interface for intercept provisioning
+#   x1:
+#     listen: "127.0.0.1:8443"           # separate HTTPS listener (not main admin)
+#     tls:
+#       certificate: "/etc/siphon/li/x1.crt"
+#       private_key: "/etc/siphon/li/x1.key"
+#       verify_client: true              # mTLS required for LEA authentication
+#     auth_token: "warrant-auth-xyz"     # additional bearer token
+#
+#   # X2: ETSI TS 102 232-5 — IRI (signaling events) delivery
+#   x2:
+#     delivery_address: "10.0.0.50:6543" # mediation device IRI collector
+#     transport: tcp                      # tcp | tls
+#     reconnect_interval_secs: 5
+#     channel_size: 10000
+#     # tls:
+#     #   ca_cert: "/etc/siphon/li/mediation-ca.pem"
+#
+#   # X3: ETSI TS 102 232-1 — CC (media content) delivery
+#   x3:
+#     listen_udp: "127.0.0.1:0"          # local UDP for RTPEngine mirror reception
+#     delivery_address: "10.0.0.50:6544"  # mediation device CC collector
+#     transport: udp                       # udp | tcp
+#     encapsulation: etsi                  # etsi (TS 102 232 CC-PDU) | raw_ip
+#
+#   # SIPREC: RFC 7866 — SIP-based media recording
+#   siprec:
+#     srs_uri: "sip:srs@recorder.example.com"
+#     session_copies: 1                   # parallel recording sessions per call
+#     transport: tcp                       # transport for SRS INVITE
+
+# ---------------------------------------------------------------------------
+# Diameter peer connections and application routing
+# ---------------------------------------------------------------------------
+# SIPhon connects outbound to Diameter peers (HSS, OCS, PCRF, CDF) and uses
+# the routing table to select which peer(s) handle each application interface.
+#
+# Supported applications: cx (HSS auth/reg), sh (HSS user data),
+#   ro (online charging), rf (offline charging), rx (QoS policy).
+#
+# diameter:
+#   origin_host: "siphon.ims.example.com"
+#   origin_realm: "ims.example.com"
+#   product_name: "SIPhon"              # advertised in CER/CEA (default: SIPhon)
+#   transport: tcp                       # tcp | sctp (default for all peers)
+#   watchdog_interval: 30                # DWR/DWA interval in seconds
+#   reconnect_delay: 5                   # seconds between reconnect attempts
+
+#   peers:
+#     - name: "hss1"
+#       host: "hss1.example.com"
+#       port: 3868
+#       destination_realm: "example.com"
+
+#     - name: "hss2"
+#       host: "hss2.example.com"
+#       port: 3868
+#       destination_realm: "example.com"
+
+#     - name: "ocs1"
+#       host: "ocs.example.com"
+#       port: 3868
+#       destination_realm: "charging.example.com"
+
+#     - name: "pcrf1"
+#       host: "pcrf.example.com"
+#       port: 3868
+#       destination_realm: "example.com"
+#       transport: sctp                  # per-peer override
+
+#     - name: "cdf1"
+#       host: "cdf.example.com"
+#       port: 3868
+#       destination_realm: "charging.example.com"
+
+#   routes:
+#     - application: cx                  # HSS: MAR/SAR/UAR/LIR
+#       realm: "example.com"             # optional realm filter
+#       peers: ["hss1", "hss2"]          # failover order
+#       algorithm: failover              # failover (default) | round_robin
+
+#     - application: sh                  # HSS: UDR/PUR/SNR
+#       peers: ["hss1"]
+
+#     - application: ro                  # OCS: CCR/CCA
+#       peers: ["ocs1"]
+
+#     - application: rx                  # PCRF: AAR/STR/RAR/ASR
+#       peers: ["pcrf1"]
+
+#     - application: rf                  # CDF: ACR/ACA
+#       peers: ["cdf1"]
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log:
+  level: info      # debug | info | warn | error
+  format: pretty   # pretty (human-readable) | json (structured, for log aggregators)

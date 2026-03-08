@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# run-tests.sh — SIPhon full test pipeline
+#
+# Usage:
+#   ./scripts/run-tests.sh              # Rust tests + basic SIPp
+#   ./scripts/run-tests.sh --ipsec      # Also run IPsec VoLTE tests
+#   ./scripts/run-tests.sh --skip-rust  # Skip Rust tests (Docker only)
+#   ./scripts/run-tests.sh --call       # Also run call scenarios (UAC+UAS)
+#   ./scripts/run-tests.sh --rtpengine  # Also run B2BUA + RTPEngine tests
+#   ./scripts/run-tests.sh --b2bua     # Also run B2BUA call/session-timer/cancel/failure tests
+set -euo pipefail
+
+# SIPp exit code 255 means "dead call messages" (late retransmissions received
+# after the scenario completed). This is not a real failure — tolerate it.
+run_sipp() {
+  local rc=0
+  "$@" || rc=$?
+  if [[ $rc -ne 0 && $rc -ne 255 ]]; then
+    echo "FAILED (exit $rc): $*"
+    exit $rc
+  fi
+}
+
+COMPOSE_FILE="sipp/docker-compose.yaml"
+RUN_IPSEC=false
+RUN_CALL=false
+RUN_PRESENCE=false
+RUN_RTPENGINE=false
+RUN_REINVITE=false
+RUN_B2BUA=false
+RUN_GATEWAY=false
+SKIP_RUST=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --ipsec)      RUN_IPSEC=true ;;
+    --call)       RUN_CALL=true ;;
+    --presence)   RUN_PRESENCE=true ;;
+    --rtpengine)  RUN_RTPENGINE=true ;;
+    --reinvite)   RUN_REINVITE=true ;;
+    --b2bua)      RUN_B2BUA=true ;;
+    --gateway)    RUN_GATEWAY=true ;;
+    --skip-rust)  SKIP_RUST=true ;;
+    --help|-h)
+      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--skip-rust]"
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $arg"
+      exit 1
+      ;;
+  esac
+done
+
+cleanup() {
+  echo "--- Cleaning up ---"
+  docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ── Step 1: Rust tests ───────────────────────────────────────────────────────
+if [[ "$SKIP_RUST" == false ]]; then
+  echo "=== Rust tests ==="
+  PYO3_PYTHON=python3 cargo test
+  echo ""
+fi
+
+# ── Step 2: Build siphon image ──────────────────────────────────────────────
+echo "=== Building siphon Docker image ==="
+docker compose -f "$COMPOSE_FILE" build siphon
+
+# ── Step 3: Start siphon ────────────────────────────────────────────────────
+echo "=== Starting siphon ==="
+docker compose -f "$COMPOSE_FILE" up -d siphon
+
+echo "Waiting for siphon to be healthy..."
+docker compose -f "$COMPOSE_FILE" up -d --wait siphon
+
+# ── Step 4: Basic SIPp tests ────────────────────────────────────────────────
+echo "=== SIPp OPTIONS test ==="
+run_sipp docker compose -f "$COMPOSE_FILE" run --rm sipp-options
+
+echo "=== SIPp REGISTER test ==="
+run_sipp docker compose -f "$COMPOSE_FILE" run --rm sipp-register
+
+# ── Step 5: Call tests (optional) ────────────────────────────────────────────
+if [[ "$RUN_CALL" == true ]]; then
+  echo "=== SIPp call test (UAC + UAS) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile call up --abort-on-container-exit sipp-uac sipp-uas
+fi
+
+# ── Step 6: Presence/event tests (optional) ─────────────────────────────────
+if [[ "$RUN_PRESENCE" == true ]]; then
+  echo "=== SIPp MESSAGE test (register alice → relay MESSAGE to UAS) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile presence run --rm sipp-message-register
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile presence up --abort-on-container-exit sipp-message-uas sipp-message-uac
+fi
+
+# ── Step 7: RTPEngine proxy tests (optional) ──────────────────────────────
+if [[ "$RUN_RTPENGINE" == true ]]; then
+  echo "=== SIPp RTPEngine test (register bob → INVITE with media anchoring) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile rtpengine run --rm sipp-rtpengine-register
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile rtpengine up --abort-on-container-exit sipp-rtpengine-uac sipp-rtpengine-uas
+fi
+
+# ── Step 8: RTPEngine re-INVITE tests (optional) ──────────────────────────
+if [[ "$RUN_REINVITE" == true ]]; then
+  echo "=== SIPp re-INVITE test (hold/resume with RTPEngine media renegotiation) ==="
+  # Re-uses the rtpengine profile for siphon-rtpengine + mock-rtpengine + register
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile reinvite --profile rtpengine run --rm sipp-rtpengine-register
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile reinvite --profile rtpengine up --abort-on-container-exit sipp-reinvite-uac sipp-reinvite-uas
+fi
+
+# ── Step 9: B2BUA tests (optional) ──────────────────────────────────────────
+if [[ "$RUN_B2BUA" == true ]]; then
+  echo "=== Building siphon-b2bua image ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua build siphon-b2bua
+
+  echo "=== Starting siphon-b2bua ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua up -d siphon-b2bua
+  docker compose -f "$COMPOSE_FILE" --profile b2bua up -d --wait siphon-b2bua
+
+  echo "=== B2BUA basic call test (register bob → INVITE → 200 → BYE) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua run --rm sipp-b2bua-register
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua up --abort-on-container-exit --exit-code-from sipp-b2bua-uac sipp-b2bua-uac sipp-b2bua-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua rm -sf sipp-b2bua-uac sipp-b2bua-uas 2>/dev/null || true
+
+  echo "=== B2BUA session timer test (Session-Expires negotiation) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-session-timer up --abort-on-container-exit --exit-code-from sipp-b2bua-st-uac sipp-b2bua-st-uac sipp-b2bua-st-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-session-timer rm -sf sipp-b2bua-st-uac sipp-b2bua-st-uas 2>/dev/null || true
+
+  echo "=== B2BUA re-INVITE test (hold/resume) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite rm -sf sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas 2>/dev/null || true
+
+  echo "=== B2BUA CANCEL test (INVITE → CANCEL → 487) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel up --abort-on-container-exit --exit-code-from sipp-b2bua-cancel-uac sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel rm -sf sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas 2>/dev/null || true
+
+  echo "=== B2BUA failure test (INVITE → 486 Busy) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-failure run --rm sipp-b2bua-register-failure
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-failure up --abort-on-container-exit --exit-code-from sipp-b2bua-failure-uac sipp-b2bua-failure-uac sipp-b2bua-failure-uas
+fi
+
+# ── Step 10: Gateway routing tests (optional) ──────────────────────────────────
+if [[ "$RUN_GATEWAY" == true ]]; then
+  echo "=== Building siphon-gateway image ==="
+  docker compose -f "$COMPOSE_FILE" --profile gateway build siphon-gateway
+
+  echo "=== Starting siphon-gateway ==="
+  docker compose -f "$COMPOSE_FILE" --profile gateway up -d siphon-gateway
+  docker compose -f "$COMPOSE_FILE" --profile gateway up -d --wait siphon-gateway
+
+  echo "=== Gateway proxy test (INVITE via gateway.select) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile gateway up --abort-on-container-exit --exit-code-from sipp-gateway-uac sipp-gateway-uac sipp-gateway-uas
+  docker compose -f "$COMPOSE_FILE" --profile gateway rm -sf sipp-gateway-uac sipp-gateway-uas 2>/dev/null || true
+
+  echo "=== Building siphon-b2bua-gateway image ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-gateway build siphon-b2bua-gateway
+
+  echo "=== Starting siphon-b2bua-gateway ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-gateway up -d siphon-b2bua-gateway
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-gateway up -d --wait siphon-b2bua-gateway
+
+  echo "=== B2BUA gateway test (INVITE via gateway.select for B-leg) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-gateway up --abort-on-container-exit --exit-code-from sipp-b2bua-gateway-uac sipp-b2bua-gateway-uac sipp-b2bua-gateway-uas
+fi
+
+# ── Step 11: IPsec tests (optional) ──────────────────────────────────────────
+if [[ "$RUN_IPSEC" == true ]]; then
+  echo "=== SIPp IPsec VoLTE registration test ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile ipsec run --rm sipp-ipsec
+fi
+
+echo ""
+echo "=== All tests passed ==="

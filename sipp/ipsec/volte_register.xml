@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  VoLTE IMS Registration with IPSec (3GPP TS 33.203)
+
+  Adapted from carstenbock/sipp_ipsec for SIPhon P-CSCF testing.
+
+  Flow:
+    1. Send initial REGISTER with Security-Client (unprotected)
+    2. Receive 401 with AKA challenge + Security-Server
+    3. Set up IPSec SAs using CK/IK from AKA (ipsec_setup action)
+    4. Send second REGISTER over IPSec with Authorization + Security-Verify
+    5. Receive 200 OK
+    6. De-register
+
+  Uses 3GPP TS 35.208 test set 2 credentials (set 1 contains 0x5b '[' which
+  breaks sipp_ipsec's SendingMessage parser):
+    K:   0396eb317b6d1c36f19c1c84cd6ffd16
+    OP:  ff9bb4d0b607f35029a9384c2e7eb8a3
+    AMF: 2175
+
+  Usage:
+    sudo sipp 172.20.0.10:5060 \
+      -sf volte_register.xml \
+      -ipsec \
+      -ipsec_aalg hmac-sha-1-96 \
+      -ipsec_ealg null \
+      -s 001010000000001 \
+      -key domain ims.test \
+      -key aka_K 0x0396eb317b6d1c36f19c1c84cd6ffd16 \
+      -key aka_OP 0xff9bb4d0b607f35029a9384c2e7eb8a3 \
+      -key aka_AMF 0x2175 \
+      -m 1 -l 1
+
+  Requires CAP_NET_ADMIN for XFRM SA/SP creation.
+-->
+
+<scenario name="VoLTE IMS Registration with IPSec">
+
+  <!-- Step 1: Initial REGISTER (unprotected) with Security-Client -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[domain]>;tag=[call_number]
+      To: <sip:[service]@[domain]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Authorization: Digest username="[service]@[domain]",realm="[domain]",uri="sip:[domain]",nonce="",response=""
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/siphon-test
+      Expires: 600000
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Step 2: Receive 401 with AKA challenge + Security-Server -->
+  <recv response="401" auth="true">
+    <action>
+      <ipsec_setup />
+    </action>
+  </recv>
+
+  <!-- Step 3: Re-REGISTER over IPSec-protected path -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[domain]>;tag=[call_number]
+      To: <sip:[service]@[domain]>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      [authentication username=[service]@[domain]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/siphon-test
+      Expires: 600000
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Step 4: Receive 200 OK -->
+  <recv response="200" />
+
+  <!-- Brief pause (shortened from 30s for CI) -->
+  <pause milliseconds="2000"/>
+
+  <!-- Step 5: De-REGISTER over IPSec -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[domain]>;tag=[call_number]
+      To: <sip:[service]@[domain]>
+      Call-ID: [call_id]
+      CSeq: 3 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=0
+      [authentication username=[service]@[domain]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/siphon-test
+      Expires: 0
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Receive 200 OK + tear down IPSec SAs -->
+  <recv response="200">
+    <action>
+      <ipsec_teardown />
+    </action>
+  </recv>
+
+  <ResponseTimeRepartition value="10, 20, 30, 40, 50, 100, 150, 200"/>
+  <CallLengthRepartition value="10, 50, 100, 500, 1000, 5000, 10000"/>
+
+</scenario>

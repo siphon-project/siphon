@@ -1,0 +1,43 @@
+# siphon.b2bua-test.yaml — B2BUA functional test configuration
+#
+# Used with: sipp/docker-compose.yaml (b2bua profile)
+# Script:    scripts/b2bua_default.py
+# Tests:     basic call, session timers, CANCEL, failure routing
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.50"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_default.py"
+  reload: auto
+
+advertised_address: "172.20.0.50"
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+session_timer:
+  session_expires: 1800
+  min_se: 90
+  refresher: b2bua
+  enabled: true
+
+log:
+  level: debug
+  format: pretty

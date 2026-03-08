@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Register bob with contact pointing to 127.0.0.1:5090 (where UAS will listen).
+  Two-step: REGISTER → 401 → REGISTER with auth → 200 OK.
+-->
+<scenario name="REGISTER bob">
+
+  <!-- Step 1: Initial REGISTER (no credentials) -->
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:bob@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 REGISTER
+Contact: <sip:bob@127.0.0.1:5090;transport=udp>;expires=3600
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Expect 401 Unauthorized with challenge -->
+  <recv response="401" auth="true" />
+
+  <!-- Step 2: Re-REGISTER with digest credentials -->
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:bob@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 2 REGISTER
+Contact: <sip:bob@127.0.0.1:5090;transport=udp>;expires=3600
+[authentication username=bob password=secret]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Expect 200 OK -->
+  <recv response="200" rtd="true" />
+
+</scenario>

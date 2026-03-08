@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA re-INVITE UAS scenario (B-leg side):
+  Receive INVITE → 180 → 200 → ACK
+  → re-INVITE(hold) → 200(recvonly) → ACK
+  → re-INVITE(resume) → 200(sendrecv) → ACK
+  → BYE → 200
+
+  The B2BUA generates new INVITE/re-INVITEs to the B-leg with its own Via.
+-->
+<scenario name="B2BUA re-INVITE UAS">
+
+  <!-- Receive initial INVITE from B2BUA (B-leg) -->
+  <recv request="INVITE" crlf="true" />
+
+  <!-- Send 180 Ringing -->
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <!-- Send 200 OK with SDP -->
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+]]>
+  </send>
+
+  <!-- Receive ACK from B2BUA -->
+  <recv request="ACK" optional="true" timeout="5000" />
+
+  <!-- ============================================================ -->
+  <!-- re-INVITE #1: HOLD — receive sendonly, respond recvonly -->
+  <!-- ============================================================ -->
+  <recv request="INVITE" crlf="true" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 2353687638 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=recvonly
+]]>
+  </send>
+
+  <!-- Receive ACK for hold re-INVITE -->
+  <recv request="ACK" optional="true" timeout="5000" />
+
+  <!-- ============================================================ -->
+  <!-- re-INVITE #2: RESUME — receive sendrecv, respond sendrecv -->
+  <!-- ============================================================ -->
+  <recv request="INVITE" crlf="true" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 2353687639 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+]]>
+  </send>
+
+  <!-- Receive ACK for resume re-INVITE -->
+  <recv request="ACK" optional="true" timeout="5000" />
+
+  <!-- Receive BYE from B2BUA -->
+  <recv request="BYE" />
+
+  <!-- Send 200 OK for BYE -->
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

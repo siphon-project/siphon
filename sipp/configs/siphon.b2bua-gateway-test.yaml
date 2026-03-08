@@ -1,0 +1,47 @@
+# siphon.b2bua-gateway-test.yaml — B2BUA with gateway routing
+#
+# Uses gateway.select("gateways") for B-leg target instead of registrar.lookup().
+# SIPp UAS at 172.20.0.66.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.65"
+    - "127.0.0.1"
+
+script:
+  path: "examples/b2bua_gateway.py"
+  reload: auto
+
+advertised_address: "172.20.0.65"
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+gateway:
+  groups:
+    - name: "gateways"
+      algorithm: round_robin
+      probe:
+        enabled: false
+      destinations:
+        - uri: "sip:172.20.0.66:5060"
+          address: "172.20.0.66:5060"
+          weight: 1
+
+log:
+  level: debug
+  format: pretty

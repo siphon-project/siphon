@@ -1,0 +1,117 @@
+# SIPhon IMS P-CSCF (Proxy-CSCF) configuration
+#
+# The P-CSCF is the first contact point for UEs in the IMS network.
+# It handles:
+#   - IPsec security association negotiation (3GPP TS 33.203)
+#   - AKA digest authentication (local Milenage, no HSS needed)
+#   - Media anchoring via RTPEngine
+#   - Diameter Rx to PCRF for QoS/policy (bearer authorization)
+#   - NAT traversal for UEs behind NAT
+#   - Path header insertion for routing through the P-CSCF
+#
+# Equivalent to: opensips_ims_pcscf in docker_open5gs
+#
+# Usage:
+#   siphon --config examples/ims_pcscf.yaml
+
+listen:
+  udp:
+    - "0.0.0.0:5060"        # Unprotected SIP (initial REGISTER)
+    - "0.0.0.0:5064"        # IPsec protected client port
+    - "0.0.0.0:5066"        # IPsec protected server port
+  tcp:
+    - "0.0.0.0:5060"
+
+# Public IP — set to the P-CSCF's routable address
+advertised_address: "10.0.0.10"
+
+domain:
+  local:
+    - "ims.example.com"
+    - "10.0.0.10"
+
+script:
+  path: "examples/ims_pcscf.py"
+  reload: auto
+
+# ---------------------------------------------------------------------------
+# Registrar — P-CSCF stores contacts locally for routing
+# ---------------------------------------------------------------------------
+registrar:
+  backend: memory
+  default_expires: 600000    # IMS registrations are long-lived
+  max_expires: 600000
+
+# ---------------------------------------------------------------------------
+# Authentication — AKA digest with local Milenage credentials
+# ---------------------------------------------------------------------------
+# For production IMS, use auth.backend: diameter_cx to query the HSS.
+# Local AKA credentials are useful for lab/test environments without an HSS.
+auth:
+  realm: "ims.example.com"
+  backend: static
+  aka_credentials:
+    "001010000000001":
+      k: "465b5ce8b199b49faa5f0a2ee238a6bc"
+      op: "cdc202d5123e20f62b6d676ac72cb318"
+      amf: "8000"
+    "001010000000002":
+      k: "0396eb317b6d1c36f19c1c84cd6ffd16"
+      op: "ff9bb4d0b607f35029a9384c2e7eb8a3"
+      amf: "8000"
+
+# ---------------------------------------------------------------------------
+# IPsec — 3GPP TS 33.203 security associations
+# ---------------------------------------------------------------------------
+ipsec:
+  pcscf_port_c: 5064         # P-CSCF client port (protected)
+  pcscf_port_s: 5066         # P-CSCF server port (protected)
+
+# ---------------------------------------------------------------------------
+# NAT traversal
+# ---------------------------------------------------------------------------
+nat:
+  force_rport: true
+  fix_contact: true
+  fix_register: true
+
+# ---------------------------------------------------------------------------
+# Media — RTPEngine for media anchoring
+# ---------------------------------------------------------------------------
+# media:
+#   rtpengine:
+#     address: "127.0.0.1:22222"
+#     timeout_ms: 1000
+
+# ---------------------------------------------------------------------------
+# Diameter Rx — QoS policy via PCRF
+# ---------------------------------------------------------------------------
+# The P-CSCF sends AAR to the PCRF on INVITE (media authorization)
+# and STR on BYE (session termination).
+#
+# diameter:
+#   origin_host: "pcscf.ims.example.com"
+#   origin_realm: "ims.example.com"
+#   product_name: "SIPhon-PCSCF"
+#   peers:
+#     - name: "pcrf1"
+#       host: "pcrf.ims.example.com"
+#       port: 3868
+#       destination_realm: "ims.example.com"
+#   routes:
+#     - application: rx
+#       peers: ["pcrf1"]
+
+# ---------------------------------------------------------------------------
+# Transaction timers
+# ---------------------------------------------------------------------------
+transaction:
+  timeout_secs: 5
+  invite_timeout_secs: 30
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log:
+  level: info
+  format: pretty

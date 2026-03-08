@@ -1,0 +1,35 @@
+//! SIPhon — high-performance SIP proxy, B2BUA and IMS platform.
+
+pub mod apiban;
+pub mod auth;
+pub mod b2bua;
+pub mod cache;
+pub mod config;
+pub mod diameter;
+pub mod dialog;
+pub mod dispatcher;
+pub mod dns;
+pub mod hep;
+pub mod error;
+pub mod nat;
+pub mod presence;
+pub mod proxy;
+pub mod gateway;
+pub mod registrant;
+pub mod registrar;
+pub mod rtpengine;
+pub mod script;
+pub mod sip;
+pub mod transaction;
+pub mod transport;
+pub mod uac;
+pub mod metrics;
+pub mod admin;
+pub mod cdr;
+pub mod shutdown;
+pub mod media;
+pub mod ifc;
+pub mod ipsec;
+pub mod li;
+pub mod sbi;
+pub mod siprec;

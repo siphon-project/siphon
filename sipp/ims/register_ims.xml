@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  IMS REGISTER with digest auth.
+
+  Uses [domain] keyword for the SIP domain (set via -key domain ims.test)
+  and [field0] from CSV for the Contact URI.
+
+  Usage:
+    sipp <target>:6060 -sf register_ims.xml \
+      -s alice -ap secret -key domain ims.test \
+      -inf contacts.csv -m 1
+-->
+<scenario name="IMS REGISTER">
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[domain] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[domain]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[domain]>
+Call-ID: [call_id]
+CSeq: 1 REGISTER
+Contact: <[field0]>;expires=3600
+Max-Forwards: 70
+User-Agent: SIPp-IMS/[service]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="401" auth="true" />
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[domain] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[domain]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[domain]>
+Call-ID: [call_id]
+CSeq: 2 REGISTER
+Contact: <[field0]>;expires=3600
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp-IMS/[service]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

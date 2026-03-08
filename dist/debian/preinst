@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+# Create siphon system user and group
+if ! getent group siphon >/dev/null; then
+    addgroup --system siphon
+fi
+
+if ! getent passwd siphon >/dev/null; then
+    adduser --system --ingroup siphon --home /var/lib/siphon \
+        --no-create-home --gecos "SIPhon SIP proxy" siphon
+fi
+
+mkdir -p /var/lib/siphon
+chown siphon:siphon /var/lib/siphon
+
+#DEBHELPER#

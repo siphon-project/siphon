@@ -1,0 +1,27 @@
+# siphon config for B2BUA + RTPEngine functional test
+#
+# Used with: sipp/docker-compose.yaml (rtpengine profile)
+# Script:    examples/b2bua_rtpengine.py
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.10"
+    - "127.0.0.1"
+
+script:
+  path: "examples/b2bua_rtpengine.py"
+  reload: auto
+
+media:
+  rtpengine:
+    address: "172.20.0.40:22222"
+    timeout_ms: 2000
+
+log:
+  level: debug
+  format: pretty

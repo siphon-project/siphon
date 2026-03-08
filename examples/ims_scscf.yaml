@@ -1,0 +1,127 @@
+# SIPhon IMS S-CSCF (Serving-CSCF) configuration
+#
+# The S-CSCF is the central SIP registrar and call controller in IMS.
+# It handles:
+#   - User authentication via Diameter Cx MAR (AKA challenge from HSS)
+#   - Registration via Diameter Cx SAR (server assignment)
+#   - Initial Filter Criteria (iFC) evaluation for application server routing
+#   - Service-Route insertion (RFC 3608)
+#   - P-Associated-URI generation from HSS user profile
+#   - Third-party REGISTER to application servers
+#   - INVITE routing for registered users
+#
+# Equivalent to: opensips_ims_scscf in docker_open5gs
+#
+# Usage:
+#   siphon --config examples/ims_scscf.yaml
+#
+# Typical IMS port assignments:
+#   P-CSCF: 5060    I-CSCF: 4060    S-CSCF: 6060
+
+listen:
+  udp:
+    - "0.0.0.0:6060"
+  tcp:
+    - "0.0.0.0:6060"
+
+advertised_address: "10.0.0.30"
+
+domain:
+  local:
+    - "ims.example.com"
+    - "10.0.0.30"
+
+script:
+  path: "examples/ims_scscf.py"
+  reload: auto
+
+# ---------------------------------------------------------------------------
+# Registrar — S-CSCF is the authoritative registrar
+# ---------------------------------------------------------------------------
+registrar:
+  backend: memory
+  default_expires: 600000
+  max_expires: 600000
+  # For production, use Redis or PostgreSQL for persistence:
+  # backend: redis
+  # redis:
+  #   url: "redis://127.0.0.1:6379"
+  #   key_prefix: "siphon:scscf:reg:"
+
+# ---------------------------------------------------------------------------
+# Authentication — Diameter Cx to HSS for AKA vectors
+# ---------------------------------------------------------------------------
+# In production IMS, the S-CSCF sends MAR to the HSS to obtain AKA
+# authentication vectors. The HSS returns RAND, AUTN, XRES, CK, IK.
+#
+# For lab/test without an HSS, use local AKA credentials instead:
+auth:
+  realm: "ims.example.com"
+  backend: static
+  aka_credentials:
+    "001010000000001":
+      k: "465b5ce8b199b49faa5f0a2ee238a6bc"
+      op: "cdc202d5123e20f62b6d676ac72cb318"
+      amf: "8000"
+    "001010000000002":
+      k: "0396eb317b6d1c36f19c1c84cd6ffd16"
+      op: "ff9bb4d0b607f35029a9384c2e7eb8a3"
+      amf: "8000"
+
+# ---------------------------------------------------------------------------
+# Diameter Cx — HSS integration for authentication and registration
+# ---------------------------------------------------------------------------
+# The S-CSCF uses these Cx commands:
+#   MAR: "Give me AKA auth vectors for this user" (during REGISTER challenge)
+#   SAR: "I am now serving this user" (after successful REGISTER)
+#
+# For lab without HSS, comment out the diameter section and use local
+# aka_credentials above with auth.require_aka_digest().
+#
+diameter:
+  origin_host: "scscf.ims.example.com"
+  origin_realm: "ims.example.com"
+  product_name: "SIPhon-SCSCF"
+  peers:
+    - name: "hss1"
+      host: "hss.ims.example.com"
+      port: 3868
+      destination_realm: "ims.example.com"
+  routes:
+    - application: cx
+      peers: ["hss1"]
+
+# ---------------------------------------------------------------------------
+# Initial Filter Criteria (iFC) — application server routing
+# ---------------------------------------------------------------------------
+# iFCs are XML documents downloaded from the HSS during SAR.
+# They define which application servers should be triggered for
+# each request type (originating/terminating).
+#
+# For lab testing, static iFCs can be configured:
+# isc:
+#   filter_criteria:
+#     - priority: 0
+#       trigger:
+#         method: "INVITE"
+#         session_case: originating
+#       application_server: "sip:as1.ims.example.com:5060"
+#     - priority: 1
+#       trigger:
+#         method: "INVITE"
+#         session_case: terminating
+#       application_server: "sip:voicemail.ims.example.com:5060"
+
+# ---------------------------------------------------------------------------
+# Transaction timers
+# ---------------------------------------------------------------------------
+transaction:
+  timeout_secs: 5
+  invite_timeout_secs: 30
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log:
+  level: info
+  format: pretty

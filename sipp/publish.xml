@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  PUBLISH scenario (RFC 3903 presence publication):
+  1. Send initial PUBLISH -> expect 200 OK with SIP-ETag
+  2. Send refresh PUBLISH with SIP-If-Match -> expect 200 OK
+  3. Send remove PUBLISH (Expires: 0) -> expect 200 OK
+
+  Inspired by Kamailio test/unit/publish_scenario.xml (GPLv2) — rewritten for SIPhon.
+  Run: sipp -sf publish.xml -s user <target>:<port>
+-->
+<scenario name="PUBLISH (presence)">
+
+  <!-- Step 1: Initial PUBLISH -->
+  <send retrans="500">
+    <![CDATA[
+PUBLISH sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 PUBLISH
+Event: presence
+Expires: 3600
+Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/pidf+xml
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: [len]
+
+<?xml version="1.0" encoding="UTF-8"?>
+<presence xmlns="urn:ietf:params:xml:ns:pidf"
+ entity="sip:[service]@[remote_ip]">
+ <tuple id="t1">
+  <status><basic>open</basic></status>
+  <note>Available</note>
+ </tuple>
+</presence>
+]]>
+  </send>
+
+  <!-- Expect 200 OK with SIP-ETag -->
+  <recv response="200" rtd="true">
+    <action>
+      <ereg regexp="SIP-ETag: (.*)" search_in="msg" header="SIP-ETag:" assign_to="1,2" />
+    </action>
+  </recv>
+
+  <pause milliseconds="500" />
+
+  <!-- Step 2: Refresh PUBLISH with SIP-If-Match -->
+  <send retrans="500">
+    <![CDATA[
+PUBLISH sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 2 PUBLISH
+Event: presence
+Expires: 3600
+SIP-If-Match: [$2]
+Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/pidf+xml
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: [len]
+
+<?xml version="1.0" encoding="UTF-8"?>
+<presence xmlns="urn:ietf:params:xml:ns:pidf"
+ entity="sip:[service]@[remote_ip]">
+ <tuple id="t1">
+  <status><basic>closed</basic></status>
+  <note>Busy</note>
+ </tuple>
+</presence>
+]]>
+  </send>
+
+  <!-- Expect 200 OK -->
+  <recv response="200" rtd="true" />
+
+  <pause milliseconds="500" />
+
+  <!-- Step 3: Remove publication (Expires: 0) -->
+  <send retrans="500">
+    <![CDATA[
+PUBLISH sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 3 PUBLISH
+Event: presence
+Expires: 0
+SIP-If-Match: [$2]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Expect 200 OK -->
+  <recv response="200" rtd="true" />
+
+</scenario>

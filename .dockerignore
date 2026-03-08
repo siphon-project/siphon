@@ -1,0 +1,7 @@
+target/
+.git/
+*.md
+tasks/
+sipp/
+tests/
+.python-version

@@ -1,0 +1,173 @@
+"""
+Core SIP types used by SIPhon scripts.
+
+These mirror the Rust PyO3 classes that SIPhon injects at runtime.
+All properties and methods carry type annotations and docstrings so that
+type checkers and LLMs can reason about script correctness.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class SipUri:
+    """A parsed SIP or SIPS URI (e.g. ``sip:alice@example.com:5060``).
+
+    At runtime this is backed by the Rust ``PySipUri`` class.  The mock
+    version is a plain dataclass with the same properties.
+
+    Examples::
+
+        uri = SipUri(user="alice", host="example.com")
+        assert str(uri) == "sip:alice@example.com"
+
+        uri = SipUri(scheme="sips", host="proxy.example.com", port=5061)
+        assert str(uri) == "sips:proxy.example.com:5061"
+    """
+
+    scheme: str = "sip"
+    """URI scheme — ``"sip"`` or ``"sips"``."""
+
+    user: Optional[str] = None
+    """User part of the URI (e.g. ``"alice"``).  ``None`` for server URIs."""
+
+    host: str = "localhost"
+    """Host or domain (e.g. ``"example.com"``, ``"10.0.0.1"``)."""
+
+    port: Optional[int] = None
+    """Port number.  ``None`` means default (5060 for SIP, 5061 for SIPS)."""
+
+    # Set by the engine based on the ``domain:`` config list.
+    _is_local: bool = False
+
+    @property
+    def is_local(self) -> bool:
+        """``True`` if the host matches one of the locally configured domains.
+
+        In the mock, set via ``SipUri._is_local = True`` or via the test
+        harness ``local_domains`` parameter.
+        """
+        return self._is_local
+
+    @property
+    def is_tel(self) -> bool:
+        """``True`` if the scheme is ``tel:``."""
+        return self.scheme == "tel"
+
+    def __str__(self) -> str:
+        uri = f"{self.scheme}:"
+        if self.user is not None:
+            uri += f"{self.user}@"
+        uri += self.host
+        if self.port is not None:
+            uri += f":{self.port}"
+        return uri
+
+    def __repr__(self) -> str:
+        return f"SipUri({self})"
+
+
+@dataclass
+class Contact:
+    """A registered contact binding returned by ``registrar.lookup()``.
+
+    Attributes:
+        uri: The contact URI string (e.g. ``"sip:alice@192.168.1.5:5060"``).
+        q: Quality value between 0.0 and 1.0 (higher = preferred).
+        expires: Seconds remaining until this binding expires.
+    """
+
+    uri: str
+    """Contact URI as a string."""
+
+    q: float = 1.0
+    """Quality value (0.0–1.0).  Higher values are preferred.
+    Default is 1.0 per RFC 3261."""
+
+    expires: int = 3600
+    """Seconds remaining until this contact binding expires."""
+
+
+@dataclass
+class Action:
+    """Records a single action taken by a handler (reply, relay, fork, etc.).
+
+    Used by the test harness to capture what a script did in response to a
+    SIP message, so you can assert on it.
+    """
+
+    kind: str
+    """Action type: ``"reply"``, ``"relay"``, ``"fork"``, ``"reject"``,
+    ``"dial"``, ``"terminate"``, ``"record_route"``, ``"silent_drop"``."""
+
+    status_code: Optional[int] = None
+    """For ``reply`` / ``reject`` — the SIP status code (e.g. 200, 404)."""
+
+    reason: Optional[str] = None
+    """For ``reply`` / ``reject`` — the reason phrase (e.g. ``"OK"``)."""
+
+    next_hop: Optional[str] = None
+    """For ``relay`` — the explicit next-hop URI, or ``None`` for default."""
+
+    targets: Optional[list[str]] = None
+    """For ``fork`` — list of target URIs."""
+
+    strategy: Optional[str] = None
+    """For ``fork`` — ``"parallel"`` or ``"sequential"``."""
+
+    timeout: Optional[int] = None
+    """For ``dial`` / ``fork`` — timeout in seconds."""
+
+    headers_set: dict[str, str] = field(default_factory=dict)
+    """Headers that were set/modified before this action."""
+
+    headers_removed: list[str] = field(default_factory=list)
+    """Headers that were removed before this action."""
+
+    extras: Optional[dict] = None
+    """Additional action-specific data (e.g. session timer params, SRS URI)."""
+
+
+@dataclass
+class ByeInitiator:
+    """Passed to ``@b2bua.on_bye`` handlers indicating which side sent BYE.
+
+    Attributes:
+        side: ``"a"`` (caller) or ``"b"`` (callee).
+    """
+
+    side: str
+    """``"a"`` for the A-leg (caller) or ``"b"`` for the B-leg (callee)."""
+
+
+@dataclass
+class MediaHandle:
+    """Handle for media anchoring operations on a B2BUA call.
+
+    Accessible as ``call.media``.  In the mock, ``anchor()`` and
+    ``release()`` are recorded as actions.
+    """
+
+    is_active: bool = False
+    """``True`` if media is currently anchored through an RTP engine."""
+
+    _actions: list[str] = field(default_factory=list)
+
+    def anchor(self, engine: str = "rtpengine", profile: str = "srtp_to_rtp") -> None:
+        """Anchor media through an RTP engine.
+
+        Args:
+            engine: Engine name (currently only ``"rtpengine"``).
+            profile: RTP profile — ``"srtp_to_rtp"``, ``"ws_to_rtp"``,
+                     ``"wss_to_rtp"``, or ``"rtp_passthrough"``.
+        """
+        self.is_active = True
+        self._actions.append(f"anchor:{engine}:{profile}")
+
+    def release(self) -> None:
+        """Release media anchor, returning to direct RTP flow."""
+        self.is_active = False
+        self._actions.append("release")

@@ -1,0 +1,46 @@
+# siphon.gateway-test.yaml — test config for gateway SIPp functional test
+#
+# Routes INVITEs via gateway.select("gateways") to the SIPp UAS at 172.20.0.61
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.60"
+    - "127.0.0.1"
+
+script:
+  path: "examples/proxy_gateway.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+gateway:
+  groups:
+    - name: "gateways"
+      algorithm: round_robin
+      probe:
+        enabled: false
+      destinations:
+        - uri: "sip:172.20.0.61:5060"
+          address: "172.20.0.61:5060"
+          weight: 1
+
+log:
+  level: debug
+  format: pretty

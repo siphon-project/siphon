@@ -1,0 +1,71 @@
+# SIPhon IMS I-CSCF (Interrogating-CSCF) configuration
+#
+# The I-CSCF is the entry point from external networks into the IMS core.
+# It handles:
+#   - Diameter Cx UAR (User-Authorization-Request) to find the S-CSCF for REGISTER
+#   - Diameter Cx LIR (Location-Info-Request) to find the S-CSCF for other requests
+#   - Topology hiding (optional) — masks internal S-CSCF addresses
+#   - Routes REGISTER to the assigned S-CSCF
+#   - Routes initial requests to the serving S-CSCF
+#
+# The I-CSCF does NOT authenticate — that's the S-CSCF's job.
+# It only queries the HSS to discover which S-CSCF serves a given user.
+#
+# Equivalent to: opensips_ims_icscf in docker_open5gs
+#
+# Usage:
+#   siphon --config examples/ims_icscf.yaml
+#
+# Typical IMS port assignments:
+#   P-CSCF: 5060    I-CSCF: 4060    S-CSCF: 6060
+
+listen:
+  udp:
+    - "0.0.0.0:4060"
+  tcp:
+    - "0.0.0.0:4060"
+
+advertised_address: "10.0.0.20"
+
+domain:
+  local:
+    - "ims.example.com"
+    - "10.0.0.20"
+
+script:
+  path: "examples/ims_icscf.py"
+  reload: auto
+
+# ---------------------------------------------------------------------------
+# Diameter Cx — HSS integration for S-CSCF discovery
+# ---------------------------------------------------------------------------
+# The I-CSCF uses two Cx commands:
+#   UAR: "Which S-CSCF should handle this REGISTER?"
+#   LIR: "Which S-CSCF is currently serving this user?"
+#
+diameter:
+  origin_host: "icscf.ims.example.com"
+  origin_realm: "ims.example.com"
+  product_name: "SIPhon-ICSCF"
+  peers:
+    - name: "hss1"
+      host: "hss.ims.example.com"
+      port: 3868
+      destination_realm: "ims.example.com"
+  routes:
+    - application: cx
+      peers: ["hss1"]
+
+# ---------------------------------------------------------------------------
+# Transaction timers
+# ---------------------------------------------------------------------------
+transaction:
+  timeout_secs: 5
+  invite_timeout_secs: 30
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log:
+  level: info
+  format: pretty

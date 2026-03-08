@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA failure UAS scenario (B-leg side):
+  Receive INVITE → 486 Busy Here
+
+  Tests that the B2BUA on_failure handler fires and propagates
+  the error to the A-leg caller.
+-->
+<scenario name="B2BUA failure UAS">
+
+  <!-- Receive INVITE from B2BUA (B-leg) -->
+  <recv request="INVITE" crlf="true" />
+
+  <!-- Respond 486 Busy Here immediately -->
+  <send>
+    <![CDATA[
+SIP/2.0 486 Busy Here
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Receive ACK for the 486 -->
+  <recv request="ACK" optional="true" timeout="5000" />
+
+</scenario>

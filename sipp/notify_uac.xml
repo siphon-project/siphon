@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  NOTIFY UAC scenario (standalone, e.g. MWI voicemail notification):
+  Send NOTIFY with message-summary body -> expect 200 OK
+
+  This tests the proxy's ability to relay NOTIFY requests
+  independently of SUBSCRIBE (e.g. server-initiated MWI per RFC 3842).
+  Run: sipp -sf notify_uac.xml -s user <target>:<port>
+-->
+<scenario name="NOTIFY UAC (MWI)">
+
+  <!-- Send NOTIFY with MWI body -->
+  <send retrans="500">
+    <![CDATA[
+NOTIFY sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:voicemail@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>;tag=mwi-endpoint-tag
+Call-ID: [call_id]
+CSeq: 1 NOTIFY
+Event: message-summary
+Subscription-State: active
+Contact: <sip:voicemail@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/simple-message-summary
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: [len]
+
+Messages-Waiting: yes
+Message-Account: sip:[service]@[remote_ip]
+Voice-Message: 2/8 (0/0)
+]]>
+  </send>
+
+  <!-- Expect 200 OK -->
+  <recv response="200" rtd="true" />
+
+</scenario>

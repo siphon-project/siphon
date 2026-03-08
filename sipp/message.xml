@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  MESSAGE scenario (RFC 3428 instant messaging):
+  Send MESSAGE with text/plain body -> expect 200 OK
+
+  Tests SIP instant messaging relay through the proxy.
+  Run: sipp -sf message.xml -s user <target>:<port>
+-->
+<scenario name="MESSAGE (instant messaging)">
+
+  <!-- Send MESSAGE with text body -->
+  <send retrans="500">
+    <![CDATA[
+MESSAGE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:sender@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 MESSAGE
+Contact: <sip:sender@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Type: text/plain
+Content-Length: [len]
+
+Hello from SIPp test scenario
+]]>
+  </send>
+
+  <!-- Expect 200 OK -->
+  <recv response="200" rtd="true" />
+
+</scenario>

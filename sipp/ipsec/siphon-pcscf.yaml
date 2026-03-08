@@ -1,0 +1,58 @@
+# siphon P-CSCF test config — for IPsec SIPp testing
+#
+# Usage:
+#   siphon --config sipp/ipsec/siphon-pcscf.yaml
+#
+# Then run sipp_ipsec:
+#   sudo sipp 172.20.0.10:5060 \
+#     -sf sipp/ipsec/volte_register.xml \
+#     -ipsec -ipsec_aalg hmac-sha-1-96 -ipsec_ealg null \
+#     -s 001010000000001 -key domain ims.test \
+#     -key aka_K 0x0396eb317b6d1c36f19c1c84cd6ffd16 \
+#     -key aka_OP 0xff9bb4d0b607f35029a9384c2e7eb8a3 \
+#     -key aka_AMF 0x2175 \
+#     -m 1 -l 1
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+    - "0.0.0.0:5064"   # IPsec protected client port
+    - "0.0.0.0:5066"   # IPsec protected server port
+  tcp:
+    - "0.0.0.0:5060"
+
+advertised_address: "172.20.0.35"
+
+domain:
+  local:
+    - "ims.test"
+    - "172.20.0.35"
+
+script:
+  path: "examples/ims_pcscf.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 600000
+  max_expires: 600000
+
+auth:
+  realm: "ims.test"
+  backend: static
+  # AKA credentials for local Milenage auth (3GPP TS 35.208 test set 2)
+  # Test set 2 chosen because its hex-decoded bytes don't contain 0x5b '[' or 0x0a,
+  # which would break sipp_ipsec's SendingMessage parser (sipp bug).
+  aka_credentials:
+    "001010000000001":
+      k: "0396eb317b6d1c36f19c1c84cd6ffd16"
+      op: "ff9bb4d0b607f35029a9384c2e7eb8a3"
+      amf: "2175"
+
+ipsec:
+  pcscf_port_c: 5064
+  pcscf_port_s: 5066
+
+log:
+  level: debug
+  format: pretty

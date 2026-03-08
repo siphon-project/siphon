@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  MESSAGE UAS: receives MESSAGE and responds 200 OK.
+  Used as the backend for message.xml through the proxy.
+  Run: sipp -sf message_uas.xml -p 5060
+-->
+<scenario name="MESSAGE UAS">
+
+  <recv request="MESSAGE" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag00[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

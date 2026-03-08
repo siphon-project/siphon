@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  SUBSCRIBE UAS scenario (RFC 3265 presence notifier):
+  1. Receive SUBSCRIBE -> 200 OK
+  2. Send NOTIFY with presence state -> expect 200 OK
+  3. Receive unsubscribe (Expires: 0) -> 200 OK
+  4. Send final NOTIFY (terminated) -> expect 200 OK
+
+  Run: sipp -sf subscribe_uas.xml -p 5080
+  Pair with subscribe_uac.xml on the client side.
+-->
+<scenario name="SUBSCRIBE UAS (presence notifier)">
+
+  <!-- Step 1: Receive SUBSCRIBE -->
+  <recv request="SUBSCRIBE" />
+
+  <!-- Respond 200 OK -->
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag00[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Expires: 3600
+Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Step 2: Send initial NOTIFY (active) -->
+  <send retrans="500">
+    <![CDATA[
+NOTIFY sip:watcher@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:watcher@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 NOTIFY
+Event: presence
+Subscription-State: active;expires=3600
+Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/pidf+xml
+Max-Forwards: 70
+Content-Length: [len]
+
+<?xml version="1.0" encoding="UTF-8"?>
+<presence xmlns="urn:ietf:params:xml:ns:pidf"
+ entity="sip:[service]@[local_ip]">
+ <tuple id="t1">
+  <status><basic>open</basic></status>
+ </tuple>
+</presence>
+]]>
+  </send>
+
+  <!-- Expect 200 OK for NOTIFY -->
+  <recv response="200" rtd="true" />
+
+  <!-- Step 3: Receive unsubscribe -->
+  <recv request="SUBSCRIBE" />
+
+  <!-- Respond 200 OK -->
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Expires: 0
+Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Step 4: Send final NOTIFY (terminated) -->
+  <send retrans="500">
+    <![CDATA[
+NOTIFY sip:watcher@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:watcher@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 NOTIFY
+Event: presence
+Subscription-State: terminated;reason=timeout
+Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Expect 200 OK for final NOTIFY -->
+  <recv response="200" rtd="true" />
+
+</scenario>

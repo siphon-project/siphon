@@ -1,0 +1,19 @@
+[package]
+name = "siphon-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+siphon = { path = ".." }
+
+[[bin]]
+name = "sip_parser_fuzz"
+path = "fuzz_targets/sip_parser_fuzz.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA CANCEL UAS scenario (B-leg side):
+  Receive INVITE → 180 Ringing → receive CANCEL → 200 (CANCEL) → 487 (INVITE)
+
+  Simulates a slow-ringing endpoint that gets cancelled.
+-->
+<scenario name="B2BUA CANCEL UAS">
+
+  <!-- Receive INVITE from B2BUA (B-leg) -->
+  <recv request="INVITE" crlf="true" />
+
+  <!-- Send 180 Ringing (keep ringing so the UAC has time to CANCEL) -->
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Expect CANCEL from B2BUA -->
+  <recv request="CANCEL" />
+
+  <!-- Respond 200 OK to CANCEL -->
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Respond 487 Request Terminated for the original INVITE -->
+  <send>
+    <![CDATA[
+SIP/2.0 487 Request Terminated
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+CSeq: 1 INVITE
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Receive ACK for the 487 -->
+  <recv request="ACK" optional="true" timeout="5000" />
+
+</scenario>

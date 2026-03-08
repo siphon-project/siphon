@@ -1,0 +1,183 @@
+[package]
+name = "siphon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "SIPhon — high-performance SIP proxy, B2BUA and IMS platform with free-threaded Python scripting"
+readme = "README.md"
+homepage = "https://github.com/siphon-project/siphon"
+repository = "https://github.com/siphon-project/siphon"
+keywords = ["sip", "voip", "proxy", "b2bua", "ims"]
+categories = ["network-programming"]
+exclude = [
+    "sipp/",
+    "fuzz/",
+    "tests/",
+    "scripts/run-tests.sh",
+    "scripts/scale_test.sh",
+    ".github/",
+    "CLAUDE.md",
+    ".python-version",
+    ".dockerignore",
+    "Dockerfile",
+    "sdk/",
+]
+
+[[bin]]
+name = "siphon"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.50", features = ["full"] }
+flume = "0.12"
+num_cpus = "1"
+
+# SIP parsing
+nom = "8"
+bytes = "1.11"
+indexmap = "2.13"
+
+# Concurrency
+dashmap = "6"
+arc-swap = "1"
+
+# Python scripting
+# Free-threaded support is auto-detected by PyO3 0.28 when building against Python 3.14t.
+# No feature flag needed — just: pyenv shell 3.14t && cargo build
+pyo3 = { version = "0.28", features = ["py-clone"] }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+
+# DNS
+hickory-resolver = "0.25"
+
+# Transport
+socket2 = "0.6"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+webpki-roots = "1"
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+tokio-sctp = "0.2"
+http = "1"
+
+# Diameter AVP decoding
+serde_json = "1"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_yml = "0.0.12"
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client (APIBAN, HTTP auth backend)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+
+# Crypto (Milenage AKA key derivation for IMS IPsec)
+aes = "0.8"
+
+# Utilities
+md5 = "0.7"
+uuid = { version = "1.22", features = ["v4", "fast-rng"] }
+ipnet = "2"
+notify = "8"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Registrar persistence backends (optional, feature-flagged)
+redis = { version = "1", features = ["tokio-comp"], optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+prometheus = { version = "0.13.4", features = ["process"] }
+axum = { version = "0.8.8", features = ["tokio"] }
+tower = { version = "0.5.3", features = ["util"] }
+
+# Lawful Intercept — ETSI ASN.1/BER + XML
+rasn = "0.22"
+rasn-derive = "0.22"
+chrono = { version = "0.4", default-features = false }
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+# iFC evaluation engine — regex for SPT header content matching
+regex = "1"
+
+[dev-dependencies]
+proptest = "1"
+tokio-test = "0.4"
+tempfile = "3"
+rcgen = "0.14"
+
+[features]
+default = []
+redis-backend = ["dep:redis"]
+postgres-backend = ["dep:tokio-postgres"]
+
+[profile.release]
+strip = true
+opt-level = 3
+lto = "thin"
+
+# --- docs.rs configuration ---
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# --- Debian packaging (cargo-deb) ---
+[package.metadata.deb]
+maintainer = "SIPhon Contributors <mvdvlies@gmail.com>"
+section = "net"
+priority = "optional"
+extended-description = """\
+SIPhon is a high-performance SIP proxy, B2BUA, and IMS platform \
+written in Rust with free-threaded Python 3.14t scripting support. \
+It features a RFC 3261 compliant SIP parser, stateful proxy with \
+parallel/sequential forking, digest authentication, in-memory \
+registrar with Redis/PostgreSQL backends, and hot-reloaded Python \
+routing scripts."""
+depends = "$auto, python3 (>= 3.12)"
+assets = [
+    ["target/release/siphon", "usr/bin/", "755"],
+    ["siphon.yaml", "etc/siphon/siphon.yaml", "644"],
+    ["scripts/proxy_default.py", "etc/siphon/scripts/proxy_default.py", "644"],
+    ["scripts/b2bua_default.py", "etc/siphon/scripts/b2bua_default.py", "644"],
+    ["dist/siphon.service", "lib/systemd/system/siphon.service", "644"],
+    ["README.md", "usr/share/doc/siphon/README.md", "644"],
+    ["LICENSE", "usr/share/doc/siphon/LICENSE", "644"],
+]
+conf-files = ["/etc/siphon/siphon.yaml"]
+maintainer-scripts = "dist/debian/"
+systemd-units = { unit-name = "siphon", enable = false, start = false }
+
+# --- RPM packaging (cargo-generate-rpm) ---
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/siphon", dest = "/usr/bin/siphon", mode = "755" },
+    { source = "siphon.yaml", dest = "/etc/siphon/siphon.yaml", mode = "644", config = true },
+    { source = "scripts/proxy_default.py", dest = "/etc/siphon/scripts/proxy_default.py", mode = "644" },
+    { source = "scripts/b2bua_default.py", dest = "/etc/siphon/scripts/b2bua_default.py", mode = "644" },
+    { source = "dist/siphon.service", dest = "/usr/lib/systemd/system/siphon.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/siphon/README.md", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/doc/siphon/LICENSE", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+python3 = ">= 3.12"
+
+# RPM scriptlets: create user, reload systemd, enable on install
+[package.metadata.generate-rpm.scriptlets]
+pre_install_script = """
+getent group siphon >/dev/null || groupadd -r siphon
+getent passwd siphon >/dev/null || useradd -r -g siphon -d /var/lib/siphon -s /sbin/nologin -c "SIPhon SIP proxy" siphon
+mkdir -p /var/lib/siphon
+chown siphon:siphon /var/lib/siphon
+"""
+post_install_script = """
+systemctl daemon-reload
+"""
+pre_uninstall_script = """
+systemctl stop siphon.service 2>/dev/null || true
+systemctl disable siphon.service 2>/dev/null || true
+"""
+post_uninstall_script = """
+systemctl daemon-reload
+"""
