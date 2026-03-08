@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/siphon-project/siphon/master/assets/logo.svg" alt="SIPhon" width="100">
+  <img src="https://raw.githubusercontent.com/siphon-project/siphon/main/assets/logo.svg" alt="SIPhon" width="100">
 </p>
 
 # siphon-sdk
@@ -182,6 +182,12 @@ harness.reset()
 | `log` | Structured logging |
 | `cache` | Named cache (local LRU + Redis) |
 | `rtpengine` | RTPEngine media proxy operations |
+| `gateway` | Destination groups, load balancing, health probing |
+| `cdr` | Call detail records |
+| `diameter` | Diameter protocol (Cx, Ro, Rx, Rf, Sh) |
+| `presence` | SUBSCRIBE/NOTIFY, PIDF presence |
+| `li` | Lawful intercept (ETSI X1/X2/X3, SIPREC) |
+| `registration` | Outbound REGISTER client (trunk registration) |
 
 ### Request properties
 
@@ -234,6 +240,13 @@ harness.reset()
 | `save(request, force=False)` | Save REGISTER bindings |
 | `lookup(uri) -> list[Contact]` | Look up contacts (sorted by q-value) |
 | `is_registered(uri) -> bool` | Check if URI has contacts |
+| `service_route(uri) -> list[str]` | Get stored service routes (RFC 3608) |
+| `set_service_routes(aor, routes)` | Store service routes for an AoR |
+| `save_pending(request)` | IMS: save binding in pending state |
+| `confirm_pending(uri)` | IMS: promote pending to active after SAR |
+| `asserted_identity(uri) -> str \| None` | IMS: stored P-Asserted-Identity |
+| `reginfo_xml(aor, state, version) -> str` | Generate reginfo XML (RFC 3680) |
+| `on_change` | Decorator: fires on registration state changes |
 
 ### Auth
 
@@ -243,6 +256,8 @@ harness.reset()
 | `require_proxy_digest(request, realm) -> bool` | 407 challenge |
 | `require_digest(request, realm) -> bool` | Alias for www_digest |
 | `verify_digest(request, realm) -> bool` | Verify without challenge |
+| `require_ims_digest(request, realm) -> bool` | IMS AKA via Diameter Cx MAR |
+| `require_aka_digest(request, realm) -> bool` | Local Milenage AKA (no HSS) |
 
 ### B2BUA call
 
@@ -256,8 +271,11 @@ harness.reset()
 | `call.dial(uri, timeout=30)` | Dial single target |
 | `call.fork(targets, strategy, timeout)` | Fork to multiple |
 | `call.terminate()` | End call (BYE both legs) |
-| `call.media.anchor()` | Anchor media through RTPEngine |
+| `call.media.anchor(engine)` | Anchor media through RTPEngine |
+| `call.media.release()` | Release media anchor |
+| `call.record(srs_uri)` | Start SIPREC recording |
+| `call.stop_recording()` | Stop SIPREC recording |
 
 ## License
 
-Apache-2.0
+MIT
