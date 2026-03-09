@@ -10,7 +10,7 @@ use tokio::net::UdpSocket;
 
 use siphon::rtpengine::bencode::{self, BencodeValue};
 use siphon::rtpengine::client::{RtpEngineClient, RtpEngineSet};
-use siphon::rtpengine::profile::{NgFlags, RtpProfile};
+use siphon::rtpengine::profile::{NgFlags, ProfileRegistry};
 use siphon::rtpengine::session::{MediaSession, MediaSessionStore};
 use siphon::sip::parser::parse_sip_message;
 
@@ -166,9 +166,10 @@ async fn full_offer_answer_delete_flow() {
     let original_sdp = &invite.body;
     assert!(!original_sdp.is_empty());
 
-    let offer_flags = RtpProfile::SrtpToRtp.offer_flags();
+    let registry = ProfileRegistry::new();
+    let offer_flags = &registry.get("srtp_to_rtp").unwrap().offer;
     let rewritten_sdp = client
-        .offer("call-rtpengine-test-1", "from-tag-1", original_sdp, &offer_flags)
+        .offer("call-rtpengine-test-1", "from-tag-1", original_sdp, offer_flags)
         .await
         .unwrap();
 
@@ -182,9 +183,9 @@ async fn full_offer_answer_delete_flow() {
     let ok_msg = parse_sip_message(&ok_raw).unwrap().1;
     let answer_sdp = &ok_msg.body;
 
-    let answer_flags = RtpProfile::SrtpToRtp.answer_flags();
+    let answer_flags = &registry.get("srtp_to_rtp").unwrap().answer;
     let rewritten_answer = client
-        .answer("call-rtpengine-test-1", "from-tag-1", "to-tag-1", answer_sdp, &answer_flags)
+        .answer("call-rtpengine-test-1", "from-tag-1", "to-tag-1", answer_sdp, answer_flags)
         .await
         .unwrap();
 
@@ -214,7 +215,7 @@ async fn session_store_tracks_offer_and_answer() {
         call_id: "call-1".to_string(),
         from_tag: "tag-a".to_string(),
         to_tag: None,
-        profile: RtpProfile::SrtpToRtp,
+        profile: "srtp_to_rtp".to_string(),
         created_at: std::time::Instant::now(),
     });
 
@@ -272,14 +273,11 @@ async fn multi_instance_weighted_round_robin() {
 #[tokio::test]
 async fn profile_flags_produce_valid_bencode() {
     // Verify that NgFlags for each profile produce valid bencode dictionaries.
-    for profile in &[
-        RtpProfile::SrtpToRtp,
-        RtpProfile::WsToRtp,
-        RtpProfile::WssToRtp,
-        RtpProfile::RtpPassthrough,
-    ] {
-        let offer_flags = profile.offer_flags();
-        let answer_flags = profile.answer_flags();
+    let registry = ProfileRegistry::new();
+    for name in &["srtp_to_rtp", "ws_to_rtp", "wss_to_rtp", "rtp_passthrough"] {
+        let entry = registry.get(name).unwrap();
+        let offer_flags = &entry.offer;
+        let answer_flags = &entry.answer;
 
         // Convert to bencode pairs and build a dict.
         let offer_pairs = offer_flags.to_bencode_pairs();

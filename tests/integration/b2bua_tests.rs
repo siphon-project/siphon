@@ -611,8 +611,6 @@ fn b2bua_a_leg_invite_stored_and_available_through_lifecycle() {
 #[test]
 fn media_session_store_lifecycle() {
     use siphon::rtpengine::session::{MediaSession, MediaSessionStore};
-    use siphon::rtpengine::profile::RtpProfile;
-
     let store = MediaSessionStore::new();
 
     // Offer: create session (from_tag known, to_tag not yet)
@@ -620,7 +618,7 @@ fn media_session_store_lifecycle() {
         call_id: "media-lifecycle@test".to_string(),
         from_tag: "alice-tag".to_string(),
         to_tag: None,
-        profile: RtpProfile::SrtpToRtp,
+        profile: "srtp_to_rtp".to_string(),
         created_at: std::time::Instant::now(),
     };
     store.insert(session);
