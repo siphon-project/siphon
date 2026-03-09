@@ -166,7 +166,7 @@ impl NamedCache {
             .redis
             .get_or_try_init(|| async {
                 let client = redis::Client::open(self.url.as_str())?;
-                client.get_multiplexed_tokio_connection().await
+                client.get_multiplexed_async_connection().await
             })
             .await;
 

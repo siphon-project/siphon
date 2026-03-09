@@ -112,7 +112,7 @@ tempfile = "3"
 rcgen = "0.14"
 
 [features]
-default = []
+default = ["redis-backend", "postgres-backend"]
 redis-backend = ["dep:redis"]
 postgres-backend = ["dep:tokio-postgres"]
 

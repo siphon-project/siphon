@@ -503,36 +503,23 @@ impl RedisBackend {
 
 #[cfg(not(feature = "redis-backend"))]
 impl RegistrarBackend for RedisBackend {
-    async fn save(&self, aor: &str, contacts: &[StoredContact]) -> Result<(), BackendError> {
-        let _key = self.key(aor);
-        let _json = serde_json::to_string(contacts)
-            .map_err(|error| BackendError::Serialization(error.to_string()))?;
-        tracing::warn!("redis backend stub: save is a no-op (enable redis-backend feature)");
+    async fn save(&self, _aor: &str, _contacts: &[StoredContact]) -> Result<(), BackendError> {
         Ok(())
     }
 
-    async fn load(&self, aor: &str) -> Result<Vec<StoredContact>, BackendError> {
-        let _key = self.key(aor);
-        tracing::warn!("redis backend stub: load returns empty (enable redis-backend feature)");
+    async fn load(&self, _aor: &str) -> Result<Vec<StoredContact>, BackendError> {
         Ok(Vec::new())
     }
 
-    async fn remove(&self, aor: &str) -> Result<(), BackendError> {
-        let _key = self.key(aor);
-        tracing::warn!("redis backend stub: remove is a no-op (enable redis-backend feature)");
+    async fn remove(&self, _aor: &str) -> Result<(), BackendError> {
         Ok(())
     }
 
-    async fn exists(&self, aor: &str) -> Result<bool, BackendError> {
-        let _key = self.key(aor);
-        tracing::warn!("redis backend stub: exists returns false (enable redis-backend feature)");
+    async fn exists(&self, _aor: &str) -> Result<bool, BackendError> {
         Ok(false)
     }
 
     async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
-        tracing::warn!(
-            "redis backend stub: all_aors returns empty (enable redis-backend feature)"
-        );
         Ok(Vec::new())
     }
 }
@@ -817,40 +804,23 @@ impl PostgresBackend {
 
 #[cfg(not(feature = "postgres-backend"))]
 impl RegistrarBackend for PostgresBackend {
-    async fn save(&self, _aor: &str, contacts: &[StoredContact]) -> Result<(), BackendError> {
-        let _json = serde_json::to_string(contacts)
-            .map_err(|error| BackendError::Serialization(error.to_string()))?;
-        tracing::warn!(
-            "postgres backend stub: save is a no-op (enable postgres-backend feature)"
-        );
+    async fn save(&self, _aor: &str, _contacts: &[StoredContact]) -> Result<(), BackendError> {
         Ok(())
     }
 
     async fn load(&self, _aor: &str) -> Result<Vec<StoredContact>, BackendError> {
-        tracing::warn!(
-            "postgres backend stub: load returns empty (enable postgres-backend feature)"
-        );
         Ok(Vec::new())
     }
 
     async fn remove(&self, _aor: &str) -> Result<(), BackendError> {
-        tracing::warn!(
-            "postgres backend stub: remove is a no-op (enable postgres-backend feature)"
-        );
         Ok(())
     }
 
     async fn exists(&self, _aor: &str) -> Result<bool, BackendError> {
-        tracing::warn!(
-            "postgres backend stub: exists returns false (enable postgres-backend feature)"
-        );
         Ok(false)
     }
 
     async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
-        tracing::warn!(
-            "postgres backend stub: all_aors returns empty (enable postgres-backend feature)"
-        );
         Ok(Vec::new())
     }
 }
@@ -1118,6 +1088,7 @@ mod tests {
         assert_eq!(contact.remaining_secs(), 3600);
     }
 
+    #[cfg(not(feature = "redis-backend"))]
     #[test]
     fn redis_backend_key_format() {
         let backend = RedisBackend::new(RedisBackendConfig::default());
