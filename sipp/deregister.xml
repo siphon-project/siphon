@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Deregister all contacts for a user (Contact: * with Expires: 0).
+  Run: sipp -sf deregister.xml -s bob -ap secret <target>:<port>
+-->
+<scenario name="DEREGISTER (wildcard)">
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 REGISTER
+Contact: *
+Expires: 0
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="401" auth="true" />
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 2 REGISTER
+Contact: *
+Expires: 0
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

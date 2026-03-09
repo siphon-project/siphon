@@ -728,12 +728,39 @@ services:
 
   # --- B2BUA failure test ---
 
-  # Register bob pointing to failure UAS (172.20.0.54)
-  sipp-b2bua-register-failure:
+  # Deregister bob (clear contacts from previous tests)
+  sipp-b2bua-deregister-bob:
     image: ctaloi/sipp:latest
     depends_on:
       siphon-b2bua:
         condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.51
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/deregister.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-failure
+
+  # Register bob pointing to failure UAS (172.20.0.54)
+  sipp-b2bua-register-failure:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-deregister-bob:
+        condition: service_completed_successfully
     volumes:
       - .:/sipp/scenarios:ro
     networks:
