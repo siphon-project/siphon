@@ -12,6 +12,21 @@ use siphon::sip::builder::SipMessageBuilder;
 use siphon::sip::message::Method;
 use siphon::sip::uri::SipUri;
 
+/// Compute MD5 hex digest of a string (mirrors auth.rs's md5_hex).
+fn md5_hex(input: &str) -> String {
+    format!("{:x}", md5::compute(input.as_bytes()))
+}
+
+/// Build a Digest Authorization header with a valid RFC 2617 response.
+fn digest_header(username: &str, password: &str, realm: &str, nonce: &str, uri: &str, method: &str) -> String {
+    let ha1 = md5_hex(&format!("{username}:{realm}:{password}"));
+    let ha2 = md5_hex(&format!("{method}:{uri}"));
+    let response = md5_hex(&format!("{ha1}:{nonce}:{ha2}"));
+    format!(
+        "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\""
+    )
+}
+
 fn make_register(auth_header: Option<&str>) -> PyRequest {
     let mut builder = SipMessageBuilder::new()
         .request(
@@ -117,9 +132,8 @@ fn proxy_digest_challenge_sets_407_reply() {
 #[test]
 fn valid_credentials_return_true() {
     let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
-    let mut request = make_register(Some(
-        "Digest username=\"alice\", realm=\"atlanta.com\", nonce=\"abc\", uri=\"sip:atlanta.com\", response=\"xyz\""
-    ));
+    let header = digest_header("alice", "secret123", "atlanta.com", "abc", "sip:atlanta.com", "REGISTER");
+    let mut request = make_register(Some(&header));
 
     let result = auth.challenge_www(&mut request, Some("atlanta.com")).unwrap();
     assert!(result, "valid user should be authenticated");
@@ -143,9 +157,8 @@ fn check_credentials_without_header_returns_false() {
 #[test]
 fn check_credentials_with_valid_user_returns_true() {
     let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
-    let request = make_register(Some(
-        "Digest username=\"alice\", realm=\"atlanta.com\", nonce=\"abc\", uri=\"sip:atlanta.com\", response=\"xyz\""
-    ));
+    let header = digest_header("alice", "secret123", "atlanta.com", "abc", "sip:atlanta.com", "REGISTER");
+    let request = make_register(Some(&header));
 
     let result = auth.check_credentials(&request, Some("atlanta.com")).unwrap();
     assert!(result, "should return true for known user");
@@ -176,15 +189,13 @@ fn multi_realm_users() {
     let auth = PyAuth::new(realm_users, "realm1.com".to_string());
 
     // Bob is in realm1
-    let request = make_register(Some(
-        "Digest username=\"bob\", realm=\"realm1.com\", nonce=\"abc\", uri=\"sip:realm1.com\", response=\"xyz\""
-    ));
+    let header = digest_header("bob", "pass1", "realm1.com", "abc", "sip:realm1.com", "REGISTER");
+    let request = make_register(Some(&header));
     assert!(auth.check_credentials(&request, Some("realm1.com")).unwrap());
 
     // Carol is in realm2 — static backend checks all realms regardless
-    let request = make_register(Some(
-        "Digest username=\"carol\", realm=\"realm2.com\", nonce=\"abc\", uri=\"sip:realm2.com\", response=\"xyz\""
-    ));
+    let header = digest_header("carol", "pass2", "realm2.com", "abc", "sip:realm2.com", "REGISTER");
+    let request = make_register(Some(&header));
     assert!(auth.check_credentials(&request, Some("realm2.com")).unwrap());
 
     // Unknown user fails
