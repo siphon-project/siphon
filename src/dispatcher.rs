@@ -106,6 +106,10 @@ struct DispatcherState {
     ipsec_config: Option<crate::config::IpsecConfig>,
     /// Outbound TCP/TLS connection pool for relay to new destinations.
     connection_pool: Arc<ConnectionPool>,
+    /// Reverse map: TLS remote SocketAddr → ConnectionId for connection reuse.
+    /// Populated by the TLS listener; used by send_to_target to reuse inbound
+    /// TLS connections when relaying to registered endpoints (like OpenSIPS).
+    tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
 }
 
 /// Run the core dispatcher loop.
@@ -130,6 +134,7 @@ pub async fn run(
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     ipsec_config: Option<crate::config::IpsecConfig>,
+    tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
 ) {
     // Resolve the local address for Via insertion.
     // If bound to 0.0.0.0 / [::], use advertised_address from config, or loopback.
@@ -210,6 +215,7 @@ pub async fn run(
         ipsec_manager,
         ipsec_config,
         connection_pool,
+        tls_addr_map,
     });
 
     // Spawn background task: fire transaction timers + sweep stale entries
@@ -2037,6 +2043,45 @@ fn send_to_target(
                     error!(destination = %destination, "TCP pool send failed: {error}");
                     fallback_connection_id
                 }
+            }
+        }
+        Transport::Tls => {
+            // TLS connection reuse: find an existing inbound TLS connection
+            // to the destination (like OpenSIPS connection reuse).
+            // First try exact SocketAddr match, then fall back to IP-only match
+            // (handles NAT where Contact URI port differs from source port).
+            let connection_id = state.tls_addr_map.get(&destination).map(|r| *r.value())
+                .or_else(|| {
+                    // IP-only fallback: find any TLS connection from the same IP
+                    let target_ip = destination.ip();
+                    state.tls_addr_map.iter()
+                        .find(|entry| entry.key().ip() == target_ip)
+                        .map(|entry| *entry.value())
+                });
+
+            if let Some(connection_id) = connection_id {
+                let outbound_message = OutboundMessage {
+                    connection_id,
+                    transport: Transport::Tls,
+                    destination,
+                    data,
+                };
+                if let Err(error) = state.outbound.send(outbound_message) {
+                    error!(destination = %destination, "TLS connection reuse send failed: {error}");
+                } else {
+                    debug!(
+                        destination = %destination,
+                        connection_id = ?connection_id,
+                        "relayed via TLS connection reuse"
+                    );
+                }
+                connection_id
+            } else {
+                warn!(
+                    destination = %destination,
+                    "no TLS connection available for destination (no inbound connection to reuse)"
+                );
+                fallback_connection_id
             }
         }
         _ => {

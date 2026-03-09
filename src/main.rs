@@ -303,6 +303,8 @@ async fn main() {
     }
 
     // --- Start TLS listeners ---
+    let tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>> =
+        Arc::new(dashmap::DashMap::new());
     if let Some(ref tls_config) = config.tls {
         let tls_connection_map = Arc::new(dashmap::DashMap::new());
         for addr_str in &config.listen.tls {
@@ -315,7 +317,7 @@ async fn main() {
             }
             listen_addrs.entry(transport::Transport::Tls).or_insert(addr);
             info!(addr = %addr, "starting TLS transport");
-            transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl)).await;
+            transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map)).await;
         }
     }
 
@@ -720,6 +722,7 @@ async fn main() {
         registrant_manager,
         ipsec_manager,
         config.ipsec.clone(),
+        tls_addr_map,
     ));
 
     info!("SIPhon ready — press Ctrl+C to stop");

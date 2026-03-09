@@ -94,6 +94,7 @@ pub async fn listen(
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
+    addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
 ) {
     let acceptor = build_tls_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
@@ -130,6 +131,7 @@ pub async fn listen(
                     let acceptor = acceptor.clone();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
+                    let addr_map = addr_map.clone();
 
                     configure_tcp_socket(&tcp_stream);
 
@@ -152,6 +154,7 @@ pub async fn listen(
                         // Per-connection outbound channel
                         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
                         connection_map.insert(connection_id, outbound_tx);
+                        addr_map.insert(remote_addr, connection_id);
 
                         // Read task with idle timeout
                         let inbound_tx_clone = inbound_tx.clone();
@@ -206,6 +209,7 @@ pub async fn listen(
                         }
 
                         connection_map.remove(&connection_id);
+                        addr_map.remove(&remote_addr);
                         debug!("TLS connection {:?} cleaned up", connection_id);
                     });
                 }
@@ -319,6 +323,7 @@ mod tests {
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
+            Arc::new(DashMap::new()),
         )
         .await;
 
@@ -365,6 +370,7 @@ mod tests {
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
+            Arc::new(DashMap::new()),
         )
         .await;
 
@@ -426,6 +432,7 @@ mod tests {
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
+        let addr_map: Arc<DashMap<SocketAddr, ConnectionId>> = Arc::new(DashMap::new());
 
         listen(
             bound_addr,
@@ -434,6 +441,7 @@ mod tests {
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
+            Arc::clone(&addr_map),
         )
         .await;
 
@@ -469,7 +477,14 @@ mod tests {
         .unwrap();
 
         let connection_id = message.connection_id;
+        let remote_addr = message.remote_addr;
         assert!(connection_map.contains_key(&connection_id));
+        // Verify addr_map is populated for connection reuse
+        assert!(
+            addr_map.contains_key(&remote_addr),
+            "addr_map should track TLS connection by remote address"
+        );
+        assert_eq!(*addr_map.get(&remote_addr).unwrap(), connection_id);
 
         // Drop the client
         drop(tls_stream);
@@ -480,6 +495,10 @@ mod tests {
         assert!(
             !connection_map.contains_key(&connection_id),
             "connection should have been cleaned up after client drop"
+        );
+        assert!(
+            !addr_map.contains_key(&remote_addr),
+            "addr_map should be cleaned up after client drop"
         );
     }
 }
