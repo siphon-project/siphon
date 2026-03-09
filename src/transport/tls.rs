@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::TlsServerConfig;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
@@ -138,7 +138,7 @@ pub async fn listen(
                         };
 
                         let connection_id = next_connection_id();
-                        info!("TLS accepted {} as {:?}", remote_addr, connection_id);
+                        debug!("TLS accepted {} as {:?}", remote_addr, connection_id);
 
                         let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
                         let (mut reader, mut writer) = tokio::io::split(tls_stream);

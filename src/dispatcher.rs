@@ -473,6 +473,11 @@ fn handle_inbound(inbound: InboundMessage, state: &DispatcherState) {
         }
     };
 
+    // RFC 5626 §3.5.1: CRLF keep-alive — silently ignore
+    if raw.trim().is_empty() {
+        return;
+    }
+
     // Parse SIP message
     let message = match parse_sip_message(raw) {
         Ok((_, message)) => message,
