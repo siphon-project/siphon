@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 
@@ -60,7 +60,7 @@ pub async fn listen(
                     let connection_map = connection_map.clone();
 
                     configure_tcp_socket(&socket);
-                    info!("TCP accepted {} as {:?}", remote_addr, connection_id);
+                    debug!("TCP accepted {} as {:?}", remote_addr, connection_id);
 
                     tokio::spawn(async move {
                         let local_addr = socket.local_addr().unwrap_or(local_addr);
@@ -77,7 +77,7 @@ pub async fn listen(
                             loop {
                                 match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.read(&mut buffer)).await {
                                     Ok(Ok(0)) => {
-                                        info!("TCP connection {:?} closed by peer", connection_id);
+                                        debug!("TCP connection {:?} closed by peer", connection_id);
                                         break;
                                     }
                                     Ok(Ok(size)) => {
@@ -99,7 +99,7 @@ pub async fn listen(
                                         break;
                                     }
                                     Err(_) => {
-                                        info!("TCP connection {:?} idle timeout ({}s)", connection_id, CONNECTION_IDLE_TIMEOUT.as_secs());
+                                        debug!("TCP connection {:?} idle timeout ({}s)", connection_id, CONNECTION_IDLE_TIMEOUT.as_secs());
                                         break;
                                     }
                                 }
@@ -123,7 +123,7 @@ pub async fn listen(
                         }
 
                         connection_map.remove(&connection_id);
-                        info!("TCP connection {:?} cleaned up", connection_id);
+                        debug!("TCP connection {:?} cleaned up", connection_id);
                     });
                 }
                 Err(e) => {
