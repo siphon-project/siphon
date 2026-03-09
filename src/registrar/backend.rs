@@ -22,6 +22,11 @@ pub struct StoredContact {
     pub q: f32,
     /// Expires duration in seconds (from the time of storage).
     pub expires_secs: u64,
+    /// Absolute expiry as Unix epoch seconds.
+    /// Added to support correct TTL after restart. Older entries without
+    /// this field fall back to treating `expires_secs` as remaining.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
     /// Call-ID that created this binding.
     pub call_id: String,
     /// CSeq sequence number.
@@ -37,10 +42,17 @@ pub struct StoredContact {
 impl StoredContact {
     /// Convert from the in-memory Contact type.
     pub fn from_contact(contact: &super::Contact) -> Self {
+        let remaining = contact.remaining_seconds();
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         Self {
             uri: contact.uri.to_string(),
             q: contact.q,
-            expires_secs: contact.remaining_seconds(),
+            expires_secs: remaining,
+            expires_at: Some(now_epoch + remaining),
             call_id: contact.call_id.clone(),
             cseq: contact.cseq,
             source_addr: contact.source_addr.map(|a| a.to_string()),
@@ -49,9 +61,35 @@ impl StoredContact {
         }
     }
 
+    /// Returns the number of seconds remaining until this contact expires,
+    /// using `expires_at` (absolute epoch) when available, falling back to
+    /// `expires_secs` for entries stored before this field was added.
+    pub fn remaining_secs(&self) -> u64 {
+        if let Some(expires_at) = self.expires_at {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            expires_at.saturating_sub(now)
+        } else {
+            self.expires_secs
+        }
+    }
+
+    /// Returns true if this contact has expired.
+    pub fn is_expired(&self) -> bool {
+        self.remaining_secs() == 0
+    }
+
     /// Convert to an in-memory Contact type.
+    /// Returns `None` if the URI is unparseable or the contact has expired.
     pub fn to_contact(&self) -> Option<super::Contact> {
         use crate::sip::parser::parse_uri_standalone;
+
+        let remaining = self.remaining_secs();
+        if remaining == 0 {
+            return None;
+        }
 
         let uri = parse_uri_standalone(&self.uri).ok()?;
         let source_addr = self
@@ -63,7 +101,7 @@ impl StoredContact {
             uri,
             q: self.q,
             registered_at: std::time::Instant::now(),
-            expires: Duration::from_secs(self.expires_secs),
+            expires: Duration::from_secs(remaining),
             call_id: self.call_id.clone(),
             cseq: self.cseq,
             source_addr,
@@ -201,6 +239,9 @@ pub struct RedisBackendConfig {
     pub key_prefix: String,
     /// Number of shards. 0 = no sharding (use `url`), >0 = shard by AoR hash.
     pub shard_count: usize,
+    /// Extra seconds beyond the longest contact expiry to retain the Redis key.
+    /// Prevents race conditions where a key expires moments before a refresh.
+    pub ttl_slack_secs: u64,
 }
 
 impl Default for RedisBackendConfig {
@@ -210,6 +251,7 @@ impl Default for RedisBackendConfig {
             urls: Vec::new(),
             key_prefix: "siphon:reg:".to_string(),
             shard_count: 0,
+            ttl_slack_secs: 30,
         }
     }
 }
@@ -321,15 +363,18 @@ mod redis_real {
                     .hset(&key, &contact.uri, &json)
                     .await
                     .map_err(|error| BackendError::Query(error.to_string()))?;
-                if contact.expires_secs > max_ttl {
-                    max_ttl = contact.expires_secs;
+                let remaining = contact.remaining_secs();
+                if remaining > max_ttl {
+                    max_ttl = remaining;
                 }
             }
 
-            // Set TTL to the longest contact expiry (minimum 1 second).
+            // Set TTL to the longest contact expiry + slack (minimum 1 second).
+            // The slack prevents the key from expiring moments before a refresh.
             if max_ttl > 0 {
+                let ttl_with_slack = max_ttl + self.config.ttl_slack_secs;
                 let _: () = connection
-                    .expire(&key, max_ttl as i64)
+                    .expire(&key, ttl_with_slack as i64)
                     .await
                     .map_err(|error| BackendError::Query(error.to_string()))?;
             }
@@ -347,11 +392,28 @@ mod redis_real {
                 .map_err(|error| BackendError::Query(error.to_string()))?;
 
             let mut contacts = Vec::with_capacity(entries.len());
-            for (_field, value) in entries {
+            let mut expired_fields: Vec<String> = Vec::new();
+            for (field, value) in entries {
                 let contact: StoredContact = serde_json::from_str(&value)
                     .map_err(|error| BackendError::Serialization(error.to_string()))?;
-                contacts.push(contact);
+                // Filter out individually expired contacts (the hash key TTL
+                // is set to the *longest* contact, so shorter ones may linger).
+                if contact.is_expired() {
+                    expired_fields.push(field);
+                } else {
+                    contacts.push(contact);
+                }
             }
+
+            // Lazily delete expired fields from the hash.
+            if !expired_fields.is_empty() {
+                let fields: Vec<&str> = expired_fields.iter().map(|s| s.as_str()).collect();
+                let _: () = connection
+                    .hdel(&key, &fields[..])
+                    .await
+                    .map_err(|error| BackendError::Query(error.to_string()))?;
+            }
+
             Ok(contacts)
         }
 
@@ -623,7 +685,7 @@ mod postgres_real {
             for contact in contacts {
                 let json = serde_json::to_string(contact)
                     .map_err(|error| BackendError::Serialization(error.to_string()))?;
-                let expires_secs = contact.expires_secs as f64;
+                let expires_secs = contact.remaining_secs() as f64;
 
                 client
                     .execute(&query, &[&aor, &contact.uri, &json, &expires_secs])
@@ -638,8 +700,11 @@ mod postgres_real {
             let client = self.client_for(aor);
             let table = &self.config.table;
 
+            // Select remaining seconds so we can set accurate TTL on the
+            // deserialized StoredContact, regardless of when it was stored.
             let query = format!(
-                "SELECT data FROM {} WHERE aor = $1 AND expires_at > NOW()",
+                "SELECT data, EXTRACT(EPOCH FROM (expires_at - NOW()))::bigint AS remaining \
+                 FROM {} WHERE aor = $1 AND expires_at > NOW()",
                 table
             );
             let rows = client
@@ -647,11 +712,21 @@ mod postgres_real {
                 .await
                 .map_err(|error| BackendError::Query(error.to_string()))?;
 
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
             let mut contacts = Vec::with_capacity(rows.len());
             for row in rows {
                 let data: &str = row.get(0);
-                let contact: StoredContact = serde_json::from_str(data)
+                let remaining: i64 = row.get(1);
+                let mut contact: StoredContact = serde_json::from_str(data)
                     .map_err(|error| BackendError::Serialization(error.to_string()))?;
+                // Overwrite with the actual remaining TTL from the database.
+                let remaining = remaining.max(0) as u64;
+                contact.expires_secs = remaining;
+                contact.expires_at = Some(now_epoch + remaining);
                 contacts.push(contact);
             }
             Ok(contacts)
@@ -775,10 +850,15 @@ mod tests {
     use super::*;
 
     fn sample_stored_contact() -> StoredContact {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         StoredContact {
             uri: "sip:alice@10.0.0.1".to_string(),
             q: 1.0,
             expires_secs: 3600,
+            expires_at: Some(now_epoch + 3600),
             call_id: "call-1".to_string(),
             cseq: 1,
             source_addr: None,
@@ -803,11 +883,10 @@ mod tests {
 
     #[test]
     fn stored_contact_with_instance() {
-        let stored = StoredContact {
-            sip_instance: Some("<urn:uuid:abc>".to_string()),
-            reg_id: Some(1),
-            ..sample_stored_contact()
-        };
+        let mut stored = sample_stored_contact();
+        stored.sip_instance = Some("<urn:uuid:abc>".to_string());
+        stored.reg_id = Some(1);
+        let stored = stored;
         let contact = stored.to_contact().unwrap();
         assert_eq!(contact.sip_instance.as_deref(), Some("<urn:uuid:abc>"));
         assert_eq!(contact.reg_id, Some(1));
@@ -876,6 +955,52 @@ mod tests {
             .unwrap();
         backend.save("sip:a@x.com", &[]).await.unwrap();
         assert!(!backend.exists("sip:a@x.com").await.unwrap());
+    }
+
+    #[test]
+    fn expired_contact_filtered_by_to_contact() {
+        let stored = StoredContact {
+            expires_secs: 0,
+            expires_at: Some(1), // epoch second 1 — long expired
+            ..sample_stored_contact()
+        };
+        assert!(stored.is_expired());
+        assert!(stored.to_contact().is_none(), "expired contact should return None");
+    }
+
+    #[test]
+    fn remaining_secs_uses_expires_at() {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let stored = StoredContact {
+            expires_secs: 9999, // stale value — should be ignored
+            expires_at: Some(now_epoch + 100),
+            ..sample_stored_contact()
+        };
+        let remaining = stored.remaining_secs();
+        // Should be ~100, not 9999
+        assert!(remaining <= 100 && remaining >= 98);
+    }
+
+    #[test]
+    fn remaining_secs_falls_back_without_expires_at() {
+        let stored = StoredContact {
+            expires_secs: 500,
+            expires_at: None,
+            ..sample_stored_contact()
+        };
+        assert_eq!(stored.remaining_secs(), 500);
+    }
+
+    #[test]
+    fn legacy_json_without_expires_at_deserializes() {
+        // Simulate a JSON blob stored before expires_at was added.
+        let json = r#"{"uri":"sip:alice@10.0.0.1","q":1.0,"expires_secs":3600,"call_id":"c1","cseq":1,"source_addr":null,"sip_instance":null,"reg_id":null}"#;
+        let contact: StoredContact = serde_json::from_str(json).unwrap();
+        assert!(contact.expires_at.is_none());
+        assert_eq!(contact.remaining_secs(), 3600);
     }
 
     #[test]
