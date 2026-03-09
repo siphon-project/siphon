@@ -368,6 +368,13 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // --- Create outbound TCP connection pool ---
+    let connection_pool = Arc::new(transport::pool::ConnectionPool::new(
+        Arc::clone(&tcp_connection_map),
+        inbound_tx.clone(),
+        local_addr,
+    ));
+
     // Drop our copy of senders — workers hold their own clones
     drop(inbound_tx);
 
@@ -705,6 +712,7 @@ async fn main() {
         listen_addrs,
         hep_sender,
         uac_sender,
+        connection_pool,
         pre_rtpengine,
         registrant_manager,
         ipsec_manager,

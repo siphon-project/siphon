@@ -39,6 +39,7 @@ use crate::transaction::{TransactionManager, ServerEvent, ClientEvent};
 use crate::transaction::timer::TimerConfig;
 use crate::hep::HepSender;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, OutboundRouter, Transport};
+use crate::transport::pool::ConnectionPool;
 use crate::uac::UacSender;
 
 /// A pending timer entry in the timer wheel.
@@ -102,6 +103,8 @@ struct DispatcherState {
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     /// IPsec config (P-CSCF ports).
     ipsec_config: Option<crate::config::IpsecConfig>,
+    /// Outbound TCP/TLS connection pool for relay to new destinations.
+    connection_pool: Arc<ConnectionPool>,
 }
 
 /// Run the core dispatcher loop.
@@ -118,6 +121,7 @@ pub async fn run(
     listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
     hep_sender: Option<Arc<HepSender>>,
     uac_sender: Arc<UacSender>,
+    connection_pool: Arc<ConnectionPool>,
     pre_rtpengine: (
         Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
         Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
@@ -204,6 +208,7 @@ pub async fn run(
         recording_manager: Arc::new(crate::siprec::RecordingManager::new()),
         ipsec_manager,
         ipsec_config,
+        connection_pool,
     });
 
     // Spawn background task: fire transaction timers + sweep stale entries
@@ -1005,9 +1010,9 @@ fn relay_request(
         }
     };
 
-    // Resolve to SocketAddr
-    let destination = match resolve_target(&target_uri_string, &state.dns_resolver) {
-        Some(addr) => addr,
+    // Resolve to SocketAddr + transport
+    let target = match resolve_target(&target_uri_string, &state.dns_resolver) {
+        Some(t) => t,
         None => {
             warn!(target = %target_uri_string, "cannot resolve relay target");
             let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref());
@@ -1015,6 +1020,8 @@ fn relay_request(
             return;
         }
     };
+    let destination = target.address;
+    let outbound_transport = target.transport.unwrap_or(inbound.transport);
 
     // Prevent routing loops — don't relay to ourselves
     if destination.port() == state.local_addr.port()
@@ -1053,8 +1060,8 @@ fn relay_request(
         return;
     }
 
-    // Add our Via
-    let transport_str = format!("{}", inbound.transport);
+    // Add our Via — use the outbound transport for the Via header
+    let transport_str = format!("{}", outbound_transport);
     let branch = core::add_via(
         &mut relayed.headers,
         &transport_str,
@@ -1065,7 +1072,7 @@ fn relay_request(
     // Add Record-Route if the script requested it
     if record_routed {
         let host = format_sip_host(&state.local_addr.ip().to_string());
-        let rr_uri = format!("sip:{}:{}", host, state.local_addr.port());
+        let rr_uri = format!("sip:{}:{};transport={}", host, state.local_addr.port(), transport_str.to_lowercase());
         core::add_record_route(&mut relayed.headers, &rr_uri);
     }
 
@@ -1084,30 +1091,23 @@ fn relay_request(
     debug!(
         branch = %branch,
         destination = %destination,
+        transport = %outbound_transport,
         "relaying request"
     );
 
     // HEP capture — outbound relayed request
     if let Some(ref hep) = state.hep_sender {
-        hep.capture_outbound(state.local_addr, destination, inbound.transport, &data);
+        let local = state.listen_addrs.get(&outbound_transport).copied().unwrap_or(state.local_addr);
+        hep.capture_outbound(local, destination, outbound_transport, &data);
     }
 
-    // Send to target — use the same transport as the inbound message
-    let outbound_message = OutboundMessage {
-        connection_id: inbound.connection_id,
-        transport: inbound.transport,
-        destination,
-        data,
-    };
-    if let Err(error) = state.outbound.send(outbound_message) {
-        error!("failed to enqueue relayed request: {error}");
-        return;
-    }
+    // Send to target — use resolved transport, with connection pool for TCP/TLS
+    let connection_id = send_to_target(data, &target, inbound.transport, inbound.connection_id, state);
 
     // Create client transaction for retransmission and timeout handling.
     // The state machine will schedule Timer A/E (retransmit) and Timer B/F (timeout).
     // We've already sent the initial request above, so we only process timer actions.
-    let txn_transport = crate::transaction::state::Transport::from(inbound.transport);
+    let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
     match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
         Ok((client_key, actions)) => {
             for action in &actions {
@@ -1118,8 +1118,8 @@ fn relay_request(
                         name: *name,
                         fires_at: std::time::Instant::now() + *duration,
                         destination: Some(destination),
-                        transport: Some(inbound.transport),
-                        connection_id: Some(inbound.connection_id),
+                        transport: Some(outbound_transport),
+                        connection_id: Some(connection_id),
                     });
                 }
             }
@@ -1137,8 +1137,8 @@ fn relay_request(
                 session.add_client_key(client_key.clone());
                 session.set_client_branch(client_key, ClientBranch {
                     destination,
-                    transport: inbound.transport,
-                    connection_id: inbound.connection_id,
+                    transport: outbound_transport,
+                    connection_id,
                 });
                 session.on_reply_callback = on_reply_callback;
                 session.on_failure_callback = on_failure_callback;
@@ -1247,13 +1247,15 @@ fn relay_fork_branch(
     state: &DispatcherState,
 ) {
     // Resolve target
-    let destination = match resolve_target(target, &state.dns_resolver) {
-        Some(addr) => addr,
+    let relay_target = match resolve_target(target, &state.dns_resolver) {
+        Some(t) => t,
         None => {
             warn!(target = %target, branch = branch_index, "fork: cannot resolve target");
             return;
         }
     };
+    let destination = relay_target.address;
+    let outbound_transport = relay_target.transport.unwrap_or(inbound.transport);
 
     // Loop detection
     if destination.port() == state.local_addr.port()
@@ -1270,7 +1272,7 @@ fn relay_fork_branch(
         return; // caller handles the error for the whole fork
     }
 
-    let transport_str = format!("{}", inbound.transport);
+    let transport_str = format!("{}", outbound_transport);
     let branch = core::add_via(
         &mut relayed.headers,
         &transport_str,
@@ -1280,7 +1282,7 @@ fn relay_fork_branch(
 
     if record_routed {
         let host = format_sip_host(&state.local_addr.ip().to_string());
-        let rr_uri = format!("sip:{}:{}", host, state.local_addr.port());
+        let rr_uri = format!("sip:{}:{};transport={}", host, state.local_addr.port(), transport_str.to_lowercase());
         core::add_record_route(&mut relayed.headers, &rr_uri);
     }
 
@@ -1295,25 +1297,19 @@ fn relay_fork_branch(
 
     // HEP capture — outbound fork branch
     if let Some(ref hep) = state.hep_sender {
-        hep.capture_outbound(state.local_addr, destination, inbound.transport, &data);
+        let local = state.listen_addrs.get(&outbound_transport).copied().unwrap_or(state.local_addr);
+        hep.capture_outbound(local, destination, outbound_transport, &data);
     }
 
-    // Send
-    if let Err(error) = state.outbound.send(OutboundMessage {
-        connection_id: inbound.connection_id,
-        transport: inbound.transport,
-        destination,
-        data,
-    }) {
-        error!("fork branch {branch_index}: failed to send: {error}");
-        return;
-    }
+    // Send via pool for TCP/TLS, direct channel for UDP
+    let connection_id = send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state);
 
     debug!(
         branch = %branch,
         target = %target,
         branch_index = branch_index,
         destination = %destination,
+        transport = %outbound_transport,
         "fork: sent branch"
     );
 
@@ -1323,7 +1319,7 @@ fn relay_fork_branch(
     }
 
     // Create client transaction
-    let txn_transport = crate::transaction::state::Transport::from(inbound.transport);
+    let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
     match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
         Ok((client_key, actions)) => {
             for action in &actions {
@@ -1334,8 +1330,8 @@ fn relay_fork_branch(
                         name: *name,
                         fires_at: std::time::Instant::now() + *duration,
                         destination: Some(destination),
-                        transport: Some(inbound.transport),
-                        connection_id: Some(inbound.connection_id),
+                        transport: Some(outbound_transport),
+                        connection_id: Some(connection_id),
                     });
                 }
             }
@@ -1344,8 +1340,8 @@ fn relay_fork_branch(
             session.add_client_key(client_key.clone());
             session.set_client_branch(client_key.clone(), ClientBranch {
                 destination,
-                transport: inbound.transport,
-                connection_id: inbound.connection_id,
+                transport: outbound_transport,
+                connection_id,
             });
             session.branch_index_map.insert(client_key, branch_index);
         }
@@ -1894,10 +1890,17 @@ fn run_reply_handlers(
 /// DNS A/AAAA/SRV resolution.  Called from synchronous context using
 /// `block_in_place` because the callers (relay, fork, B2BUA) are sync
 /// functions running on the tokio multi-threaded runtime.
-fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<SocketAddr> {
+/// Resolved relay target: address + optional transport override.
+struct RelayTarget {
+    address: SocketAddr,
+    /// Transport from URI params or SRV; `None` means use the inbound transport.
+    transport: Option<Transport>,
+}
+
+fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<RelayTarget> {
     // Try as bare IP:port first (cheapest check)
     if let Ok(addr) = uri_string.parse::<SocketAddr>() {
-        return Some(addr);
+        return Some(RelayTarget { address: addr, transport: None });
     }
 
     // Try parsing as a full SIP URI
@@ -1914,10 +1917,75 @@ fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<SocketAddr
             ))
         });
 
-        return results.into_iter().next().map(|r| r.address);
+        return results.into_iter().next().map(|r| {
+            let transport = r.transport.as_deref()
+                .or(transport_hint.as_deref())
+                .and_then(|t| match t.to_lowercase().as_str() {
+                    "tcp" => Some(Transport::Tcp),
+                    "tls" => Some(Transport::Tls),
+                    "udp" => Some(Transport::Udp),
+                    "ws" => Some(Transport::WebSocket),
+                    "wss" => Some(Transport::WebSocketSecure),
+                    _ => None,
+                });
+            RelayTarget { address: r.address, transport }
+        });
     }
 
     None
+}
+
+/// Send a relayed request to a resolved target, using the connection pool for
+/// TCP/TLS when no existing inbound connection is available.
+///
+/// Returns the `ConnectionId` used (new pool connection or the existing one).
+fn send_to_target(
+    data: Bytes,
+    target: &RelayTarget,
+    fallback_transport: Transport,
+    fallback_connection_id: ConnectionId,
+    state: &DispatcherState,
+) -> ConnectionId {
+    let transport = target.transport.unwrap_or(fallback_transport);
+    let destination = target.address;
+
+    match transport {
+        Transport::Tcp => {
+            // Use connection pool for outbound TCP
+            let pool = Arc::clone(&state.connection_pool);
+            let data_clone = data;
+            match tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(pool.send_tcp(destination, data_clone))
+            }) {
+                Ok(connection_id) => {
+                    debug!(
+                        destination = %destination,
+                        connection_id = ?connection_id,
+                        "relayed via TCP pool"
+                    );
+                    connection_id
+                }
+                Err(error) => {
+                    error!(destination = %destination, "TCP pool send failed: {error}");
+                    fallback_connection_id
+                }
+            }
+        }
+        _ => {
+            // UDP and other transports: use the existing outbound channel
+            let outbound_message = OutboundMessage {
+                connection_id: fallback_connection_id,
+                transport,
+                destination,
+                data,
+            };
+            if let Err(error) = state.outbound.send(outbound_message) {
+                error!("failed to enqueue relayed request: {error}");
+            }
+            fallback_connection_id
+        }
+    }
 }
 
 /// Run a Python coroutine to completion.
@@ -2730,18 +2798,21 @@ fn b2bua_send_b_leg_invite(
     _inbound: &InboundMessage,
     state: &DispatcherState,
 ) {
-    let destination = match resolve_target(target_uri, &state.dns_resolver) {
-        Some(addr) => addr,
+    let relay_target = match resolve_target(target_uri, &state.dns_resolver) {
+        Some(t) => t,
         None => {
             warn!(call_id = %call_id, target = %target_uri, "B2BUA: cannot resolve target");
             return;
         }
     };
+    let destination = relay_target.address;
+    let outbound_transport = relay_target.transport.unwrap_or(Transport::Udp);
 
     // Build a new INVITE for the B-leg
     let branch = TransactionKey::generate_branch();
     let via_value = format!(
-        "SIP/2.0/UDP {}:{};branch={}",
+        "SIP/2.0/{} {}:{};branch={}",
+        outbound_transport,
         state.local_addr.ip(),
         state.local_addr.port(),
         branch,
@@ -2786,22 +2857,22 @@ fn b2bua_send_b_leg_invite(
     // Register B-leg with call manager
     let b_leg = BLeg {
         destination,
-        transport: Transport::Udp, // TODO: detect from URI
+        transport: outbound_transport,
         branch: branch.clone(),
         target_uri: target_uri.to_string(),
     };
     state.call_manager.add_b_leg(call_id, b_leg);
 
     let data = Bytes::from(b_leg_invite.to_bytes());
-    let outbound_message = OutboundMessage {
-        connection_id: ConnectionId::default(),
-        transport: Transport::Udp,
-        destination,
-        data,
-    };
-    if let Err(error) = state.outbound.send(outbound_message) {
-        error!(call_id = %call_id, "B2BUA: failed to send B-leg INVITE: {error}");
+
+    // HEP capture
+    if let Some(ref hep) = state.hep_sender {
+        let local = state.listen_addrs.get(&outbound_transport).copied().unwrap_or(state.local_addr);
+        hep.capture_outbound(local, destination, outbound_transport, &data);
     }
+
+    // Send via pool for TCP/TLS, direct channel for UDP
+    send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
 }
 
 /// Handle a response to an outbound registration (z9hG4bK-reg- branch).
@@ -3117,63 +3188,58 @@ fn handle_b2bua_response(
                                 "B2BUA: 422 received, retrying with Session-Expires={min_se}"
                             );
 
-                            // Build retry INVITE from stored A-leg INVITE
-                            let original = invite_arc.lock().unwrap();
-                            let mut retry = original.clone();
-                            drop(original);
+                            // Resolve target
+                            if let Some(relay_target) = resolve_target(target_uri, &state.dns_resolver) {
+                                let destination = relay_target.address;
+                                let transport = relay_target.transport.unwrap_or(Transport::Udp);
 
-                            // Replace Via with new branch
-                            let new_branch = TransactionKey::generate_branch();
-                            let via_value = format!(
-                                "SIP/2.0/UDP {}:{};branch={}",
-                                state.local_addr.ip(),
-                                state.local_addr.port(),
-                                new_branch,
-                            );
-                            retry.headers.remove("Via");
-                            retry.headers.add("Via", via_value);
+                                // Build retry INVITE from stored A-leg INVITE
+                                let original = invite_arc.lock().unwrap();
+                                let mut retry = original.clone();
+                                drop(original);
 
-                            // Update Request-URI
-                            if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
-                                retry.start_line = StartLine::Request(
-                                    crate::sip::message::RequestLine {
-                                        method: crate::sip::message::Method::Invite,
-                                        request_uri: target_parsed,
-                                        version: crate::sip::message::Version::sip_2_0(),
-                                    },
+                                // Replace Via with new branch
+                                let new_branch = TransactionKey::generate_branch();
+                                let via_value = format!(
+                                    "SIP/2.0/{} {}:{};branch={}",
+                                    transport,
+                                    state.local_addr.ip(),
+                                    state.local_addr.port(),
+                                    new_branch,
                                 );
-                            }
+                                retry.headers.remove("Via");
+                                retry.headers.add("Via", via_value);
 
-                            // Set updated session timer headers
-                            retry.headers.remove("Session-Expires");
-                            retry.headers.remove("Min-SE");
-                            retry.headers.add(
-                                "Session-Expires",
-                                format!("{};refresher=uac", min_se),
-                            );
-                            retry.headers.add("Min-SE", min_se.to_string());
+                                // Update Request-URI
+                                if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
+                                    retry.start_line = StartLine::Request(
+                                        crate::sip::message::RequestLine {
+                                            method: crate::sip::message::Method::Invite,
+                                            request_uri: target_parsed,
+                                            version: crate::sip::message::Version::sip_2_0(),
+                                        },
+                                    );
+                                }
 
-                            // Resolve and send
-                            if let Some(destination) = resolve_target(target_uri, &state.dns_resolver) {
-                                // Remove old B-leg branch, add new one
+                                // Set updated session timer headers
+                                retry.headers.remove("Session-Expires");
+                                retry.headers.remove("Min-SE");
+                                retry.headers.add(
+                                    "Session-Expires",
+                                    format!("{};refresher=uac", min_se),
+                                );
+                                retry.headers.add("Min-SE", min_se.to_string());
+
                                 let b_leg = BLeg {
                                     destination,
-                                    transport: Transport::Udp,
+                                    transport,
                                     branch: new_branch,
                                     target_uri: target_uri.clone(),
                                 };
                                 state.call_manager.add_b_leg(call_id, b_leg);
 
                                 let data = Bytes::from(retry.to_bytes());
-                                let outbound_message = OutboundMessage {
-                                    connection_id: ConnectionId::default(),
-                                    transport: Transport::Udp,
-                                    destination,
-                                    data,
-                                };
-                                if let Err(error) = state.outbound.send(outbound_message) {
-                                    error!(call_id = %call_id, "B2BUA: failed to send 422 retry INVITE: {error}");
-                                }
+                                send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
                             }
                             return; // don't forward 422 to A-leg or fire on_failure
                         }
@@ -3221,57 +3287,53 @@ fn handle_b2bua_response(
                                 None,
                             );
 
-                            // Build retry INVITE from stored A-leg INVITE
-                            let original = invite_arc.lock().unwrap();
-                            let mut retry = original.clone();
-                            drop(original);
+                            // Resolve target
+                            if let Some(relay_target) = resolve_target(target_uri, &state.dns_resolver) {
+                                let destination = relay_target.address;
+                                let transport = relay_target.transport.unwrap_or(Transport::Udp);
 
-                            // Replace Via with new branch
-                            let new_branch = TransactionKey::generate_branch();
-                            let via_value = format!(
-                                "SIP/2.0/UDP {}:{};branch={}",
-                                state.local_addr.ip(),
-                                state.local_addr.port(),
-                                new_branch,
-                            );
-                            retry.headers.remove("Via");
-                            retry.headers.add("Via", via_value);
+                                // Build retry INVITE from stored A-leg INVITE
+                                let original = invite_arc.lock().unwrap();
+                                let mut retry = original.clone();
+                                drop(original);
 
-                            // Update Request-URI
-                            if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
-                                retry.start_line = StartLine::Request(
-                                    crate::sip::message::RequestLine {
-                                        method: crate::sip::message::Method::Invite,
-                                        request_uri: target_parsed,
-                                        version: crate::sip::message::Version::sip_2_0(),
-                                    },
+                                // Replace Via with new branch
+                                let new_branch = TransactionKey::generate_branch();
+                                let via_value = format!(
+                                    "SIP/2.0/{} {}:{};branch={}",
+                                    transport,
+                                    state.local_addr.ip(),
+                                    state.local_addr.port(),
+                                    new_branch,
                                 );
-                            }
+                                retry.headers.remove("Via");
+                                retry.headers.add("Via", via_value);
 
-                            // Add authorization header
-                            retry.headers.remove(auth_header_name);
-                            retry.headers.add(auth_header_name, auth_value);
+                                // Update Request-URI
+                                if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
+                                    retry.start_line = StartLine::Request(
+                                        crate::sip::message::RequestLine {
+                                            method: crate::sip::message::Method::Invite,
+                                            request_uri: target_parsed,
+                                            version: crate::sip::message::Version::sip_2_0(),
+                                        },
+                                    );
+                                }
 
-                            // Resolve and send
-                            if let Some(destination) = resolve_target(target_uri, &state.dns_resolver) {
+                                // Add authorization header
+                                retry.headers.remove(auth_header_name);
+                                retry.headers.add(auth_header_name, auth_value);
+
                                 let b_leg = BLeg {
                                     destination,
-                                    transport: Transport::Udp,
+                                    transport,
                                     branch: new_branch,
                                     target_uri: target_uri.clone(),
                                 };
                                 state.call_manager.add_b_leg(call_id, b_leg);
 
                                 let data = Bytes::from(retry.to_bytes());
-                                let outbound_message = OutboundMessage {
-                                    connection_id: ConnectionId::default(),
-                                    transport: Transport::Udp,
-                                    destination,
-                                    data,
-                                };
-                                if let Err(error) = state.outbound.send(outbound_message) {
-                                    error!(call_id = %call_id, "B2BUA: failed to send auth retry INVITE: {error}");
-                                }
+                                send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
                             }
                             return; // don't forward 401/407 to A-leg or fire on_failure
                         }
@@ -3926,30 +3988,39 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_target_ip_with_port() {
         let resolver = test_resolver();
-        let addr = resolve_target("sip:alice@192.168.1.100:5080", &resolver).unwrap();
-        assert_eq!(addr, "192.168.1.100:5080".parse::<SocketAddr>().unwrap());
+        let result = resolve_target("sip:alice@192.168.1.100:5080", &resolver).unwrap();
+        assert_eq!(result.address, "192.168.1.100:5080".parse::<SocketAddr>().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_target_ip_default_port() {
         let resolver = test_resolver();
-        let addr = resolve_target("sip:alice@10.0.0.1", &resolver).unwrap();
-        assert_eq!(addr, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+        let result = resolve_target("sip:alice@10.0.0.1", &resolver).unwrap();
+        assert_eq!(result.address, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_target_localhost() {
         let resolver = test_resolver();
-        let addr = resolve_target("sip:bob@localhost:5090", &resolver).unwrap();
-        assert_eq!(addr.port(), 5090);
-        assert!(addr.ip().is_loopback());
+        let result = resolve_target("sip:bob@localhost:5090", &resolver).unwrap();
+        assert_eq!(result.address.port(), 5090);
+        assert!(result.address.ip().is_loopback());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_target_bare_socketaddr() {
         let resolver = test_resolver();
-        let addr = resolve_target("10.0.0.1:5060", &resolver).unwrap();
-        assert_eq!(addr, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+        let result = resolve_target("10.0.0.1:5060", &resolver).unwrap();
+        assert_eq!(result.address, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+        assert!(result.transport.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_target_transport_tcp() {
+        let resolver = test_resolver();
+        let result = resolve_target("sip:alice@10.0.0.1:5060;transport=tcp", &resolver).unwrap();
+        assert_eq!(result.address, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(result.transport, Some(Transport::Tcp));
     }
 
     #[tokio::test(flavor = "multi_thread")]
