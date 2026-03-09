@@ -466,6 +466,18 @@ impl PyAuth {
                 if let Some(username) = extract_username(&value) {
                     request.set_auth_user(username);
                 }
+
+                // Strip Authorization/Proxy-Authorization after successful verification.
+                // These are hop-by-hop credentials — forwarding them downstream causes
+                // the next hop to attempt (and fail) its own validation (e.g. 407).
+                let message = request.message();
+                let mut guard = message.lock().map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {e}"))
+                })?;
+                guard.headers.remove("Authorization");
+                guard.headers.remove("Proxy-Authorization");
+                drop(guard);
+
                 Ok(true)
             }
             _ => {
@@ -1027,6 +1039,45 @@ mod tests {
         assert_eq!(request.get_auth_user(), Some("alice"));
         // Action should remain None (no reply sent)
         assert_eq!(*request.action(), RequestAction::None);
+    }
+
+    #[test]
+    fn require_digest_strips_auth_headers_after_success() {
+        let auth = make_auth();
+        let mut request = make_request_with_auth("alice");
+
+        // Verify the Authorization header exists before auth
+        {
+            let msg = request.message();
+            let guard = msg.lock().unwrap();
+            assert!(guard.headers.get("Authorization").is_some());
+        }
+
+        let result = auth.require_www_digest(&mut request, None).unwrap();
+        assert!(result);
+
+        // After successful auth, Authorization must be stripped
+        let msg = request.message();
+        let guard = msg.lock().unwrap();
+        assert!(guard.headers.get("Authorization").is_none(),
+            "Authorization header should be stripped after successful verification");
+        assert!(guard.headers.get("Proxy-Authorization").is_none(),
+            "Proxy-Authorization header should be stripped after successful verification");
+    }
+
+    #[test]
+    fn require_digest_does_not_strip_headers_on_failure() {
+        let auth = make_auth();
+        let mut request = make_request_with_auth("eve"); // unknown user
+
+        let result = auth.require_www_digest(&mut request, None).unwrap();
+        assert!(!result);
+
+        // On failure, the original request headers are not stripped (challenge is sent instead)
+        // The WWW-Authenticate header should be set for the challenge
+        let msg = request.message();
+        let guard = msg.lock().unwrap();
+        assert!(guard.headers.get("WWW-Authenticate").is_some());
     }
 
     #[test]

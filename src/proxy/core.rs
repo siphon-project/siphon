@@ -393,4 +393,39 @@ mod tests {
         let remaining = headers.get_all("Via").unwrap();
         assert_eq!(remaining.len(), 1);
     }
+
+    #[test]
+    fn double_record_route_for_transport_bridging() {
+        // When bridging TLS↔TCP, two Record-Route headers are needed
+        // so each leg uses the correct transport for in-dialog requests.
+        // The dispatcher calls add_record_route twice — verify ordering.
+        let mut headers = SipHeaders::new();
+
+        // Simulate dispatcher's double RR insertion (inbound first, outbound second)
+        let rr_inbound = "sip:10.0.0.1:5061;transport=tls";
+        let rr_outbound = "sip:10.0.0.1:5060;transport=tcp";
+        add_record_route(&mut headers, rr_inbound);
+        add_record_route(&mut headers, rr_outbound);
+
+        let all_rr = headers.get_all("Record-Route").unwrap();
+        assert_eq!(all_rr.len(), 2, "should have two Record-Route headers");
+        // Outbound (topmost) should be first — the AS sees this as the next hop
+        assert!(all_rr[0].contains("transport=tcp"),
+            "topmost RR should be outbound transport: {}", all_rr[0]);
+        // Inbound should be second — the subscriber sees this as the next hop
+        assert!(all_rr[1].contains("transport=tls"),
+            "second RR should be inbound transport: {}", all_rr[1]);
+    }
+
+    #[test]
+    fn single_record_route_when_same_transport() {
+        // When inbound and outbound transports match, only one RR is needed.
+        let mut headers = SipHeaders::new();
+        let rr_uri = "sip:10.0.0.1:5060;transport=tcp";
+        add_record_route(&mut headers, rr_uri);
+
+        let all_rr = headers.get_all("Record-Route").unwrap();
+        assert_eq!(all_rr.len(), 1);
+        assert!(all_rr[0].contains("transport=tcp"));
+    }
 }
