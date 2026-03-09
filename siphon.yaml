@@ -28,6 +28,20 @@ listen:
   #                      # WSS shares the TLS cert from the `tls:` block below.
   #                      # It's a separate listener because the HTTP upgrade
   #                      # handshake differs from raw SIP/TLS.
+  #
+  # Per-socket advertised address (like OpenSIPS `socket ... as ...`).
+  # Use when the bind IP differs from what external peers should see
+  # in Record-Route / Via (e.g. cloud instances, NAT, split-horizon DNS).
+  #
+  # Example — internal TCP, public-facing TLS:
+  #   tcp:
+  #     - "10.0.0.1:5060"                            # plain string = no advertise
+  #   tls:
+  #     - address: "10.0.0.1:5061"                    # extended form
+  #       advertise: "sip.example.com"                # hostname or IP for Record-Route
+  #
+  # The global `advertised_address` (below) serves as fallback for transports
+  # that don't have a per-socket advertise.
 
 # ---------------------------------------------------------------------------
 # Network identity
