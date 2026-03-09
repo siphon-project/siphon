@@ -127,6 +127,48 @@ impl TransactionManager {
         Ok((key, actions))
     }
 
+    /// Handle an incoming ACK by matching it to an existing INVITE server
+    /// transaction (IST).
+    ///
+    /// ACK for non-2xx responses is hop-by-hop and must be absorbed by the
+    /// transaction layer (RFC 3261 §17.2.1). The IST transitions from
+    /// Completed → Confirmed and the ACK never reaches the TU/script.
+    ///
+    /// Returns `Ok(Some(actions))` if an IST was found and processed (ACK
+    /// absorbed), or `Ok(None)` if no IST exists — meaning this is either
+    /// an ACK for a 2xx (end-to-end, handled by TU) or a stale ACK.
+    pub fn handle_ack(
+        &self,
+        request: &SipMessage,
+    ) -> Result<Option<(TransactionKey, Vec<Action>)>, String> {
+        let key = Self::key_from_message(request)?;
+
+        let mut entry = match self.transactions.get_mut(&key) {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
+
+        let actions = match &mut *entry {
+            Transaction::Ist(ist) => {
+                ist.process(IstEvent::AckReceived(request.clone()))
+            }
+            _ => {
+                // Not an IST — nothing to absorb
+                return Ok(None);
+            }
+        };
+
+        let terminated = actions.iter().any(|a| matches!(a, Action::Terminated));
+        let key_clone = key.clone();
+        drop(entry);
+
+        if terminated {
+            self.transactions.remove(&key);
+        }
+
+        Ok(Some((key_clone, actions)))
+    }
+
     /// Try to handle an incoming request as a retransmission.
     ///
     /// If a server transaction already exists for this request's key, feeds the
@@ -445,6 +487,123 @@ mod tests {
             ServerEvent::Nist(NistEvent::TimerJ),
         );
         assert!(result.is_err());
+    }
+
+    fn ack_for_invite() -> SipMessage {
+        SipMessageBuilder::new()
+            .request(
+                Method::Ack,
+                SipUri::new("biloxi.com".to_string()).with_user("bob".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-inv1".to_string())
+            .to("<sip:bob@biloxi.com>".to_string())
+            .from("<sip:alice@atlanta.com>;tag=xyz".to_string())
+            .call_id("mgr-test-2".to_string())
+            .cseq("1 ACK".to_string())
+            .content_length(0)
+            .build()
+            .unwrap()
+    }
+
+    fn response_401() -> SipMessage {
+        SipMessageBuilder::new()
+            .response(401, "Unauthorized".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-inv1".to_string())
+            .to("<sip:bob@biloxi.com>".to_string())
+            .from("<sip:alice@atlanta.com>;tag=xyz".to_string())
+            .call_id("mgr-test-2".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn handle_ack_absorbs_non_2xx_ack() {
+        let manager = TransactionManager::default();
+
+        // Create IST for INVITE
+        let (key, _) = manager
+            .new_server_transaction(&invite_request(), Transport::Udp)
+            .unwrap();
+        assert_eq!(manager.count(), 1);
+
+        // TU sends 401 → IST moves to Completed
+        manager
+            .process_server_event(
+                &key,
+                ServerEvent::Ist(IstEvent::TuNon2xxFinal(response_401())),
+            )
+            .unwrap();
+
+        // ACK arrives — should be absorbed by IST (Completed → Confirmed)
+        let result = manager.handle_ack(&ack_for_invite()).unwrap();
+        assert!(result.is_some(), "ACK should match the IST");
+        let (matched_key, actions) = result.unwrap();
+        assert_eq!(matched_key, key);
+        // Should cancel timers G and H, no PassToTu
+        assert!(!actions.iter().any(|a| matches!(a, Action::PassToTu(_))));
+        assert!(actions.iter().any(|a| matches!(a, Action::CancelTimer(_))));
+    }
+
+    #[test]
+    fn handle_ack_absorbs_non_2xx_ack_tcp() {
+        // On reliable transport, Timer I is 0 → immediate termination
+        let manager = TransactionManager::default();
+
+        let (key, _) = manager
+            .new_server_transaction(&invite_request(), Transport::Reliable)
+            .unwrap();
+
+        // TU sends 401
+        manager
+            .process_server_event(
+                &key,
+                ServerEvent::Ist(IstEvent::TuNon2xxFinal(response_401())),
+            )
+            .unwrap();
+        assert_eq!(manager.count(), 1);
+
+        // ACK arrives — IST should terminate immediately (Timer I = 0 for TCP)
+        let result = manager.handle_ack(&ack_for_invite()).unwrap();
+        assert!(result.is_some());
+        let (_, actions) = result.unwrap();
+        assert!(actions.iter().any(|a| matches!(a, Action::Terminated)));
+        assert_eq!(manager.count(), 0);
+    }
+
+    #[test]
+    fn handle_ack_no_ist_returns_none() {
+        // No transaction at all — ACK for 2xx (IST already terminated) or stale
+        let manager = TransactionManager::default();
+        let result = manager.handle_ack(&ack_for_invite()).unwrap();
+        assert!(result.is_none(), "no IST → None (ACK for 2xx or stale)");
+    }
+
+    #[test]
+    fn handle_ack_retransmit_in_confirmed() {
+        let manager = TransactionManager::default();
+
+        let (key, _) = manager
+            .new_server_transaction(&invite_request(), Transport::Udp)
+            .unwrap();
+
+        // TU sends 401 → Completed
+        manager
+            .process_server_event(
+                &key,
+                ServerEvent::Ist(IstEvent::TuNon2xxFinal(response_401())),
+            )
+            .unwrap();
+
+        // First ACK → Confirmed
+        manager.handle_ack(&ack_for_invite()).unwrap();
+
+        // Second ACK (retransmit) → absorbed silently
+        let result = manager.handle_ack(&ack_for_invite()).unwrap();
+        assert!(result.is_some());
+        let (_, actions) = result.unwrap();
+        assert!(actions.is_empty(), "ACK retransmit in Confirmed should be silently absorbed");
     }
 
     #[test]

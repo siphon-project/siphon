@@ -69,6 +69,9 @@ struct DispatcherState {
     listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
     /// Server header value injected into locally-generated responses.
     server_header: Option<String>,
+    /// User-Agent header value for outbound requests (UAC, registrant).
+    #[allow(dead_code)]
+    user_agent_header: Option<String>,
     /// Transaction timeout for pending branch TTL.
     transaction_timeout: std::time::Duration,
     /// B2BUA call manager (active when script has @b2bua handlers).
@@ -151,20 +154,25 @@ pub async fn run(
             .server
             .as_ref()
             .and_then(|s| s.server_header.clone())
+            .unwrap_or_else(|| default_server.clone()),
+    );
+    let user_agent_header = Some(
+        config
+            .server
+            .as_ref()
+            .and_then(|s| s.user_agent_header.clone())
             .unwrap_or(default_server),
     );
 
+    let tx_config = config.transaction.as_ref();
     let transaction_timeout = std::time::Duration::from_secs(
-        config
-            .transaction
-            .as_ref()
-            .map(|t| t.invite_timeout_secs as u64)
-            .unwrap_or(30)
-            + 2, // small grace period beyond INVITE timeout
+        tx_config.map(|t| t.invite_timeout_secs as u64).unwrap_or(30) + 2,
+    );
+    let _non_invite_timeout = std::time::Duration::from_secs(
+        tx_config.map(|t| t.timeout_secs as u64).unwrap_or(5),
     );
 
-    // Build TimerConfig from config
-    let timer_config = TimerConfig::default(); // TODO: allow config overrides for T1/T2/T4
+    let timer_config = TimerConfig::default();
     let transaction_manager = Arc::new(TransactionManager::new(timer_config));
 
     let dns_resolver = Arc::new(
@@ -180,6 +188,7 @@ pub async fn run(
         local_addr: via_addr,
         listen_addrs,
         server_header,
+        user_agent_header,
         transaction_timeout,
         call_manager: Arc::new(CallManager::new()),
         transaction_manager,
@@ -545,6 +554,38 @@ fn handle_request(
     if method == "CANCEL" {
         handle_cancel(inbound, message, uac_branch.as_deref(), &uac_sent_by, state);
         return;
+    }
+
+    // --- ACK handling (RFC 3261 §17.2.1) ---
+    // ACK for non-2xx is hop-by-hop: the transaction layer absorbs it.
+    // ACK for 2xx is end-to-end: no IST exists (it terminated on 2xx),
+    // so handle_ack returns None and we fall through to the script.
+    if method == "ACK" {
+        match state.transaction_manager.handle_ack(&message) {
+            Ok(Some((key, actions))) => {
+                debug!(
+                    key = %key,
+                    "ACK absorbed by INVITE server transaction"
+                );
+                process_timer_actions(
+                    &actions,
+                    &key,
+                    Some(inbound.remote_addr),
+                    Some(inbound.transport),
+                    Some(inbound.connection_id),
+                    state,
+                );
+                return;
+            }
+            Ok(None) => {
+                // No IST found — either ACK for 2xx (end-to-end) or stale.
+                // Fall through to normal processing.
+                debug!("ACK has no matching IST — passing through");
+            }
+            Err(error) => {
+                debug!("failed to match ACK to transaction: {error}");
+            }
+        }
     }
 
     // --- Server transaction retransmission detection ---

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Verify ACK for non-2xx is absorbed by the transaction layer.
+
+  1. Send INVITE (no credentials) -> expect 407
+  2. Send ACK for 407 (hop-by-hop, must be absorbed by IST)
+  3. Verify no error response to the ACK (no 401/500/etc.)
+  4. Brief pause — if Siphon leaked the ACK to the script, we'd get
+     an unexpected response here and SIPp would fail.
+
+  Run: sipp -sf ack_non2xx.xml -s alice <target>:<port>
+-->
+<scenario name="ACK for non-2xx absorbed">
+
+  <!-- INVITE with no credentials -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/siphon-ack-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Expect 407 Proxy Authentication Required (or 401) -->
+  <recv response="407" />
+
+  <!-- ACK the 407 — this MUST be silently absorbed -->
+  <send>
+    <![CDATA[
+ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!--
+    Pause to ensure no spurious response arrives for the ACK.
+    If the ACK leaked to the script and generated a 401/500/etc.,
+    SIPp would report an unexpected message and fail.
+  -->
+  <pause milliseconds="500" />
+
+</scenario>
