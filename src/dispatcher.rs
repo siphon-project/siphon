@@ -1904,10 +1904,16 @@ pub fn init_rtpengine(
             let rtpengine_set = Arc::new(rtpengine_set);
             let sessions = Arc::new(crate::rtpengine::session::MediaSessionStore::new());
 
+            // Build profile registry from built-in defaults + custom YAML profiles
+            let registry = Arc::new(
+                crate::rtpengine::ProfileRegistry::from_config(&media_config.profiles),
+            );
+
             // Create the Python-side singleton (shares the same Arcs)
             let py_rtpengine = crate::script::api::rtpengine::PyRtpEngine::new(
                 Arc::clone(&rtpengine_set),
                 Arc::clone(&sessions),
+                registry,
             );
 
             Python::attach(|python| {

@@ -4,8 +4,6 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 
-use super::profile::RtpProfile;
-
 /// An active RTPEngine media session associated with a SIP dialog.
 #[derive(Debug, Clone)]
 pub struct MediaSession {
@@ -15,8 +13,8 @@ pub struct MediaSession {
     pub from_tag: String,
     /// SIP To-tag (B leg) — set after the answer.
     pub to_tag: Option<String>,
-    /// The media profile used for this session.
-    pub profile: RtpProfile,
+    /// The media profile name used for this session.
+    pub profile: String,
     /// When this session was created.
     pub created_at: Instant,
 }
@@ -93,7 +91,7 @@ mod tests {
             call_id: call_id.to_string(),
             from_tag: "tag-a".to_string(),
             to_tag: None,
-            profile: RtpProfile::SrtpToRtp,
+            profile: "srtp_to_rtp".to_string(),
             created_at: Instant::now(),
         }
     }

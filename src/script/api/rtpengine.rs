@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use tracing::{debug, warn};
 
 use crate::rtpengine::client::RtpEngineSet;
-use crate::rtpengine::profile::RtpProfile;
+use crate::rtpengine::profile::ProfileRegistry;
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
 use crate::sip::message::SipMessage;
 
@@ -30,26 +30,21 @@ use super::request::PyRequest;
 pub struct PyRtpEngine {
     client: Arc<RtpEngineSet>,
     sessions: Arc<MediaSessionStore>,
+    registry: Arc<ProfileRegistry>,
 }
 
 impl PyRtpEngine {
-    pub fn new(client: Arc<RtpEngineSet>, sessions: Arc<MediaSessionStore>) -> Self {
-        Self { client, sessions }
+    pub fn new(
+        client: Arc<RtpEngineSet>,
+        sessions: Arc<MediaSessionStore>,
+        registry: Arc<ProfileRegistry>,
+    ) -> Self {
+        Self { client, sessions, registry }
     }
 }
 
-/// Parse a profile string into an RtpProfile, defaulting to SrtpToRtp.
-fn parse_profile(profile: Option<&str>) -> PyResult<RtpProfile> {
-    match profile {
-        None => Ok(RtpProfile::SrtpToRtp),
-        Some(name) => RtpProfile::from_name(name).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown RTP profile '{name}'; valid profiles: \
-                 srtp_to_rtp, ws_to_rtp, wss_to_rtp, rtp_passthrough"
-            ))
-        }),
-    }
-}
+/// Default profile name when none is specified.
+const DEFAULT_PROFILE: &str = "srtp_to_rtp";
 
 /// Extract `Arc<Mutex<SipMessage>>` from a Python object that is either
 /// a `Request`, `Reply`, or `Call`.
@@ -88,14 +83,21 @@ impl PyRtpEngine {
         request: &Bound<'py, PyAny>,
         profile: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let rtp_profile = parse_profile(profile)?;
-        let flags = rtp_profile.offer_flags();
+        let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
+        let entry = self.registry.get(profile_name).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown RTP profile '{profile_name}'; valid profiles: {}",
+                self.registry.profile_names().join(", ")
+            ))
+        })?;
+        let flags = entry.offer.clone();
 
         let message = extract_message(request)?;
         let (call_id, from_tag, sdp) = extract_offer_params(&message)?;
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
+        let profile_str = profile_name.to_string();
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             let rewritten_sdp = client
@@ -119,7 +121,7 @@ impl PyRtpEngine {
                 call_id,
                 from_tag,
                 to_tag: None,
-                profile: rtp_profile,
+                profile: profile_str,
                 created_at: std::time::Instant::now(),
             });
 
@@ -142,8 +144,14 @@ impl PyRtpEngine {
         reply: &Bound<'py, PyAny>,
         profile: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let rtp_profile = parse_profile(profile)?;
-        let flags = rtp_profile.answer_flags();
+        let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
+        let entry = self.registry.get(profile_name).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown RTP profile '{profile_name}'; valid profiles: {}",
+                self.registry.profile_names().join(", ")
+            ))
+        })?;
+        let flags = entry.answer.clone();
 
         let message = extract_message(reply)?;
         let (call_id, from_tag, to_tag, sdp) = extract_answer_params(&message)?;
@@ -406,23 +414,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_profile_default() {
-        let profile = parse_profile(None).unwrap();
-        assert_eq!(profile, RtpProfile::SrtpToRtp);
+    fn registry_resolves_builtins() {
+        let registry = ProfileRegistry::new();
+        assert!(registry.get(DEFAULT_PROFILE).is_some());
+        assert!(registry.get("ws_to_rtp").is_some());
+        assert!(registry.get("wss_to_rtp").is_some());
+        assert!(registry.get("rtp_passthrough").is_some());
     }
 
     #[test]
-    fn parse_profile_all_valid() {
-        assert_eq!(parse_profile(Some("srtp_to_rtp")).unwrap(), RtpProfile::SrtpToRtp);
-        assert_eq!(parse_profile(Some("ws_to_rtp")).unwrap(), RtpProfile::WsToRtp);
-        assert_eq!(parse_profile(Some("wss_to_rtp")).unwrap(), RtpProfile::WssToRtp);
-        assert_eq!(parse_profile(Some("rtp_passthrough")).unwrap(), RtpProfile::RtpPassthrough);
-    }
-
-    #[test]
-    fn parse_profile_invalid() {
-        let result = parse_profile(Some("invalid"));
-        assert!(result.is_err());
+    fn registry_rejects_unknown() {
+        let registry = ProfileRegistry::new();
+        assert!(registry.get("invalid").is_none());
     }
 
     #[test]

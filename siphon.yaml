@@ -193,6 +193,35 @@ auth:
 #       - address: "10.0.0.2:22222"
 #         weight: 1
 #         timeout_ms: 2000
+#
+# Custom media profiles (extend or override built-ins):
+#
+# Built-in profiles (always available):
+#   srtp_to_rtp     — SRTP UE ↔ RTP core (default)
+#   ws_to_rtp       — WebSocket UE (RTP/AVPF + ICE) ↔ RTP core
+#   wss_to_rtp      — Secure WebSocket UE (DTLS-SRTP/AVPF + ICE) ↔ RTP core
+#   rtp_passthrough — Plain RTP both sides (IMS-internal)
+#
+# Define custom profiles under media.profiles:
+# media:
+#   rtpengine:
+#     address: "127.0.0.1:22222"
+#   profiles:
+#     srtp_to_srtp:
+#       offer:
+#         transport_protocol: "RTP/SAVP"
+#         ice: "remove"
+#         replace: ["origin", "session-connection"]
+#         direction: ["external", "internal"]
+#       answer:
+#         transport_protocol: "RTP/SAVP"
+#         ice: "remove"
+#         replace: ["origin", "session-connection"]
+#         direction: ["internal", "external"]
+#
+# Python usage:
+#   rtpengine.offer(request, profile="srtp_to_srtp")
+#   rtpengine.answer(reply, profile="srtp_to_srtp")
 
 # ---------------------------------------------------------------------------
 # SIP tracing via HEP (Homer / captAgent)

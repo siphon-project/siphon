@@ -17,5 +17,5 @@ pub mod session;
 
 pub use client::{RtpEngineClient, RtpEngineSet};
 pub use error::RtpEngineError;
-pub use profile::{NgFlags, RtpProfile};
+pub use profile::{NgFlags, ProfileEntry, ProfileRegistry};
 pub use session::{MediaSession, MediaSessionStore};

@@ -760,6 +760,38 @@ pub struct NamedCacheConfig {
 pub struct MediaConfig {
     /// RTPEngine instance(s). A single instance or a list for load-balancing / HA.
     pub rtpengine: RtpEngineSetConfig,
+    /// Custom media profiles (name → offer/answer NG flags).
+    /// Built-in profiles (srtp_to_rtp, ws_to_rtp, wss_to_rtp, rtp_passthrough)
+    /// are always available; custom entries here extend or override them.
+    #[serde(default)]
+    pub profiles: std::collections::HashMap<String, MediaProfileConfig>,
+}
+
+/// A user-defined RTPEngine media profile with separate offer/answer NG flags.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MediaProfileConfig {
+    pub offer: NgFlagsConfig,
+    pub answer: NgFlagsConfig,
+}
+
+/// NG protocol flags for one direction (offer or answer).
+#[derive(Debug, Deserialize, Clone)]
+pub struct NgFlagsConfig {
+    /// Transport protocol override (e.g. "RTP/AVP", "RTP/SAVPF").
+    pub transport_protocol: Option<String>,
+    /// ICE handling: "remove", "force", or "force-relay".
+    pub ice: Option<String>,
+    /// DTLS mode: "passive", "active", or "off".
+    pub dtls: Option<String>,
+    /// SDP fields to replace: "origin", "session-connection".
+    #[serde(default)]
+    pub replace: Vec<String>,
+    /// Additional flags: "trust-address", "symmetric", "asymmetric".
+    #[serde(default)]
+    pub flags: Vec<String>,
+    /// Direction pair for NAT traversal: ["external", "internal"].
+    #[serde(default)]
+    pub direction: Vec<String>,
 }
 
 /// One or more RTPEngine instances.
@@ -1967,6 +1999,64 @@ media:
         let instances = media.rtpengine.instances();
         assert_eq!(instances[0].timeout_ms, 1000); // default
         assert_eq!(instances[0].weight, 1); // default
+    }
+
+    #[test]
+    fn parses_media_custom_profiles() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+  profiles:
+    srtp_to_srtp:
+      offer:
+        transport_protocol: "RTP/SAVP"
+        ice: "remove"
+        replace: ["origin", "session-connection"]
+        direction: ["external", "internal"]
+      answer:
+        transport_protocol: "RTP/SAVP"
+        ice: "remove"
+        replace: ["origin", "session-connection"]
+        direction: ["internal", "external"]
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        assert_eq!(media.profiles.len(), 1);
+        let profile = media.profiles.get("srtp_to_srtp").unwrap();
+        assert_eq!(profile.offer.transport_protocol.as_deref(), Some("RTP/SAVP"));
+        assert_eq!(profile.offer.ice.as_deref(), Some("remove"));
+        assert!(profile.offer.dtls.is_none());
+        assert_eq!(profile.offer.direction, vec!["external", "internal"]);
+        assert_eq!(profile.answer.direction, vec!["internal", "external"]);
+    }
+
+    #[test]
+    fn parses_media_no_profiles_defaults_to_empty() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        assert!(media.profiles.is_empty());
     }
 
     #[test]
