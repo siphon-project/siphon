@@ -178,7 +178,7 @@ pub async fn listen(
                                         }
                                     }
                                     Ok(Err(error)) => {
-                                        warn!("TLS read error on {:?}: {}", connection_id, error);
+                                        warn!("TLS read error on {:?} from {}: {}", connection_id, remote_addr, error);
                                         break;
                                     }
                                     Err(_) => {
@@ -206,7 +206,7 @@ pub async fn listen(
                         }
 
                         connection_map.remove(&connection_id);
-                        info!("TLS connection {:?} cleaned up", connection_id);
+                        debug!("TLS connection {:?} cleaned up", connection_id);
                     });
                 }
                 Err(error) => {
