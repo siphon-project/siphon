@@ -237,9 +237,9 @@ async fn main() {
             };
 
             let acl = if let Some(banned) = apiban_set {
-                TransportAcl::with_apiban(vec![], sec.trusted_cidrs.clone(), banned)
+                TransportAcl::with_apiban(vec![], vec![], banned)
             } else {
-                TransportAcl::new(vec![], sec.trusted_cidrs.clone())
+                TransportAcl::new(vec![], vec![])
             };
             Arc::new(acl)
         } else {
