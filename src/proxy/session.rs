@@ -119,16 +119,19 @@ impl ProxySession {
 // ProxySessionStore
 // ---------------------------------------------------------------------------
 
-/// Concurrent store for proxy sessions with two lookup indices.
+/// Concurrent store for proxy sessions with three lookup indices.
 ///
 /// - **Primary index**: client transaction key → session (for response routing).
 /// - **Reverse index**: server transaction key → list of client keys (for CANCEL).
+/// - **Call-ID index**: SIP Call-ID → session (for ACK-2xx routing).
 #[derive(Debug)]
 pub struct ProxySessionStore {
     /// client_key → session.
     by_client_key: DashMap<TransactionKey, Arc<RwLock<ProxySession>>>,
     /// server_key → list of client keys.
     server_to_clients: DashMap<TransactionKey, Vec<TransactionKey>>,
+    /// SIP Call-ID → session (for ACK-2xx end-to-end routing).
+    by_call_id: DashMap<String, Arc<RwLock<ProxySession>>>,
 }
 
 impl ProxySessionStore {
@@ -136,18 +139,24 @@ impl ProxySessionStore {
         Self {
             by_client_key: DashMap::new(),
             server_to_clients: DashMap::new(),
+            by_call_id: DashMap::new(),
         }
     }
 
-    /// Insert a session, indexing it by all its client keys and server key.
+    /// Insert a session, indexing it by all its client keys, server key, and Call-ID.
     pub fn insert(&self, session: ProxySession) {
         let server_key = session.server_key.clone();
         let client_keys: Vec<TransactionKey> = session.client_keys.clone();
+        let call_id = session.original_request.headers.get("Call-ID").map(|s| s.to_string());
         let session_arc = Arc::new(RwLock::new(session));
 
         for client_key in &client_keys {
             self.by_client_key
                 .insert(client_key.clone(), Arc::clone(&session_arc));
+        }
+
+        if let Some(call_id) = call_id {
+            self.by_call_id.insert(call_id, Arc::clone(&session_arc));
         }
 
         self.server_to_clients
@@ -229,6 +238,16 @@ impl ProxySessionStore {
             .map(|entry| Arc::clone(entry.value()))
     }
 
+    /// Look up a session by SIP Call-ID (for ACK-2xx end-to-end routing).
+    pub fn get_by_call_id(
+        &self,
+        call_id: &str,
+    ) -> Option<Arc<RwLock<ProxySession>>> {
+        self.by_call_id
+            .get(call_id)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
     /// Get all client keys for a given server transaction key.
     pub fn get_client_keys_for_server(
         &self,
@@ -242,6 +261,16 @@ impl ProxySessionStore {
     /// Remove a session by its server key, cleaning up all indices.
     pub fn remove_by_server_key(&self, server_key: &TransactionKey) {
         if let Some((_, client_keys)) = self.server_to_clients.remove(server_key) {
+            // Remove Call-ID index entry via the session's original request
+            if let Some(first) = client_keys.first() {
+                if let Some(session_ref) = self.by_client_key.get(first) {
+                    if let Ok(session) = session_ref.value().read() {
+                        if let Some(call_id) = session.original_request.headers.get("Call-ID") {
+                            self.by_call_id.remove(call_id);
+                        }
+                    }
+                }
+            }
             for client_key in &client_keys {
                 self.by_client_key.remove(client_key);
             }

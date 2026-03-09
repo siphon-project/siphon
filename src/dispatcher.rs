@@ -590,9 +590,15 @@ fn handle_request(
                 return;
             }
             Ok(None) => {
-                // No IST found — either ACK for 2xx (end-to-end) or stale.
-                // Fall through to normal processing.
-                debug!("ACK has no matching IST — passing through");
+                // No IST found — ACK for 2xx (end-to-end) or stale.
+                // Route via ProxySession using Call-ID lookup.
+                if let Some(call_id) = message.headers.get("Call-ID") {
+                    if let Some(session_arc) = state.session_store.get_by_call_id(call_id) {
+                        handle_ack_via_session(inbound, message, session_arc, state);
+                        return;
+                    }
+                }
+                debug!("ACK has no matching IST or session — passing through");
             }
             Err(error) => {
                 debug!("failed to match ACK to transaction: {error}");
@@ -2618,6 +2624,74 @@ fn handle_cancel(
     debug!(uac_branch = %uac_branch, "CANCEL for unknown transaction");
     let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref());
     send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+}
+
+// ---------------------------------------------------------------------------
+// ProxySession-based ACK (2xx) handling
+// ---------------------------------------------------------------------------
+
+/// Handle ACK for 2xx responses by relaying it downstream via the ProxySession.
+///
+/// ACK for 2xx is end-to-end (RFC 3261 §13.2.2.4): the proxy must relay it
+/// downstream to the UAS. Unlike ACK for non-2xx (which is hop-by-hop and
+/// absorbed by the transaction layer), this ACK has a new Via branch and must
+/// be matched by Call-ID.
+fn handle_ack_via_session(
+    _inbound: InboundMessage,
+    message: SipMessage,
+    session_arc: Arc<RwLock<ProxySession>>,
+    state: &DispatcherState,
+) {
+    let session = match session_arc.read() {
+        Ok(s) => s,
+        Err(_) => {
+            error!("ProxySession lock poisoned during ACK handling");
+            return;
+        }
+    };
+
+    // Forward ACK to each client branch (typically just one for a completed call)
+    for client_key in &session.client_keys {
+        if let Some(client_branch) = session.get_client_branch(client_key) {
+            let mut ack_downstream = message.clone();
+
+            // Strip all existing Via headers, add our own
+            ack_downstream.headers.remove("Via");
+            let transport_str = format!("{}", client_branch.transport);
+            let outbound_port = state.listen_addrs.get(&client_branch.transport)
+                .map(|a| a.port())
+                .unwrap_or(state.local_addr.port());
+            let via_value = format!(
+                "SIP/2.0/{} {}:{};branch={}",
+                transport_str.to_uppercase(),
+                format_sip_host(&state.local_addr.ip().to_string()),
+                outbound_port,
+                TransactionKey::generate_branch(),
+            );
+            ack_downstream.headers.add("Via", via_value);
+
+            let data = Bytes::from(ack_downstream.to_bytes());
+            debug!(
+                client_key = %client_key,
+                destination = %client_branch.destination,
+                "relaying ACK for 2xx downstream via session"
+            );
+
+            if let Some(ref hep) = state.hep_sender {
+                let local = state.listen_addrs.get(&client_branch.transport).copied().unwrap_or(state.local_addr);
+                hep.capture_outbound(local, client_branch.destination, client_branch.transport, &data);
+            }
+
+            if let Err(error) = state.outbound.send(OutboundMessage {
+                connection_id: client_branch.connection_id,
+                transport: client_branch.transport,
+                destination: client_branch.destination,
+                data,
+            }) {
+                error!("failed to relay ACK to {}: {error}", client_branch.destination);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
