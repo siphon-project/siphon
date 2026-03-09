@@ -64,6 +64,9 @@ struct DispatcherState {
     outbound: Arc<OutboundRouter>,
     local_domains: LocalDomains,
     local_addr: SocketAddr,
+    /// Per-transport listen address for HEP capture (so TLS responses report
+    /// port 5061, not the UDP/TCP port 5060).
+    listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
     /// Server header value injected into locally-generated responses.
     server_header: Option<String>,
     /// Transaction timeout for pending branch TTL.
@@ -109,6 +112,7 @@ pub async fn run(
     engine: Arc<ScriptEngine>,
     config: Arc<Config>,
     local_addr: SocketAddr,
+    listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
     hep_sender: Option<Arc<HepSender>>,
     uac_sender: Arc<UacSender>,
     pre_rtpengine: (
@@ -174,6 +178,7 @@ pub async fn run(
         outbound,
         local_domains: Arc::new(config.domain.local.clone()),
         local_addr: via_addr,
+        listen_addrs,
         server_header,
         transaction_timeout,
         call_manager: Arc::new(CallManager::new()),
@@ -832,6 +837,9 @@ fn handle_request(
 
             // Feed response into server transaction so it can cache it for
             // retransmit handling and manage Timer J/G/H.
+            // The state machine emits SendMessage which process_timer_actions
+            // delivers, so we only send manually if the transaction path didn't fire.
+            let mut sent_by_transaction = false;
             if let Some(ref key) = server_key {
                 let server_event = if *code < 200 {
                     // Provisional
@@ -859,9 +867,7 @@ fn handle_request(
                                 Some(inbound.connection_id),
                                 state,
                             );
-                            // The server transaction's SendMessage action sends the
-                            // response. We still send it ourselves below for safety,
-                            // but the transaction now has it cached for retransmits.
+                            sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
                         }
                         Err(error) => {
                             debug!(key = %key, "failed to feed reply to server transaction: {error}");
@@ -869,7 +875,9 @@ fn handle_request(
                     }
                 }
             }
-            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            if !sent_by_transaction {
+                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            }
         }
         RequestAction::Relay { next_hop } => {
             relay_request(
@@ -2025,8 +2033,11 @@ fn send_message(
     );
 
     // HEP capture — outbound (sent to network)
+    // Use the per-transport listen address so HEP reports the correct source
+    // port (e.g. 5061 for TLS instead of the generic local_addr on 5060).
     if let Some(ref hep) = state.hep_sender {
-        hep.capture_outbound(state.local_addr, destination, transport, &data);
+        let local = state.listen_addrs.get(&transport).copied().unwrap_or(state.local_addr);
+        hep.capture_outbound(local, destination, transport, &data);
     }
 
     let outbound_message = OutboundMessage {
@@ -2061,6 +2072,17 @@ pub fn inject_python_singletons(config: &Config) {
     let mut realm_users = std::collections::HashMap::new();
     realm_users.insert(config.auth.realm.clone(), config.auth.users.clone());
     let mut py_auth = PyAuth::new(realm_users, config.auth.realm.clone());
+    py_auth.set_backend_type(config.auth.backend.clone());
+
+    // Wire HTTP auth backend if configured
+    if let Some(http_config) = &config.auth.http {
+        py_auth.set_http_config(http_config.clone());
+        info!(
+            url = %http_config.url,
+            ha1 = http_config.ha1,
+            "HTTP auth backend configured"
+        );
+    }
 
     // Wire AKA credentials for local Milenage auth (IMS P-CSCF)
     if !config.auth.aka_credentials.is_empty() {

@@ -11,9 +11,10 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use pyo3::prelude::*;
+use tracing::{debug, warn};
 
 use super::request::PyRequest;
-use crate::config::AkaCredential;
+use crate::config::{AkaCredential, AuthBackendType, HttpAuthConfig};
 use crate::diameter::DiameterManager;
 
 /// AKA key material derived during authentication, stored for IPsec SA creation.
@@ -37,6 +38,8 @@ pub fn aka_key_store() -> &'static Arc<DashMap<String, AkaKeyMaterial>> {
 /// Scripts use: `from siphon import auth` then `auth.require_www_digest(request, realm)`.
 #[pyclass(name = "AuthNamespace")]
 pub struct PyAuth {
+    /// Which backend to use for credential lookup.
+    backend_type: AuthBackendType,
     /// realm → (username → password) for static backend.
     static_users: Arc<HashMap<String, HashMap<String, String>>>,
     /// Default realm used when none is specified.
@@ -45,6 +48,10 @@ pub struct PyAuth {
     diameter_manager: Option<Arc<DiameterManager>>,
     /// AKA credentials: IMPI → (K, OP, AMF) for local Milenage computation.
     aka_credentials: Arc<HashMap<String, AkaCredential>>,
+    /// HTTP auth backend config (url template, timeouts, ha1 flag).
+    http_config: Option<HttpAuthConfig>,
+    /// Shared reqwest client for HTTP auth lookups.
+    http_client: Option<reqwest::Client>,
 }
 
 impl PyAuth {
@@ -54,21 +61,43 @@ impl PyAuth {
         default_realm: String,
     ) -> Self {
         Self {
+            backend_type: AuthBackendType::Static,
             static_users: Arc::new(static_users),
             default_realm,
             diameter_manager: None,
             aka_credentials: Arc::new(HashMap::new()),
+            http_config: None,
+            http_client: None,
         }
     }
 
     /// Create an auth namespace with no users (for testing or when auth is disabled).
     pub fn empty() -> Self {
         Self {
+            backend_type: AuthBackendType::Static,
             static_users: Arc::new(HashMap::new()),
             default_realm: "siphon".to_string(),
             diameter_manager: None,
             aka_credentials: Arc::new(HashMap::new()),
+            http_config: None,
+            http_client: None,
         }
+    }
+
+    /// Set the auth backend type.
+    pub fn set_backend_type(&mut self, backend: AuthBackendType) {
+        self.backend_type = backend;
+    }
+
+    /// Configure the HTTP auth backend.
+    pub fn set_http_config(&mut self, config: HttpAuthConfig) {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(config.connect_timeout_ms))
+            .timeout(std::time::Duration::from_millis(config.timeout_ms))
+            .build()
+            .expect("failed to build reqwest client for HTTP auth");
+        self.http_config = Some(config);
+        self.http_client = Some(client);
     }
 
     /// Set the Diameter manager for IMS authentication (Cx MAR).
@@ -336,6 +365,11 @@ impl PyAuth {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
 
+        let method = match &message.start_line {
+            crate::sip::message::StartLine::Request(rl) => rl.method.as_str().to_string(),
+            _ => "REGISTER".to_string(),
+        };
+
         // Look for Authorization or Proxy-Authorization header
         let auth_header = message
             .headers
@@ -343,7 +377,7 @@ impl PyAuth {
             .or_else(|| message.headers.get("Proxy-Authorization"));
 
         match auth_header {
-            Some(value) => Ok(self.validate_credentials(value, realm)),
+            Some(value) => Ok(self.validate_credentials(value, realm, &method)),
             None => Ok(false),
         }
     }
@@ -371,12 +405,16 @@ impl PyAuth {
         let message = message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
+        let method = match &message.start_line {
+            crate::sip::message::StartLine::Request(rl) => rl.method.as_str().to_string(),
+            _ => "REGISTER".to_string(),
+        };
         let auth_header = message
             .headers
             .get("Authorization")
             .or_else(|| message.headers.get("Proxy-Authorization"));
         match auth_header {
-            Some(value) => Ok(self.validate_credentials(value, realm)),
+            Some(value) => Ok(self.validate_credentials(value, realm, &method)),
             None => Ok(false),
         }
     }
@@ -410,8 +448,20 @@ impl PyAuth {
 
         drop(message_guard);
 
+        // Extract the SIP method for digest HA2 computation
+        let method = {
+            let msg = request.message();
+            let guard = msg.lock().map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {e}"))
+            })?;
+            match &guard.start_line {
+                crate::sip::message::StartLine::Request(rl) => rl.method.as_str().to_string(),
+                _ => "REGISTER".to_string(),
+            }
+        };
+
         match auth_header {
-            Some(value) if self.validate_credentials(&value, realm) => {
+            Some(value) if self.validate_credentials(&value, realm, &method) => {
                 // Extract username from the Authorization header
                 if let Some(username) = extract_username(&value) {
                     request.set_auth_user(username);
@@ -518,28 +568,190 @@ impl PyAuth {
         Ok(())
     }
 
-    /// Validate credentials against the static user store.
-    ///
-    /// In a real deployment this would implement RFC 2617 digest validation
-    /// (HA1/HA2 hashing). For now, we do a simple username/password check
-    /// against the static backend — full digest support is Phase 5+.
-    ///
-    /// For the static backend, the realm in the challenge is cosmetic — we
-    /// check the username against ALL configured realms. Scripts may pass a
-    /// custom realm to `require_digest()` (e.g. for branded challenges) while
-    /// users are stored under the config's `auth.realm`.
-    fn validate_credentials(&self, auth_value: &str, _realm: &str) -> bool {
-        let username = match extract_username(auth_value) {
-            Some(u) => u,
+    /// Validate credentials by dispatching to the configured backend.
+    fn validate_credentials(&self, auth_value: &str, realm: &str, method: &str) -> bool {
+        match self.backend_type {
+            AuthBackendType::Static => self.validate_static(auth_value, realm, method),
+            AuthBackendType::Http => self.validate_http(auth_value, realm, method),
+            _ => {
+                warn!(backend = ?self.backend_type, "unsupported auth backend");
+                false
+            }
+        }
+    }
+
+    /// Static backend: look up plaintext password from config, compute digest.
+    fn validate_static(&self, auth_value: &str, realm: &str, method: &str) -> bool {
+        let fields = match DigestFields::parse(auth_value) {
+            Some(f) => f,
             None => return false,
         };
 
-        // Static backend: check username across all configured realms.
-        // The realm parameter controls the challenge header only; user lookup
-        // is not realm-scoped (there's a single flat user table in config).
-        self.static_users
+        // Find the password across all configured realms
+        let password = self
+            .static_users
             .values()
-            .any(|realm_users| realm_users.contains_key(&username))
+            .find_map(|realm_users| realm_users.get(&fields.username));
+
+        let password = match password {
+            Some(p) => p,
+            None => return false,
+        };
+
+        // Compute HA1 from username:realm:password
+        let ha1 = md5_hex(&format!("{}:{}:{}", fields.username, realm, password));
+        fields.verify(&ha1, method)
+    }
+
+    /// HTTP backend: fetch HA1 (or password) from REST endpoint, then verify digest.
+    fn validate_http(&self, auth_value: &str, realm: &str, method: &str) -> bool {
+        let fields = match DigestFields::parse(auth_value) {
+            Some(f) => f,
+            None => return false,
+        };
+
+        let (http_config, client) = match (&self.http_config, &self.http_client) {
+            (Some(c), Some(cl)) => (c, cl),
+            _ => {
+                warn!("auth backend is http but no http config set");
+                return false;
+            }
+        };
+
+        let url = http_config.url.replace("{username}", &fields.username);
+        debug!(url = %url, username = %fields.username, "HTTP auth lookup");
+
+        // Block on the async HTTP request (we're called from sync Python context)
+        let response = match tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.get(&url).send())
+        }) {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!(error = %e, url = %url, "HTTP auth request failed");
+                return false;
+            }
+        };
+
+        if !response.status().is_success() {
+            debug!(status = %response.status(), username = %fields.username, "HTTP auth: user not found");
+            return false;
+        }
+
+        let body = match tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(response.text())
+        }) {
+            Ok(b) => b.trim().to_string(),
+            Err(e) => {
+                warn!(error = %e, "HTTP auth: failed to read response body");
+                return false;
+            }
+        };
+
+        let ha1 = if http_config.ha1 {
+            // Response body is already the HA1 hex string
+            body
+        } else {
+            // Response body is a plaintext password — hash it
+            md5_hex(&format!("{}:{}:{}", fields.username, realm, body))
+        };
+
+        let valid = fields.verify(&ha1, method);
+        debug!(username = %fields.username, valid, "HTTP auth digest verification");
+        valid
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 2617 digest validation helpers
+// ---------------------------------------------------------------------------
+
+/// Parsed fields from a Digest Authorization header.
+struct DigestFields {
+    username: String,
+    #[allow(dead_code)]
+    realm: String,
+    nonce: String,
+    uri: String,
+    response: String,
+    qop: Option<String>,
+    cnonce: Option<String>,
+    nc: Option<String>,
+}
+
+impl DigestFields {
+    /// Parse all relevant fields from a Digest Authorization header value.
+    fn parse(auth_value: &str) -> Option<Self> {
+        Some(Self {
+            username: extract_username(auth_value)?,
+            realm: extract_digest_param(auth_value, "realm")?,
+            nonce: extract_nonce_field(auth_value)?,
+            uri: extract_digest_param(auth_value, "uri")?,
+            response: extract_response_field(auth_value)?,
+            qop: extract_digest_param(auth_value, "qop"),
+            cnonce: extract_digest_param(auth_value, "cnonce"),
+            nc: extract_digest_param(auth_value, "nc"),
+        })
+    }
+
+    /// Verify the digest response against a known HA1.
+    fn verify(&self, ha1: &str, method: &str) -> bool {
+        // HA2 = MD5(method:uri)
+        let ha2 = md5_hex(&format!("{}:{}", method, self.uri));
+
+        let expected = if self.qop.as_deref() == Some("auth") {
+            // response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+            let nc = self.nc.as_deref().unwrap_or("00000001");
+            let cnonce = self.cnonce.as_deref().unwrap_or("");
+            md5_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, self.nonce, nc, cnonce, ha2))
+        } else {
+            // response = MD5(HA1:nonce:HA2)
+            md5_hex(&format!("{}:{}:{}", ha1, self.nonce, ha2))
+        };
+
+        expected.eq_ignore_ascii_case(&self.response)
+    }
+}
+
+/// Compute MD5 hex digest of a string.
+fn md5_hex(input: &str) -> String {
+    format!("{:x}", md5::compute(input.as_bytes()))
+}
+
+/// Extract a named parameter from a Digest header value.
+/// Handles both quoted and unquoted values.
+fn extract_digest_param(auth_value: &str, param: &str) -> Option<String> {
+    let auth_lower = auth_value.to_lowercase();
+    let needle = format!("{}=", param);
+    let pos = auth_lower.find(&needle)?;
+
+    // Make sure it's not a substring of a longer param name
+    // (e.g. "cnonce" when looking for "nonce" — handled by extract_nonce_field)
+    if pos > 0 && auth_lower.as_bytes()[pos - 1].is_ascii_alphanumeric() {
+        // Try finding next occurrence
+        let mut search_start = pos + needle.len();
+        loop {
+            let next_pos = auth_lower[search_start..].find(&needle)?;
+            let abs_pos = search_start + next_pos;
+            if abs_pos == 0 || !auth_lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric() {
+                let rest = &auth_value[abs_pos + needle.len()..];
+                return parse_param_value(rest);
+            }
+            search_start = abs_pos + needle.len();
+        }
+    }
+
+    let rest = &auth_value[pos + needle.len()..];
+    parse_param_value(rest)
+}
+
+/// Parse a parameter value (quoted or unquoted) from the remaining string.
+fn parse_param_value(rest: &str) -> Option<String> {
+    if let Some(after) = rest.strip_prefix('"') {
+        let end = after.find('"')?;
+        Some(after[..end].to_string())
+    } else {
+        let end = rest.find(',').unwrap_or(rest.len());
+        Some(rest[..end].trim().to_string())
     }
 }
 
@@ -733,6 +945,20 @@ mod tests {
     }
 
     fn make_request_with_auth(username: &str) -> PyRequest {
+        // Compute a valid RFC 2617 digest response for the test credentials.
+        // alice:pass123, bob:secret — realm=example.com, nonce=abc, method=REGISTER
+        let password = match username {
+            "alice" => "pass123",
+            "bob" => "secret",
+            _ => "wrong",
+        };
+        let realm = "example.com";
+        let nonce = "abc";
+        let digest_uri = "sip:example.com";
+        let ha1 = md5_hex(&format!("{}:{}:{}", username, realm, password));
+        let ha2 = md5_hex(&format!("REGISTER:{}", digest_uri));
+        let response = md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2));
+
         let uri = SipUri::new("example.com".to_string());
         let message = SipMessageBuilder::new()
             .request(Method::Register, uri)
@@ -744,7 +970,7 @@ mod tests {
             .header(
                 "Authorization",
                 format!(
-                    "Digest username=\"{username}\", realm=\"example.com\", nonce=\"abc\", uri=\"sip:example.com\", response=\"xyz\""
+                    "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{digest_uri}\", response=\"{response}\""
                 ),
             )
             .content_length(0)
