@@ -27,7 +27,8 @@ use crate::script::api::request::{LocalDomains, PyRequest, RequestAction};
 use crate::script::engine::{HandlerKind, ScriptEngine};
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::headers::via::Via;
-use crate::sip::message::{SipMessage, StartLine};
+use crate::sip::message::{Method, SipMessage, StartLine};
+use crate::sip::uri::SipUri;
 use crate::sip::parser::{parse_sip_message, parse_uri_standalone};
 use crate::sip::uri::format_sip_host;
 use crate::transaction::key::TransactionKey;
@@ -1419,6 +1420,13 @@ fn handle_response(
         }
     }
 
+    // RFC 3261 §16.7 step 3: a proxy MUST NOT forward 100 Trying upstream.
+    // It is hop-by-hop; the proxy already sends its own 100 Trying to the UAC.
+    if status_code == 100 {
+        debug!("absorbing 100 Trying from downstream");
+        return;
+    }
+
     // Get the topmost Via to find the branch
     let top_via = match message.headers.get("Via") {
         Some(raw) => match Via::parse_multi(raw) {
@@ -1515,7 +1523,7 @@ fn handle_response(
 
     if let Some(ref client_key) = client_txn_key {
         if let Some(session_arc) = state.session_store.get_by_client_key(client_key) {
-            let (source_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure) = {
+            let (source_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure, client_branch) = {
                 let session = match session_arc.read() {
                     Ok(s) => s,
                     Err(error) => {
@@ -1533,8 +1541,32 @@ fn handle_response(
                     session.original_request.clone(),
                     session.on_reply_callback.clone(),
                     session.on_failure_callback.clone(),
+                    session.client_branches.get(client_key).cloned(),
                 )
             };
+
+            // RFC 3261 §17.1.1.3: the client transaction MUST generate an ACK
+            // for non-2xx final responses to INVITE, sent hop-by-hop to the
+            // same downstream destination.
+            if status_code >= 300
+                && client_key.method == crate::sip::message::Method::Invite
+            {
+                if let Some(ref cb) = client_branch {
+                    let ack = build_ack_for_non2xx(&original_request, &message, &branch, cb.transport, state.local_addr);
+                    send_to_target(
+                        ack.to_bytes().into(),
+                        &RelayTarget { address: cb.destination, transport: Some(cb.transport) },
+                        cb.transport,
+                        cb.connection_id,
+                        state,
+                    );
+                    debug!(
+                        branch = %branch,
+                        destination = %cb.destination,
+                        "sent ACK for non-2xx response"
+                    );
+                }
+            }
 
             // Strip our topmost Via before forwarding
             core::strip_top_via(&mut message.headers);
@@ -1775,8 +1807,12 @@ fn handle_response(
                 Some(ServerEvent::Nist(NistEvent::TuFinal(message.clone())))
             };
 
+            // Feed response to server transaction. If the transaction emits
+            // SendMessage, it handles delivery — we must not send again ourselves.
+            let mut sent_by_transaction = false;
             if let Some(event) = server_event {
                 if let Ok(actions) = state.transaction_manager.process_server_event(&server_key, event) {
+                    sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
                     process_timer_actions(
                         &actions,
                         &server_key,
@@ -1788,14 +1824,15 @@ fn handle_response(
                 }
             }
 
-            debug!(
-                status = status_code,
-                destination = %source_addr,
-                branch = %branch,
-                "forwarding response via session"
-            );
-
-            send_message(message, transport, source_addr, connection_id, state);
+            if !sent_by_transaction {
+                debug!(
+                    status = status_code,
+                    destination = %source_addr,
+                    branch = %branch,
+                    "forwarding response via session"
+                );
+                send_message(message, transport, source_addr, connection_id, state);
+            }
 
             // Clean up on final response
             if status_code >= 200 {
@@ -2160,6 +2197,71 @@ fn build_response(
     builder = builder.content_length(0);
 
     builder.build().expect("response builder should not fail")
+}
+
+/// Build an ACK for a non-2xx final response to INVITE (RFC 3261 §17.1.1.3).
+///
+/// The ACK is hop-by-hop: each proxy generates its own for non-2xx.
+/// - Request-URI: same as the original INVITE
+/// - Via: only our own Via (the branch that created the client transaction)
+/// - From: from the original request
+/// - To: from the response (includes To-tag added by UAS)
+/// - Call-ID: from the original request
+/// - CSeq: same sequence number, ACK method
+/// - Route: same as original INVITE (if any)
+fn build_ack_for_non2xx(
+    original_request: &SipMessage,
+    response: &SipMessage,
+    branch: &str,
+    downstream_transport: Transport,
+    local_addr: SocketAddr,
+) -> SipMessage {
+    let request_uri = match &original_request.start_line {
+        StartLine::Request(rl) => rl.request_uri.clone(),
+        _ => SipUri::new("invalid".to_string()),
+    };
+
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Ack, request_uri);
+
+    // Via: only our own hop with the client transaction branch
+    let transport_str = format!("{}", downstream_transport).to_uppercase();
+    let host = format_sip_host(&local_addr.ip().to_string());
+    builder = builder.via(format!(
+        "SIP/2.0/{} {}:{};branch={}",
+        transport_str, host, local_addr.port(), branch
+    ));
+
+    if let Some(from) = original_request.headers.from() {
+        builder = builder.from(from.clone());
+    }
+
+    // To: from the response (includes To-tag from UAS)
+    if let Some(to) = response.headers.to() {
+        builder = builder.to(to.clone());
+    }
+
+    if let Some(call_id) = original_request.headers.call_id() {
+        builder = builder.call_id(call_id.clone());
+    }
+
+    // CSeq: same sequence number, ACK method
+    if let Some(cseq) = original_request.headers.cseq() {
+        let cseq_num = cseq.split_whitespace().next().unwrap_or("1");
+        builder = builder.cseq(format!("{} ACK", cseq_num));
+    }
+
+    // Route: copy from original request if present
+    if let Some(routes) = original_request.headers.get_all("Route") {
+        for route in routes {
+            builder = builder.header("Route", route.clone());
+        }
+    }
+
+    builder = builder.header("Max-Forwards", "70".to_string());
+    builder = builder.content_length(0);
+
+    builder.build().expect("ACK builder should not fail")
 }
 
 /// Serialize a SIP message and send it to a specific destination.
@@ -3999,6 +4101,53 @@ mod tests {
         let request = sample_invite();
         let response = build_response(&request, 200, "OK", None);
         assert!(response.headers.get("Server").is_none());
+    }
+
+    #[test]
+    fn build_ack_for_non2xx_has_correct_headers() {
+        let request = sample_invite();
+        let response = build_response(&request, 480, "Temporarily Unavailable", None);
+        let local_addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+
+        let ack = build_ack_for_non2xx(
+            &request,
+            &response,
+            "z9hG4bK-proxy-branch",
+            Transport::Tcp,
+            local_addr,
+        );
+
+        // Must be an ACK request
+        assert!(ack.is_request());
+        let bytes = String::from_utf8(ack.to_bytes()).unwrap();
+        assert!(bytes.starts_with("ACK sip:bob@biloxi.com SIP/2.0\r\n"));
+
+        // Via: our own hop only (not the UAC's)
+        let via = ack.headers.via().unwrap();
+        assert!(via.contains("z9hG4bK-proxy-branch"));
+        assert!(via.contains("TCP"));
+        assert!(via.contains("10.0.0.1:5060"));
+
+        // From: same as original request
+        assert_eq!(ack.headers.from().unwrap(), request.headers.from().unwrap());
+
+        // To: from the response (may have To-tag)
+        assert_eq!(ack.headers.to().unwrap(), response.headers.to().unwrap());
+
+        // Call-ID: same as original
+        assert_eq!(ack.headers.call_id().unwrap(), request.headers.call_id().unwrap());
+
+        // CSeq: same number, ACK method
+        let cseq = ack.headers.cseq().unwrap();
+        assert!(cseq.contains("314159"));
+        assert!(cseq.contains("ACK"));
+        assert!(!cseq.contains("INVITE"));
+
+        // Max-Forwards present
+        assert_eq!(ack.headers.get("Max-Forwards").unwrap(), "70");
+
+        // Content-Length: 0
+        assert_eq!(ack.headers.content_length(), Some(0));
     }
 
     fn test_resolver() -> SipResolver {
