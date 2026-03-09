@@ -1551,20 +1551,30 @@ fn handle_response(
             if status_code >= 300
                 && client_key.method == crate::sip::message::Method::Invite
             {
-                if let Some(ref cb) = client_branch {
-                    let ack = build_ack_for_non2xx(&original_request, &message, &branch, cb.transport, state.local_addr);
-                    send_to_target(
-                        ack.to_bytes().into(),
-                        &RelayTarget { address: cb.destination, transport: Some(cb.transport) },
-                        cb.transport,
-                        cb.connection_id,
-                        state,
-                    );
-                    debug!(
-                        branch = %branch,
-                        destination = %cb.destination,
-                        "sent ACK for non-2xx response"
-                    );
+                match client_branch {
+                    Some(ref cb) => {
+                        let ack = build_ack_for_non2xx(&original_request, &message, &branch, cb.transport, state.local_addr);
+                        send_to_target(
+                            ack.to_bytes().into(),
+                            &RelayTarget { address: cb.destination, transport: Some(cb.transport) },
+                            cb.transport,
+                            cb.connection_id,
+                            state,
+                        );
+                        info!(
+                            branch = %branch,
+                            destination = %cb.destination,
+                            transport = %cb.transport,
+                            "ACK for {status_code} sent downstream"
+                        );
+                    }
+                    None => {
+                        warn!(
+                            branch = %branch,
+                            status = status_code,
+                            "cannot send ACK for non-2xx: no client branch in session"
+                        );
+                    }
                 }
             }
 
