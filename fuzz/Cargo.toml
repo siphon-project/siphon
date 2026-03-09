@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-siphon = { path = ".." }
+siphon = { path = "..", package = "siphon-sip" }
 
 [[bin]]
 name = "sip_parser_fuzz"
