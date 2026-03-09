@@ -84,23 +84,64 @@ pub struct Config {
 // Transport listeners
 // ---------------------------------------------------------------------------
 
+/// A listen entry: either a plain address string or a struct with an
+/// optional advertised address (like OpenSIPS `socket ... as ...`).
+///
+/// ```yaml
+/// listen:
+///   tcp:
+///     - "10.0.0.1:5060"                          # plain string
+///     - address: "10.0.0.1:5061"                  # struct form
+///       advertise: "sip.example.com"              #   with advertised host
+/// ```
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum ListenEntry {
+    /// Plain address string (e.g. `"10.0.0.1:5060"`).
+    Plain(String),
+    /// Address with optional advertised host.
+    Extended {
+        address: String,
+        #[serde(default)]
+        advertise: Option<String>,
+    },
+}
+
+impl ListenEntry {
+    /// The bind address string.
+    pub fn address(&self) -> &str {
+        match self {
+            ListenEntry::Plain(addr) => addr,
+            ListenEntry::Extended { address, .. } => address,
+        }
+    }
+
+    /// The advertised host (if configured).
+    pub fn advertise(&self) -> Option<&str> {
+        match self {
+            ListenEntry::Plain(_) => None,
+            ListenEntry::Extended { advertise, .. } => advertise.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ListenConfig {
     #[serde(default)]
-    pub udp: Vec<String>,
+    pub udp: Vec<ListenEntry>,
     #[serde(default)]
-    pub tcp: Vec<String>,
+    pub tcp: Vec<ListenEntry>,
     #[serde(default)]
-    pub tls: Vec<String>,
+    pub tls: Vec<ListenEntry>,
     /// WebSocket (ws://) — browser/WebRTC UEs.
     #[serde(default)]
-    pub ws: Vec<String>,
+    pub ws: Vec<ListenEntry>,
     /// Secure WebSocket (wss://) — browser/WebRTC UEs.
     #[serde(default)]
-    pub wss: Vec<String>,
+    pub wss: Vec<ListenEntry>,
     /// SCTP (RFC 4168) — used between IMS core nodes.
     #[serde(default)]
-    pub sctp: Vec<String>,
+    pub sctp: Vec<ListenEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1511,7 +1552,7 @@ log:
     #[test]
     fn parses_minimal_config() {
         let config = Config::from_str(minimal_yaml()).unwrap();
-        assert_eq!(config.listen.udp, vec!["0.0.0.0:5060"]);
+        assert_eq!(config.listen.udp[0].address(), "0.0.0.0:5060");
         assert!(config.listen.tcp.is_empty());
         assert_eq!(config.domain.local, vec!["example.com"]);
         assert_eq!(config.script.path, "scripts/proxy_default.py");
@@ -1579,8 +1620,8 @@ log:
 "#;
         let config = Config::from_str(yaml).unwrap();
         assert_eq!(config.listen.udp.len(), 2);
-        assert_eq!(config.listen.tcp, vec!["0.0.0.0:5060"]);
-        assert_eq!(config.listen.tls, vec!["0.0.0.0:5061"]);
+        assert_eq!(config.listen.tcp[0].address(), "0.0.0.0:5060");
+        assert_eq!(config.listen.tls[0].address(), "0.0.0.0:5061");
         assert_eq!(config.domain.local.len(), 3);
         assert_eq!(config.script.reload, ReloadMode::Sighup);
         assert_eq!(config.registrar.backend, RegistrarBackendType::Redis);

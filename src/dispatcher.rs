@@ -66,9 +66,10 @@ struct DispatcherState {
     outbound: Arc<OutboundRouter>,
     local_domains: LocalDomains,
     local_addr: SocketAddr,
-    /// Advertised host (hostname or IP) for external-facing Record-Route/Via.
-    /// When set, used instead of `local_addr` IP for the inbound-leg Record-Route.
-    advertised_host: Option<String>,
+    /// Per-transport advertised host (hostname or IP) for Record-Route/Via.
+    /// Configured via `listen: { tls: [{ address: ..., advertise: "..." }] }`.
+    /// Falls back to the global `advertised_address` config when not set per-transport.
+    advertised_addrs: std::collections::HashMap<Transport, String>,
     /// Per-transport listen address for HEP capture (so TLS responses report
     /// port 5061, not the UDP/TCP port 5060).
     listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
@@ -127,6 +128,7 @@ pub async fn run(
     config: Arc<Config>,
     local_addr: SocketAddr,
     listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
+    advertised_addrs: std::collections::HashMap<Transport, String>,
     hep_sender: Option<Arc<HepSender>>,
     uac_sender: Arc<UacSender>,
     connection_pool: Arc<ConnectionPool>,
@@ -194,12 +196,21 @@ pub async fn run(
 
     let (rtpengine_set, rtpengine_sessions) = pre_rtpengine;
 
+    // Merge per-transport advertised addresses with global advertised_address fallback.
+    // Per-transport takes precedence; global fills in any transport that lacks one.
+    let mut merged_advertised = advertised_addrs;
+    if let Some(ref global_adv) = config.advertised_address {
+        for &transport in listen_addrs.keys() {
+            merged_advertised.entry(transport).or_insert_with(|| global_adv.clone());
+        }
+    }
+
     let state = Arc::new(DispatcherState {
         engine,
         outbound,
         local_domains: Arc::new(config.domain.local.clone()),
         local_addr: via_addr,
-        advertised_host: config.advertised_address.clone(),
+        advertised_addrs: merged_advertised,
         listen_addrs,
         server_header,
         user_agent_header,
@@ -1110,9 +1121,8 @@ fn relay_request(
             // external peers may not be able to reach the internal bind IP.
             let outbound_port = state.listen_addrs.get(&outbound_transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
             let inbound_port = state.listen_addrs.get(&inbound.transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
-            let advertised = state.advertised_host.as_deref().map(|h| format_sip_host(h));
-            let outbound_host = if outbound_transport == Transport::Tls { advertised.clone().unwrap_or_else(|| internal_host.clone()) } else { internal_host.clone() };
-            let inbound_host = if inbound.transport == Transport::Tls { advertised.unwrap_or_else(|| internal_host.clone()) } else { internal_host.clone() };
+            let outbound_host = state.advertised_addrs.get(&outbound_transport).map(|h| format_sip_host(h)).unwrap_or_else(|| internal_host.clone());
+            let inbound_host = state.advertised_addrs.get(&inbound.transport).map(|h| format_sip_host(h)).unwrap_or_else(|| internal_host.clone());
             let rr_outbound = format!("sip:{}:{};transport={}", outbound_host, outbound_port, transport_str.to_lowercase());
             let rr_inbound = format!("sip:{}:{};transport={}", inbound_host, inbound_port, inbound_transport_str);
             core::add_record_route(&mut relayed.headers, &rr_inbound);
@@ -1324,9 +1334,8 @@ fn relay_fork_branch(
         if inbound_transport_str != transport_str.to_lowercase() {
             let outbound_port = state.listen_addrs.get(&outbound_transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
             let inbound_port = state.listen_addrs.get(&inbound.transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
-            let advertised = state.advertised_host.as_deref().map(|h| format_sip_host(h));
-            let outbound_host = if outbound_transport == Transport::Tls { advertised.clone().unwrap_or_else(|| internal_host.clone()) } else { internal_host.clone() };
-            let inbound_host = if inbound.transport == Transport::Tls { advertised.unwrap_or_else(|| internal_host.clone()) } else { internal_host.clone() };
+            let outbound_host = state.advertised_addrs.get(&outbound_transport).map(|h| format_sip_host(h)).unwrap_or_else(|| internal_host.clone());
+            let inbound_host = state.advertised_addrs.get(&inbound.transport).map(|h| format_sip_host(h)).unwrap_or_else(|| internal_host.clone());
             let rr_outbound = format!("sip:{}:{};transport={}", outbound_host, outbound_port, transport_str.to_lowercase());
             let rr_inbound = format!("sip:{}:{};transport={}", inbound_host, inbound_port, inbound_transport_str);
             core::add_record_route(&mut relayed.headers, &rr_inbound);

@@ -274,30 +274,37 @@ async fn main() {
     // --- Start UDP listeners ---
     let mut first_listen_addr: Option<std::net::SocketAddr> = None;
     let mut listen_addrs = std::collections::HashMap::new();
-    for addr_str in &config.listen.udp {
-        let addr: std::net::SocketAddr = addr_str.parse().unwrap_or_else(|error| {
-            eprintln!("Invalid UDP listen address '{addr_str}': {error}");
+    let mut advertised_addrs: std::collections::HashMap<transport::Transport, String> = std::collections::HashMap::new();
+    for entry in &config.listen.udp {
+        let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
+            eprintln!("Invalid UDP listen address '{}': {error}", entry.address());
             std::process::exit(1);
         });
         if first_listen_addr.is_none() {
             first_listen_addr = Some(addr);
         }
         listen_addrs.entry(transport::Transport::Udp).or_insert(addr);
+        if let Some(adv) = entry.advertise() {
+            advertised_addrs.entry(transport::Transport::Udp).or_insert_with(|| adv.to_string());
+        }
         info!(addr = %addr, "starting UDP transport");
         transport::udp::listen(addr, inbound_tx.clone(), udp_outbound_rx.clone(), Arc::clone(&transport_acl)).await;
     }
 
     // --- Start TCP listeners ---
     let tcp_connection_map = Arc::new(dashmap::DashMap::new());
-    for addr_str in &config.listen.tcp {
-        let addr: std::net::SocketAddr = addr_str.parse().unwrap_or_else(|error| {
-            eprintln!("Invalid TCP listen address '{addr_str}': {error}");
+    for entry in &config.listen.tcp {
+        let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
+            eprintln!("Invalid TCP listen address '{}': {error}", entry.address());
             std::process::exit(1);
         });
         if first_listen_addr.is_none() {
             first_listen_addr = Some(addr);
         }
         listen_addrs.entry(transport::Transport::Tcp).or_insert(addr);
+        if let Some(adv) = entry.advertise() {
+            advertised_addrs.entry(transport::Transport::Tcp).or_insert_with(|| adv.to_string());
+        }
         info!(addr = %addr, "starting TCP transport");
         transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl)).await;
     }
@@ -307,15 +314,18 @@ async fn main() {
         Arc::new(dashmap::DashMap::new());
     if let Some(ref tls_config) = config.tls {
         let tls_connection_map = Arc::new(dashmap::DashMap::new());
-        for addr_str in &config.listen.tls {
-            let addr: std::net::SocketAddr = addr_str.parse().unwrap_or_else(|error| {
-                eprintln!("Invalid TLS listen address '{addr_str}': {error}");
+        for entry in &config.listen.tls {
+            let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
+                eprintln!("Invalid TLS listen address '{}': {error}", entry.address());
                 std::process::exit(1);
             });
             if first_listen_addr.is_none() {
                 first_listen_addr = Some(addr);
             }
             listen_addrs.entry(transport::Transport::Tls).or_insert(addr);
+            if let Some(adv) = entry.advertise() {
+                advertised_addrs.entry(transport::Transport::Tls).or_insert_with(|| adv.to_string());
+            }
             info!(addr = %addr, "starting TLS transport");
             transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map)).await;
         }
@@ -323,15 +333,18 @@ async fn main() {
 
     // --- Start WebSocket listeners ---
     let ws_connection_map = Arc::new(dashmap::DashMap::new());
-    for addr_str in &config.listen.ws {
-        let addr: std::net::SocketAddr = addr_str.parse().unwrap_or_else(|error| {
-            eprintln!("Invalid WS listen address '{addr_str}': {error}");
+    for entry in &config.listen.ws {
+        let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
+            eprintln!("Invalid WS listen address '{}': {error}", entry.address());
             std::process::exit(1);
         });
         if first_listen_addr.is_none() {
             first_listen_addr = Some(addr);
         }
         listen_addrs.entry(transport::Transport::WebSocket).or_insert(addr);
+        if let Some(adv) = entry.advertise() {
+            advertised_addrs.entry(transport::Transport::WebSocket).or_insert_with(|| adv.to_string());
+        }
         info!(addr = %addr, "starting WS transport");
         transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl)).await;
     }
@@ -339,15 +352,18 @@ async fn main() {
     // --- Start WSS listeners ---
     if let Some(ref tls_config) = config.tls {
         let wss_connection_map = Arc::new(dashmap::DashMap::new());
-        for addr_str in &config.listen.wss {
-            let addr: std::net::SocketAddr = addr_str.parse().unwrap_or_else(|error| {
-                eprintln!("Invalid WSS listen address '{addr_str}': {error}");
+        for entry in &config.listen.wss {
+            let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
+                eprintln!("Invalid WSS listen address '{}': {error}", entry.address());
                 std::process::exit(1);
             });
             if first_listen_addr.is_none() {
                 first_listen_addr = Some(addr);
             }
             listen_addrs.entry(transport::Transport::WebSocketSecure).or_insert(addr);
+            if let Some(adv) = entry.advertise() {
+                advertised_addrs.entry(transport::Transport::WebSocketSecure).or_insert_with(|| adv.to_string());
+            }
             info!(addr = %addr, "starting WSS transport");
             transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl)).await;
         }
@@ -355,15 +371,18 @@ async fn main() {
 
     // --- Start SCTP listeners ---
     let sctp_connection_map = Arc::new(dashmap::DashMap::new());
-    for addr_str in &config.listen.sctp {
-        let addr: std::net::SocketAddr = addr_str.parse().unwrap_or_else(|error| {
-            eprintln!("Invalid SCTP listen address '{addr_str}': {error}");
+    for entry in &config.listen.sctp {
+        let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
+            eprintln!("Invalid SCTP listen address '{}': {error}", entry.address());
             std::process::exit(1);
         });
         if first_listen_addr.is_none() {
             first_listen_addr = Some(addr);
         }
         listen_addrs.entry(transport::Transport::Sctp).or_insert(addr);
+        if let Some(adv) = entry.advertise() {
+            advertised_addrs.entry(transport::Transport::Sctp).or_insert_with(|| adv.to_string());
+        }
         info!(addr = %addr, "starting SCTP transport");
         transport::sctp::listen(addr, inbound_tx.clone(), sctp_outbound_rx.clone(), Arc::clone(&sctp_connection_map), Arc::clone(&transport_acl)).await;
     }
@@ -715,6 +734,7 @@ async fn main() {
         Arc::clone(&config),
         local_addr,
         listen_addrs,
+        advertised_addrs,
         hep_sender,
         uac_sender,
         connection_pool,
