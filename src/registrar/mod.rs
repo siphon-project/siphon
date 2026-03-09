@@ -10,6 +10,7 @@ pub mod backend;
 pub mod reginfo;
 
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -99,7 +100,7 @@ impl Default for RegistrarConfig {
 /// In-memory registrar store.
 pub struct Registrar {
     /// AoR → list of contact bindings.
-    bindings: DashMap<Aor, Vec<Contact>>,
+    pub(crate) bindings: DashMap<Aor, Vec<Contact>>,
     /// AoR → Service-Route headers (RFC 3608), stored from 200 OK to REGISTER.
     service_routes: DashMap<Aor, Vec<String>>,
     /// AoR → P-Asserted-Identity (IMS: stored from SAR user profile).
@@ -107,6 +108,8 @@ pub struct Registrar {
     pub config: RegistrarConfig,
     /// Broadcast channel for registration change events.
     event_sender: broadcast::Sender<RegistrationEvent>,
+    /// Optional backend writer for write-through persistence (set once at startup).
+    backend_writer: OnceLock<backend::BackendWriter>,
 }
 
 impl std::fmt::Debug for Registrar {
@@ -128,7 +131,14 @@ impl Registrar {
             asserted_identities: DashMap::new(),
             config,
             event_sender,
+            backend_writer: OnceLock::new(),
         }
+    }
+
+    /// Set the backend writer for write-through persistence.
+    /// Can only be called once (at startup); subsequent calls are ignored.
+    pub fn set_backend_writer(&self, writer: backend::BackendWriter) {
+        let _ = self.backend_writer.set(writer);
     }
 
     /// Subscribe to registration change events.
@@ -139,6 +149,17 @@ impl Registrar {
     /// Emit a registration event (best-effort, ignores if no receivers).
     fn emit_event(&self, event: RegistrationEvent) {
         let _ = self.event_sender.send(event);
+    }
+
+    /// Write-through an AoR's contacts to the backend (if configured).
+    fn persist_aor(&self, aor: &str, contacts: Vec<backend::StoredContact>) {
+        if let Some(writer) = self.backend_writer.get() {
+            if contacts.is_empty() {
+                writer.remove(aor);
+            } else {
+                writer.save(aor, contacts);
+            }
+        }
     }
 
     /// Save a contact binding for an AoR.
@@ -201,10 +222,17 @@ impl Registrar {
         if expires_secs == 0 {
             // Expires=0 means deregister this specific contact
             contacts.retain(|c| c.uri.to_string() != uri_string);
+            let remaining: Vec<_> = contacts
+                .iter()
+                .map(backend::StoredContact::from_contact)
+                .collect();
             if contacts.is_empty() {
                 drop(entry);
                 self.bindings.remove(aor);
+            } else {
+                drop(entry);
             }
+            self.persist_aor(aor, remaining);
             self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
             return Ok(());
         }
@@ -226,9 +254,14 @@ impl Registrar {
         // Sort by q-value descending
         contacts.sort_by(|a, b| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Emit event after releasing the DashMap entry.
+        // Write-through to backend before releasing the DashMap entry.
+        let stored: Vec<_> = contacts
+            .iter()
+            .map(backend::StoredContact::from_contact)
+            .collect();
         let aor_owned = aor.to_string();
         drop(entry);
+        self.persist_aor(aor, stored);
         if is_refresh {
             self.emit_event(RegistrationEvent::Refreshed { aor: aor_owned });
         } else {
@@ -242,6 +275,9 @@ impl Registrar {
     pub fn remove_all(&self, aor: &str) {
         self.bindings.remove(aor);
         self.service_routes.remove(aor);
+        if let Some(writer) = self.backend_writer.get() {
+            writer.remove(aor);
+        }
         self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
     }
 

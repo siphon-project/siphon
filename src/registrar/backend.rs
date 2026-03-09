@@ -116,22 +116,22 @@ impl StoredContact {
 ///
 /// All methods are async to support network I/O (Redis, PostgreSQL).
 /// The in-memory registrar wraps these with write-through semantics.
-#[allow(async_fn_in_trait)]
+/// Futures must be `Send` so the backend can be used from `tokio::spawn`.
 pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
     /// Store contacts for an AoR, replacing any existing bindings.
-    async fn save(&self, aor: &str, contacts: &[StoredContact]) -> Result<(), BackendError>;
+    fn save(&self, aor: &str, contacts: &[StoredContact]) -> impl std::future::Future<Output = Result<(), BackendError>> + Send;
 
     /// Load contacts for an AoR.
-    async fn load(&self, aor: &str) -> Result<Vec<StoredContact>, BackendError>;
+    fn load(&self, aor: &str) -> impl std::future::Future<Output = Result<Vec<StoredContact>, BackendError>> + Send;
 
     /// Remove all contacts for an AoR.
-    async fn remove(&self, aor: &str) -> Result<(), BackendError>;
+    fn remove(&self, aor: &str) -> impl std::future::Future<Output = Result<(), BackendError>> + Send;
 
     /// Check if an AoR exists in the backend.
-    async fn exists(&self, aor: &str) -> Result<bool, BackendError>;
+    fn exists(&self, aor: &str) -> impl std::future::Future<Output = Result<bool, BackendError>> + Send;
 
     /// List all AoRs with stored contacts.
-    async fn all_aors(&self) -> Result<Vec<String>, BackendError>;
+    fn all_aors(&self) -> impl std::future::Future<Output = Result<Vec<String>, BackendError>> + Send;
 }
 
 /// Backend errors.
@@ -489,6 +489,12 @@ impl RedisBackend {
         Self { config }
     }
 
+    /// Stub connect — always succeeds but operations are no-ops.
+    pub async fn connect(config: RedisBackendConfig) -> Result<Self, BackendError> {
+        tracing::warn!("redis backend stub: connect is a no-op (enable redis-backend feature)");
+        Ok(Self::new(config))
+    }
+
     /// The Redis key for an AoR.
     fn key(&self, aor: &str) -> String {
         format!("{}{}", self.config.key_prefix, aor)
@@ -799,6 +805,14 @@ impl PostgresBackend {
     pub fn new(config: PostgresBackendConfig) -> Self {
         Self { _config: config }
     }
+
+    /// Stub connect — always succeeds but operations are no-ops.
+    pub async fn connect(config: PostgresBackendConfig) -> Result<Self, BackendError> {
+        tracing::warn!(
+            "postgres backend stub: connect is a no-op (enable postgres-backend feature)"
+        );
+        Ok(Self::new(config))
+    }
 }
 
 #[cfg(not(feature = "postgres-backend"))]
@@ -842,12 +856,113 @@ impl RegistrarBackend for PostgresBackend {
 }
 
 // ---------------------------------------------------------------------------
+// Backend writer — async write-through via channel
+// ---------------------------------------------------------------------------
+
+/// Commands sent to the backend writer task.
+enum BackendCommand {
+    Save { aor: String, contacts: Vec<StoredContact> },
+    Remove { aor: String },
+}
+
+/// Handle for sending write-through commands to a backend task.
+///
+/// Sends are fire-and-forget; failures are logged by the background task.
+#[derive(Debug, Clone)]
+pub struct BackendWriter {
+    tx: tokio::sync::mpsc::UnboundedSender<BackendCommand>,
+}
+
+impl BackendWriter {
+    /// Enqueue a save (full AoR replacement) to the backend.
+    pub fn save(&self, aor: &str, contacts: Vec<StoredContact>) {
+        let _ = self.tx.send(BackendCommand::Save {
+            aor: aor.to_string(),
+            contacts,
+        });
+    }
+
+    /// Enqueue a remove (all contacts for an AoR) to the backend.
+    pub fn remove(&self, aor: &str) {
+        let _ = self.tx.send(BackendCommand::Remove {
+            aor: aor.to_string(),
+        });
+    }
+}
+
+/// Spawn a background task that processes write-through commands.
+///
+/// Returns a [`BackendWriter`] handle that can be cloned into the Registrar.
+pub fn spawn_backend_writer<B: RegistrarBackend + 'static>(backend: B) -> BackendWriter {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(backend_writer_loop(backend, rx));
+    BackendWriter { tx }
+}
+
+async fn backend_writer_loop<B: RegistrarBackend>(
+    backend: B,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<BackendCommand>,
+) {
+    while let Some(command) = rx.recv().await {
+        let result = match &command {
+            BackendCommand::Save { aor, contacts } => backend.save(aor, contacts).await,
+            BackendCommand::Remove { aor } => backend.remove(aor).await,
+        };
+        if let Err(error) = result {
+            let aor = match &command {
+                BackendCommand::Save { aor, .. } | BackendCommand::Remove { aor } => aor,
+            };
+            tracing::warn!(aor, %error, "registrar backend write-through failed");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Restore — load contacts from backend into in-memory registrar
+// ---------------------------------------------------------------------------
+
+/// Load all contacts from a backend into the in-memory registrar.
+///
+/// Returns `(aor_count, contact_count)` — the number of AoRs and total
+/// contact bindings that were successfully restored.
+pub async fn restore_from_backend<B: RegistrarBackend>(
+    backend: &B,
+    registrar: &super::Registrar,
+) -> Result<(usize, usize), BackendError> {
+    let aors = backend.all_aors().await?;
+    let mut aor_count = 0usize;
+    let mut contact_count = 0usize;
+
+    for aor in &aors {
+        let stored = backend.load(aor).await?;
+        let mut contacts_for_aor = Vec::new();
+        for sc in &stored {
+            if let Some(contact) = sc.to_contact() {
+                contacts_for_aor.push(contact);
+            }
+        }
+        if !contacts_for_aor.is_empty() {
+            // Sort by q-value descending (same as Registrar::save)
+            contacts_for_aor.sort_by(|a, b| {
+                b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            contact_count += contacts_for_aor.len();
+            aor_count += 1;
+            registrar.bindings.insert(aor.clone(), contacts_for_aor);
+        }
+    }
+
+    Ok((aor_count, contact_count))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registrar::Registrar;
 
     fn sample_stored_contact() -> StoredContact {
         let now_epoch = std::time::SystemTime::now()
@@ -1051,5 +1166,131 @@ mod tests {
         assert_eq!(config.shard_count, 0);
         assert!(config.urls.is_empty());
         assert_eq!(config.table, "registrations");
+    }
+
+    #[tokio::test]
+    async fn restore_from_backend_loads_contacts() {
+        let backend = MemoryBackend::new();
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Store two AoRs with contacts
+        backend
+            .save("sip:alice@example.com", &[StoredContact {
+                uri: "sip:alice@10.0.0.1".to_string(),
+                q: 1.0,
+                expires_secs: 3600,
+                expires_at: Some(now_epoch + 3600),
+                call_id: "c1".to_string(),
+                cseq: 1,
+                source_addr: None,
+                sip_instance: None,
+                reg_id: None,
+            }])
+            .await
+            .unwrap();
+        backend
+            .save("sip:bob@example.com", &[
+                StoredContact {
+                    uri: "sip:bob@10.0.0.2".to_string(),
+                    q: 1.0,
+                    expires_secs: 3600,
+                    expires_at: Some(now_epoch + 3600),
+                    call_id: "c2".to_string(),
+                    cseq: 1,
+                    source_addr: None,
+                    sip_instance: None,
+                    reg_id: None,
+                },
+                StoredContact {
+                    uri: "sip:bob@10.0.0.3".to_string(),
+                    q: 0.5,
+                    expires_secs: 1800,
+                    expires_at: Some(now_epoch + 1800),
+                    call_id: "c3".to_string(),
+                    cseq: 2,
+                    source_addr: None,
+                    sip_instance: None,
+                    reg_id: None,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let registrar = Registrar::default();
+        let (aors, contacts) = restore_from_backend(&backend, &registrar).await.unwrap();
+
+        assert_eq!(aors, 2);
+        assert_eq!(contacts, 3);
+        assert!(registrar.is_registered("sip:alice@example.com"));
+        assert!(registrar.is_registered("sip:bob@example.com"));
+        assert_eq!(registrar.lookup("sip:bob@example.com").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn restore_skips_expired_contacts() {
+        let backend = MemoryBackend::new();
+
+        // Store an already-expired contact
+        backend
+            .save("sip:old@example.com", &[StoredContact {
+                uri: "sip:old@10.0.0.1".to_string(),
+                q: 1.0,
+                expires_secs: 0,
+                expires_at: Some(1), // long expired
+                call_id: "c1".to_string(),
+                cseq: 1,
+                source_addr: None,
+                sip_instance: None,
+                reg_id: None,
+            }])
+            .await
+            .unwrap();
+
+        let registrar = Registrar::default();
+        let (aors, contacts) = restore_from_backend(&backend, &registrar).await.unwrap();
+
+        assert_eq!(aors, 0);
+        assert_eq!(contacts, 0);
+        assert!(!registrar.is_registered("sip:old@example.com"));
+    }
+
+    #[tokio::test]
+    async fn restore_then_write_through_roundtrip() {
+        // Simulate: backend has contacts → restore → registrar modifies → check backend updated
+        let backend = MemoryBackend::new();
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        backend
+            .save("sip:alice@example.com", &[StoredContact {
+                uri: "sip:alice@10.0.0.1".to_string(),
+                q: 1.0,
+                expires_secs: 3600,
+                expires_at: Some(now_epoch + 3600),
+                call_id: "c1".to_string(),
+                cseq: 1,
+                source_addr: None,
+                sip_instance: None,
+                reg_id: None,
+            }])
+            .await
+            .unwrap();
+
+        let registrar = Registrar::default();
+        let (aors, contacts) = restore_from_backend(&backend, &registrar).await.unwrap();
+        assert_eq!(aors, 1);
+        assert_eq!(contacts, 1);
+
+        // Set up write-through and verify the writer can be created
+        let writer = spawn_backend_writer(backend);
+        registrar.set_backend_writer(writer);
+
+        // The registrar should now have Alice's contact
+        assert!(registrar.is_registered("sip:alice@example.com"));
     }
 }

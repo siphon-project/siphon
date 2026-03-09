@@ -53,6 +53,9 @@ async fn main() {
     dispatcher::inject_python_singletons(&config);
     let pre_rtpengine = dispatcher::init_rtpengine(&config);
 
+    // --- Restore registrar contacts from backend (if configured) ---
+    init_registrar_backend(&config).await;
+
     // --- Gateway dispatcher (create manager + inject singleton before script loads) ---
     let gateway_manager = if let Some(ref gateway_config) = config.gateway {
         use siphon::gateway::{Algorithm, Destination, DispatcherGroup, ProbeConfig};
@@ -734,4 +737,84 @@ async fn main() {
     // file watchers, etc.) that have no shutdown signal yet.  Rather than
     // hanging while the runtime waits for them, exit the process immediately.
     std::process::exit(0);
+}
+
+/// Create the registrar backend (Redis/Postgres), restore persisted contacts
+/// into the in-memory registrar, and set up write-through persistence.
+async fn init_registrar_backend(config: &Config) {
+    use siphon::config::RegistrarBackendType;
+    use siphon::registrar::backend;
+    use siphon::script::api::registrar_arc;
+
+    let registrar = match registrar_arc() {
+        Some(r) => r,
+        None => return,
+    };
+
+    match config.registrar.backend {
+        RegistrarBackendType::Redis => {
+            let redis_config = match &config.registrar.redis {
+                Some(cfg) => backend::RedisBackendConfig {
+                    url: cfg.url.clone(),
+                    urls: Vec::new(),
+                    key_prefix: cfg.key_prefix.clone(),
+                    shard_count: 0,
+                    ttl_slack_secs: cfg.ttl_slack_secs as u64,
+                },
+                None => {
+                    error!("registrar backend is redis but no redis config provided");
+                    return;
+                }
+            };
+            match backend::RedisBackend::connect(redis_config).await {
+                Ok(redis_backend) => {
+                    match backend::restore_from_backend(&redis_backend, registrar).await {
+                        Ok((aors, contacts)) => {
+                            info!(aors, contacts, "restored contacts from Redis backend");
+                        }
+                        Err(err) => {
+                            error!(%err, "failed to restore contacts from Redis backend");
+                        }
+                    }
+                    registrar.set_backend_writer(backend::spawn_backend_writer(redis_backend));
+                }
+                Err(err) => {
+                    error!(%err, "failed to connect to Redis registrar backend");
+                }
+            }
+        }
+        RegistrarBackendType::Postgres => {
+            let pg_config = match &config.registrar.postgres {
+                Some(cfg) => backend::PostgresBackendConfig {
+                    url: cfg.url.clone(),
+                    urls: Vec::new(),
+                    table: cfg.table.clone(),
+                    shard_count: 0,
+                },
+                None => {
+                    error!("registrar backend is postgres but no postgres config provided");
+                    return;
+                }
+            };
+            match backend::PostgresBackend::connect(pg_config).await {
+                Ok(pg_backend) => {
+                    match backend::restore_from_backend(&pg_backend, registrar).await {
+                        Ok((aors, contacts)) => {
+                            info!(aors, contacts, "restored contacts from Postgres backend");
+                        }
+                        Err(err) => {
+                            error!(%err, "failed to restore contacts from Postgres backend");
+                        }
+                    }
+                    registrar.set_backend_writer(backend::spawn_backend_writer(pg_backend));
+                }
+                Err(err) => {
+                    error!(%err, "failed to connect to Postgres registrar backend");
+                }
+            }
+        }
+        RegistrarBackendType::Memory | RegistrarBackendType::Python => {
+            // No persistence backend — nothing to restore.
+        }
+    }
 }
