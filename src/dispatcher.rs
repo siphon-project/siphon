@@ -299,11 +299,23 @@ pub async fn run(
                                 event_type_str.as_str(),
                                 &py_contacts,
                             ));
-                            if let Err(error) = result {
-                                tracing::error!(
-                                    %error,
-                                    "registrar.on_change handler failed"
-                                );
+                            match result {
+                                Ok(ret) => {
+                                    if handler.is_async {
+                                        if let Err(error) = run_coroutine(python, &ret) {
+                                            tracing::error!(
+                                                %error,
+                                                "async registrar.on_change handler error"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        %error,
+                                        "registrar.on_change handler failed"
+                                    );
+                                }
                             }
                         }
                     });
