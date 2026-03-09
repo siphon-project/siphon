@@ -232,6 +232,7 @@ async fn main() {
 
     // --- Start UDP listeners ---
     let mut first_listen_addr: Option<std::net::SocketAddr> = None;
+    let mut listen_addrs = std::collections::HashMap::new();
     for addr_str in &config.listen.udp {
         let addr: std::net::SocketAddr = addr_str.parse().unwrap_or_else(|error| {
             eprintln!("Invalid UDP listen address '{addr_str}': {error}");
@@ -240,6 +241,7 @@ async fn main() {
         if first_listen_addr.is_none() {
             first_listen_addr = Some(addr);
         }
+        listen_addrs.entry(transport::Transport::Udp).or_insert(addr);
         info!(addr = %addr, "starting UDP transport");
         transport::udp::listen(addr, inbound_tx.clone(), udp_outbound_rx.clone()).await;
     }
@@ -254,6 +256,7 @@ async fn main() {
         if first_listen_addr.is_none() {
             first_listen_addr = Some(addr);
         }
+        listen_addrs.entry(transport::Transport::Tcp).or_insert(addr);
         info!(addr = %addr, "starting TCP transport");
         transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map)).await;
     }
@@ -269,6 +272,7 @@ async fn main() {
             if first_listen_addr.is_none() {
                 first_listen_addr = Some(addr);
             }
+            listen_addrs.entry(transport::Transport::Tls).or_insert(addr);
             info!(addr = %addr, "starting TLS transport");
             transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map)).await;
         }
@@ -284,6 +288,7 @@ async fn main() {
         if first_listen_addr.is_none() {
             first_listen_addr = Some(addr);
         }
+        listen_addrs.entry(transport::Transport::WebSocket).or_insert(addr);
         info!(addr = %addr, "starting WS transport");
         transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map)).await;
     }
@@ -299,6 +304,7 @@ async fn main() {
             if first_listen_addr.is_none() {
                 first_listen_addr = Some(addr);
             }
+            listen_addrs.entry(transport::Transport::WebSocketSecure).or_insert(addr);
             info!(addr = %addr, "starting WSS transport");
             transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map)).await;
         }
@@ -314,6 +320,7 @@ async fn main() {
         if first_listen_addr.is_none() {
             first_listen_addr = Some(addr);
         }
+        listen_addrs.entry(transport::Transport::Sctp).or_insert(addr);
         info!(addr = %addr, "starting SCTP transport");
         transport::sctp::listen(addr, inbound_tx.clone(), sctp_outbound_rx.clone(), Arc::clone(&sctp_connection_map)).await;
     }
@@ -633,6 +640,7 @@ async fn main() {
         Arc::clone(&engine),
         Arc::clone(&config),
         local_addr,
+        listen_addrs,
         hep_sender,
         uac_sender,
         pre_rtpengine,
