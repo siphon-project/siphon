@@ -115,8 +115,8 @@ impl PyRegistrar {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
 
-        // AoR from To header
-        let aor = extract_aor(&message)?;
+        // AoR from To header, normalized to strip transport params etc.
+        let aor = normalize_aor(&extract_aor(&message)?);
 
         if force {
             self.inner.remove_all(&aor);
@@ -410,29 +410,31 @@ fn extract_uri_string(uri: &Bound<'_, PyAny>) -> PyResult<String> {
 /// Normalize a URI string to an AoR format.
 ///
 /// - If the input doesn't start with "sip:" or "sips:", prepend "sip:".
+/// - Strip URI parameters (e.g. `transport=tls`) so that the same user@host
+///   is always matched regardless of transport or other parameters.
 /// - Strip the default port (:5060 for sip, :5061 for sips) so that
 ///   `sip:bob@host` and `sip:bob@host:5060` map to the same AoR.
 fn normalize_aor(uri: &str) -> String {
+    // Strip angle brackets first
+    let uri = uri.trim_start_matches('<').trim_end_matches('>');
+
     let uri = if uri.starts_with("sip:") || uri.starts_with("sips:") {
         uri.to_string()
     } else {
         format!("sip:{uri}")
     };
 
-    // Strip default port for consistent AoR matching
-    let uri = if uri.starts_with("sips:") {
-        uri.replace(":5061>", ">")
-            .replace(":5061;", ";")
-            .trim_end_matches(":5061")
-            .to_string()
-    } else {
-        uri.replace(":5060>", ">")
-            .replace(":5060;", ";")
-            .trim_end_matches(":5060")
-            .to_string()
-    };
+    // Strip URI parameters (everything after ';') and headers (after '?')
+    // AoR should be just scheme:user@host[:port]
+    let uri = uri.split(';').next().unwrap_or(&uri).to_string();
+    let uri = uri.split('?').next().unwrap_or(&uri).to_string();
 
-    uri
+    // Strip default port for consistent AoR matching
+    if uri.starts_with("sips:") {
+        uri.trim_end_matches(":5061").to_string()
+    } else {
+        uri.trim_end_matches(":5060").to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +584,42 @@ mod tests {
         assert_eq!(normalize_aor("sip:bob@127.0.0.1:5080"), "sip:bob@127.0.0.1:5080");
         assert_eq!(normalize_aor("sips:bob@host:5061"), "sips:bob@host");
         assert_eq!(normalize_aor("sips:bob@host:5060"), "sips:bob@host:5060");
+    }
+
+    #[test]
+    fn normalize_aor_strips_uri_params() {
+        assert_eq!(
+            normalize_aor("sip:alice@example.com;transport=tcp"),
+            "sip:alice@example.com"
+        );
+        assert_eq!(
+            normalize_aor("sip:alice@example.com:5060;transport=tls"),
+            "sip:alice@example.com"
+        );
+        assert_eq!(
+            normalize_aor("sip:alice@example.com:5061;transport=tls"),
+            "sip:alice@example.com:5061"
+        );
+        assert_eq!(
+            normalize_aor("<sip:alice@example.com;transport=tcp>"),
+            "sip:alice@example.com"
+        );
+    }
+
+    #[test]
+    fn lookup_ignores_transport_param() {
+        let registrar = make_registrar();
+        let (request, py_reg) = make_register_request(
+            "<sip:alice@example.com>",
+            "<sip:alice@10.0.0.1:5060>",
+            &registrar,
+        );
+        py_reg.save(&request, false).unwrap();
+
+        // Lookup with transport param should still find the contact
+        let contacts = py_reg.lookup_str("sip:alice@example.com;transport=tcp");
+        assert_eq!(contacts.len(), 1);
+        assert!(contacts[0].uri().contains("alice"));
     }
 
     #[test]
