@@ -638,11 +638,17 @@ async fn main() {
 
     info!("SIPhon ready — press Ctrl+C to stop");
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for Ctrl+C");
+    // Wait for shutdown signal (SIGINT or SIGTERM)
+    siphon::shutdown::wait_for_signal().await;
 
     info!("shutting down...");
+
+    // Abort the dispatcher (stops accepting new SIP messages).
     dispatcher_handle.abort();
+    let _ = dispatcher_handle.await;
+
+    // The tokio runtime has many background tasks (transport workers, timers,
+    // file watchers, etc.) that have no shutdown signal yet.  Rather than
+    // hanging while the runtime waits for them, exit the process immediately.
+    std::process::exit(0);
 }

@@ -153,10 +153,10 @@ SIPhon requires **Python 3.12+** at runtime for scripting support. For optimal p
 
 ```bash
 # Requires Rust 1.80+ and Python 3.12+ development headers
-cargo install siphon
+cargo install siphon-sip
 
 # Or with optional backends
-cargo install siphon --features redis-backend,postgres-backend
+cargo install siphon-sip --features redis-backend,postgres-backend
 ```
 
 ### Option 2: Docker
