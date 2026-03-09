@@ -330,6 +330,26 @@ impl PyRegistrar {
         Ok(self.inner.asserted_identity(&aor))
     }
 
+    /// Decorator to register a handler for registration state changes.
+    ///
+    /// The handler receives (aor, event_type, contacts) where:
+    ///   - aor: str — Address of Record (e.g. "sip:alice@example.com")
+    ///   - event_type: str — "registered", "refreshed", "deregistered", or "expired"
+    ///   - contacts: list[Contact] — current contact bindings
+    #[staticmethod]
+    fn on_change(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let asyncio = python.import("asyncio")?;
+        let is_async = asyncio
+            .call_method1("iscoroutinefunction", (func.bind(python),))?
+            .is_truthy()?;
+        let registry = python.import("_siphon_registry")?;
+        registry.call_method1(
+            "register",
+            ("registrar.on_change", python.None(), func.bind(python), is_async),
+        )?;
+        Ok(func)
+    }
+
     /// Generate RFC 3680 reginfo XML for an AoR.
     ///
     /// Returns the XML document as a string. Used to build NOTIFY bodies
