@@ -1106,14 +1106,14 @@ fn relay_request(
             // Double Record-Route: outbound transport first (topmost after prepend order).
             // Each RR must use the port of the respective transport listener so that
             // in-dialog requests from each leg reach the correct listener.
-            // The inbound (caller-facing) RR uses the advertised address when set,
-            // since the external caller may not be able to reach the internal IP.
+            // The TLS-facing RR uses the advertised address when set, since
+            // external peers may not be able to reach the internal bind IP.
             let outbound_port = state.listen_addrs.get(&outbound_transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
             let inbound_port = state.listen_addrs.get(&inbound.transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
-            let inbound_host = state.advertised_host.as_deref()
-                .map(|h| format_sip_host(h))
-                .unwrap_or_else(|| internal_host.clone());
-            let rr_outbound = format!("sip:{}:{};transport={}", internal_host, outbound_port, transport_str.to_lowercase());
+            let advertised = state.advertised_host.as_deref().map(|h| format_sip_host(h));
+            let outbound_host = if outbound_transport == Transport::Tls { advertised.clone().unwrap_or_else(|| internal_host.clone()) } else { internal_host.clone() };
+            let inbound_host = if inbound.transport == Transport::Tls { advertised.unwrap_or_else(|| internal_host.clone()) } else { internal_host.clone() };
+            let rr_outbound = format!("sip:{}:{};transport={}", outbound_host, outbound_port, transport_str.to_lowercase());
             let rr_inbound = format!("sip:{}:{};transport={}", inbound_host, inbound_port, inbound_transport_str);
             core::add_record_route(&mut relayed.headers, &rr_inbound);
             core::add_record_route(&mut relayed.headers, &rr_outbound);
@@ -1324,10 +1324,10 @@ fn relay_fork_branch(
         if inbound_transport_str != transport_str.to_lowercase() {
             let outbound_port = state.listen_addrs.get(&outbound_transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
             let inbound_port = state.listen_addrs.get(&inbound.transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
-            let inbound_host = state.advertised_host.as_deref()
-                .map(|h| format_sip_host(h))
-                .unwrap_or_else(|| internal_host.clone());
-            let rr_outbound = format!("sip:{}:{};transport={}", internal_host, outbound_port, transport_str.to_lowercase());
+            let advertised = state.advertised_host.as_deref().map(|h| format_sip_host(h));
+            let outbound_host = if outbound_transport == Transport::Tls { advertised.clone().unwrap_or_else(|| internal_host.clone()) } else { internal_host.clone() };
+            let inbound_host = if inbound.transport == Transport::Tls { advertised.unwrap_or_else(|| internal_host.clone()) } else { internal_host.clone() };
+            let rr_outbound = format!("sip:{}:{};transport={}", outbound_host, outbound_port, transport_str.to_lowercase());
             let rr_inbound = format!("sip:{}:{};transport={}", inbound_host, inbound_port, inbound_transport_str);
             core::add_record_route(&mut relayed.headers, &rr_inbound);
             core::add_record_route(&mut relayed.headers, &rr_outbound);
