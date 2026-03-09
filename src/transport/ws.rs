@@ -20,6 +20,7 @@ use tracing::{error, info, warn};
 
 use crate::config::TlsServerConfig;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
+use crate::transport::acl::TransportAcl;
 
 /// Handle a single WebSocket connection after the upgrade handshake.
 /// Generic over the underlying stream (plain TCP for WS, TLS for WSS).
@@ -149,6 +150,7 @@ pub async fn listen(
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    acl: Arc<TransportAcl>,
 ) {
     spawn_outbound_dispatcher(outbound_rx, connection_map.clone(), "WS");
 
@@ -161,6 +163,9 @@ pub async fn listen(
         loop {
             match listener.accept().await {
                 Ok((tcp_stream, remote_addr)) => {
+                    if !acl.is_allowed(remote_addr.ip()) {
+                        continue;
+                    }
                     let connection_id = next_connection_id();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
@@ -198,6 +203,7 @@ pub async fn listen_secure(
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    acl: Arc<TransportAcl>,
 ) {
     let acceptor = crate::transport::tls::build_tls_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor for WSS: {error}");
@@ -215,6 +221,9 @@ pub async fn listen_secure(
         loop {
             match listener.accept().await {
                 Ok((tcp_stream, remote_addr)) => {
+                    if !acl.is_allowed(remote_addr.ip()) {
+                        continue;
+                    }
                     let acceptor = acceptor.clone();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
@@ -260,6 +269,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn test_acl() -> Arc<TransportAcl> {
+        Arc::new(TransportAcl::new(vec![], vec![]))
+    }
+
     /// Helper: find a free port by binding and releasing.
     fn free_port() -> SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -274,7 +287,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Connect as a WebSocket client
@@ -325,7 +338,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -368,7 +381,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -408,7 +421,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+        listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Build a TLS client config that trusts our self-signed cert

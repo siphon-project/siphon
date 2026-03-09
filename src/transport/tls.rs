@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::TlsServerConfig;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
+use crate::transport::acl::TransportAcl;
 
 /// Build a `TlsAcceptor` from the certificate and key paths in config.
 pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
@@ -92,6 +93,7 @@ pub async fn listen(
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    acl: Arc<TransportAcl>,
 ) {
     let acceptor = build_tls_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
@@ -121,6 +123,10 @@ pub async fn listen(
         loop {
             match listener.accept().await {
                 Ok((tcp_stream, remote_addr)) => {
+                    if !acl.is_allowed(remote_addr.ip()) {
+                        debug!("TLS rejected {} by ACL", remote_addr);
+                        continue;
+                    }
                     let acceptor = acceptor.clone();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
@@ -216,6 +222,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn test_acl() -> Arc<TransportAcl> {
+        Arc::new(TransportAcl::new(vec![], vec![]))
+    }
+
     fn ensure_crypto_provider() {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     }
@@ -308,6 +318,7 @@ mod tests {
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
+            test_acl(),
         )
         .await;
 
@@ -353,6 +364,7 @@ mod tests {
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
+            test_acl(),
         )
         .await;
 
@@ -421,6 +433,7 @@ mod tests {
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
+            test_acl(),
         )
         .await;
 

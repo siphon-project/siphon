@@ -186,6 +186,28 @@ pub fn set_diameter_singleton(
     Ok(())
 }
 
+/// Wire the Diameter manager into the already-stored PyAuth singleton.
+///
+/// Called after the Diameter manager is created in main.rs (which happens
+/// after `set_rust_singletons`).
+pub fn wire_auth_diameter_manager(
+    python: Python<'_>,
+    manager: std::sync::Arc<crate::diameter::DiameterManager>,
+) {
+    if let Some((auth_py, _, _, _, _)) = RUST_SINGLETONS.get() {
+        let auth_bound = auth_py.bind(python);
+        match auth_bound.cast::<auth::PyAuth>() {
+            Ok(py_cell) => {
+                let mut py_auth = py_cell.borrow_mut();
+                py_auth.set_diameter_manager(manager);
+            }
+            Err(error) => {
+                tracing::warn!("failed to downcast auth singleton for Diameter wiring: {error}");
+            }
+        }
+    }
+}
+
 /// Store the presence singleton for injection into the siphon module.
 ///
 /// Called at startup when the presence subsystem is available.

@@ -19,6 +19,7 @@ use tokio::net::UdpSocket;
 use tracing::{error, info, warn};
 
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport};
+use crate::transport::acl::TransportAcl;
 
 /// Spawn `num_cpus::get()` UDP listener workers, all sharing the same port
 /// via SO_REUSEPORT. Each worker sends inbound messages to `inbound_tx` and
@@ -27,6 +28,7 @@ pub async fn listen(
     local_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
+    acl: Arc<TransportAcl>,
 ) {
     let worker_count = num_cpus::get();
     info!("Starting {} UDP workers on {}", worker_count, local_addr);
@@ -34,6 +36,7 @@ pub async fn listen(
     for worker_index in 0..worker_count {
         let inbound_tx = inbound_tx.clone();
         let outbound_rx = outbound_rx.clone();
+        let acl = Arc::clone(&acl);
 
         tokio::spawn(async move {
             let socket = Arc::new(create_reusable_udp_socket(local_addr));
@@ -47,6 +50,9 @@ pub async fn listen(
                     recv_result = socket.recv_from(&mut buffer) => {
                         match recv_result {
                             Ok((size, remote_addr)) => {
+                                if !acl.is_allowed(remote_addr.ip()) {
+                                    continue;
+                                }
                                 buffer.truncate(size);
                                 let data = buffer.freeze();
 

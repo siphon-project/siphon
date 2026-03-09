@@ -16,6 +16,7 @@ use tokio_sctp::{SctpListener, SendOptions};
 use tracing::{error, info, warn};
 
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, next_connection_id};
+use crate::transport::acl::TransportAcl;
 
 /// Spawn an SCTP listener.
 pub async fn listen(
@@ -23,6 +24,7 @@ pub async fn listen(
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    acl: Arc<TransportAcl>,
 ) {
     // Spawn outbound dispatcher
     let connection_map_clone = connection_map.clone();
@@ -47,6 +49,9 @@ pub async fn listen(
         loop {
             match listener.accept().await {
                 Ok((sctp_stream, remote_addr)) => {
+                    if !acl.is_allowed(remote_addr.ip()) {
+                        continue;
+                    }
                     let connection_id = next_connection_id();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
@@ -128,6 +133,10 @@ mod tests {
     use std::sync::Arc;
     use tokio_sctp::SctpStream;
 
+    fn test_acl() -> Arc<TransportAcl> {
+        Arc::new(TransportAcl::new(vec![], vec![]))
+    }
+
     /// Helper: find a free port by binding and releasing.
     fn free_port() -> SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -142,7 +151,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Connect as an SCTP client
@@ -185,7 +194,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let client = SctpStream::connect(addr).await.expect("SCTP connect failed");
@@ -223,7 +232,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let client = SctpStream::connect(addr).await.expect("SCTP connect failed");

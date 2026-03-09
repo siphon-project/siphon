@@ -198,6 +198,14 @@ async fn main() {
             None
         };
 
+    // Wire Diameter manager into PyAuth for IMS digest (require_ims_digest)
+    if let Some(ref manager) = diameter_manager {
+        pyo3::Python::attach(|python| {
+            siphon::script::api::wire_auth_diameter_manager(python, Arc::clone(manager));
+            info!("Diameter manager wired into auth namespace for IMS digest");
+        });
+    }
+
     // --- Script engine ---
     let engine = Arc::new(
         ScriptEngine::new(&config.script).unwrap_or_else(|error| {
@@ -208,6 +216,36 @@ async fn main() {
 
     // Start file watcher for hot-reload
     spawn_file_watcher(Arc::clone(&engine));
+
+    // --- Initialize metrics ---
+    siphon::metrics::init();
+
+    // --- Build transport ACL from security config ---
+    let transport_acl = {
+        use siphon::transport::acl::TransportAcl;
+
+        if let Some(ref sec) = config.security {
+            // Start APIBAN poller if configured
+            let apiban_set = if let Some(ref apiban_config) = sec.apiban {
+                let client = siphon::apiban::ApiBanClient::new(apiban_config);
+                let banned = client.banned();
+                client.start();
+                info!("APIBAN blocklist poller started");
+                Some(banned)
+            } else {
+                None
+            };
+
+            let acl = if let Some(banned) = apiban_set {
+                TransportAcl::with_apiban(vec![], sec.trusted_cidrs.clone(), banned)
+            } else {
+                TransportAcl::new(vec![], sec.trusted_cidrs.clone())
+            };
+            Arc::new(acl)
+        } else {
+            Arc::new(TransportAcl::new(vec![], vec![]))
+        }
+    };
 
     // --- Transport channels ---
     // Single inbound channel: all transports → dispatcher.
@@ -243,7 +281,7 @@ async fn main() {
         }
         listen_addrs.entry(transport::Transport::Udp).or_insert(addr);
         info!(addr = %addr, "starting UDP transport");
-        transport::udp::listen(addr, inbound_tx.clone(), udp_outbound_rx.clone()).await;
+        transport::udp::listen(addr, inbound_tx.clone(), udp_outbound_rx.clone(), Arc::clone(&transport_acl)).await;
     }
 
     // --- Start TCP listeners ---
@@ -258,7 +296,7 @@ async fn main() {
         }
         listen_addrs.entry(transport::Transport::Tcp).or_insert(addr);
         info!(addr = %addr, "starting TCP transport");
-        transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map)).await;
+        transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl)).await;
     }
 
     // --- Start TLS listeners ---
@@ -274,7 +312,7 @@ async fn main() {
             }
             listen_addrs.entry(transport::Transport::Tls).or_insert(addr);
             info!(addr = %addr, "starting TLS transport");
-            transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map)).await;
+            transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl)).await;
         }
     }
 
@@ -290,7 +328,7 @@ async fn main() {
         }
         listen_addrs.entry(transport::Transport::WebSocket).or_insert(addr);
         info!(addr = %addr, "starting WS transport");
-        transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map)).await;
+        transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl)).await;
     }
 
     // --- Start WSS listeners ---
@@ -306,7 +344,7 @@ async fn main() {
             }
             listen_addrs.entry(transport::Transport::WebSocketSecure).or_insert(addr);
             info!(addr = %addr, "starting WSS transport");
-            transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map)).await;
+            transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl)).await;
         }
     }
 
@@ -322,7 +360,7 @@ async fn main() {
         }
         listen_addrs.entry(transport::Transport::Sctp).or_insert(addr);
         info!(addr = %addr, "starting SCTP transport");
-        transport::sctp::listen(addr, inbound_tx.clone(), sctp_outbound_rx.clone(), Arc::clone(&sctp_connection_map)).await;
+        transport::sctp::listen(addr, inbound_tx.clone(), sctp_outbound_rx.clone(), Arc::clone(&sctp_connection_map), Arc::clone(&transport_acl)).await;
     }
 
     let local_addr = first_listen_addr.unwrap_or_else(|| {
@@ -349,6 +387,30 @@ async fn main() {
     } else {
         None
     };
+
+    // --- Prometheus metrics endpoint (if configured) ---
+    if let Some(ref metrics_config) = config.metrics {
+        if let Some(ref prom_config) = metrics_config.prometheus {
+            let listen_addr: std::net::SocketAddr = prom_config.listen.parse().unwrap_or_else(|error| {
+                eprintln!("Invalid metrics listen address '{}': {error}", prom_config.listen);
+                std::process::exit(1);
+            });
+            let path = prom_config.path.clone();
+            tokio::spawn(async move {
+                use axum::{routing::get, Router};
+                let app = Router::new().route(&path, get(|| async {
+                    siphon::metrics::encode_metrics()
+                }));
+                info!(addr = %listen_addr, path = %path, "Prometheus metrics endpoint started");
+                if let Err(error) = axum::serve(
+                    tokio::net::TcpListener::bind(listen_addr).await.unwrap(),
+                    app,
+                ).await {
+                    error!("metrics HTTP server failed: {error}");
+                }
+            });
+        }
+    }
 
     // --- UAC sender (for keepalive & health probes) ---
     let uac_sender = Arc::new(UacSender::new(Arc::clone(&outbound_senders), local_addr));

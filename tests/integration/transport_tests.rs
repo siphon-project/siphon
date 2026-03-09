@@ -20,6 +20,12 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use siphon::transport::{ConnectionId, OutboundMessage, Transport};
 use siphon::transport::{udp, tcp, tls, ws};
+use siphon::transport::acl::TransportAcl;
+
+/// Helper: build a permissive ACL for tests.
+fn test_acl() -> Arc<TransportAcl> {
+    Arc::new(TransportAcl::new(vec![], vec![]))
+}
 
 /// Helper: find a free port by binding and releasing.
 fn free_port() -> SocketAddr {
@@ -68,7 +74,7 @@ async fn udp_roundtrip() {
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
 
-    udp::listen(addr, inbound_tx, outbound_rx).await;
+    udp::listen(addr, inbound_tx, outbound_rx, test_acl()).await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: send OPTIONS
@@ -119,7 +125,7 @@ async fn tcp_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    tcp::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+    tcp::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect and send OPTIONS
@@ -179,7 +185,7 @@ async fn tls_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
     tokio::time::sleep(SETTLE).await;
 
     // Build a TLS client that trusts our self-signed cert
@@ -240,7 +246,7 @@ async fn ws_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    ws::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+    ws::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect via WebSocket
@@ -303,7 +309,7 @@ async fn wss_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    ws::listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map)).await;
+    ws::listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
     tokio::time::sleep(SETTLE).await;
 
     // Manual TLS connect then WebSocket upgrade
@@ -380,9 +386,9 @@ async fn multi_transport_shared_inbound_channel() {
         Arc::new(DashMap::new());
 
     // Start all three transports with the same inbound_tx
-    udp::listen(udp_addr, inbound_tx.clone(), udp_outbound_rx).await;
-    tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map)).await;
-    ws::listen(ws_addr, inbound_tx.clone(), ws_outbound_rx, Arc::clone(&ws_connection_map)).await;
+    udp::listen(udp_addr, inbound_tx.clone(), udp_outbound_rx, test_acl()).await;
+    tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map), test_acl()).await;
+    ws::listen(ws_addr, inbound_tx.clone(), ws_outbound_rx, Arc::clone(&ws_connection_map), test_acl()).await;
     drop(inbound_tx); // Only transport workers hold clones now
     tokio::time::sleep(SETTLE).await;
 

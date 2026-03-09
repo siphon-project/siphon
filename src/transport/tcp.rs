@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
+use crate::transport::acl::TransportAcl;
 
 /// Spawn a TCP listener. For each accepted connection a task is spawned that:
 ///   1. Reads inbound SIP messages and sends them to `inbound_tx`
@@ -31,6 +32,7 @@ pub async fn listen(
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    acl: Arc<TransportAcl>,
 ) {
     // Spawn a task that distributes outbound messages to per-connection senders.
     let connection_map_clone = connection_map.clone();
@@ -55,6 +57,10 @@ pub async fn listen(
         loop {
             match listener.accept().await {
                 Ok((socket, remote_addr)) => {
+                    if !acl.is_allowed(remote_addr.ip()) {
+                        debug!("TCP rejected {} by ACL", remote_addr);
+                        continue;
+                    }
                     let connection_id = next_connection_id();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
