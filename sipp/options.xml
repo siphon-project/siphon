@@ -4,7 +4,7 @@
 <!-- OPTIONS keepalive — send OPTIONS, expect 200 OK -->
 <scenario name="OPTIONS ping">
 
-  <send retrans="500">
+  <send>
     <![CDATA[
 OPTIONS sip:[remote_ip] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
@@ -20,5 +20,8 @@ Content-Length: 0
   </send>
 
   <recv response="200" rtd="true" />
+
+  <!-- Small pause to avoid dead-call race in old SIPp builds -->
+  <pause milliseconds="50" />
 
 </scenario>
