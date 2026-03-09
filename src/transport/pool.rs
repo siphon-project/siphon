@@ -16,7 +16,6 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -90,8 +89,21 @@ impl ConnectionPool {
             self.connections.remove(&key);
         }
 
-        // Create new connection
-        let stream = TcpStream::connect(destination).await?;
+        // Create new connection, binding to the local listening address so
+        // outbound connections originate from the well-known SIP port (e.g. :5060)
+        // rather than a random ephemeral port. TCP identifies connections by the
+        // full 4-tuple so multiple outbound connections from the same local port
+        // to different destinations are fine.
+        let socket = if destination.is_ipv6() {
+            tokio::net::TcpSocket::new_v6()?
+        } else {
+            tokio::net::TcpSocket::new_v4()?
+        };
+        socket.set_reuseaddr(true)?;
+        #[cfg(unix)]
+        socket.set_reuseport(true)?;
+        socket.bind(self.local_addr)?;
+        let stream = socket.connect(destination).await?;
         configure_tcp_socket(&stream);
 
         let connection_id = next_connection_id();
