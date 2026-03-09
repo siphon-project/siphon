@@ -943,6 +943,12 @@ fn handle_request(
             }
         }
         RequestAction::Relay { next_hop } => {
+            // RFC 3261 §16.2: a stateful proxy SHOULD send 100 Trying
+            // immediately upon receiving an INVITE to stop UAC retransmissions.
+            if method == "INVITE" {
+                let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref());
+                send_message(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            }
             relay_request(
                 &message_guard,
                 next_hop.as_deref(),
@@ -960,6 +966,10 @@ fn handle_request(
                 let response = build_response(&message_guard, 500, "No Targets", state.server_header.as_deref());
                 send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
             } else {
+                if method == "INVITE" {
+                    let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref());
+                    send_message(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+                }
                 let fork_strategy = match strategy.as_str() {
                     "sequential" => crate::proxy::fork::ForkStrategy::Sequential,
                     _ => crate::proxy::fork::ForkStrategy::Parallel,

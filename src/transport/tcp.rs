@@ -13,7 +13,6 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -49,9 +48,19 @@ pub async fn listen(
     });
 
     tokio::spawn(async move {
-        let listener = TcpListener::bind(local_addr)
-            .await
-            .expect("failed to bind TCP listener");
+        // Use TcpSocket so we can set SO_REUSEADDR/SO_REUSEPORT before binding.
+        // This allows the outbound connection pool to also bind to this address,
+        // enabling outbound connections from the well-known SIP port.
+        let socket = if local_addr.is_ipv6() {
+            tokio::net::TcpSocket::new_v6().expect("failed to create TCP socket")
+        } else {
+            tokio::net::TcpSocket::new_v4().expect("failed to create TCP socket")
+        };
+        socket.set_reuseaddr(true).expect("failed to set SO_REUSEADDR");
+        #[cfg(unix)]
+        socket.set_reuseport(true).expect("failed to set SO_REUSEPORT");
+        socket.bind(local_addr).expect("failed to bind TCP listener");
+        let listener = socket.listen(1024).expect("failed to listen on TCP socket");
         info!("TCP listener on {}", local_addr);
 
         loop {
