@@ -20,6 +20,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    // Install rustls crypto provider before any TLS operations
+    tokio_rustls::rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls CryptoProvider");
+
     // Initialise structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
