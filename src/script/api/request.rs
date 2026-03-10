@@ -545,6 +545,21 @@ impl PyRequest {
         Ok(())
     }
 
+    /// Remove all headers whose names start with a given prefix (case-insensitive).
+    fn remove_headers_matching(&self, prefix: &str) -> PyResult<()> {
+        let mut message = self.lock_mut()?;
+        let prefix_lower = prefix.to_lowercase();
+        let names_to_remove: Vec<String> = message.headers.names()
+            .iter()
+            .filter(|name| name.to_lowercase().starts_with(&prefix_lower))
+            .map(|name| name.to_string())
+            .collect();
+        for name in names_to_remove {
+            message.headers.remove(&name);
+        }
+        Ok(())
+    }
+
     /// Check if a header exists.
     fn has_header(&self, name: &str) -> PyResult<bool> {
         let message = self.lock()?;
@@ -1021,6 +1036,19 @@ mod tests {
 
         request.remove_header("X-Custom").unwrap();
         assert!(!request.has_header("X-Custom").unwrap());
+    }
+
+    #[test]
+    fn remove_headers_matching_prefix() {
+        let request = make_request();
+        request.set_header("X-Foo", "1").unwrap();
+        request.set_header("X-Bar", "2").unwrap();
+        request.set_header("P-Custom", "3").unwrap();
+
+        request.remove_headers_matching("X-").unwrap();
+        assert!(!request.has_header("X-Foo").unwrap());
+        assert!(!request.has_header("X-Bar").unwrap());
+        assert!(request.has_header("P-Custom").unwrap());
     }
 
     #[test]

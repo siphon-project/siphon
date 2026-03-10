@@ -142,6 +142,23 @@ impl PyReply {
         Ok(())
     }
 
+    /// Remove all headers whose names start with a given prefix (case-insensitive).
+    fn remove_headers_matching(&self, prefix: &str) -> PyResult<()> {
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        let prefix_lower = prefix.to_lowercase();
+        let names_to_remove: Vec<String> = message.headers.names()
+            .iter()
+            .filter(|name| name.to_lowercase().starts_with(&prefix_lower))
+            .map(|name| name.to_string())
+            .collect();
+        for name in names_to_remove {
+            message.headers.remove(&name);
+        }
+        Ok(())
+    }
+
     /// Check if the body matches a given content type.
     fn has_body(&self, content_type: &str) -> PyResult<bool> {
         let message = self.message.lock().map_err(|error| {
