@@ -154,12 +154,12 @@ fn spawn_udp_sender(endpoint: SocketAddr, receiver: flume::Receiver<Bytes>) {
 
         debug!(endpoint = %endpoint, "HEP UDP sender connected");
 
-        let mut last_error_log = Instant::now() - std::time::Duration::from_secs(60);
+        let mut last_error_log = Instant::now() - std::time::Duration::from_secs(600);
         let mut suppressed: u64 = 0;
 
         while let Ok(packet) = receiver.recv_async().await {
             if let Err(error) = socket.send(&packet).await {
-                if last_error_log.elapsed() >= std::time::Duration::from_secs(10) {
+                if last_error_log.elapsed() >= std::time::Duration::from_secs(60) {
                     if suppressed > 0 {
                         warn!(endpoint = %endpoint, suppressed, "HEP UDP send failed: {error}");
                     } else {
