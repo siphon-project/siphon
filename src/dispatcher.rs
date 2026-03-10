@@ -116,6 +116,8 @@ struct DispatcherState {
     tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
     /// RFC 5626 CRLF pong tracker (None when crlf_keepalive is not configured).
     crlf_pong_tracker: Option<Arc<crate::transport::crlf_keepalive::CrlfPongTracker>>,
+    /// Name used in SDP `o=` and `s=` lines (from media.sdp_name config).
+    sdp_name: String,
 }
 
 /// Run the core dispatcher loop.
@@ -236,6 +238,9 @@ pub async fn run(
         connection_pool,
         tls_addr_map,
         crlf_pong_tracker,
+        sdp_name: config.media.as_ref()
+            .and_then(|m| m.sdp_name.clone())
+            .unwrap_or_else(|| "SIPhon".to_string()),
     });
 
     // Spawn background task: fire transaction timers + sweep stale entries
@@ -2436,6 +2441,59 @@ fn sanitize_b2bua_response(
     response.headers.remove("Allow-Events");
     response.headers.remove("Require");
     response.headers.remove("Content-Disposition");
+
+    // Sanitize SDP: mask B-leg identity in o= and s= lines
+    sanitize_sdp_identity(&mut response.body, &state.sdp_name);
+}
+
+/// Rewrite `o=` and `s=` lines in an SDP body to hide the remote endpoint's
+/// identity.  Replaces the username in `o=` and the session name in `s=` with
+/// "SIPhon" so that neither leg leaks the other's software name or hostname.
+fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str) {
+    if body.is_empty() {
+        return;
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return;
+    };
+    let mut changed = false;
+    let mut result = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("o=") {
+            // o=<username> <sess-id> <sess-version> <nettype> <addrtype> <addr>
+            // Replace username only, keep the rest.
+            if let Some(rest) = line.strip_prefix("o=") {
+                if let Some(space_pos) = rest.find(' ') {
+                    result.push_str("o=");
+                    result.push_str(name);
+                    result.push_str(&rest[space_pos..]);
+                    changed = true;
+                    continue;
+                }
+            }
+            result.push_str(line);
+        } else if line.starts_with("s=") {
+            // s=<session name> — replace entirely
+            if line.ends_with("\r\n") {
+                result.push_str("s=");
+                result.push_str(name);
+                result.push_str("\r\n");
+            } else if line.ends_with('\n') {
+                result.push_str("s=");
+                result.push_str(name);
+                result.push_str("\n");
+            } else {
+                result.push_str("s=");
+                result.push_str(name);
+            }
+            changed = true;
+        } else {
+            result.push_str(line);
+        }
+    }
+    if changed {
+        *body = result.into_bytes();
+    }
 }
 
 fn build_b2bua_ack_for_non2xx(
@@ -3354,6 +3412,9 @@ fn b2bua_send_b_leg_invite(
             b_leg_invite.headers.add("Min-SE", timer_config.min_se.to_string());
         }
     }
+
+    // Sanitize SDP: mask A-leg identity in o= and s= lines
+    sanitize_sdp_identity(&mut b_leg_invite.body, &state.sdp_name);
 
     // Register B-leg with call manager
     let b_leg = BLeg {
@@ -5101,6 +5162,27 @@ mod tests {
             manager.find_by_sip_call_id("ack-bridge-test@host"),
             Some(call_id),
         );
+    }
+
+    #[test]
+    fn sanitize_sdp_identity_rewrites_o_and_s_lines() {
+        let sdp = "v=0\r\no=FreeSWITCH 123 456 IN IP4 10.0.0.1\r\ns=FreeSWITCH\r\nt=0 0\r\nm=audio 8000 RTP/AVP 0\r\n";
+        let mut body = sdp.as_bytes().to_vec();
+        sanitize_sdp_identity(&mut body, "Invenio SBC");
+        let result = std::str::from_utf8(&body).unwrap();
+        assert!(result.contains("o=Invenio SBC 123 456 IN IP4 10.0.0.1\r\n"));
+        assert!(result.contains("s=Invenio SBC\r\n"));
+        assert!(!result.contains("FreeSWITCH"));
+        // Other lines unchanged
+        assert!(result.contains("v=0\r\n"));
+        assert!(result.contains("m=audio 8000 RTP/AVP 0\r\n"));
+    }
+
+    #[test]
+    fn sanitize_sdp_identity_no_op_on_empty_body() {
+        let mut body = Vec::new();
+        sanitize_sdp_identity(&mut body, "SIPhon");
+        assert!(body.is_empty());
     }
 
     /// Verify that fork targets DO update the R-URI (each branch gets its Contact).

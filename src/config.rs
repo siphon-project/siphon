@@ -837,6 +837,10 @@ pub struct MediaConfig {
     /// are always available; custom entries here extend or override them.
     #[serde(default)]
     pub profiles: std::collections::HashMap<String, MediaProfileConfig>,
+    /// Name used in SDP `o=` and `s=` lines when sanitizing relayed SDP.
+    /// Hides the remote endpoint's identity (e.g. "FreeSWITCH") from the other leg.
+    /// Defaults to "SIPhon" if not set.
+    pub sdp_name: Option<String>,
 }
 
 /// A user-defined RTPEngine media profile with separate offer/answer NG flags.

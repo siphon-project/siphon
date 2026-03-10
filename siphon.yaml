@@ -201,6 +201,8 @@ auth:
 #   rtpengine:
 #     address: "127.0.0.1:22222"   # NG control protocol (UDP)
 #     timeout_ms: 1000              # NG protocol response timeout
+#   sdp_name: "SIPhon"             # Name used in SDP o= and s= lines
+#                                   # (masks remote endpoint identity, default: "SIPhon")
 #
 # Multiple instances (weighted round-robin):
 # media:
@@ -215,10 +217,10 @@ auth:
 # Custom media profiles (extend or override built-ins):
 #
 # Built-in profiles (always available):
-#   srtp_to_rtp     — SRTP UE ↔ RTP core (default)
+#   rtp_passthrough — Plain RTP both sides, media anchoring only (default)
+#   srtp_to_rtp     — SRTP UE ↔ RTP core
 #   ws_to_rtp       — WebSocket UE (RTP/AVPF + ICE) ↔ RTP core
 #   wss_to_rtp      — Secure WebSocket UE (DTLS-SRTP/AVPF + ICE) ↔ RTP core
-#   rtp_passthrough — Plain RTP both sides (IMS-internal)
 #
 # Define custom profiles under media.profiles:
 # media:

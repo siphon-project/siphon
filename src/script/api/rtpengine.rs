@@ -44,7 +44,7 @@ impl PyRtpEngine {
 }
 
 /// Default profile name when none is specified.
-const DEFAULT_PROFILE: &str = "srtp_to_rtp";
+const DEFAULT_PROFILE: &str = "rtp_passthrough";
 
 /// Extract `Arc<Mutex<SipMessage>>` from a Python object that is either
 /// a `Request`, `Reply`, or `Call`.
@@ -75,7 +75,7 @@ impl PyRtpEngine {
     ///
     /// Args:
     ///     request: A Request or Call object containing the INVITE with SDP.
-    ///     profile: RTP profile name (default: "srtp_to_rtp").
+    ///     profile: RTP profile name (default: "rtp_passthrough").
     #[pyo3(signature = (request, profile=None))]
     fn offer<'py>(
         &self,
@@ -141,7 +141,7 @@ impl PyRtpEngine {
     ///
     /// Args:
     ///     reply: A Reply or Call object containing the 200 OK with SDP.
-    ///     profile: RTP profile name (default: "srtp_to_rtp").
+    ///     profile: RTP profile name (default: "rtp_passthrough").
     ///     call: Optional Call object — when provided, Call-ID and From-tag are
     ///           taken from this object (matching the earlier `offer`), while
     ///           To-tag and SDP body still come from `reply`.
