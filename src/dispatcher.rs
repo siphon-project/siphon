@@ -634,9 +634,14 @@ fn handle_request(
                     }
 
                     // B2BUA: bridge ACK to the winning B-leg.
-                    // ProxySession won't exist for B2BUA calls; use the call manager instead.
+                    // B2BUA: absorb the A-leg's ACK. We already ACK'd the B-leg
+                    // ourselves on receiving 200 OK — the A-leg ACK is for our
+                    // dialog with the A-leg and must not be relayed.
                     if let Some(internal_id) = state.call_manager.find_by_sip_call_id(cid) {
-                        handle_b2bua_ack(inbound, message, &internal_id, state);
+                        debug!(
+                            call_id = %internal_id,
+                            "B2BUA: absorbed A-leg ACK for 2xx (B-leg already ACK'd)"
+                        );
                         return;
                     }
                 }
@@ -4089,78 +4094,6 @@ fn handle_b2bua_response(
         );
         state.call_manager.remove_call(call_id);
     }
-}
-
-/// Bridge an ACK for 2xx from the A-leg to the winning B-leg.
-///
-/// RFC 3261 §13.2.2.4: ACK for 2xx is end-to-end, so the B2BUA must relay
-/// it. We rewrite dialog identifiers from A-leg to B-leg before forwarding.
-fn handle_b2bua_ack(
-    _inbound: InboundMessage,
-    message: SipMessage,
-    call_id: &str,
-    state: &DispatcherState,
-) {
-    let (b_leg_call_id, b_leg_from_tag, a_leg_from_tag, destination, transport) =
-        match state.call_manager.get_call(call_id) {
-            Some(call) => {
-                // Use the winning B-leg, fall back to the first one
-                let winner_idx = call.winner.unwrap_or(0);
-                match call.b_legs.get(winner_idx) {
-                    Some(b) => (
-                        b.call_id.clone(),
-                        b.from_tag.clone(),
-                        call.a_leg.from_tag.clone(),
-                        b.destination,
-                        b.transport,
-                    ),
-                    None => {
-                        warn!(call_id = %call_id, "B2BUA ACK: no B-leg found");
-                        return;
-                    }
-                }
-            }
-            None => {
-                debug!(call_id = %call_id, "B2BUA ACK: call not found (already terminated?)");
-                return;
-            }
-        };
-
-    let mut ack = message;
-
-    // Rewrite dialog: A-leg Call-ID → B-leg Call-ID, A-leg From-tag → B-leg From-tag
-    crate::b2bua::manager::rewrite_dialog_headers(
-        &mut ack,
-        &b_leg_call_id,
-        &a_leg_from_tag,
-        &b_leg_from_tag,
-    );
-
-    // Replace Via: strip A-leg Vias, add our own with a fresh branch
-    ack.headers.remove("Via");
-    let transport_str = format!("{}", transport).to_uppercase();
-    let outbound_port = state
-        .listen_addrs
-        .get(&transport)
-        .map(|a| a.port())
-        .unwrap_or(state.local_addr.port());
-    let via_value = format!(
-        "SIP/2.0/{} {}:{};branch={}",
-        transport_str,
-        format_sip_host(&state.local_addr.ip().to_string()),
-        outbound_port,
-        TransactionKey::generate_branch(),
-    );
-    ack.headers.add("Via", via_value);
-
-    debug!(
-        call_id = %call_id,
-        b_leg_call_id = %b_leg_call_id,
-        destination = %destination,
-        "B2BUA: bridging ACK for 2xx to B-leg"
-    );
-
-    send_message(ack, transport, destination, ConnectionId::default(), state);
 }
 
 /// Handle a BYE for a B2BUA call — bridge to the other leg.
