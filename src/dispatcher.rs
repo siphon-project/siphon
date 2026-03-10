@@ -2398,9 +2398,12 @@ fn sanitize_b2bua_response(
 ) {
     // Contact: must point to siphon so in-dialog requests (ACK, BYE, re-INVITE)
     // route through us, not directly to the B-leg.
+    // Use advertised address (public IP) when configured, otherwise listen address.
     let listen_addr = state.listen_addrs.get(&a_leg_transport).copied()
         .unwrap_or(state.local_addr);
-    let contact_host = format_sip_host(&listen_addr.ip().to_string());
+    let contact_host = state.advertised_addrs.get(&a_leg_transport)
+        .map(|h| format_sip_host(h))
+        .unwrap_or_else(|| format_sip_host(&listen_addr.ip().to_string()));
     let contact_value = format!(
         "<sip:{}:{};transport={}>",
         contact_host,
@@ -3300,9 +3303,12 @@ fn b2bua_send_b_leg_invite(
         b_leg_invite.headers.set("From", new_from);
     }
 
-    // Set Contact to siphon's own address so in-dialog requests route through us
+    // Set Contact to siphon's own address so in-dialog requests route through us.
+    // Use advertised address (public IP) when configured.
     let b_listen = state.listen_addrs.get(&outbound_transport).copied().unwrap_or(state.local_addr);
-    let b_contact_host = format_sip_host(&b_listen.ip().to_string());
+    let b_contact_host = state.advertised_addrs.get(&outbound_transport)
+        .map(|h| format_sip_host(h))
+        .unwrap_or_else(|| format_sip_host(&b_listen.ip().to_string()));
     b_leg_invite.headers.set("Contact", format!(
         "<sip:{}:{};transport={}>",
         b_contact_host, b_listen.port(),
