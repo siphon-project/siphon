@@ -2409,20 +2409,14 @@ fn sanitize_b2bua_response(
     );
     response.headers.set("Contact", contact_value);
 
-    // Replace User-Agent / Server with our own
-    if response.headers.get("User-Agent").is_some() {
-        if let Some(ref ua) = state.user_agent_header {
-            response.headers.set("User-Agent", ua.clone());
-        } else {
-            response.headers.remove("User-Agent");
-        }
+    // Always set our own User-Agent and Server — we are the B2BUA endpoint.
+    response.headers.remove("User-Agent");
+    if let Some(ref ua) = state.user_agent_header {
+        response.headers.set("User-Agent", ua.clone());
     }
-    if response.headers.get("Server").is_some() {
-        if let Some(ref srv) = state.server_header {
-            response.headers.set("Server", srv.clone());
-        } else {
-            response.headers.remove("Server");
-        }
+    response.headers.remove("Server");
+    if let Some(ref srv) = state.server_header {
+        response.headers.set("Server", srv.clone());
     }
 
     // P-Asserted-Identity, P-Charging-Vector, P-Charging-Function-Addresses:
