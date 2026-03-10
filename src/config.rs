@@ -625,6 +625,8 @@ pub struct NatConfig {
     pub fix_register: bool,
     /// Send periodic OPTIONS keep-alives to maintain NAT pinholes.
     pub keepalive: Option<NatKeepaliveConfig>,
+    /// RFC 5626 §4.4.1 CRLF keep-alive for persistent connections (TCP/TLS).
+    pub crlf_keepalive: Option<CrlfKeepaliveConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -647,6 +649,27 @@ fn default_keepalive_interval() -> u32 {
 }
 fn default_keepalive_failure_threshold() -> u32 {
     10
+}
+
+/// RFC 5626 §4.4.1 CRLF keepalive for connection-oriented transports.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CrlfKeepaliveConfig {
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// Interval between CRLF pings (seconds).  RFC 5626 recommends 20-30s.
+    #[serde(default = "default_crlf_keepalive_interval")]
+    pub interval_secs: u32,
+    /// Close connection after this many consecutive missed pongs.
+    #[serde(default = "default_crlf_keepalive_failure_threshold")]
+    pub failure_threshold: u32,
+}
+
+fn default_crlf_keepalive_interval() -> u32 {
+    30
+}
+
+fn default_crlf_keepalive_failure_threshold() -> u32 {
+    3
 }
 
 // ---------------------------------------------------------------------------

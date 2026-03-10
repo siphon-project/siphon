@@ -114,6 +114,8 @@ struct DispatcherState {
     /// Populated by the TLS listener; used by send_to_target to reuse inbound
     /// TLS connections when relaying to registered endpoints (like OpenSIPS).
     tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
+    /// RFC 5626 CRLF pong tracker (None when crlf_keepalive is not configured).
+    crlf_pong_tracker: Option<Arc<crate::transport::crlf_keepalive::CrlfPongTracker>>,
 }
 
 /// Run the core dispatcher loop.
@@ -140,6 +142,7 @@ pub async fn run(
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     ipsec_config: Option<crate::config::IpsecConfig>,
     tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
+    crlf_pong_tracker: Option<Arc<crate::transport::crlf_keepalive::CrlfPongTracker>>,
 ) {
     // Resolve the local address for Via insertion.
     // If bound to 0.0.0.0 / [::], use advertised_address from config, or loopback.
@@ -231,6 +234,7 @@ pub async fn run(
         ipsec_config,
         connection_pool,
         tls_addr_map,
+        crlf_pong_tracker,
     });
 
     // Spawn background task: fire transaction timers + sweep stale entries
@@ -521,8 +525,14 @@ fn handle_inbound(inbound: InboundMessage, state: &DispatcherState) {
         }
     };
 
-    // RFC 5626 §3.5.1: CRLF keep-alive — silently ignore
+    // RFC 5626 §3.5.1 / §4.4.1: CRLF keep-alive
     if raw.trim().is_empty() {
+        // Record pong for CRLF keepalive tracker (TCP/TLS only).
+        if matches!(inbound.transport, Transport::Tcp | Transport::Tls) {
+            if let Some(ref tracker) = state.crlf_pong_tracker {
+                tracker.record_pong(inbound.connection_id);
+            }
+        }
         return;
     }
 

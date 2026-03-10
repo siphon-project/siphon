@@ -1264,4 +1264,5 @@ mod tests {
         // The registrar should now have Alice's contact
         assert!(registrar.is_registered("sip:alice@example.com"));
     }
+
 }

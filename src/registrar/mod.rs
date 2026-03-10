@@ -281,6 +281,65 @@ impl Registrar {
         self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
     }
 
+    /// Evict all connection-oriented contacts (TCP/TLS/WS/WSS) from the registrar.
+    ///
+    /// Called after restart: these contacts reference transport connections that
+    /// no longer exist, so they are unreachable.  Emits `Deregistered` events
+    /// and writes through to the backend so `@registrar.on_change` handlers fire.
+    pub fn evict_connection_oriented(&self) -> usize {
+        let mut evicted = 0usize;
+        let aors: Vec<String> = self.bindings.iter().map(|e| e.key().clone()).collect();
+
+        for aor in aors {
+            let before;
+            let after;
+
+            if let Some(mut entry) = self.bindings.get_mut(&aor) {
+                before = entry.value().len();
+                entry.value_mut().retain(|c| {
+                    let transport = c.uri.get_param("transport").unwrap_or("");
+                    !matches!(
+                        transport.to_ascii_lowercase().as_str(),
+                        "tcp" | "tls" | "ws" | "wss"
+                    )
+                });
+                after = entry.value().len();
+            } else {
+                continue;
+            }
+
+            if before == after {
+                continue; // nothing evicted for this AoR
+            }
+
+            evicted += before - after;
+
+            if after == 0 {
+                // All contacts were connection-oriented — remove the AoR.
+                self.bindings.remove(&aor);
+                if let Some(writer) = self.backend_writer.get() {
+                    writer.remove(&aor);
+                }
+                self.emit_event(RegistrationEvent::Deregistered { aor });
+            } else {
+                // Mixed: write back surviving contacts to backend.
+                if let Some(writer) = self.backend_writer.get() {
+                    if let Some(entry) = self.bindings.get(&aor) {
+                        let stored: Vec<backend::StoredContact> = entry
+                            .value()
+                            .iter()
+                            .map(backend::StoredContact::from_contact)
+                            .collect();
+                        writer.save(&aor, stored);
+                    }
+                }
+                self.emit_event(RegistrationEvent::Deregistered { aor });
+            }
+        }
+
+        evicted
+    }
+
     /// Look up contacts for an AoR. Returns non-expired contacts sorted by q descending.
     pub fn lookup(&self, aor: &str) -> Vec<Contact> {
         match self.bindings.get(aor) {
@@ -973,5 +1032,66 @@ mod tests {
             registrar.asserted_identity("sip:alice@example.com"),
             Some("sip:+15551234@ims.example.com".to_string()),
         );
+    }
+
+    #[test]
+    fn evict_connection_oriented_removes_tls_contacts() {
+        let registrar = Registrar::default();
+
+        // UDP contact — should survive
+        registrar
+            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+
+        // TLS contact — should be evicted
+        let tls_uri = SipUri::new("10.0.0.2".to_string())
+            .with_user("bob".to_string())
+            .with_port(5061)
+            .with_param("transport".to_string(), Some("TLS".to_string()));
+        registrar
+            .save("sip:bob@example.com", tls_uri, 3600, 1.0, "c2".into(), 1)
+            .unwrap();
+
+        // TCP contact — should be evicted
+        let tcp_uri = SipUri::new("10.0.0.3".to_string())
+            .with_user("carol".to_string())
+            .with_param("transport".to_string(), Some("tcp".to_string()));
+        registrar
+            .save("sip:carol@example.com", tcp_uri, 3600, 1.0, "c3".into(), 1)
+            .unwrap();
+
+        assert_eq!(registrar.aor_count(), 3);
+
+        let evicted = registrar.evict_connection_oriented();
+        assert_eq!(evicted, 2);
+        assert!(registrar.is_registered("sip:alice@example.com"));
+        assert!(!registrar.is_registered("sip:bob@example.com"));
+        assert!(!registrar.is_registered("sip:carol@example.com"));
+    }
+
+    #[test]
+    fn evict_connection_oriented_mixed_aor() {
+        let registrar = Registrar::default();
+
+        // Same AoR, two contacts: one UDP, one TLS
+        registrar
+            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+        let tls_uri = SipUri::new("10.0.0.2".to_string())
+            .with_user("alice".to_string())
+            .with_port(5061)
+            .with_param("transport".to_string(), Some("TLS".to_string()));
+        registrar
+            .save("sip:alice@example.com", tls_uri, 3600, 0.8, "c2".into(), 2)
+            .unwrap();
+
+        assert_eq!(registrar.lookup("sip:alice@example.com").len(), 2);
+
+        let evicted = registrar.evict_connection_oriented();
+        assert_eq!(evicted, 1);
+        assert!(registrar.is_registered("sip:alice@example.com"));
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].uri.host, "10.0.0.1");
     }
 }

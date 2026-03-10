@@ -10,6 +10,7 @@ pub mod pool;
 pub mod rate_limit;
 pub mod acl;
 pub mod flow;
+pub mod crlf_keepalive;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

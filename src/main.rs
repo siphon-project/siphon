@@ -307,8 +307,9 @@ async fn main() {
     // --- Start TLS listeners ---
     let tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>> =
         Arc::new(dashmap::DashMap::new());
+    let tls_connection_map: Arc<dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>> =
+        Arc::new(dashmap::DashMap::new());
     if let Some(ref tls_config) = config.tls {
-        let tls_connection_map = Arc::new(dashmap::DashMap::new());
         for entry in &config.listen.tls {
             let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
                 eprintln!("Invalid TLS listen address '{}': {error}", entry.address());
@@ -713,6 +714,26 @@ async fn main() {
         }
     }
 
+    // --- CRLF keepalive for persistent connections (RFC 5626 §4.4.1) ---
+    let crlf_pong_tracker = if let Some(ref nat_config) = config.nat {
+        if let Some(ref crlf_config) = nat_config.crlf_keepalive {
+            let tracker = Arc::new(transport::crlf_keepalive::CrlfPongTracker::new());
+            transport::crlf_keepalive::spawn(
+                crlf_config.clone(),
+                vec![
+                    Arc::clone(&tcp_connection_map),
+                    Arc::clone(&tls_connection_map),
+                ],
+                Arc::clone(&tracker),
+            );
+            Some(tracker)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // --- Start dispatcher ---
     let dispatcher_handle = tokio::spawn(dispatcher::run(
         inbound_rx,
@@ -730,7 +751,19 @@ async fn main() {
         ipsec_manager,
         config.ipsec.clone(),
         tls_addr_map,
+        crlf_pong_tracker,
     ));
+
+    // Evict connection-oriented contacts (TCP/TLS/WS/WSS) restored from
+    // the backend.  The transport connections are gone after restart, so these
+    // bindings are unreachable.  Done after the dispatcher starts so that
+    // @registrar.on_change events fire to notify scripts.
+    if let Some(registrar) = siphon::script::api::registrar_arc() {
+        let evicted = registrar.evict_connection_oriented();
+        if evicted > 0 {
+            info!(evicted, "evicted connection-oriented contacts after restart");
+        }
+    }
 
     info!("SIPhon ready — press Ctrl+C to stop");
 
