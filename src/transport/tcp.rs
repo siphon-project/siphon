@@ -42,7 +42,7 @@ pub async fn listen(
                     warn!("TCP outbound send failed for connection {:?}: {}", outbound.connection_id, e);
                 }
             } else {
-                warn!("TCP outbound: connection {:?} not found (may have closed)", outbound.connection_id);
+                debug!("TCP outbound: connection {:?} not found (may have closed)", outbound.connection_id);
             }
         }
     });

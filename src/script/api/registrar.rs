@@ -119,7 +119,7 @@ impl PyRegistrar {
         let aor = normalize_aor(&extract_aor(&message)?);
 
         if force {
-            self.inner.remove_all(&aor);
+            self.inner.clear_bindings(&aor);
         }
 
         // Check for wildcard Contact: *

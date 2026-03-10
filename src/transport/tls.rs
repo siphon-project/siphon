@@ -110,7 +110,7 @@ pub async fn listen(
                     warn!("TLS outbound send failed for connection {:?}: {}", outbound.connection_id, error);
                 }
             } else {
-                warn!("TLS outbound: connection {:?} not found (may have closed)", outbound.connection_id);
+                debug!("TLS outbound: connection {:?} not found (may have closed)", outbound.connection_id);
             }
         }
     });

@@ -281,6 +281,19 @@ impl Registrar {
         self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
     }
 
+    /// Remove all contacts for an AoR **without** emitting a change event.
+    ///
+    /// Used by `PyRegistrar::save(force=True)` to clear bindings before
+    /// re-processing contacts — the subsequent per-contact `save()` calls
+    /// emit the appropriate events themselves.
+    pub fn clear_bindings(&self, aor: &str) {
+        self.bindings.remove(aor);
+        self.service_routes.remove(aor);
+        if let Some(writer) = self.backend_writer.get() {
+            writer.remove(aor);
+        }
+    }
+
     /// Evict all connection-oriented contacts (TCP/TLS/WS/WSS) from the registrar.
     ///
     /// Called after restart: these contacts reference transport connections that
@@ -1093,5 +1106,44 @@ mod tests {
         let contacts = registrar.lookup("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].uri.host, "10.0.0.1");
+    }
+
+    #[test]
+    fn clear_bindings_removes_without_event() {
+        let registrar = Registrar::default();
+        let mut rx = registrar.subscribe_events();
+        registrar
+            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+        // Drain the Registered event
+        let _ = rx.try_recv();
+
+        registrar.clear_bindings("sip:alice@example.com");
+
+        assert!(!registrar.is_registered("sip:alice@example.com"));
+        // No event should have been emitted
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn force_save_then_deregister_emits_single_event() {
+        let registrar = Registrar::default();
+        registrar
+            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+
+        let mut rx = registrar.subscribe_events();
+
+        // Simulate force=True + Expires: 0 (what PyRegistrar::save does)
+        registrar.clear_bindings("sip:alice@example.com");
+        registrar
+            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 0, 1.0, "c1".into(), 2)
+            .unwrap();
+
+        // Should get exactly one Deregistered event (from save with expires=0)
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(event, RegistrationEvent::Deregistered { .. }));
+        // No second event
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::TlsServerConfig;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
@@ -138,7 +138,7 @@ fn spawn_outbound_dispatcher(
                     warn!("{} outbound send failed for connection {:?}: {}", label, outbound.connection_id, error);
                 }
             } else {
-                warn!("{} outbound: connection {:?} not found (may have closed)", label, outbound.connection_id);
+                debug!("{} outbound: connection {:?} not found (may have closed)", label, outbound.connection_id);
             }
         }
     });

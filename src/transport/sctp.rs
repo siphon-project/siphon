@@ -13,7 +13,7 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio_sctp::{SctpListener, SendOptions};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, next_connection_id};
 use crate::transport::acl::TransportAcl;
@@ -35,7 +35,7 @@ pub async fn listen(
                     warn!("SCTP outbound send failed for connection {:?}: {}", outbound.connection_id, error);
                 }
             } else {
-                warn!("SCTP outbound: connection {:?} not found (may have closed)", outbound.connection_id);
+                debug!("SCTP outbound: connection {:?} not found (may have closed)", outbound.connection_id);
             }
         }
     });
