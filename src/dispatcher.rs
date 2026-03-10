@@ -606,9 +606,17 @@ fn handle_request(
             }
             Ok(None) => {
                 // No IST found — ACK for 2xx (end-to-end) or stale.
-                // Route via ProxySession using Call-ID lookup.
-                if let Some(call_id) = message.headers.get("Call-ID") {
-                    if let Some(session_arc) = state.session_store.get_by_call_id(call_id) {
+                // Route via ProxySession using Call-ID + From-tag dialog key.
+                // Using both fields avoids ambiguity when a B2BUA (e.g. FreeSWITCH)
+                // reuses the same Call-ID for both call legs through this proxy.
+                let call_id = message.headers.get("Call-ID");
+                let from_tag = message
+                    .typed_from()
+                    .ok()
+                    .flatten()
+                    .and_then(|na| na.tag);
+                if let (Some(cid), Some(ftag)) = (call_id, from_tag.as_deref()) {
+                    if let Some(session_arc) = state.session_store.get_by_dialog_key(cid, ftag) {
                         handle_ack_via_session(inbound, message, session_arc, state);
                         return;
                     }

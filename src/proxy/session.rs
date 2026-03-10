@@ -130,8 +130,10 @@ pub struct ProxySessionStore {
     by_client_key: DashMap<TransactionKey, Arc<RwLock<ProxySession>>>,
     /// server_key → list of client keys.
     server_to_clients: DashMap<TransactionKey, Vec<TransactionKey>>,
-    /// SIP Call-ID → session (for ACK-2xx end-to-end routing).
-    by_call_id: DashMap<String, Arc<RwLock<ProxySession>>>,
+    /// SIP dialog key (Call-ID + From-tag) → session (for ACK-2xx routing).
+    /// Using Call-ID alone is ambiguous when both legs of a B2BUA call
+    /// (e.g. caller→proxy→FS and FS→proxy→callee) share the same Call-ID.
+    by_dialog_key: DashMap<String, Arc<RwLock<ProxySession>>>,
 }
 
 impl ProxySessionStore {
@@ -139,15 +141,15 @@ impl ProxySessionStore {
         Self {
             by_client_key: DashMap::new(),
             server_to_clients: DashMap::new(),
-            by_call_id: DashMap::new(),
+            by_dialog_key: DashMap::new(),
         }
     }
 
-    /// Insert a session, indexing it by all its client keys, server key, and Call-ID.
+    /// Insert a session, indexing it by all its client keys, server key, and dialog key.
     pub fn insert(&self, session: ProxySession) {
         let server_key = session.server_key.clone();
         let client_keys: Vec<TransactionKey> = session.client_keys.clone();
-        let call_id = session.original_request.headers.get("Call-ID").map(|s| s.to_string());
+        let dialog_key = Self::dialog_key_from_message(&session.original_request);
         let session_arc = Arc::new(RwLock::new(session));
 
         for client_key in &client_keys {
@@ -155,8 +157,8 @@ impl ProxySessionStore {
                 .insert(client_key.clone(), Arc::clone(&session_arc));
         }
 
-        if let Some(call_id) = call_id {
-            self.by_call_id.insert(call_id, Arc::clone(&session_arc));
+        if let Some(dk) = dialog_key {
+            self.by_dialog_key.insert(dk, Arc::clone(&session_arc));
         }
 
         self.server_to_clients
@@ -238,13 +240,15 @@ impl ProxySessionStore {
             .map(|entry| Arc::clone(entry.value()))
     }
 
-    /// Look up a session by SIP Call-ID (for ACK-2xx end-to-end routing).
-    pub fn get_by_call_id(
+    /// Look up a session by dialog key (Call-ID + From-tag) for ACK-2xx routing.
+    pub fn get_by_dialog_key(
         &self,
         call_id: &str,
+        from_tag: &str,
     ) -> Option<Arc<RwLock<ProxySession>>> {
-        self.by_call_id
-            .get(call_id)
+        let key = format!("{}\0{}", call_id, from_tag);
+        self.by_dialog_key
+            .get(&key)
             .map(|entry| Arc::clone(entry.value()))
     }
 
@@ -261,12 +265,12 @@ impl ProxySessionStore {
     /// Remove a session by its server key, cleaning up all indices.
     pub fn remove_by_server_key(&self, server_key: &TransactionKey) {
         if let Some((_, client_keys)) = self.server_to_clients.remove(server_key) {
-            // Remove Call-ID index entry via the session's original request
+            // Remove dialog key index entry via the session's original request
             if let Some(first) = client_keys.first() {
                 if let Some(session_ref) = self.by_client_key.get(first) {
                     if let Ok(session) = session_ref.value().read() {
-                        if let Some(call_id) = session.original_request.headers.get("Call-ID") {
-                            self.by_call_id.remove(call_id);
+                        if let Some(dk) = Self::dialog_key_from_message(&session.original_request) {
+                            self.by_dialog_key.remove(&dk);
                         }
                     }
                 }
@@ -340,6 +344,19 @@ impl ProxySessionStore {
     /// Number of client key entries.
     pub fn client_key_count(&self) -> usize {
         self.by_client_key.len()
+    }
+
+    /// Build a dialog key (Call-ID + From-tag) from a SIP message.
+    ///
+    /// Returns `None` if Call-ID or From tag is missing.
+    fn dialog_key_from_message(msg: &SipMessage) -> Option<String> {
+        let call_id = msg.headers.get("Call-ID")?;
+        let from_tag = msg
+            .typed_from()
+            .ok()
+            .flatten()
+            .and_then(|na| na.tag)?;
+        Some(format!("{}\0{}", call_id, from_tag))
     }
 }
 
@@ -716,5 +733,110 @@ mod tests {
         let session = make_session();
         assert!(session.fork_aggregator.is_none());
         assert!(session.branch_index_map.is_empty());
+    }
+
+    // -- Dialog key (Call-ID + From-tag) tests --
+
+    #[test]
+    fn store_dialog_key_lookup() {
+        let store = ProxySessionStore::new();
+        store.insert(make_session());
+
+        // dummy_request() has Call-ID "session-test" and From tag "abc"
+        let found = store.get_by_dialog_key("session-test", "abc");
+        assert!(found.is_some());
+
+        // Wrong From-tag should not match
+        assert!(store.get_by_dialog_key("session-test", "wrong").is_none());
+
+        // Wrong Call-ID should not match
+        assert!(store.get_by_dialog_key("wrong", "abc").is_none());
+    }
+
+    #[test]
+    fn store_dialog_key_disambiguates_same_call_id() {
+        // Simulates a B2BUA (e.g. FreeSWITCH) that reuses the same Call-ID
+        // for both call legs through the proxy.
+        let store = ProxySessionStore::new();
+
+        // Leg 1: caller → proxy → FS (From-tag = "caller-tag")
+        let leg1_request = SipMessageBuilder::new()
+            .request(Method::Invite, SipUri::new("fs.local".to_string()))
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-leg1".to_string())
+            .to("<sip:callee@example.com>".to_string())
+            .from("<sip:caller@example.com>;tag=caller-tag".to_string())
+            .call_id("shared-call-id".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let leg1_server = TransactionKey::new("z9hG4bK-leg1".to_string(), Method::Invite, "10.0.0.1:5060".to_string());
+        let leg1_client = TransactionKey::new("z9hG4bK-leg1-c".to_string(), Method::Invite, "10.0.0.1:5060".to_string());
+        let mut session1 = ProxySession::new(
+            leg1_server.clone(),
+            "10.0.0.1:5060".parse().unwrap(),
+            ConnectionId::default(),
+            Transport::Udp,
+            leg1_request,
+            false,
+        );
+        session1.add_client_key(leg1_client.clone());
+        session1.set_client_branch(leg1_client.clone(), ClientBranch {
+            destination: "10.0.0.2:5060".parse().unwrap(), // FreeSWITCH
+            transport: Transport::Tcp,
+            connection_id: ConnectionId::default(),
+        });
+        store.insert(session1);
+
+        // Leg 2: FS → proxy → callee (same Call-ID, different From-tag = "fs-tag")
+        let leg2_request = SipMessageBuilder::new()
+            .request(Method::Invite, SipUri::new("callee.local".to_string()))
+            .via("SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-leg2".to_string())
+            .to("<sip:callee@example.com>".to_string())
+            .from("<sip:caller@example.com>;tag=fs-tag".to_string())
+            .call_id("shared-call-id".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let leg2_server = TransactionKey::new("z9hG4bK-leg2".to_string(), Method::Invite, "10.0.0.2:5060".to_string());
+        let leg2_client = TransactionKey::new("z9hG4bK-leg2-c".to_string(), Method::Invite, "10.0.0.2:5060".to_string());
+        let mut session2 = ProxySession::new(
+            leg2_server.clone(),
+            "10.0.0.2:5060".parse().unwrap(),
+            ConnectionId::default(),
+            Transport::Udp,
+            leg2_request,
+            false,
+        );
+        session2.add_client_key(leg2_client.clone());
+        session2.set_client_branch(leg2_client.clone(), ClientBranch {
+            destination: "10.0.0.3:5060".parse().unwrap(), // callee
+            transport: Transport::Tls,
+            connection_id: ConnectionId::default(),
+        });
+        store.insert(session2);
+
+        // ACK from caller (From-tag = "caller-tag") should find Leg 1 → FS
+        let found1 = store.get_by_dialog_key("shared-call-id", "caller-tag").unwrap();
+        let s1 = found1.read().unwrap();
+        let branch1 = s1.get_client_branch(&leg1_client).unwrap();
+        assert_eq!(branch1.destination, "10.0.0.2:5060".parse::<SocketAddr>().unwrap());
+
+        // ACK from FS (From-tag = "fs-tag") should find Leg 2 → callee
+        let found2 = store.get_by_dialog_key("shared-call-id", "fs-tag").unwrap();
+        let s2 = found2.read().unwrap();
+        let branch2 = s2.get_client_branch(&leg2_client).unwrap();
+        assert_eq!(branch2.destination, "10.0.0.3:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn store_remove_cleans_dialog_key() {
+        let store = ProxySessionStore::new();
+        store.insert(make_session());
+
+        assert!(store.get_by_dialog_key("session-test", "abc").is_some());
+        store.remove_by_server_key(&server_key());
+        assert!(store.get_by_dialog_key("session-test", "abc").is_none());
     }
 }
