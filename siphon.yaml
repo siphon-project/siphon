@@ -461,3 +461,4 @@ auth:
 log:
   level: info      # debug | info | warn | error
   format: pretty   # pretty (human-readable) | json (structured, for log aggregators)
+  # file: /var/log/siphon.log   # optional: also write logs to file (for logrotate)

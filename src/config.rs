@@ -1397,6 +1397,9 @@ fn default_siprec_transport() -> String { "tcp".to_string() }
 pub struct LogConfig {
     pub level: LogLevel,
     pub format: LogFormat,
+    /// Optional path to a log file (e.g. `/var/log/siphon.log`).
+    /// When set, logs are written to both stderr and the file.
+    pub file: Option<String>,
 }
 
 impl Default for LogConfig {
@@ -1404,6 +1407,7 @@ impl Default for LogConfig {
         Self {
             level: LogLevel::Info,
             format: LogFormat::Pretty,
+            file: None,
         }
     }
 }

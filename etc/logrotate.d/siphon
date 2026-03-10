@@ -1,0 +1,9 @@
+/var/log/siphon.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

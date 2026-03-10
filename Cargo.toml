@@ -87,7 +87,8 @@ ipnet = "2"
 notify = "8"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Registrar persistence backends (optional, feature-flagged)
 redis = { version = "1", features = ["tokio-comp"], optional = true }

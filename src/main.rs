@@ -25,20 +25,15 @@ async fn main() {
         .install_default()
         .expect("failed to install rustls CryptoProvider");
 
-    // Initialise structured logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
 
     let config = Arc::new(Config::from_file(&cli.config).unwrap_or_else(|error| {
         eprintln!("Failed to load {}: {error}", cli.config);
         std::process::exit(1);
     }));
+
+    // Initialise structured logging (console + optional file)
+    let _log_guard = init_logging(&config.log);
 
     info!(
         "SIPhon starting — script: {}, domain: {:?}",
@@ -760,6 +755,78 @@ async fn main() {
     // file watchers, etc.) that have no shutdown signal yet.  Rather than
     // hanging while the runtime waits for them, exit the process immediately.
     std::process::exit(0);
+}
+
+/// Initialise tracing subscriber with console output and optional file output.
+///
+/// Returns an optional guard that must be kept alive for the duration of the
+/// process — dropping it flushes and closes the non-blocking file writer.
+fn init_logging(
+    log_config: &siphon::config::LogConfig,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use siphon::config::{LogFormat, LogLevel};
+    use tracing_subscriber::prelude::*;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| {
+            let level = match log_config.level {
+                LogLevel::Debug => "debug",
+                LogLevel::Info => "info",
+                LogLevel::Warn => "warn",
+                LogLevel::Error => "error",
+            };
+            tracing_subscriber::EnvFilter::new(level)
+        });
+
+    let is_json = log_config.format == LogFormat::Json;
+
+    // Console layer (always present)
+    let console_layer = if is_json {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .boxed()
+    };
+
+    // Optional file layer
+    let (file_layer, guard) = if let Some(ref path) = log_config.file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap_or_else(|error| {
+                eprintln!("Failed to open log file {path}: {error}");
+                std::process::exit(1);
+            });
+        let (non_blocking, guard) = tracing_appender::non_blocking(file);
+
+        let layer = if is_json {
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .boxed()
+        } else {
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .boxed()
+        };
+
+        (Some(layer), Some(guard))
+    } else {
+        (None, None)
+    };
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(console_layer)
+        .with(file_layer)
+        .init();
+
+    guard
 }
 
 /// Create the registrar backend (Redis/Postgres), restore persisted contacts
