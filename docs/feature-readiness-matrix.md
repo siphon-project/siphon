@@ -93,6 +93,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Fix REGISTER Contact | **Production** | `nat.fix_register: true` | |
 | Fix NATed Contact (script) | **Production** | `request.fix_nated_contact()` | |
 | NAT keepalive (OPTIONS ping) | Implemented | `nat.keepalive` | Configurable interval + failure threshold |
+| CRLF keepalive (RFC 5626 §4.4.1) | Implemented | `nat.crlf_keepalive` | TCP/TLS/WS connection keep-alive |
+| Stale contact eviction on restart | **Production** | Core | Evicts connection-oriented contacts + on_change notify |
 | Outbound flow tokens (RFC 5626) | Implemented | | Via/Route flow tokens |
 
 ## Media
@@ -273,7 +275,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Registrar | 5 (Redis, expires, max contacts, hooks, TTL slack) | 5 (memory, PG, Python, GRUU, Service-Route) | 10 |
 | Authentication | 4 (HTTP/HA1, digest 401/407, anti-spoof) | 4 (static, Diameter Cx, AKA, SHA-256) | 8 |
 | Security | 5 (rate limit, scanner, trusted CIDR, fail ban, APIBan) | 1 (IP ACLs) | 6 |
-| NAT | 4 (rport, fix contact, fix register, script fixup) | 2 (keepalive, flow tokens) | 6 |
+| NAT | 5 (rport, fix contact, fix register, script fixup, stale eviction) | 3 (keepalive, CRLF keepalive, flow tokens) | 8 |
 | Media | 0 | 7 (RTPEngine, LB, 4 profiles, custom profiles) | 7 |
 | Gateway routing | 0 | 7 (groups, 3 algorithms, probes, failover, dynamic) | 7 |
 | CDR | 0 | 5 (file, syslog, HTTP, register events, extra fields) | 5 |
@@ -282,4 +284,4 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Scripting | 9 (proxy, registrar, auth, logging, header ops) | 7 (B2BUA, gateway, cache, presence, LI, async, SDK) | 16 |
 | 3GPP/IMS | 0 | 14 (Diameter 5 apps, AKA, IPsec, iFC, 3 CSCFs, 2 SBI) | 14 |
 | LI/Recording | 0 | 5 (X1, X2, X3, SIPREC, audit) | 5 |
-| **Totals** | **~41** | **~68** | **~109** |
+| **Totals** | **~42** | **~69** | **~111** |
