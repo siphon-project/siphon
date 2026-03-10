@@ -673,6 +673,14 @@ pub struct HepConfig {
     pub ca_cert: Option<String>,
     /// Server name for TLS SNI. Defaults to the hostname from `endpoint`.
     pub tls_server_name: Option<String>,
+    /// Minimum interval (in seconds) between repeated error log messages.
+    /// Prevents log flooding when the collector is unreachable. Default: 30.
+    #[serde(default = "default_hep_error_log_interval")]
+    pub error_log_interval: u64,
+}
+
+fn default_hep_error_log_interval() -> u64 {
+    30
 }
 
 fn default_hep_version() -> u8 {

@@ -45,7 +45,7 @@ impl HepSender {
 
         match config.transport {
             HepTransport::Udp => {
-                spawn_udp_sender(endpoint, receiver);
+                spawn_udp_sender(endpoint, receiver, config.error_log_interval);
             }
             HepTransport::Tcp => {
                 spawn_tcp_sender(endpoint, receiver);
@@ -132,7 +132,7 @@ fn now_timestamp() -> (u32, u32) {
 // Background sender tasks
 // ---------------------------------------------------------------------------
 
-fn spawn_udp_sender(endpoint: SocketAddr, receiver: flume::Receiver<Bytes>) {
+fn spawn_udp_sender(endpoint: SocketAddr, receiver: flume::Receiver<Bytes>, error_log_interval: u64) {
     tokio::spawn(async move {
         // Bind to any available port
         let bind_addr = if endpoint.is_ipv6() {
@@ -154,12 +154,13 @@ fn spawn_udp_sender(endpoint: SocketAddr, receiver: flume::Receiver<Bytes>) {
 
         debug!(endpoint = %endpoint, "HEP UDP sender connected");
 
-        let mut last_error_log = Instant::now() - std::time::Duration::from_secs(600);
+        let interval = std::time::Duration::from_secs(error_log_interval);
+        let mut last_error_log = Instant::now() - interval - std::time::Duration::from_secs(1);
         let mut suppressed: u64 = 0;
 
         while let Ok(packet) = receiver.recv_async().await {
             if let Err(error) = socket.send(&packet).await {
-                if last_error_log.elapsed() >= std::time::Duration::from_secs(60) {
+                if last_error_log.elapsed() >= interval {
                     if suppressed > 0 {
                         warn!(endpoint = %endpoint, suppressed, "HEP UDP send failed: {error}");
                     } else {
@@ -362,6 +363,7 @@ mod tests {
             agent_id: Some("99".to_string()),
             ca_cert: None,
             tls_server_name: None,
+            error_log_interval: 60,
         };
 
         let sender = HepSender::new(&config).await.unwrap();
@@ -424,6 +426,7 @@ mod tests {
             agent_id: Some("77".to_string()),
             ca_cert: None,
             tls_server_name: None,
+            error_log_interval: 60,
         };
 
         let sender = HepSender::new(&config).await.unwrap();
@@ -483,6 +486,7 @@ mod tests {
             agent_id: None,
             ca_cert: None,
             tls_server_name: None,
+            error_log_interval: 60,
         };
 
         let sender = HepSender::new(&config).await.unwrap();

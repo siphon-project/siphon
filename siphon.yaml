@@ -250,6 +250,7 @@ auth:
 #                                   # so multiple nodes appear separately
 #     # ca_cert: /etc/ssl/homer-ca.pem      # CA for TLS transport (default: system roots)
 #     # tls_server_name: homer.example.com  # SNI for TLS (default: endpoint host)
+#     # error_log_interval: 30              # Seconds between repeated error logs (default: 30)
 
 # ---------------------------------------------------------------------------
 # Server identity headers
