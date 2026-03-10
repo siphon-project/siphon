@@ -2384,6 +2384,58 @@ fn build_ack_for_non2xx(
 /// Unlike the proxy path, we don't store the B-leg INVITE. Instead we
 /// reconstruct the ACK from the response (which carries the same Call-ID,
 /// From, and CSeq as the original B-leg INVITE) plus the B-leg target URI.
+/// Sanitize a B2BUA response before forwarding it to the A-leg.
+///
+/// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
+/// headers must not leak to the A-leg. This function:
+/// - Replaces Contact with siphon's own address (critical for dialog routing)
+/// - Replaces/removes User-Agent, Server, Allow, Allow-Events, Supported, Require
+/// - Strips B-leg-specific P-Asserted-Identity, P-Charging-Vector
+fn sanitize_b2bua_response(
+    response: &mut SipMessage,
+    state: &DispatcherState,
+    a_leg_transport: Transport,
+) {
+    // Contact: must point to siphon so in-dialog requests (ACK, BYE, re-INVITE)
+    // route through us, not directly to the B-leg.
+    let listen_addr = state.listen_addrs.get(&a_leg_transport).copied()
+        .unwrap_or(state.local_addr);
+    let contact_host = format_sip_host(&listen_addr.ip().to_string());
+    let contact_value = format!(
+        "<sip:{}:{};transport={}>",
+        contact_host,
+        listen_addr.port(),
+        a_leg_transport.to_string().to_lowercase(),
+    );
+    response.headers.set("Contact", contact_value);
+
+    // Replace User-Agent / Server with our own
+    if response.headers.get("User-Agent").is_some() {
+        if let Some(ref ua) = state.user_agent_header {
+            response.headers.set("User-Agent", ua.clone());
+        } else {
+            response.headers.remove("User-Agent");
+        }
+    }
+    if response.headers.get("Server").is_some() {
+        if let Some(ref srv) = state.server_header {
+            response.headers.set("Server", srv.clone());
+        } else {
+            response.headers.remove("Server");
+        }
+    }
+
+    // P-Asserted-Identity, P-Charging-Vector, P-Charging-Function-Addresses:
+    // Per RFC 3325 / RFC 3455, these are trust-domain headers that B2BUAs
+    // within the trust domain SHOULD forward. Keep them.
+
+    // Strip B-leg capability headers — siphon terminates the dialog
+    response.headers.remove("Allow");
+    response.headers.remove("Allow-Events");
+    response.headers.remove("Require");
+    response.headers.remove("Content-Disposition");
+}
+
 fn build_b2bua_ack_for_non2xx(
     response: &SipMessage,
     branch: &str,
@@ -3055,6 +3107,17 @@ fn handle_b2bua_invite(
         return;
     }
 
+    // Send 100 Trying immediately to suppress A-leg retransmissions
+    // (RFC 3261 §8.2.6.1: SHOULD send 100 within 200ms for INVITE)
+    let trying = build_response(&message, 100, "Trying", state.server_header.as_deref());
+    send_message(
+        trying,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        state,
+    );
+
     // Create the call in the manager
     let a_leg = ALeg {
         source_addr: inbound.remote_addr,
@@ -3243,6 +3306,20 @@ fn b2bua_send_b_leg_invite(
         b_leg_invite.headers.set("From", new_from);
     }
 
+    // Set Contact to siphon's own address so in-dialog requests route through us
+    let b_listen = state.listen_addrs.get(&outbound_transport).copied().unwrap_or(state.local_addr);
+    let b_contact_host = format_sip_host(&b_listen.ip().to_string());
+    b_leg_invite.headers.set("Contact", format!(
+        "<sip:{}:{};transport={}>",
+        b_contact_host, b_listen.port(),
+        outbound_transport.to_string().to_lowercase(),
+    ));
+
+    // Replace User-Agent with our own
+    if let Some(ref ua) = state.user_agent_header {
+        b_leg_invite.headers.set("User-Agent", ua.clone());
+    }
+
     // Strip any To-tag (B-leg INVITE should not have one)
     if let Some(to) = b_leg_invite.headers.get("To")
         .or_else(|| b_leg_invite.headers.get("t"))
@@ -3399,14 +3476,14 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_dialog, b_leg_dest, b_leg_index, outbound_credentials, recording_srs) = match state.call_manager.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_dialog, b_leg_dest, b_leg_index, call_state, outbound_credentials, recording_srs) = match state.call_manager.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
             let target = matching_b.map(|b| b.target_uri.clone());
             let dialog = matching_b.map(|b| (b.call_id.clone(), b.from_tag.clone()));
             let dest = matching_b.map(|b| (b.destination, b.transport));
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, dialog, dest, matching_b_idx, call.outbound_credentials.clone(), call.recording_srs.clone())
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, dialog, dest, matching_b_idx, call.state.clone(), call.outbound_credentials.clone(), call.recording_srs.clone())
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -3415,6 +3492,60 @@ fn handle_b2bua_response(
     };
 
     if (200..300).contains(&status_code) {
+        // Absorb 200 OK retransmissions: if the call is already answered,
+        // this is a retransmit from the B-leg (it hasn't received our ACK yet).
+        // Re-send ACK to B-leg but don't re-forward or re-fire on_answer.
+        if call_state == CallState::Answered {
+            debug!(
+                call_id = %call_id,
+                "B2BUA: absorbing 200 OK retransmission (already answered)"
+            );
+            // Re-send ACK to B-leg to stop retransmissions
+            if let Some((b_dest, b_transport)) = b_leg_dest {
+                if let Some((ref b_cid, ref b_ftag)) = b_leg_dialog {
+                    let mut ack = message.clone();
+                    // Build ACK from the 200 OK
+                    let request_uri = b_leg_target.as_deref()
+                        .and_then(|uri| parse_uri_standalone(uri).ok())
+                        .unwrap_or_else(|| SipUri::new("invalid".to_string()));
+                    ack.start_line = StartLine::Request(crate::sip::message::RequestLine {
+                        method: Method::Ack,
+                        request_uri,
+                        version: crate::sip::message::Version::sip_2_0(),
+                    });
+                    ack.headers.remove("Via");
+                    let transport_str = format!("{}", b_transport).to_uppercase();
+                    let outbound_port = state.listen_addrs.get(&b_transport)
+                        .map(|a| a.port())
+                        .unwrap_or(state.local_addr.port());
+                    ack.headers.add("Via", format!(
+                        "SIP/2.0/{} {}:{};branch={}",
+                        transport_str,
+                        format_sip_host(&state.local_addr.ip().to_string()),
+                        outbound_port,
+                        TransactionKey::generate_branch(),
+                    ));
+                    // Ensure B-leg dialog identifiers
+                    ack.headers.set("Call-ID", b_cid.clone());
+                    if let Some(from) = ack.headers.from() {
+                        let new_from = from.replace(
+                            &format!("tag={}", a_leg.from_tag),
+                            &format!("tag={}", b_ftag),
+                        );
+                        ack.headers.set("From", new_from);
+                    }
+                    if let Some(cseq) = ack.headers.cseq() {
+                        let cseq_num = cseq.split_whitespace().next().unwrap_or("1");
+                        ack.headers.set("CSeq", format!("{} ACK", cseq_num));
+                    }
+                    ack.headers.set("Content-Length", "0".to_string());
+                    ack.body.clear();
+                    send_message(ack, b_transport, b_dest, ConnectionId::default(), state);
+                }
+            }
+            return;
+        }
+
         // 2xx — call answered; record the winning B-leg
         state.call_manager.set_state(call_id, CallState::Answered);
         if let Some(idx) = b_leg_index {
@@ -3562,6 +3693,49 @@ fn handle_b2bua_response(
             }
         }
 
+        // Sanitize B-leg headers before forwarding to A-leg
+        sanitize_b2bua_response(&mut response, state, a_leg.transport);
+
+        // Send ACK to B-leg immediately — in B2BUA mode we terminate the
+        // B-leg dialog ourselves rather than waiting for the A-leg's ACK.
+        // This stops the B-leg from retransmitting the 200 OK.
+        if let Some((b_dest, b_transport)) = b_leg_dest {
+            if let Some((ref b_cid, ref _b_ftag)) = b_leg_dialog {
+                let ack_uri = b_leg_target.as_deref()
+                    .and_then(|uri| parse_uri_standalone(uri).ok())
+                    .unwrap_or_else(|| SipUri::new("invalid".to_string()));
+                let transport_str = format!("{}", b_transport).to_uppercase();
+                let outbound_port = state.listen_addrs.get(&b_transport)
+                    .map(|a| a.port())
+                    .unwrap_or(state.local_addr.port());
+                let via_value = format!(
+                    "SIP/2.0/{} {}:{};branch={}",
+                    transport_str,
+                    format_sip_host(&state.local_addr.ip().to_string()),
+                    outbound_port,
+                    TransactionKey::generate_branch(),
+                );
+                let cseq_num = message.headers.cseq()
+                    .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "1".to_string());
+                let from = message.headers.from().cloned().unwrap_or_default();
+                let to = message.headers.to().cloned().unwrap_or_default();
+                let ack = SipMessageBuilder::new()
+                    .request(Method::Ack, ack_uri)
+                    .via(via_value)
+                    .from(from.to_string())
+                    .to(to.to_string())
+                    .call_id(b_cid.clone())
+                    .cseq(format!("{} ACK", cseq_num))
+                    .header("Max-Forwards", "70".to_string())
+                    .content_length(0)
+                    .build()
+                    .expect("B2BUA ACK for 2xx should not fail");
+                send_message(ack, b_transport, b_dest, ConnectionId::default(), state);
+                debug!(call_id = %call_id, "B2BUA: sent ACK to B-leg for 200 OK");
+            }
+        }
+
         // Extract SDP body before forwarding (needed for SIPREC)
         let sdp_body = response.body.clone();
 
@@ -3624,6 +3798,8 @@ fn handle_b2bua_response(
                 }
             }
         }
+        // Sanitize B-leg headers before forwarding to A-leg
+        sanitize_b2bua_response(message, state, a_leg.transport);
         send_message(
             message.clone(),
             a_leg.transport,
@@ -3902,6 +4078,8 @@ fn handle_b2bua_response(
                 }
             }
         }
+        // Sanitize B-leg headers before forwarding to A-leg
+        sanitize_b2bua_response(message, state, a_leg.transport);
         send_message(
             message.clone(),
             a_leg.transport,
