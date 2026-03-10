@@ -152,6 +152,10 @@ auth:
 #     enabled: true
 #     interval_secs: 30     # send OPTIONS to each registered contact
 #     failure_threshold: 10 # deregister contact after N consecutive failures
+#   crlf_keepalive:
+#     enabled: true
+#     interval_secs: 30     # RFC 5626 §4.4.1 CRLF ping on TCP/TLS connections
+#     failure_threshold: 3  # close connection after N missed pongs
 
 # ---------------------------------------------------------------------------
 # SIP transaction layer
