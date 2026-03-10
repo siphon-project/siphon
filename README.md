@@ -19,6 +19,7 @@
   <a href="#usage">Usage</a> &middot;
   <a href="#configuration">Configuration</a> &middot;
   <a href="#scripting">Scripting</a> &middot;
+  <a href="#hybrid-proxysbc-mode">Hybrid Mode</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#testing">Testing</a>
 </p>
@@ -413,6 +414,49 @@ Both sync and async handlers are supported — async is auto-detected at registr
 | `examples/ims_pcscf.py` | IMS P-CSCF | IPsec, AKA auth, media anchoring ([config](examples/ims_pcscf.yaml)) |
 | `examples/ims_icscf.py` | IMS I-CSCF | Diameter Cx UAR/LIR, S-CSCF discovery ([config](examples/ims_icscf.yaml)) |
 | `examples/ims_scscf.py` | IMS S-CSCF | AKA auth, registrar, iFC, Service-Route ([config](examples/ims_scscf.yaml)) |
+
+### Hybrid proxy/SBC mode
+
+A single script can use both `@proxy.on_request` and `@b2bua.on_invite` decorators — there's no mode switch or config flag. The dispatcher routes automatically: INVITEs go to the B2BUA handler, everything else goes to the proxy handler. This lets you build a topology-hiding SBC with media anchoring for calls while keeping lightweight proxy handling for REGISTER, OPTIONS, and other non-INVITE traffic — all in one process, one script, one deployment:
+
+```python
+from siphon import proxy, b2bua, registrar, auth, rtpengine, log
+
+@proxy.on_request
+def route(request):
+    if request.method == "OPTIONS" and request.ruri.is_local:
+        request.reply(200, "OK")
+        return
+
+    if request.method == "REGISTER":
+        if not auth.require_digest(request, realm="example.com"):
+            return
+        registrar.save(request)
+        request.reply(200, "OK")
+        return
+
+    request.reply(405, "Method Not Allowed")
+
+@b2bua.on_invite
+async def on_invite(call):
+    call.media.anchor()
+    await rtpengine.offer(call)
+
+    contacts = registrar.lookup(call.ruri)
+    if not contacts:
+        call.reject(404, "Not Found")
+        return
+
+    call.remove_headers_matching("^X-")
+    call.dial([c.uri for c in contacts])
+
+@b2bua.on_bye
+async def on_bye(call, initiator):
+    await rtpengine.delete(call)
+    log.info(f"[{call.call_id}] ended by {initiator}")
+```
+
+No entity IDs, no separate B2BUA process, no SIP handoff between a proxy and a media server. The proxy handles registration and keepalives at line rate while the B2BUA handles calls with full header sanitization and media anchoring.
 
 ## Testing Your Scripts
 
