@@ -3448,6 +3448,7 @@ fn b2bua_send_b_leg_invite(
         target_uri: target_uri.to_string(),
         call_id: b_leg_call_id,
         from_tag: b_leg_from_tag,
+        stored_vias: vec![],
     };
     state.call_manager.add_b_leg(call_id, b_leg);
 
@@ -3566,14 +3567,15 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_dialog, b_leg_dest, b_leg_index, call_state, outbound_credentials, recording_srs) = match state.call_manager.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, call_state, outbound_credentials, recording_srs) = match state.call_manager.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
             let target = matching_b.map(|b| b.target_uri.clone());
             let dialog = matching_b.map(|b| (b.call_id.clone(), b.from_tag.clone()));
             let dest = matching_b.map(|b| (b.destination, b.transport));
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, dialog, dest, matching_b_idx, call.state.clone(), call.outbound_credentials.clone(), call.recording_srs.clone())
+            let stored_vias = matching_b.map(|b| b.stored_vias.clone()).unwrap_or_default();
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, dialog, dest, matching_b_idx, stored_vias, call.state.clone(), call.outbound_credentials.clone(), call.recording_srs.clone())
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -3581,49 +3583,89 @@ fn handle_b2bua_response(
         }
     };
 
-    // Detect re-INVITE responses: the re-INVITE B-leg entry has an empty target_uri.
-    let is_reinvite_response = b_leg_target.as_deref().map_or(false, |t| t.is_empty());
+    // Detect re-INVITE responses: target_uri starts with "reinvite:".
+    let reinvite_direction = b_leg_target.as_deref().and_then(|t| t.strip_prefix("reinvite:"));
 
-    if is_reinvite_response && (100..700).contains(&status_code) {
-        // Forward re-INVITE response to the originating leg (A-leg).
-        // Rewrite dialog headers and relay transparently.
-        if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
-            crate::b2bua::manager::rewrite_dialog_headers(
-                message, &a_leg.call_id, b_ftag, &a_leg.from_tag,
-            );
-        }
-        // Replace B-leg Via with A-leg Via(s) from the stored INVITE
-        message.headers.remove("Via");
-        if let Some(invite_arc) = &a_leg_invite {
-            if let Ok(invite) = invite_arc.lock() {
-                if let Some(vias) = invite.headers.get_all("Via") {
-                    for via in vias {
-                        message.headers.add("Via", via.clone());
+    if let Some(direction) = reinvite_direction {
+        let is_a2b = direction == "a2b";
+
+        // Determine where to route the response: back to the leg that sent the re-INVITE.
+        // A→B re-INVITE: response goes to A-leg, rewrite B-leg→A-leg headers
+        // B→A re-INVITE: response goes to B-leg, rewrite A-leg→B-leg headers
+        let (resp_dest, resp_transport, resp_conn_id) = if is_a2b {
+            (a_leg.source_addr, a_leg.transport, a_leg.connection_id)
+        } else {
+            // B→A: send response to winning B-leg
+            match state.call_manager.get_call(call_id) {
+                Some(call) => {
+                    let winner = call.winner.and_then(|i| call.b_legs.get(i));
+                    if let Some(b) = winner {
+                        (b.destination, b.transport, ConnectionId::default())
+                    } else {
+                        warn!(call_id = %call_id, "B2BUA re-INVITE response: no winning B-leg");
+                        return;
                     }
+                }
+                None => return,
+            }
+        };
+
+        if is_a2b {
+            // A→B: response from B-leg → rewrite B-leg identifiers back to A-leg
+            if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
+                crate::b2bua::manager::rewrite_dialog_headers(
+                    message, &a_leg.call_id, b_ftag, &a_leg.from_tag,
+                );
+            }
+        } else {
+            // B→A: response from A-leg → rewrite A-leg identifiers back to B-leg
+            if let Some(call) = state.call_manager.get_call(call_id) {
+                if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
+                    crate::b2bua::manager::rewrite_dialog_headers(
+                        message, &winner.call_id, &a_leg.from_tag, &winner.from_tag,
+                    );
                 }
             }
         }
-        sanitize_b2bua_response(message, state, a_leg.transport);
 
-        // ACK the B-leg for 2xx re-INVITE responses
+        // Replace Via(s) — restore the originator's Via headers.
+        // A→B: restore from stored A-leg INVITE.
+        // B→A: restore from stored_vias captured when the re-INVITE was received.
+        message.headers.remove("Via");
+        if is_a2b {
+            if let Some(invite_arc) = &a_leg_invite {
+                if let Ok(invite) = invite_arc.lock() {
+                    if let Some(vias) = invite.headers.get_all("Via") {
+                        for via in vias {
+                            message.headers.add("Via", via.clone());
+                        }
+                    }
+                }
+            }
+        } else {
+            for via in &b_leg_stored_vias {
+                message.headers.add("Via", via.clone());
+            }
+        }
+
+        sanitize_b2bua_response(message, state, resp_transport);
+
+        // ACK the responder for 2xx re-INVITE responses
         if (200..300).contains(&status_code) {
-            if let Some((b_dest, b_transport)) = b_leg_dest {
-                if let Some((ref b_cid, ref _b_ftag)) = b_leg_dialog {
-                    let ack_uri = message.headers.get("Contact")
-                        .and_then(|c| {
-                            let uri_str = c.trim_start_matches('<').split('>').next().unwrap_or("");
-                            parse_uri_standalone(uri_str).ok()
-                        })
-                        .unwrap_or_else(|| SipUri::new("invalid".to_string()));
-                    let transport_str = format!("{}", b_transport).to_uppercase();
-                    let outbound_port = state.listen_addrs.get(&b_transport)
+            if let Some((responder_dest, responder_transport)) = b_leg_dest {
+                if let Some((ref responder_cid, ref _responder_ftag)) = b_leg_dialog {
+                    let transport_str = format!("{}", responder_transport).to_uppercase();
+                    let outbound_port = state.listen_addrs.get(&responder_transport)
                         .map(|a| a.port())
                         .unwrap_or(state.local_addr.port());
                     let cseq_num = message.headers.cseq()
                         .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
                         .unwrap_or_else(|| "1".to_string());
+                    // Use the responder's dialog identifiers (from the re-INVITE B-leg entry)
                     let from = message.headers.from().cloned().unwrap_or_default();
                     let to = message.headers.to().cloned().unwrap_or_default();
+                    let ack_uri = SipUri::new(responder_dest.ip().to_string())
+                        .with_port(responder_dest.port());
                     let ack = SipMessageBuilder::new()
                         .request(Method::Ack, ack_uri)
                         .via(format!(
@@ -3635,27 +3677,48 @@ fn handle_b2bua_response(
                         ))
                         .from(from.to_string())
                         .to(to.to_string())
-                        .call_id(b_cid.clone())
+                        .call_id(responder_cid.clone())
                         .cseq(format!("{} ACK", cseq_num))
                         .header("Max-Forwards", "70".to_string())
                         .content_length(0)
                         .build()
                         .expect("B2BUA ACK for re-INVITE 2xx should not fail");
-                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
-                    debug!(call_id = %call_id, "B2BUA: sent ACK to B-leg for re-INVITE 200 OK");
+                    if is_a2b {
+                        // A→B: ACK goes to B-leg (responder)
+                        send_b2bua_to_bleg(ack, responder_transport, responder_dest, state);
+                    } else {
+                        // B→A: ACK goes to A-leg (responder) via its connection
+                        send_message(ack, responder_transport, responder_dest, a_leg.connection_id, state);
+                    }
+                    debug!(
+                        call_id = %call_id,
+                        direction = direction,
+                        "B2BUA: sent ACK to responder for re-INVITE 200 OK"
+                    );
                 }
             }
 
             // Reset session timer on successful re-INVITE
             state.call_manager.reset_session_timer(call_id);
+
+            // Remove the re-INVITE B-leg entry to prevent retransmission loops.
+            if let Some(idx) = b_leg_index {
+                state.call_manager.remove_b_leg(call_id, idx);
+            }
         }
 
-        send_message(
-            message.clone(),
-            a_leg.transport,
-            a_leg.source_addr,
-            a_leg.connection_id,
-            state,
+        // Forward response to the originator
+        if is_a2b {
+            send_message(message.clone(), resp_transport, resp_dest, resp_conn_id, state);
+        } else {
+            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, state);
+        }
+
+        debug!(
+            call_id = %call_id,
+            status = status_code,
+            direction = direction,
+            "B2BUA: forwarded re-INVITE response"
         );
         return;
     }
@@ -4051,6 +4114,7 @@ fn handle_b2bua_response(
                                     target_uri: target_uri.clone(),
                                     call_id: retry_call_id,
                                     from_tag: retry_from_tag,
+                                    stored_vias: vec![],
                                 };
                                 state.call_manager.add_b_leg(call_id, b_leg);
 
@@ -4154,6 +4218,7 @@ fn handle_b2bua_response(
                                     target_uri: target_uri.clone(),
                                     call_id: retry_call_id,
                                     from_tag: retry_from_tag,
+                                    stored_vias: vec![],
                                 };
                                 state.call_manager.add_b_leg(call_id, b_leg);
 
@@ -4552,13 +4617,15 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     }
 
     // Register new branch for response routing (reuse B-leg dialog identifiers)
+    // Mark as re-INVITE so the response handler doesn't absorb it as a retransmission
     let new_b_leg = BLeg {
         destination: b_leg.destination,
         transport: b_leg.transport,
         branch: branch.clone(),
-        target_uri: b_leg.target_uri.clone(),
+        target_uri: "reinvite:a2b".to_string(),
         call_id: b_leg.call_id.clone(),
         from_tag: b_leg.from_tag.clone(),
+        stored_vias: vec![],
     };
     state.call_manager.add_b_leg(call_id, new_b_leg);
 
@@ -4741,14 +4808,21 @@ fn handle_b2bua_reinvite(
         );
         forwarded.headers.add("Via", via_value);
 
-        // Track the re-INVITE branch → call_id for response routing
+        // Track the re-INVITE branch → call_id for response routing.
+        // Encode the direction so the response handler knows where to relay.
+        // Store the originator's Via(s) so we can restore them on the response.
+        let direction = if from_a_leg { "reinvite:a2b" } else { "reinvite:b2a" };
+        let originator_vias = message.headers.get_all("Via")
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
         let reinvite_leg = BLeg {
             destination,
             transport,
             branch: branch.clone(),
-            target_uri: String::new(), // re-INVITE, no new target
+            target_uri: direction.to_string(),
             call_id: leg_call_id,
             from_tag: leg_from_tag,
+            stored_vias: originator_vias,
         };
         state.call_manager.add_b_leg(&call_id, reinvite_leg);
 
@@ -5100,6 +5174,7 @@ mod tests {
             target_uri: "sip:bob@10.0.0.2".to_string(),
             call_id: "b2b-test-1".to_string(),
             from_tag: "sb-test-1".to_string(),
+            stored_vias: vec![],
         };
         manager.add_b_leg(&call_id, b_leg);
 
@@ -5232,6 +5307,7 @@ mod tests {
             target_uri: "sip:bob@10.0.0.2".to_string(),
             call_id: "b-cid-0".to_string(),
             from_tag: "b-ftag-0".to_string(),
+            stored_vias: vec![],
         };
         let b_leg_1 = BLeg {
             destination: "10.0.0.3:5060".parse().unwrap(),
@@ -5240,6 +5316,7 @@ mod tests {
             target_uri: "sip:bob@10.0.0.3".to_string(),
             call_id: "b-cid-1".to_string(),
             from_tag: "b-ftag-1".to_string(),
+            stored_vias: vec![],
         };
         manager.add_b_leg(&call_id, b_leg_0);
         manager.add_b_leg(&call_id, b_leg_1);

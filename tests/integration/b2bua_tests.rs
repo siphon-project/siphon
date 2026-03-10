@@ -239,6 +239,7 @@ fn make_b_leg(target: &str) -> BLeg {
         target_uri: format!("sip:bob@{}", target),
         call_id: siphon::b2bua::manager::generate_b_leg_call_id(),
         from_tag: siphon::b2bua::manager::generate_b_leg_from_tag(),
+        stored_vias: vec![],
     }
 }
 
@@ -421,6 +422,7 @@ fn b2bua_multi_leg_forking() {
             target_uri: format!("sip:bob@10.0.0.{}", i + 2),
             call_id: siphon::b2bua::manager::generate_b_leg_call_id(),
             from_tag: siphon::b2bua::manager::generate_b_leg_from_tag(),
+            stored_vias: vec![],
         };
         manager.add_b_leg(&call_id, b_leg);
     }
@@ -701,6 +703,7 @@ fn session_timer_state_lifecycle() {
         target_uri: "sip:bob@10.0.0.2".to_string(),
         call_id: "b2b-timer-test".to_string(),
         from_tag: "sb-timer-test".to_string(),
+        stored_vias: vec![],
     };
     manager.add_b_leg(&call_id, b_leg);
     manager.set_winner(&call_id, 0);

@@ -63,12 +63,15 @@ pub struct BLeg {
     pub transport: Transport,
     /// Our generated branch for this B-leg.
     pub branch: String,
-    /// Target URI.
+    /// Target URI (or "reinvite:a2b"/"reinvite:b2a" for re-INVITE tracking).
     pub target_uri: String,
     /// B-leg Call-ID (generated fresh to decouple from A-leg dialog).
     pub call_id: String,
     /// Our From-tag for this B-leg (always unique per leg).
     pub from_tag: String,
+    /// Stored Via headers from the re-INVITE originator (for response routing).
+    #[allow(dead_code)]
+    pub stored_vias: Vec<String>,
 }
 
 /// A complete B2BUA call — A-leg + B-leg(s).
@@ -198,6 +201,16 @@ impl CallManager {
             true
         } else {
             false
+        }
+    }
+
+    /// Remove a B-leg entry by index (e.g. after re-INVITE completion).
+    pub fn remove_b_leg(&self, call_id: &str, index: usize) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            if index < call.b_legs.len() {
+                let removed = call.b_legs.remove(index);
+                self.branch_to_call.remove(&removed.branch);
+            }
         }
     }
 
@@ -377,6 +390,7 @@ mod tests {
             target_uri: format!("sip:bob{}@10.0.0.2", index),
             call_id: format!("b2b-bleg{}", index),
             from_tag: format!("sb-bleg{}", index),
+            stored_vias: vec![],
         }
     }
 
