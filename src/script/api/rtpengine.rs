@@ -134,15 +134,24 @@ impl PyRtpEngine {
     /// Extracts SDP from the object body, sends it to RTPEngine, and replaces
     /// the body with the rewritten SDP.
     ///
+    /// In B2BUA mode the offer was keyed by the A-leg Call-ID/From-tag, but the
+    /// reply carries B-leg identifiers. Pass the original `call` object so that
+    /// the correct (A-leg) Call-ID and From-tag are used for the RTPEngine
+    /// `answer` command.
+    ///
     /// Args:
     ///     reply: A Reply or Call object containing the 200 OK with SDP.
     ///     profile: RTP profile name (default: "srtp_to_rtp").
-    #[pyo3(signature = (reply, profile=None))]
+    ///     call: Optional Call object — when provided, Call-ID and From-tag are
+    ///           taken from this object (matching the earlier `offer`), while
+    ///           To-tag and SDP body still come from `reply`.
+    #[pyo3(signature = (reply, profile=None, call=None))]
     fn answer<'py>(
         &self,
         python: Python<'py>,
         reply: &Bound<'py, PyAny>,
         profile: Option<&str>,
+        call: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
         let entry = self.registry.get(profile_name).ok_or_else(|| {
@@ -154,7 +163,18 @@ impl PyRtpEngine {
         let flags = entry.answer.clone();
 
         let message = extract_message(reply)?;
-        let (call_id, from_tag, to_tag, sdp) = extract_answer_params(&message)?;
+
+        // When a `call` object is provided (B2BUA mode), use its Call-ID and
+        // From-tag so they match the earlier `offer`.  SDP and To-tag still
+        // come from the reply (the 200 OK).
+        let (call_id, from_tag, to_tag, sdp) = if let Some(call_obj) = call {
+            let call_msg = extract_message(call_obj)?;
+            let (cid, ftag, _sdp) = extract_offer_params(&call_msg)?;
+            let (_reply_cid, _reply_ftag, ttag, reply_sdp) = extract_answer_params(&message)?;
+            (cid, ftag, ttag, reply_sdp)
+        } else {
+            extract_answer_params(&message)?
+        };
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);

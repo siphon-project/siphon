@@ -632,6 +632,13 @@ fn handle_request(
                         handle_ack_via_session(inbound, message, session_arc, state);
                         return;
                     }
+
+                    // B2BUA: bridge ACK to the winning B-leg.
+                    // ProxySession won't exist for B2BUA calls; use the call manager instead.
+                    if let Some(internal_id) = state.call_manager.find_by_sip_call_id(cid) {
+                        handle_b2bua_ack(inbound, message, &internal_id, state);
+                        return;
+                    }
                 }
                 debug!("ACK has no matching IST or session — passing through");
             }
@@ -2372,6 +2379,60 @@ fn build_ack_for_non2xx(
     builder.build().expect("ACK builder should not fail")
 }
 
+/// Build an ACK for a non-2xx B-leg response in B2BUA mode (RFC 3261 §17.1.1.3).
+///
+/// Unlike the proxy path, we don't store the B-leg INVITE. Instead we
+/// reconstruct the ACK from the response (which carries the same Call-ID,
+/// From, and CSeq as the original B-leg INVITE) plus the B-leg target URI.
+fn build_b2bua_ack_for_non2xx(
+    response: &SipMessage,
+    branch: &str,
+    target_uri: Option<&str>,
+    downstream_transport: Transport,
+    local_addr: SocketAddr,
+) -> SipMessage {
+    let request_uri = target_uri
+        .and_then(|uri| parse_uri_standalone(uri).ok())
+        .unwrap_or_else(|| SipUri::new("invalid".to_string()));
+
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Ack, request_uri);
+
+    // Via: only our own hop with the client transaction branch
+    let transport_str = format!("{}", downstream_transport).to_uppercase();
+    let host = format_sip_host(&local_addr.ip().to_string());
+    builder = builder.via(format!(
+        "SIP/2.0/{} {}:{};branch={}",
+        transport_str, host, local_addr.port(), branch
+    ));
+
+    // From: same as in the response (which echoes the B-leg INVITE's From)
+    if let Some(from) = response.headers.from() {
+        builder = builder.from(from.clone());
+    }
+
+    // To: from the response (includes To-tag from UAS)
+    if let Some(to) = response.headers.to() {
+        builder = builder.to(to.clone());
+    }
+
+    // Call-ID: same as in the response (B-leg Call-ID)
+    if let Some(call_id) = response.headers.call_id() {
+        builder = builder.call_id(call_id.clone());
+    }
+
+    // CSeq: same sequence number, ACK method
+    if let Some(cseq) = response.headers.cseq() {
+        let cseq_num = cseq.split_whitespace().next().unwrap_or("1");
+        builder = builder.cseq(format!("{} ACK", cseq_num));
+    }
+
+    builder = builder.header("Max-Forwards", "70".to_string());
+    builder = builder.content_length(0);
+
+    builder.build().expect("B2BUA ACK builder should not fail")
+}
+
 /// Serialize a SIP message and send it to a specific destination.
 fn send_message(
     message: SipMessage,
@@ -2982,6 +3043,18 @@ fn handle_b2bua_invite(
         .and_then(|v| v.branch)
         .unwrap_or_default();
 
+    // Guard against INVITE retransmissions: if we already have a call for this
+    // SIP Call-ID, this is a retransmission — absorb it silently.
+    // Without this check, each UDP retransmission would create a new call and
+    // spawn duplicate B-leg INVITEs.
+    if state.call_manager.find_by_sip_call_id(&sip_call_id).is_some() {
+        debug!(
+            call_id = %sip_call_id,
+            "B2BUA: absorbing INVITE retransmission (call already exists)"
+        );
+        return;
+    }
+
     // Create the call in the manager
     let a_leg = ALeg {
         source_addr: inbound.remote_addr,
@@ -3326,12 +3399,14 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_dialog, outbound_credentials, recording_srs) = match state.call_manager.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_dialog, b_leg_dest, b_leg_index, outbound_credentials, recording_srs) = match state.call_manager.get_call(call_id) {
         Some(call) => {
-            let matching_b = call.b_legs.iter().find(|b| b.branch == branch);
+            let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
+            let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
             let target = matching_b.map(|b| b.target_uri.clone());
             let dialog = matching_b.map(|b| (b.call_id.clone(), b.from_tag.clone()));
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, dialog, call.outbound_credentials.clone(), call.recording_srs.clone())
+            let dest = matching_b.map(|b| (b.destination, b.transport));
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, dialog, dest, matching_b_idx, call.outbound_credentials.clone(), call.recording_srs.clone())
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -3340,8 +3415,11 @@ fn handle_b2bua_response(
     };
 
     if (200..300).contains(&status_code) {
-        // 2xx — call answered
+        // 2xx — call answered; record the winning B-leg
         state.call_manager.set_state(call_id, CallState::Answered);
+        if let Some(idx) = b_leg_index {
+            state.call_manager.set_winner(call_id, idx);
+        }
 
         // Wrap the 200 OK in Arc<Mutex<>> so Python handlers can modify SDP in-place
         let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
@@ -3470,7 +3548,18 @@ fn handle_b2bua_response(
             let _ = (b_cid,); // Call-ID already set by rewrite_dialog_headers
         }
 
-        core::strip_top_via(&mut response.headers);
+        // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
+        // The B-leg response only carries our Via; the A-leg caller expects its own.
+        response.headers.remove("Via");
+        if let Some(invite_arc) = &a_leg_invite {
+            if let Ok(invite) = invite_arc.lock() {
+                if let Some(vias) = invite.headers.get_all("Via") {
+                    for via in vias {
+                        response.headers.add("Via", via.clone());
+                    }
+                }
+            }
+        }
 
         // Extract SDP body before forwarding (needed for SIPREC)
         let sdp_body = response.body.clone();
@@ -3523,7 +3612,17 @@ fn handle_b2bua_response(
                 message, &a_leg.call_id, b_ftag, &a_leg.from_tag,
             );
         }
-        core::strip_top_via(&mut message.headers);
+        // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
+        message.headers.remove("Via");
+        if let Some(invite_arc) = &a_leg_invite {
+            if let Ok(invite) = invite_arc.lock() {
+                if let Some(vias) = invite.headers.get_all("Via") {
+                    for via in vias {
+                        message.headers.add("Via", via.clone());
+                    }
+                }
+            }
+        }
         send_message(
             message.clone(),
             a_leg.transport,
@@ -3772,13 +3871,36 @@ fn handle_b2bua_response(
             }
         }
 
+        // Send ACK to B-leg for non-2xx final response (RFC 3261 §17.1.1.3).
+        // The B2BUA must acknowledge non-2xx responses hop-by-hop.
+        if let Some((b_dest, b_transport)) = b_leg_dest {
+            let ack = build_b2bua_ack_for_non2xx(
+                message,
+                branch,
+                b_leg_target.as_deref(),
+                b_transport,
+                state.local_addr,
+            );
+            send_message(ack, b_transport, b_dest, ConnectionId::default(), state);
+        }
+
         // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg
         if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
             crate::b2bua::manager::rewrite_dialog_headers(
                 message, &a_leg.call_id, b_ftag, &a_leg.from_tag,
             );
         }
-        core::strip_top_via(&mut message.headers);
+        // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
+        message.headers.remove("Via");
+        if let Some(invite_arc) = &a_leg_invite {
+            if let Ok(invite) = invite_arc.lock() {
+                if let Some(vias) = invite.headers.get_all("Via") {
+                    for via in vias {
+                        message.headers.add("Via", via.clone());
+                    }
+                }
+            }
+        }
         send_message(
             message.clone(),
             a_leg.transport,
@@ -3788,6 +3910,78 @@ fn handle_b2bua_response(
         );
         state.call_manager.remove_call(call_id);
     }
+}
+
+/// Bridge an ACK for 2xx from the A-leg to the winning B-leg.
+///
+/// RFC 3261 §13.2.2.4: ACK for 2xx is end-to-end, so the B2BUA must relay
+/// it. We rewrite dialog identifiers from A-leg to B-leg before forwarding.
+fn handle_b2bua_ack(
+    _inbound: InboundMessage,
+    message: SipMessage,
+    call_id: &str,
+    state: &DispatcherState,
+) {
+    let (b_leg_call_id, b_leg_from_tag, a_leg_from_tag, destination, transport) =
+        match state.call_manager.get_call(call_id) {
+            Some(call) => {
+                // Use the winning B-leg, fall back to the first one
+                let winner_idx = call.winner.unwrap_or(0);
+                match call.b_legs.get(winner_idx) {
+                    Some(b) => (
+                        b.call_id.clone(),
+                        b.from_tag.clone(),
+                        call.a_leg.from_tag.clone(),
+                        b.destination,
+                        b.transport,
+                    ),
+                    None => {
+                        warn!(call_id = %call_id, "B2BUA ACK: no B-leg found");
+                        return;
+                    }
+                }
+            }
+            None => {
+                debug!(call_id = %call_id, "B2BUA ACK: call not found (already terminated?)");
+                return;
+            }
+        };
+
+    let mut ack = message;
+
+    // Rewrite dialog: A-leg Call-ID → B-leg Call-ID, A-leg From-tag → B-leg From-tag
+    crate::b2bua::manager::rewrite_dialog_headers(
+        &mut ack,
+        &b_leg_call_id,
+        &a_leg_from_tag,
+        &b_leg_from_tag,
+    );
+
+    // Replace Via: strip A-leg Vias, add our own with a fresh branch
+    ack.headers.remove("Via");
+    let transport_str = format!("{}", transport).to_uppercase();
+    let outbound_port = state
+        .listen_addrs
+        .get(&transport)
+        .map(|a| a.port())
+        .unwrap_or(state.local_addr.port());
+    let via_value = format!(
+        "SIP/2.0/{} {}:{};branch={}",
+        transport_str,
+        format_sip_host(&state.local_addr.ip().to_string()),
+        outbound_port,
+        TransactionKey::generate_branch(),
+    );
+    ack.headers.add("Via", via_value);
+
+    debug!(
+        call_id = %call_id,
+        b_leg_call_id = %b_leg_call_id,
+        destination = %destination,
+        "B2BUA: bridging ACK for 2xx to B-leg"
+    );
+
+    send_message(ack, transport, destination, ConnectionId::default(), state);
 }
 
 /// Handle a BYE for a B2BUA call — bridge to the other leg.
@@ -4671,6 +4865,130 @@ mod tests {
         };
         assert_eq!(original_ruri, ruri_after,
             "R-URI must be preserved when next_hop is used for routing only");
+    }
+
+    // --- Bug fix regression tests ---
+
+    /// Bug 1: INVITE retransmissions should be detected via find_by_sip_call_id.
+    #[test]
+    fn retransmission_guard_detects_duplicate_call_id() {
+        let manager = CallManager::new();
+        let a_leg = ALeg {
+            source_addr: "10.0.0.1:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            branch: "z9hG4bK-orig".to_string(),
+            call_id: "retransmit-test@host".to_string(),
+            from_tag: "tag-orig".to_string(),
+        };
+        let _call_id = manager.create_call(a_leg);
+
+        // Second INVITE with same SIP Call-ID (retransmission) should be detected
+        assert!(
+            manager.find_by_sip_call_id("retransmit-test@host").is_some(),
+            "retransmission guard must detect existing call by SIP Call-ID"
+        );
+        // Different Call-ID should not match
+        assert!(manager.find_by_sip_call_id("different-call@host").is_none());
+    }
+
+    /// Bug 2: build_b2bua_ack_for_non2xx constructs a valid ACK from a B-leg error response.
+    #[test]
+    fn build_b2bua_ack_for_non2xx_constructs_valid_ack() {
+        // Build a 486 response as if from B-leg
+        let response = SipMessageBuilder::new()
+            .response(486, "Busy Here".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-b2b-branch".to_string())
+            .from("<sip:alice@example.com>;tag=b-leg-ftag".to_string())
+            .to("<sip:bob@example.com>;tag=bob-tag".to_string())
+            .call_id("b-leg-call-id".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let local_addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+        let ack = build_b2bua_ack_for_non2xx(
+            &response,
+            "z9hG4bK-b2b-branch",
+            Some("sip:bob@10.0.0.2:5060"),
+            Transport::Udp,
+            local_addr,
+        );
+
+        assert!(ack.is_request());
+        let bytes = String::from_utf8(ack.to_bytes()).unwrap();
+        assert!(bytes.starts_with("ACK sip:bob@10.0.0.2:5060 SIP/2.0\r\n"));
+
+        // Via uses our branch (same as client transaction)
+        let via = ack.headers.via().unwrap();
+        assert!(via.contains("z9hG4bK-b2b-branch"));
+        assert!(via.contains("UDP"));
+
+        // From/To/Call-ID from the response
+        assert!(ack.headers.from().unwrap().contains("b-leg-ftag"));
+        assert!(ack.headers.to().unwrap().contains("bob-tag"));
+        assert_eq!(ack.headers.call_id().unwrap(), "b-leg-call-id");
+
+        // CSeq: same number, ACK method
+        let cseq = ack.headers.cseq().unwrap();
+        assert!(cseq.contains("1"));
+        assert!(cseq.contains("ACK"));
+        assert!(!cseq.contains("INVITE"));
+
+        assert_eq!(ack.headers.content_length(), Some(0));
+    }
+
+    /// Bug 3: Winner is recorded and can be used to find the winning B-leg for ACK bridging.
+    #[test]
+    fn winner_tracks_answered_b_leg_for_ack_bridging() {
+        let manager = CallManager::new();
+        let a_leg = ALeg {
+            source_addr: "10.0.0.1:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            branch: "z9hG4bK-a1".to_string(),
+            call_id: "ack-bridge-test@host".to_string(),
+            from_tag: "a-tag".to_string(),
+        };
+        let call_id = manager.create_call(a_leg);
+
+        // Add two B-legs (forked call)
+        let b_leg_0 = BLeg {
+            destination: "10.0.0.2:5060".parse().unwrap(),
+            transport: Transport::Udp,
+            branch: "z9hG4bK-b0".to_string(),
+            target_uri: "sip:bob@10.0.0.2".to_string(),
+            call_id: "b-cid-0".to_string(),
+            from_tag: "b-ftag-0".to_string(),
+        };
+        let b_leg_1 = BLeg {
+            destination: "10.0.0.3:5060".parse().unwrap(),
+            transport: Transport::Udp,
+            branch: "z9hG4bK-b1".to_string(),
+            target_uri: "sip:bob@10.0.0.3".to_string(),
+            call_id: "b-cid-1".to_string(),
+            from_tag: "b-ftag-1".to_string(),
+        };
+        manager.add_b_leg(&call_id, b_leg_0);
+        manager.add_b_leg(&call_id, b_leg_1);
+
+        // B-leg 1 answers first
+        manager.set_winner(&call_id, 1);
+        manager.set_state(&call_id, CallState::Answered);
+
+        let call = manager.get_call(&call_id).unwrap();
+        assert_eq!(call.winner, Some(1));
+        let winner = &call.b_legs[call.winner.unwrap()];
+        assert_eq!(winner.call_id, "b-cid-1");
+        assert_eq!(winner.from_tag, "b-ftag-1");
+        assert_eq!(winner.destination, "10.0.0.3:5060".parse::<SocketAddr>().unwrap());
+
+        // ACK bridging would use find_by_sip_call_id to locate the call
+        assert_eq!(
+            manager.find_by_sip_call_id("ack-bridge-test@host"),
+            Some(call_id),
+        );
     }
 
     /// Verify that fork targets DO update the R-URI (each branch gets its Contact).
