@@ -8,7 +8,7 @@ pub mod encoder;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
@@ -154,9 +154,22 @@ fn spawn_udp_sender(endpoint: SocketAddr, receiver: flume::Receiver<Bytes>) {
 
         debug!(endpoint = %endpoint, "HEP UDP sender connected");
 
+        let mut last_error_log = Instant::now() - std::time::Duration::from_secs(60);
+        let mut suppressed: u64 = 0;
+
         while let Ok(packet) = receiver.recv_async().await {
             if let Err(error) = socket.send(&packet).await {
-                warn!(endpoint = %endpoint, "HEP UDP send failed: {error}");
+                if last_error_log.elapsed() >= std::time::Duration::from_secs(10) {
+                    if suppressed > 0 {
+                        warn!(endpoint = %endpoint, suppressed, "HEP UDP send failed: {error}");
+                    } else {
+                        warn!(endpoint = %endpoint, "HEP UDP send failed: {error}");
+                    }
+                    suppressed = 0;
+                    last_error_log = Instant::now();
+                } else {
+                    suppressed += 1;
+                }
             }
         }
     });
