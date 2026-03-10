@@ -143,6 +143,7 @@ pub async fn run(
     ipsec_config: Option<crate::config::IpsecConfig>,
     tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
     crlf_pong_tracker: Option<Arc<crate::transport::crlf_keepalive::CrlfPongTracker>>,
+    registrar_event_rx: Option<tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>>,
 ) {
     // Resolve the local address for Via insertion.
     // If bound to 0.0.0.0 / [::], use advertised_address from config, or loopback.
@@ -277,7 +278,8 @@ pub async fn run(
 
     // Spawn background task: registrar change event → on_change handlers
     if let Some(registrar) = crate::script::api::registrar_arc() {
-        let mut event_receiver = registrar.subscribe_events();
+        let mut event_receiver = registrar_event_rx
+            .unwrap_or_else(|| registrar.subscribe_events());
         let state_for_events = Arc::clone(&state);
         let registrar = Arc::clone(registrar);
         tokio::spawn(async move {

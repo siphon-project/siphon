@@ -734,6 +734,11 @@ async fn main() {
         None
     };
 
+    // Subscribe to registrar events *before* spawning the dispatcher so the
+    // receiver is ready when evict_connection_oriented emits Deregistered events.
+    let registrar_event_rx = siphon::script::api::registrar_arc()
+        .map(|r| r.subscribe_events());
+
     // --- Start dispatcher ---
     let dispatcher_handle = tokio::spawn(dispatcher::run(
         inbound_rx,
@@ -752,12 +757,13 @@ async fn main() {
         config.ipsec.clone(),
         tls_addr_map,
         crlf_pong_tracker,
+        registrar_event_rx,
     ));
 
     // Evict connection-oriented contacts (TCP/TLS/WS/WSS) restored from
     // the backend.  The transport connections are gone after restart, so these
-    // bindings are unreachable.  Done after the dispatcher starts so that
-    // @registrar.on_change events fire to notify scripts.
+    // bindings are unreachable.  The event receiver was subscribed above, so
+    // @registrar.on_change events will be delivered to the dispatcher.
     if let Some(registrar) = siphon::script::api::registrar_arc() {
         let evicted = registrar.evict_connection_oriented();
         if evicted > 0 {
