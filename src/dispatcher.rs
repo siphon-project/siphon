@@ -2581,6 +2581,30 @@ fn send_message(
     }
 }
 
+/// Send a SIP message to the B-leg, using the TCP connection pool for TCP/TLS
+/// or the direct outbound channel for UDP. This ensures in-dialog messages
+/// (ACK, BYE) reach the B-leg over the correct transport.
+fn send_b2bua_to_bleg(
+    message: SipMessage,
+    transport: Transport,
+    destination: SocketAddr,
+    state: &DispatcherState,
+) {
+    let data = Bytes::from(message.to_bytes());
+
+    // HEP capture
+    if let Some(ref hep) = state.hep_sender {
+        let local = state.listen_addrs.get(&transport).copied().unwrap_or(state.local_addr);
+        hep.capture_outbound(local, destination, transport, &data);
+    }
+
+    let target = RelayTarget {
+        address: destination,
+        transport: Some(transport),
+    };
+    send_to_target(data, &target, transport, ConnectionId::default(), state);
+}
+
 /// Create Rust-backed auth, registrar, log, and proxy utility singletons
 /// and inject them into the Python `siphon` module, replacing the Python stubs.
 pub fn inject_python_singletons(config: &Config) {
@@ -3557,6 +3581,85 @@ fn handle_b2bua_response(
         }
     };
 
+    // Detect re-INVITE responses: the re-INVITE B-leg entry has an empty target_uri.
+    let is_reinvite_response = b_leg_target.as_deref().map_or(false, |t| t.is_empty());
+
+    if is_reinvite_response && (100..700).contains(&status_code) {
+        // Forward re-INVITE response to the originating leg (A-leg).
+        // Rewrite dialog headers and relay transparently.
+        if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
+            crate::b2bua::manager::rewrite_dialog_headers(
+                message, &a_leg.call_id, b_ftag, &a_leg.from_tag,
+            );
+        }
+        // Replace B-leg Via with A-leg Via(s) from the stored INVITE
+        message.headers.remove("Via");
+        if let Some(invite_arc) = &a_leg_invite {
+            if let Ok(invite) = invite_arc.lock() {
+                if let Some(vias) = invite.headers.get_all("Via") {
+                    for via in vias {
+                        message.headers.add("Via", via.clone());
+                    }
+                }
+            }
+        }
+        sanitize_b2bua_response(message, state, a_leg.transport);
+
+        // ACK the B-leg for 2xx re-INVITE responses
+        if (200..300).contains(&status_code) {
+            if let Some((b_dest, b_transport)) = b_leg_dest {
+                if let Some((ref b_cid, ref _b_ftag)) = b_leg_dialog {
+                    let ack_uri = message.headers.get("Contact")
+                        .and_then(|c| {
+                            let uri_str = c.trim_start_matches('<').split('>').next().unwrap_or("");
+                            parse_uri_standalone(uri_str).ok()
+                        })
+                        .unwrap_or_else(|| SipUri::new("invalid".to_string()));
+                    let transport_str = format!("{}", b_transport).to_uppercase();
+                    let outbound_port = state.listen_addrs.get(&b_transport)
+                        .map(|a| a.port())
+                        .unwrap_or(state.local_addr.port());
+                    let cseq_num = message.headers.cseq()
+                        .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "1".to_string());
+                    let from = message.headers.from().cloned().unwrap_or_default();
+                    let to = message.headers.to().cloned().unwrap_or_default();
+                    let ack = SipMessageBuilder::new()
+                        .request(Method::Ack, ack_uri)
+                        .via(format!(
+                            "SIP/2.0/{} {}:{};branch={}",
+                            transport_str,
+                            format_sip_host(&state.local_addr.ip().to_string()),
+                            outbound_port,
+                            TransactionKey::generate_branch(),
+                        ))
+                        .from(from.to_string())
+                        .to(to.to_string())
+                        .call_id(b_cid.clone())
+                        .cseq(format!("{} ACK", cseq_num))
+                        .header("Max-Forwards", "70".to_string())
+                        .content_length(0)
+                        .build()
+                        .expect("B2BUA ACK for re-INVITE 2xx should not fail");
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                    debug!(call_id = %call_id, "B2BUA: sent ACK to B-leg for re-INVITE 200 OK");
+                }
+            }
+
+            // Reset session timer on successful re-INVITE
+            state.call_manager.reset_session_timer(call_id);
+        }
+
+        send_message(
+            message.clone(),
+            a_leg.transport,
+            a_leg.source_addr,
+            a_leg.connection_id,
+            state,
+        );
+        return;
+    }
+
     if (200..300).contains(&status_code) {
         // Absorb 200 OK retransmissions: if the call is already answered,
         // this is a retransmit from the B-leg (it hasn't received our ACK yet).
@@ -3606,7 +3709,7 @@ fn handle_b2bua_response(
                     }
                     ack.headers.set("Content-Length", "0".to_string());
                     ack.body.clear();
-                    send_message(ack, b_transport, b_dest, ConnectionId::default(), state);
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
                 }
             }
             return;
@@ -3797,7 +3900,7 @@ fn handle_b2bua_response(
                     .content_length(0)
                     .build()
                     .expect("B2BUA ACK for 2xx should not fail");
-                send_message(ack, b_transport, b_dest, ConnectionId::default(), state);
+                send_b2bua_to_bleg(ack, b_transport, b_dest, state);
                 debug!(call_id = %call_id, "B2BUA: sent ACK to B-leg for 200 OK");
             }
         }
@@ -4257,10 +4360,15 @@ fn handle_b2bua_bye(
         if let Some(winner_index) = call.winner {
             if let Some(b_leg) = call.b_legs.get(winner_index) {
                 let branch = TransactionKey::generate_branch();
+                let transport_str = format!("{}", b_leg.transport).to_uppercase();
+                let outbound_port = state.listen_addrs.get(&b_leg.transport)
+                    .map(|a| a.port())
+                    .unwrap_or(state.local_addr.port());
                 let via_value = format!(
-                    "SIP/2.0/UDP {}:{};branch={}",
-                    state.local_addr.ip(),
-                    state.local_addr.port(),
+                    "SIP/2.0/{} {}:{};branch={}",
+                    transport_str,
+                    format_sip_host(&state.local_addr.ip().to_string()),
+                    outbound_port,
                     branch,
                 );
                 let mut bye = message.clone();
@@ -4270,16 +4378,7 @@ fn handle_b2bua_bye(
                 crate::b2bua::manager::rewrite_dialog_headers(
                     &mut bye, &b_leg.call_id, &call.a_leg.from_tag, &b_leg.from_tag,
                 );
-                let data = Bytes::from(bye.to_bytes());
-                let outbound_message = OutboundMessage {
-                    connection_id: ConnectionId::default(),
-                    transport: b_leg.transport,
-                    destination: b_leg.destination,
-                    data,
-                };
-                if let Err(error) = state.outbound.send(outbound_message) {
-                    error!(call_id = %call_id, "B2BUA: failed to send BYE to B-leg: {error}");
-                }
+                send_b2bua_to_bleg(bye, b_leg.transport, b_leg.destination, state);
             }
         }
     } else {
@@ -4408,10 +4507,15 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
 
     // New Via/branch
     let branch = TransactionKey::generate_branch();
+    let transport_str = format!("{}", b_leg.transport).to_uppercase();
+    let outbound_port = state.listen_addrs.get(&b_leg.transport)
+        .map(|a| a.port())
+        .unwrap_or(state.local_addr.port());
     let via_value = format!(
-        "SIP/2.0/UDP {}:{};branch={}",
-        state.local_addr.ip(),
-        state.local_addr.port(),
+        "SIP/2.0/{} {}:{};branch={}",
+        transport_str,
+        format_sip_host(&state.local_addr.ip().to_string()),
+        outbound_port,
         branch,
     );
     reinvite.headers.remove("Via");
@@ -4462,17 +4566,7 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     state.call_manager.reset_session_timer(call_id);
 
     debug!(call_id = %call_id, "B2BUA: sending session timer refresh re-INVITE");
-
-    let data = Bytes::from(reinvite.to_bytes());
-    let outbound_message = OutboundMessage {
-        connection_id: ConnectionId::default(),
-        transport: b_leg.transport,
-        destination: b_leg.destination,
-        data,
-    };
-    if let Err(error) = state.outbound.send(outbound_message) {
-        error!(call_id = %call_id, "B2BUA: failed to send refresh re-INVITE: {error}");
-    }
+    send_b2bua_to_bleg(reinvite, b_leg.transport, b_leg.destination, state);
 }
 
 /// Terminate a call due to session timer expiry — send BYE to both legs.
@@ -4494,8 +4588,11 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
                 .with_port(a_leg.source_addr.port()),
         )
         .via(format!(
-            "SIP/2.0/UDP {}:{};branch={}",
-            state.local_addr.ip(), state.local_addr.port(), bye_branch_a,
+            "SIP/2.0/{} {}:{};branch={}",
+            format!("{}", a_leg.transport).to_uppercase(),
+            format_sip_host(&state.local_addr.ip().to_string()),
+            state.listen_addrs.get(&a_leg.transport).map(|a| a.port()).unwrap_or(state.local_addr.port()),
+            bye_branch_a,
         ))
         .call_id(sip_call_id.clone())
         .from(format!("<sip:siphon@{}>;tag=session-timer", state.local_addr))
@@ -4518,8 +4615,11 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
                     .with_port(b_leg.destination.port()),
             )
             .via(format!(
-                "SIP/2.0/UDP {}:{};branch={}",
-                state.local_addr.ip(), state.local_addr.port(), bye_branch_b,
+                "SIP/2.0/{} {}:{};branch={}",
+                format!("{}", b_leg.transport).to_uppercase(),
+                format_sip_host(&state.local_addr.ip().to_string()),
+                state.listen_addrs.get(&b_leg.transport).map(|a| a.port()).unwrap_or(state.local_addr.port()),
+                bye_branch_b,
             ))
             .call_id(b_leg.call_id.clone())
             .from(format!("<sip:siphon@{}>;tag={}", state.local_addr, b_leg.from_tag))
@@ -4529,7 +4629,7 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
             .build();
 
         if let Ok(bye_msg) = bye_b {
-            send_message(bye_msg, b_leg.transport, b_leg.destination, ConnectionId::default(), state);
+            send_b2bua_to_bleg(bye_msg, b_leg.transport, b_leg.destination, state);
         }
     }
 
@@ -4600,16 +4700,9 @@ fn handle_b2bua_reinvite(
 
     // Build the forwarded re-INVITE with new Via/branch
     let branch = TransactionKey::generate_branch();
-    let via_value = format!(
-        "SIP/2.0/UDP {}:{};branch={}",
-        state.local_addr.ip(),
-        state.local_addr.port(),
-        branch,
-    );
 
     let mut forwarded = message.clone();
     forwarded.headers.remove("Via");
-    forwarded.headers.add("Via", via_value);
 
     // Register this branch for response routing back to the re-INVITE sender
     let reinvite_target = if from_a_leg {
@@ -4634,6 +4727,20 @@ fn handle_b2bua_reinvite(
     };
 
     if let Some((destination, transport, leg_call_id, leg_from_tag)) = reinvite_target {
+        // Set Via with correct transport for the target leg
+        let transport_str = format!("{}", transport).to_uppercase();
+        let outbound_port = state.listen_addrs.get(&transport)
+            .map(|a| a.port())
+            .unwrap_or(state.local_addr.port());
+        let via_value = format!(
+            "SIP/2.0/{} {}:{};branch={}",
+            transport_str,
+            format_sip_host(&state.local_addr.ip().to_string()),
+            outbound_port,
+            branch,
+        );
+        forwarded.headers.add("Via", via_value);
+
         // Track the re-INVITE branch → call_id for response routing
         let reinvite_leg = BLeg {
             destination,
@@ -4645,16 +4752,7 @@ fn handle_b2bua_reinvite(
         };
         state.call_manager.add_b_leg(&call_id, reinvite_leg);
 
-        let data = Bytes::from(forwarded.to_bytes());
-        let outbound_message = OutboundMessage {
-            connection_id: ConnectionId::default(),
-            transport,
-            destination,
-            data,
-        };
-        if let Err(error) = state.outbound.send(outbound_message) {
-            error!(call_id = %call_id, "B2BUA: failed to forward re-INVITE: {error}");
-        }
+        send_b2bua_to_bleg(forwarded, transport, destination, state);
     }
 
     // Reset session timer on successful re-INVITE (timer reset happens on 200 OK
