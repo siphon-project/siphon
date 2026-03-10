@@ -3435,7 +3435,8 @@ fn handle_b2bua_response(
                     Arc::clone(invite_arc),
                     a_leg.source_addr.ip().to_string(),
                 );
-                let py_reply = PyReply::new(Arc::clone(&response_arc));
+                let py_reply = PyReply::new(Arc::clone(&response_arc))
+                    .with_a_leg(Arc::clone(invite_arc));
 
                 answer_recording_srs = Python::attach(|python| {
                     let call_obj = match Py::new(python, py_call) {

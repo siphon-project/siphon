@@ -24,7 +24,8 @@ async def on_answer(call, reply):
     log.info(f"B2BUA answer: call {call.call_id}")
 
     # Anchor media through RTPEngine (answer direction)
-    await rtpengine.answer(reply, profile="srtp_to_rtp")
+    # Pass `call` so RTPEngine uses the A-leg Call-ID that matched the offer.
+    await rtpengine.answer(reply, profile="srtp_to_rtp", call=call)
     log.info(f"RTPEngine answer done for call {call.call_id}")
 
 

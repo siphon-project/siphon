@@ -135,9 +135,9 @@ impl PyRtpEngine {
     /// the body with the rewritten SDP.
     ///
     /// In B2BUA mode the offer was keyed by the A-leg Call-ID/From-tag, but the
-    /// reply carries B-leg identifiers. Pass the original `call` object so that
-    /// the correct (A-leg) Call-ID and From-tag are used for the RTPEngine
-    /// `answer` command.
+    /// reply carries B-leg identifiers. The A-leg identifiers are resolved
+    /// automatically when the reply carries an A-leg reference (set by the
+    /// dispatcher), or via an explicit `call` parameter.
     ///
     /// Args:
     ///     reply: A Reply or Call object containing the 200 OK with SDP.
@@ -164,12 +164,20 @@ impl PyRtpEngine {
 
         let message = extract_message(reply)?;
 
-        // When a `call` object is provided (B2BUA mode), use its Call-ID and
-        // From-tag so they match the earlier `offer`.  SDP and To-tag still
-        // come from the reply (the 200 OK).
-        let (call_id, from_tag, to_tag, sdp) = if let Some(call_obj) = call {
-            let call_msg = extract_message(call_obj)?;
-            let (cid, ftag, _sdp) = extract_offer_params(&call_msg)?;
+        // Resolve A-leg identifiers for RTPEngine correlation:
+        // 1. Explicit `call` parameter (backward compat / proxy-with-call)
+        // 2. Automatic: PyReply carries A-leg INVITE ref set by B2BUA dispatcher
+        // 3. Fallback: extract from the reply itself (proxy mode, same Call-ID)
+        let a_leg_msg: Option<Arc<Mutex<SipMessage>>> = if let Some(call_obj) = call {
+            Some(extract_message(call_obj)?)
+        } else if let Ok(py_reply) = reply.cast::<PyReply>() {
+            py_reply.borrow().a_leg_message()
+        } else {
+            None
+        };
+
+        let (call_id, from_tag, to_tag, sdp) = if let Some(ref a_msg) = a_leg_msg {
+            let (cid, ftag, _sdp) = extract_offer_params(a_msg)?;
             let (_reply_cid, _reply_ftag, ttag, reply_sdp) = extract_answer_params(&message)?;
             (cid, ftag, ttag, reply_sdp)
         } else {

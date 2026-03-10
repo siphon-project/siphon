@@ -20,6 +20,10 @@ use super::sip_uri::PySipUri;
 pub struct PyReply {
     message: Arc<Mutex<SipMessage>>,
     forwarded: bool,
+    /// In B2BUA mode, the A-leg INVITE message.  Used by `rtpengine.answer()`
+    /// to automatically correlate with the earlier `offer()` (which used the
+    /// A-leg Call-ID/From-tag).
+    a_leg_message: Option<Arc<Mutex<SipMessage>>>,
 }
 
 impl PyReply {
@@ -32,7 +36,15 @@ impl PyReply {
         Self {
             message,
             forwarded: false,
+            a_leg_message: None,
         }
+    }
+
+    /// Attach the A-leg INVITE so `rtpengine.answer()` can look up the
+    /// original Call-ID/From-tag transparently (B2BUA mode).
+    pub fn with_a_leg(mut self, a_leg: Arc<Mutex<SipMessage>>) -> Self {
+        self.a_leg_message = Some(a_leg);
+        self
     }
 
     /// Whether the script called `relay()` or `forward()`.
@@ -43,6 +55,11 @@ impl PyReply {
     /// Get the underlying message (for Rust-side forwarding).
     pub fn message(&self) -> Arc<Mutex<SipMessage>> {
         Arc::clone(&self.message)
+    }
+
+    /// Get the A-leg message, if set (B2BUA mode).
+    pub fn a_leg_message(&self) -> Option<Arc<Mutex<SipMessage>>> {
+        self.a_leg_message.as_ref().map(Arc::clone)
     }
 }
 
