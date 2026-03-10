@@ -703,21 +703,13 @@ async fn main() {
     // --- NAT keepalive (if configured) ---
     if let Some(ref nat_config) = config.nat {
         if let Some(ref keepalive_config) = nat_config.keepalive {
-            // Get the registrar from inject_python_singletons — it was already created.
-            // For keepalive we need a separate Registrar reference. We'll create one
-            // from config (it's a lightweight DashMap wrapper).
-            let registrar_config = siphon::registrar::RegistrarConfig {
-                default_expires: config.registrar.default_expires,
-                max_expires: config.registrar.max_expires,
-                min_expires: config.registrar.min_expires.unwrap_or(60),
-                max_contacts: config.registrar.max_contacts.unwrap_or(10) as usize,
-            };
-            let registrar = Arc::new(siphon::registrar::Registrar::new(registrar_config));
-            siphon::nat::spawn_keepalive(
-                keepalive_config.clone(),
-                registrar,
-                Arc::clone(&uac_sender),
-            );
+            if let Some(registrar) = siphon::script::api::registrar_arc() {
+                siphon::nat::spawn_keepalive(
+                    keepalive_config.clone(),
+                    Arc::clone(registrar),
+                    Arc::clone(&uac_sender),
+                );
+            }
         }
     }
 

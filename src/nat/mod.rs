@@ -88,6 +88,8 @@ async fn ping_all_contacts(
     threshold: u32,
 ) {
     let contacts = registrar.all_contacts();
+    let nat_count = contacts.iter().filter(|(_, c)| c.source_addr.is_some()).count();
+    debug!(total = contacts.len(), nat = nat_count, "keepalive sweep");
 
     for (aor, contact) in contacts {
         let source_addr = match contact.source_addr {
@@ -119,7 +121,7 @@ async fn ping_all_contacts(
             }
             _ => {
                 let count = tracker.record_failure(&tracker_key);
-                debug!(
+                warn!(
                     aor = %aor,
                     contact = %contact_uri_string,
                     failures = count,
