@@ -65,6 +65,10 @@ pub struct BLeg {
     pub branch: String,
     /// Target URI.
     pub target_uri: String,
+    /// B-leg Call-ID (generated fresh to decouple from A-leg dialog).
+    pub call_id: String,
+    /// Our From-tag for this B-leg (always unique per leg).
+    pub from_tag: String,
 }
 
 /// A complete B2BUA call — A-leg + B-leg(s).
@@ -95,6 +99,50 @@ pub struct Call {
     pub outbound_credentials: Option<(String, String)>,
     /// SIPREC recording session URI (set by script via call.record).
     pub recording_srs: Option<String>,
+    /// When true, copy the A-leg Call-ID to B-leg instead of generating a new one.
+    /// From-tag is always regenerated regardless of this flag.
+    pub preserve_call_id: bool,
+}
+
+/// Generate a fresh Call-ID for a B-leg dialog.
+pub fn generate_b_leg_call_id() -> String {
+    format!("b2b-{}", uuid::Uuid::new_v4())
+}
+
+/// Generate a fresh From-tag for a B-leg dialog.
+pub fn generate_b_leg_from_tag() -> String {
+    format!("sb-{}", &uuid::Uuid::new_v4().as_simple().to_string()[..12])
+}
+
+/// Rewrite dialog headers (Call-ID + From/To tags) when bridging between legs.
+///
+/// Replaces the Call-ID and swaps occurrences of `old_tag` → `new_tag` in
+/// From and To headers. This handles both directions:
+/// - B→A: swap B-leg identifiers to A-leg identifiers
+/// - A→B: swap A-leg identifiers to B-leg identifiers
+pub fn rewrite_dialog_headers(
+    message: &mut SipMessage,
+    new_call_id: &str,
+    old_tag: &str,
+    new_tag: &str,
+) {
+    message.headers.set("Call-ID", new_call_id.to_string());
+
+    let old_pattern = format!("tag={}", old_tag);
+    let new_pattern = format!("tag={}", new_tag);
+
+    if let Some(from) = message.headers.get("From").or_else(|| message.headers.get("f")) {
+        if from.contains(&old_pattern) {
+            let new_from = from.replace(&old_pattern, &new_pattern);
+            message.headers.set("From", new_from);
+        }
+    }
+    if let Some(to) = message.headers.get("To").or_else(|| message.headers.get("t")) {
+        if to.contains(&old_pattern) {
+            let new_to = to.replace(&old_pattern, &new_pattern);
+            message.headers.set("To", new_to);
+        }
+    }
 }
 
 /// Manages all active B2BUA calls.
@@ -135,6 +183,7 @@ impl CallManager {
             transfer: None,
             outbound_credentials: None,
             recording_srs: None,
+            preserve_call_id: false,
         };
         self.calls.insert(id.clone(), call);
         id
@@ -219,11 +268,16 @@ impl CallManager {
         self.calls.iter()
     }
 
-    /// Find call ID by A-leg Call-ID header.
+    /// Find call ID by SIP Call-ID header (searches both A-leg and B-leg Call-IDs).
     pub fn find_by_sip_call_id(&self, sip_call_id: &str) -> Option<String> {
         for entry in self.calls.iter() {
             if entry.a_leg.call_id == sip_call_id {
                 return Some(entry.id.clone());
+            }
+            for b_leg in &entry.b_legs {
+                if b_leg.call_id == sip_call_id {
+                    return Some(entry.id.clone());
+                }
             }
         }
         None
@@ -321,6 +375,8 @@ mod tests {
             transport: Transport::Udp,
             branch: format!("z9hG4bK-bleg{}", index),
             target_uri: format!("sip:bob{}@10.0.0.2", index),
+            call_id: format!("b2b-bleg{}", index),
+            from_tag: format!("sb-bleg{}", index),
         }
     }
 
@@ -498,5 +554,104 @@ mod tests {
         // Sweep with zero TTL removes everything
         assert_eq!(manager.sweep_stale(std::time::Duration::ZERO), 1);
         assert_eq!(manager.count(), 0);
+    }
+
+    #[test]
+    fn find_by_b_leg_call_id() {
+        let manager = CallManager::new();
+        let call_id = manager.create_call(make_a_leg());
+        let b_leg = make_b_leg(0);
+        let b_cid = b_leg.call_id.clone();
+        manager.add_b_leg(&call_id, b_leg);
+        // Should find via A-leg Call-ID
+        assert_eq!(manager.find_by_sip_call_id("call-1@10.0.0.1"), Some(call_id.clone()));
+        // Should also find via B-leg Call-ID
+        assert_eq!(manager.find_by_sip_call_id(&b_cid), Some(call_id));
+        // Nonexistent returns None
+        assert!(manager.find_by_sip_call_id("nonexistent").is_none());
+    }
+
+    #[test]
+    fn b_leg_dialog_ids_are_stored() {
+        let manager = CallManager::new();
+        let call_id = manager.create_call(make_a_leg());
+        manager.add_b_leg(&call_id, make_b_leg(0));
+        let call = manager.get_call(&call_id).unwrap();
+        assert_eq!(call.b_legs[0].call_id, "b2b-bleg0");
+        assert_eq!(call.b_legs[0].from_tag, "sb-bleg0");
+        // A-leg and B-leg Call-IDs must differ
+        assert_ne!(call.a_leg.call_id, call.b_legs[0].call_id);
+        assert_ne!(call.a_leg.from_tag, call.b_legs[0].from_tag);
+    }
+
+    #[test]
+    fn generate_b_leg_ids_are_unique() {
+        let id1 = generate_b_leg_call_id();
+        let id2 = generate_b_leg_call_id();
+        assert_ne!(id1, id2);
+        assert!(id1.starts_with("b2b-"));
+
+        let tag1 = generate_b_leg_from_tag();
+        let tag2 = generate_b_leg_from_tag();
+        assert_ne!(tag1, tag2);
+        assert!(tag1.starts_with("sb-"));
+    }
+
+    #[test]
+    fn rewrite_dialog_headers_swaps_call_id_and_tags() {
+        use crate::sip::builder::SipMessageBuilder;
+        use crate::sip::message::Method;
+        use crate::sip::uri::SipUri;
+
+        let mut msg = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-test".to_string())
+            .from("<sip:alice@example.com>;tag=old-tag".to_string())
+            .to("<sip:bob@example.com>;tag=bob-tag".to_string())
+            .call_id("old-call-id".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        rewrite_dialog_headers(&mut msg, "new-call-id", "old-tag", "new-tag");
+
+        assert_eq!(msg.headers.get("Call-ID").unwrap(), "new-call-id");
+        assert!(msg.headers.get("From").unwrap().contains("tag=new-tag"));
+        assert!(!msg.headers.get("From").unwrap().contains("tag=old-tag"));
+        // To-tag should be unchanged (bob-tag doesn't match old-tag)
+        assert!(msg.headers.get("To").unwrap().contains("tag=bob-tag"));
+    }
+
+    #[test]
+    fn rewrite_dialog_headers_swaps_to_tag_when_matched() {
+        let mut msg = crate::sip::builder::SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-test".to_string())
+            .from("<sip:bob@example.com>;tag=bob-tag".to_string())
+            .to("<sip:alice@example.com>;tag=our-b-tag".to_string())
+            .call_id("b-leg-call-id".to_string())
+            .cseq("1 BYE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        // Simulate BYE from B→A: swap B-leg identifiers to A-leg
+        rewrite_dialog_headers(&mut msg, "a-leg-call-id", "our-b-tag", "a-leg-from-tag");
+
+        assert_eq!(msg.headers.get("Call-ID").unwrap(), "a-leg-call-id");
+        // From has bob-tag (no match for our-b-tag), so unchanged
+        assert!(msg.headers.get("From").unwrap().contains("tag=bob-tag"));
+        // To had our-b-tag → should now be a-leg-from-tag
+        assert!(msg.headers.get("To").unwrap().contains("tag=a-leg-from-tag"));
+        assert!(!msg.headers.get("To").unwrap().contains("tag=our-b-tag"));
+    }
+
+    #[test]
+    fn preserve_call_id_defaults_to_false() {
+        let manager = CallManager::new();
+        let call_id = manager.create_call(make_a_leg());
+        let call = manager.get_call(&call_id).unwrap();
+        assert!(!call.preserve_call_id);
     }
 }

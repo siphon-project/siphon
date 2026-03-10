@@ -261,6 +261,8 @@ harness.reset()
 
 ### B2BUA call
 
+Each B-leg gets a fresh Call-ID and From-tag by default, fully decoupling the two SIP dialogs. Use `keep_call_id()` to opt out of Call-ID regeneration.
+
 | Property/Method | Description |
 |----------------|-------------|
 | `call.id` | UUID |
@@ -271,8 +273,11 @@ harness.reset()
 | `call.dial(uri, timeout=30)` | Dial single target |
 | `call.fork(targets, strategy, timeout)` | Fork to multiple |
 | `call.terminate()` | End call (BYE both legs) |
+| `call.keep_call_id()` | Copy A-leg Call-ID to B-leg (From-tag always unique) |
+| `call.set_credentials(user, pass)` | B-leg digest auth credentials (auto 401/407 retry) |
 | `call.media.anchor(engine)` | Anchor media through RTPEngine |
 | `call.media.release()` | Release media anchor |
+| `call.session_timer(expires, min_se, refresher)` | Per-call RFC 4028 session timer |
 | `call.record(srs_uri)` | Start SIPREC recording |
 | `call.stop_recording()` | Stop SIPREC recording |
 

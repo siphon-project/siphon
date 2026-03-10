@@ -17,7 +17,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
 | Stateful proxy (RFC 3261 §16) | **Production** | `script: @proxy.on_request` | Full transaction state machines |
-| B2BUA (RFC 3261 §6) | Implemented | `script: @b2bua.on_invite` | Two-leg call control, topology hiding |
+| B2BUA (RFC 3261 §6) | Implemented | `script: @b2bua.on_invite` | Two-leg call control, per-leg Call-ID + From-tag, topology hiding |
 | Parallel forking | **Production** | `request.fork()` | Used for AS→subscriber delivery |
 | Sequential forking | Implemented | `request.fork(strategy="sequential")` | |
 | Record-Route / Loose Route | **Production** | `request.record_route()` | Mid-dialog routing proven |

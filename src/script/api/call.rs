@@ -141,6 +141,8 @@ pub struct PyCall {
     outbound_credentials: Option<(String, String)>,
     /// SRS URI for SIPREC recording (set by Python script).
     record_srs_uri: Option<String>,
+    /// When true, copy the A-leg Call-ID to B-leg instead of generating a new one.
+    preserve_call_id_flag: bool,
 }
 
 impl PyCall {
@@ -161,6 +163,7 @@ impl PyCall {
             refer_replaces_info: None,
             outbound_credentials: None,
             record_srs_uri: None,
+            preserve_call_id_flag: false,
         }
     }
 
@@ -199,6 +202,11 @@ impl PyCall {
     /// Get the SRS URI for SIPREC recording.
     pub fn record_srs(&self) -> Option<&str> {
         self.record_srs_uri.as_deref()
+    }
+
+    /// Whether the script wants to preserve the A-leg Call-ID on the B-leg.
+    pub fn preserve_call_id(&self) -> bool {
+        self.preserve_call_id_flag
     }
 
     /// Set the Refer-To information (called by B2BUA core before firing on_refer).
@@ -474,6 +482,20 @@ impl PyCall {
     /// Stop SIPREC recording.
     fn stop_recording(&mut self) {
         self.record_srs_uri = None;
+    }
+
+    /// Copy the A-leg Call-ID to the B-leg instead of generating a new one.
+    ///
+    /// By default the B2BUA generates a fresh Call-ID for each B-leg to fully
+    /// decouple the two SIP dialogs. Call this method if you need the trunk to
+    /// see the same Call-ID as the originating side.
+    ///
+    /// Note: From-tag is always regenerated regardless — it must be unique per leg.
+    ///
+    /// Usage in Python:
+    ///   call.keep_call_id()
+    fn keep_call_id(&mut self) {
+        self.preserve_call_id_flag = true;
     }
 
     /// Accept the REFER and proceed with the transfer.

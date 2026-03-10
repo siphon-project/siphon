@@ -300,6 +300,48 @@ class Call:
         """
         self._actions.append(Action(kind="stop_recording"))
 
+    def keep_call_id(self) -> None:
+        """Copy the A-leg Call-ID to the B-leg instead of generating a new one.
+
+        By default the B2BUA generates a fresh Call-ID for each B-leg to fully
+        decouple the two SIP dialogs (proper topology hiding).  Call this
+        method if you need the trunk to see the same Call-ID as the
+        originating side.
+
+        Note: the From-tag is **always** regenerated regardless — it must be
+        unique per leg.
+
+        Example::
+
+            @b2bua.on_invite
+            def on_invite(call):
+                call.keep_call_id()  # trunk sees same Call-ID
+                call.dial("sip:trunk@carrier.example.com")
+        """
+        self._actions.append(Action(kind="keep_call_id"))
+
+    def set_credentials(self, username: str, password: str) -> None:
+        """Set outbound credentials for B-leg digest authentication.
+
+        When the B-leg returns 401/407, SIPhon automatically retries the
+        INVITE with these credentials instead of firing ``on_failure``.
+
+        Args:
+            username: Digest username.
+            password: Digest password.
+
+        Example::
+
+            @b2bua.on_invite
+            def on_invite(call):
+                call.set_credentials("trunk_user", "s3cret")
+                call.dial("sip:gw@carrier.example.com")
+        """
+        self._actions.append(Action(
+            kind="set_credentials",
+            extras={"username": username, "password": password},
+        ))
+
     # -- Header access ---------------------------------------------------------
 
     def get_header(self, name: str) -> Optional[str]:

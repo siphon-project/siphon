@@ -2880,12 +2880,17 @@ fn handle_b2bua_cancel(
         let cancel_request = SipMessageBuilder::new()
             .request(crate::sip::message::Method::Cancel, cancel_uri)
             .via(via_value)
-            .header("Call-ID", sip_call_id.clone())
+            .header("Call-ID", b_leg.call_id.clone())
             .content_length(0);
 
-        // Copy From, To, CSeq (with CANCEL method) from original
+        // Copy From (with B-leg From-tag), To, CSeq from original
         let cancel_msg = if let Some(from) = message.headers.from() {
-            cancel_request.from(from.clone())
+            // Rewrite From-tag from A-leg to B-leg
+            let b_from = from.replace(
+                &format!("tag={}", call.a_leg.from_tag),
+                &format!("tag={}", b_leg.from_tag),
+            );
+            cancel_request.from(b_from)
         } else {
             cancel_request
         };
@@ -2987,7 +2992,7 @@ fn handle_b2bua_invite(
     let engine_state = state.engine.state();
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
 
-    let (action, timer_override, credentials, recording_srs) = Python::attach(|python| {
+    let (action, timer_override, credentials, recording_srs, preserve_call_id) = Python::attach(|python| {
         let call_obj = Py::new(python, py_call).expect("failed to create PyCall");
 
         for handler in &handlers {
@@ -3000,7 +3005,7 @@ fn handle_b2bua_invite(
                             return (CallAction::Reject {
                                 code: 500,
                                 reason: "Script Error".to_string(),
-                            }, None, None, None);
+                            }, None, None, None, false);
                         }
                     }
                 }
@@ -3009,7 +3014,7 @@ fn handle_b2bua_invite(
                     return (CallAction::Reject {
                         code: 500,
                         reason: "Script Error".to_string(),
-                    }, None, None, None);
+                    }, None, None, None, false);
                 }
             }
         }
@@ -3019,14 +3024,15 @@ fn handle_b2bua_invite(
         let timer_override = borrowed.session_timer_override().cloned();
         let credentials = borrowed.outbound_credentials().map(|(u, p)| (u.to_string(), p.to_string()));
         let recording_srs = borrowed.record_srs().map(|s| s.to_string());
-        (action, timer_override, credentials, recording_srs)
+        let preserve_cid = borrowed.preserve_call_id();
+        (action, timer_override, credentials, recording_srs, preserve_cid)
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
     state.call_manager.set_a_leg_invite(&call_id, Arc::clone(&message_arc));
 
-    // Store per-call session timer override, credentials, and recording SRS if set by script
-    if timer_override.is_some() || credentials.is_some() || recording_srs.is_some() {
+    // Store per-call overrides from script
+    if timer_override.is_some() || credentials.is_some() || recording_srs.is_some() || preserve_call_id {
         if let Some(mut call) = state.call_manager.get_call_mut(&call_id) {
             if let Some(override_config) = timer_override {
                 call.session_timer_override = Some(override_config);
@@ -3037,6 +3043,7 @@ fn handle_b2bua_invite(
             if recording_srs.is_some() {
                 call.recording_srs = recording_srs;
             }
+            call.preserve_call_id = preserve_call_id;
         }
     }
 
@@ -3117,11 +3124,52 @@ fn b2bua_send_b_leg_invite(
         });
     }
 
+    // Generate fresh dialog identifiers for the B-leg (proper B2BUA behavior).
+    // Call-ID is new by default unless the script called call.preserve_call_id().
+    // From-tag is always unique per B-leg regardless.
+    let (per_call_override, preserve_call_id, a_leg_call_id, a_leg_from_tag) =
+        match state.call_manager.get_call(call_id) {
+            Some(c) => (
+                c.session_timer_override.clone(),
+                c.preserve_call_id,
+                c.a_leg.call_id.clone(),
+                c.a_leg.from_tag.clone(),
+            ),
+            None => (None, false, String::new(), String::new()),
+        };
+
+    let b_leg_call_id = if preserve_call_id {
+        a_leg_call_id
+    } else {
+        crate::b2bua::manager::generate_b_leg_call_id()
+    };
+    let b_leg_from_tag = crate::b2bua::manager::generate_b_leg_from_tag();
+
+    // Rewrite Call-ID for B-leg dialog
+    b_leg_invite.headers.set("Call-ID", b_leg_call_id.clone());
+
+    // Rewrite From-tag for B-leg dialog (keep display name and URI, replace tag)
+    if let Some(from) = b_leg_invite.headers.get("From")
+        .or_else(|| b_leg_invite.headers.get("f"))
+    {
+        let old_pattern = format!("tag={}", a_leg_from_tag);
+        let new_pattern = format!("tag={}", b_leg_from_tag);
+        let new_from = from.replace(&old_pattern, &new_pattern);
+        b_leg_invite.headers.set("From", new_from);
+    }
+
+    // Strip any To-tag (B-leg INVITE should not have one)
+    if let Some(to) = b_leg_invite.headers.get("To")
+        .or_else(|| b_leg_invite.headers.get("t"))
+    {
+        if let Some(tag_start) = to.find(";tag=") {
+            let new_to = to[..tag_start].to_string();
+            b_leg_invite.headers.set("To", new_to);
+        }
+    }
+
     // Inject RFC 4028 session timer headers if configured.
     // Per-call override (from call.session_timer()) takes precedence over global config.
-    let per_call_override = state.call_manager.get_call(call_id)
-        .and_then(|c| c.session_timer_override.clone());
-
     if let Some(ref override_config) = per_call_override {
         b_leg_invite.headers.add("Supported", "timer".to_string());
         b_leg_invite.headers.add(
@@ -3146,6 +3194,8 @@ fn b2bua_send_b_leg_invite(
         transport: outbound_transport,
         branch: branch.clone(),
         target_uri: target_uri.to_string(),
+        call_id: b_leg_call_id,
+        from_tag: b_leg_from_tag,
     };
     state.call_manager.add_b_leg(call_id, b_leg);
 
@@ -3264,12 +3314,12 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, outbound_credentials, recording_srs) = match state.call_manager.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_dialog, outbound_credentials, recording_srs) = match state.call_manager.get_call(call_id) {
         Some(call) => {
-            let target = call.b_legs.iter()
-                .find(|b| b.branch == branch)
-                .map(|b| b.target_uri.clone());
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, call.outbound_credentials.clone(), call.recording_srs.clone())
+            let matching_b = call.b_legs.iter().find(|b| b.branch == branch);
+            let target = matching_b.map(|b| b.target_uri.clone());
+            let dialog = matching_b.map(|b| (b.call_id.clone(), b.from_tag.clone()));
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, dialog, call.outbound_credentials.clone(), call.recording_srs.clone())
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -3400,6 +3450,14 @@ fn handle_b2bua_response(
             }
         }
 
+        // Rewrite B-leg dialog headers back to A-leg identifiers
+        if let Some((ref b_cid, ref b_ftag)) = b_leg_dialog {
+            crate::b2bua::manager::rewrite_dialog_headers(
+                &mut response, &a_leg.call_id, b_ftag, &a_leg.from_tag,
+            );
+            let _ = (b_cid,); // Call-ID already set by rewrite_dialog_headers
+        }
+
         core::strip_top_via(&mut response.headers);
 
         // Extract SDP body before forwarding (needed for SIPREC)
@@ -3447,6 +3505,12 @@ fn handle_b2bua_response(
     } else if (180..200).contains(&status_code) {
         // 1xx provisional — forward to A-leg
         state.call_manager.set_state(call_id, CallState::Ringing);
+        // Rewrite B-leg dialog headers back to A-leg identifiers
+        if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
+            crate::b2bua::manager::rewrite_dialog_headers(
+                message, &a_leg.call_id, b_ftag, &a_leg.from_tag,
+            );
+        }
         core::strip_top_via(&mut message.headers);
         send_message(
             message.clone(),
@@ -3516,11 +3580,20 @@ fn handle_b2bua_response(
                                 );
                                 retry.headers.add("Min-SE", min_se.to_string());
 
+                                // Reuse B-leg dialog identifiers from the failed attempt
+                                let (retry_call_id, retry_from_tag) = b_leg_dialog.clone()
+                                    .unwrap_or_else(|| (a_leg.call_id.clone(), a_leg.from_tag.clone()));
+                                crate::b2bua::manager::rewrite_dialog_headers(
+                                    &mut retry, &retry_call_id, &a_leg.from_tag, &retry_from_tag,
+                                );
+
                                 let b_leg = BLeg {
                                     destination,
                                     transport,
                                     branch: new_branch,
                                     target_uri: target_uri.clone(),
+                                    call_id: retry_call_id,
+                                    from_tag: retry_from_tag,
                                 };
                                 state.call_manager.add_b_leg(call_id, b_leg);
 
@@ -3610,11 +3683,20 @@ fn handle_b2bua_response(
                                 retry.headers.remove(auth_header_name);
                                 retry.headers.add(auth_header_name, auth_value);
 
+                                // Reuse B-leg dialog identifiers from the failed attempt
+                                let (retry_call_id, retry_from_tag) = b_leg_dialog.clone()
+                                    .unwrap_or_else(|| (a_leg.call_id.clone(), a_leg.from_tag.clone()));
+                                crate::b2bua::manager::rewrite_dialog_headers(
+                                    &mut retry, &retry_call_id, &a_leg.from_tag, &retry_from_tag,
+                                );
+
                                 let b_leg = BLeg {
                                     destination,
                                     transport,
                                     branch: new_branch,
                                     target_uri: target_uri.clone(),
+                                    call_id: retry_call_id,
+                                    from_tag: retry_from_tag,
                                 };
                                 state.call_manager.add_b_leg(call_id, b_leg);
 
@@ -3678,7 +3760,12 @@ fn handle_b2bua_response(
             }
         }
 
-        // Forward error to A-leg
+        // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg
+        if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
+            crate::b2bua::manager::rewrite_dialog_headers(
+                message, &a_leg.call_id, b_ftag, &a_leg.from_tag,
+            );
+        }
         core::strip_top_via(&mut message.headers);
         send_message(
             message.clone(),
@@ -3785,7 +3872,7 @@ fn handle_b2bua_bye(
         state,
     );
 
-    // Forward BYE to the other leg
+    // Forward BYE to the other leg with dialog header rewriting
     if from_a_leg {
         // BYE from A → forward to B-leg(s)
         if let Some(winner_index) = call.winner {
@@ -3800,6 +3887,10 @@ fn handle_b2bua_bye(
                 let mut bye = message.clone();
                 bye.headers.remove("Via");
                 bye.headers.add("Via", via_value);
+                // Rewrite A-leg dialog headers → B-leg dialog headers
+                crate::b2bua::manager::rewrite_dialog_headers(
+                    &mut bye, &b_leg.call_id, &call.a_leg.from_tag, &b_leg.from_tag,
+                );
                 let data = Bytes::from(bye.to_bytes());
                 let outbound_message = OutboundMessage {
                     connection_id: ConnectionId::default(),
@@ -3814,7 +3905,15 @@ fn handle_b2bua_bye(
         }
     } else {
         // BYE from B → forward to A-leg
-        let bye = message.clone();
+        let mut bye = message.clone();
+        // Rewrite B-leg dialog headers → A-leg dialog headers
+        if let Some(winner_index) = call.winner {
+            if let Some(b_leg) = call.b_legs.get(winner_index) {
+                crate::b2bua::manager::rewrite_dialog_headers(
+                    &mut bye, &call.a_leg.call_id, &b_leg.from_tag, &call.a_leg.from_tag,
+                );
+            }
+        }
         send_message(
             bye,
             call.a_leg.transport,
@@ -3907,11 +4006,11 @@ fn session_timer_sweep(state: &DispatcherState) {
 
 /// Send a B2BUA-initiated refresh re-INVITE to the B-leg.
 fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
-    let (a_leg_invite, winner_b_leg, session_expires) = match state.call_manager.get_call(call_id) {
+    let (a_leg_invite, a_leg_from_tag, winner_b_leg, session_expires) = match state.call_manager.get_call(call_id) {
         Some(call) => {
             let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
             let se = call.session_timer.as_ref().map(|t| t.session_expires).unwrap_or(1800);
-            (call.a_leg_invite.clone(), b_leg, se)
+            (call.a_leg_invite.clone(), call.a_leg.from_tag.clone(), b_leg, se)
         }
         None => return,
     };
@@ -3950,6 +4049,11 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
         }
     }
 
+    // Rewrite A-leg dialog headers → B-leg dialog headers
+    crate::b2bua::manager::rewrite_dialog_headers(
+        &mut reinvite, &b_leg.call_id, &a_leg_from_tag, &b_leg.from_tag,
+    );
+
     // Set session timer headers
     reinvite.headers.remove("Session-Expires");
     reinvite.headers.remove("Min-SE");
@@ -3964,12 +4068,14 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
         reinvite.headers.add("Supported", "timer".to_string());
     }
 
-    // Register new branch for response routing
+    // Register new branch for response routing (reuse B-leg dialog identifiers)
     let new_b_leg = BLeg {
         destination: b_leg.destination,
         transport: b_leg.transport,
         branch: branch.clone(),
         target_uri: b_leg.target_uri.clone(),
+        call_id: b_leg.call_id.clone(),
+        from_tag: b_leg.from_tag.clone(),
     };
     state.call_manager.add_b_leg(call_id, new_b_leg);
 
@@ -4023,7 +4129,7 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
         send_message(bye_msg, a_leg.transport, a_leg.source_addr, a_leg.connection_id, state);
     }
 
-    // BYE to B-leg
+    // BYE to B-leg (use B-leg Call-ID and From-tag)
     if let Some(b_leg) = &winner_b_leg {
         let bye_branch_b = TransactionKey::generate_branch();
         let bye_b = SipMessageBuilder::new()
@@ -4036,8 +4142,8 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
                 "SIP/2.0/UDP {}:{};branch={}",
                 state.local_addr.ip(), state.local_addr.port(), bye_branch_b,
             ))
-            .call_id(sip_call_id.clone())
-            .from(format!("<sip:siphon@{}>;tag=session-timer", state.local_addr))
+            .call_id(b_leg.call_id.clone())
+            .from(format!("<sip:siphon@{}>;tag={}", state.local_addr, b_leg.from_tag))
             .to(format!("<sip:endpoint@{}>", b_leg.destination))
             .cseq("1 BYE".to_string())
             .content_length(0)
@@ -4127,28 +4233,38 @@ fn handle_b2bua_reinvite(
     forwarded.headers.add("Via", via_value);
 
     // Register this branch for response routing back to the re-INVITE sender
-    let reinvite_b_leg = if from_a_leg {
-        // A→B: forward to winning B-leg
+    let reinvite_target = if from_a_leg {
+        // A→B: forward to winning B-leg, rewrite A-leg → B-leg dialog headers
         if let Some(b_leg) = &winner_b_leg {
-            Some((b_leg.destination, b_leg.transport))
+            crate::b2bua::manager::rewrite_dialog_headers(
+                &mut forwarded, &b_leg.call_id, &a_leg.from_tag, &b_leg.from_tag,
+            );
+            Some((b_leg.destination, b_leg.transport, b_leg.call_id.clone(), b_leg.from_tag.clone()))
         } else {
             warn!(call_id = %call_id, "B2BUA re-INVITE: no winning B-leg");
             return;
         }
     } else {
-        // B→A: forward to A-leg
-        Some((a_leg.source_addr, a_leg.transport))
+        // B→A: forward to A-leg, rewrite B-leg → A-leg dialog headers
+        if let Some(b_leg) = &winner_b_leg {
+            crate::b2bua::manager::rewrite_dialog_headers(
+                &mut forwarded, &a_leg.call_id, &b_leg.from_tag, &a_leg.from_tag,
+            );
+        }
+        Some((a_leg.source_addr, a_leg.transport, a_leg.call_id.clone(), a_leg.from_tag.clone()))
     };
 
-    if let Some((destination, transport)) = reinvite_b_leg {
+    if let Some((destination, transport, leg_call_id, leg_from_tag)) = reinvite_target {
         // Track the re-INVITE branch → call_id for response routing
-        let b_leg = BLeg {
+        let reinvite_leg = BLeg {
             destination,
             transport,
             branch: branch.clone(),
             target_uri: String::new(), // re-INVITE, no new target
+            call_id: leg_call_id,
+            from_tag: leg_from_tag,
         };
-        state.call_manager.add_b_leg(&call_id, b_leg);
+        state.call_manager.add_b_leg(&call_id, reinvite_leg);
 
         let data = Bytes::from(forwarded.to_bytes());
         let outbound_message = OutboundMessage {
@@ -4505,6 +4621,8 @@ mod tests {
             transport: Transport::Udp,
             branch: "z9hG4bK-b1".to_string(),
             target_uri: "sip:bob@10.0.0.2".to_string(),
+            call_id: "b2b-test-1".to_string(),
+            from_tag: "sb-test-1".to_string(),
         };
         manager.add_b_leg(&call_id, b_leg);
 
