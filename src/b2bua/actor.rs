@@ -988,7 +988,7 @@ impl LegActor {
 }
 
 /// Extract the To-tag from a SIP message.
-fn extract_to_tag(message: &SipMessage) -> Option<String> {
+pub fn extract_to_tag(message: &SipMessage) -> Option<String> {
     message.headers.get("To")
         .or_else(|| message.headers.get("t"))
         .and_then(|to| {
@@ -1296,38 +1296,6 @@ mod tests {
         assert!(call.b_leg_handles[0].is_some());
     }
 
-    #[test]
-    fn call_actor_event_tx_starts_none() {
-        let call = CallActor::new(make_a_leg());
-        assert!(call.event_tx.is_none());
-    }
-
-    #[test]
-    fn call_actor_shutdown_actors_sends_to_all_handles() {
-        let mut call = CallActor::new(make_a_leg());
-        call.add_b_leg(make_b_leg(0));
-        call.add_b_leg(make_b_leg(1));
-
-        let (call_tx, _call_rx) = tokio::sync::mpsc::channel(16);
-        let (_, handle0) = LegActor::new(make_b_leg(0), call_tx.clone());
-        let (_, handle1) = LegActor::new(make_b_leg(1), call_tx);
-
-        // Hold receivers to check messages arrive
-        let rx0 = handle0.tx.clone();
-        let rx1 = handle1.tx.clone();
-
-        call.set_b_leg_handle(0, handle0);
-        call.set_b_leg_handle(1, handle1);
-
-        call.shutdown_actors();
-
-        // Both handles should have received Shutdown via try_send.
-        // We can verify by checking the channel isn't empty (receivers got messages).
-        // Since we cloned tx before setting handles, the actors' rx still work.
-        // Just verify no panic occurred — the real validation is the LegActor async test.
-        let _ = (rx0, rx1);
-    }
-
     // --- LegActor async tests ---
 
     #[tokio::test]
@@ -1475,6 +1443,295 @@ mod tests {
         match event {
             CallEvent::Terminated { leg_id: id } => assert_eq!(id, leg_id),
             other => panic!("expected Terminated, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn leg_actor_classifies_bye_request() {
+        use crate::sip::message::Method;
+
+        let (call_tx, mut call_rx) = tokio::sync::mpsc::channel(16);
+        let leg = make_b_leg(0);
+        let leg_id = leg.id.clone();
+
+        let (actor, handle) = LegActor::new(leg, call_tx);
+        let join = tokio::spawn(actor.run());
+
+        let bye = crate::sip::builder::SipMessageBuilder::new()
+            .request(Method::Bye, crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060))
+            .via("SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-bye".to_string())
+            .from("<sip:bob@biloxi.com>;tag=xyz".to_string())
+            .to("<sip:alice@atlanta.com>;tag=abc".to_string())
+            .call_id("b2b-bleg0".to_string())
+            .cseq("2 BYE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        handle.tx.send(LegMessage::SipInbound {
+            message: bye,
+            source: test_transport(),
+        }).await.unwrap();
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            call_rx.recv(),
+        ).await.unwrap().unwrap();
+        match event {
+            CallEvent::Bye { leg_id: id, from_side, .. } => {
+                assert_eq!(id, leg_id);
+                assert_eq!(from_side, LegSide::B);
+            }
+            other => panic!("expected Bye, got {:?}", other),
+        }
+
+        handle.tx.send(LegMessage::Shutdown).await.unwrap();
+        join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn leg_actor_classifies_reinvite_request() {
+        use crate::sip::message::Method;
+
+        let (call_tx, mut call_rx) = tokio::sync::mpsc::channel(16);
+        let leg = make_b_leg(0);
+        let leg_id = leg.id.clone();
+
+        let (actor, handle) = LegActor::new(leg, call_tx);
+        let join = tokio::spawn(actor.run());
+
+        let reinvite = crate::sip::builder::SipMessageBuilder::new()
+            .request(Method::Invite, crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060))
+            .via("SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-reinv".to_string())
+            .from("<sip:bob@biloxi.com>;tag=xyz".to_string())
+            .to("<sip:alice@atlanta.com>;tag=abc".to_string())
+            .call_id("b2b-bleg0".to_string())
+            .cseq("2 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        handle.tx.send(LegMessage::SipInbound {
+            message: reinvite,
+            source: test_transport(),
+        }).await.unwrap();
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            call_rx.recv(),
+        ).await.unwrap().unwrap();
+        match event {
+            CallEvent::ReInvite { leg_id: id, .. } => assert_eq!(id, leg_id),
+            other => panic!("expected ReInvite, got {:?}", other),
+        }
+
+        handle.tx.send(LegMessage::Shutdown).await.unwrap();
+        join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn leg_actor_classifies_refer_request() {
+        use crate::sip::message::Method;
+
+        let (call_tx, mut call_rx) = tokio::sync::mpsc::channel(16);
+        let leg = make_b_leg(0);
+        let leg_id = leg.id.clone();
+
+        let (actor, handle) = LegActor::new(leg, call_tx);
+        let join = tokio::spawn(actor.run());
+
+        let refer = crate::sip::builder::SipMessageBuilder::new()
+            .request(Method::Refer, crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060))
+            .via("SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-refer".to_string())
+            .from("<sip:bob@biloxi.com>;tag=xyz".to_string())
+            .to("<sip:alice@atlanta.com>;tag=abc".to_string())
+            .call_id("b2b-bleg0".to_string())
+            .cseq("3 REFER".to_string())
+            .header("Refer-To", "<sip:carol@chicago.com>".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        handle.tx.send(LegMessage::SipInbound {
+            message: refer,
+            source: test_transport(),
+        }).await.unwrap();
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            call_rx.recv(),
+        ).await.unwrap().unwrap();
+        match event {
+            CallEvent::Refer { leg_id: id, .. } => assert_eq!(id, leg_id),
+            other => panic!("expected Refer, got {:?}", other),
+        }
+
+        handle.tx.send(LegMessage::Shutdown).await.unwrap();
+        join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn leg_actor_ignores_unknown_request() {
+        use crate::sip::message::Method;
+
+        let (call_tx, mut call_rx) = tokio::sync::mpsc::channel(16);
+        let leg = make_b_leg(0);
+
+        let (actor, handle) = LegActor::new(leg, call_tx);
+        let join = tokio::spawn(actor.run());
+
+        // OPTIONS is not classified by the actor — no event emitted
+        let options = crate::sip::builder::SipMessageBuilder::new()
+            .request(Method::Options, crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060))
+            .via("SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-opts".to_string())
+            .from("<sip:bob@biloxi.com>;tag=xyz".to_string())
+            .to("<sip:alice@atlanta.com>;tag=abc".to_string())
+            .call_id("b2b-bleg0".to_string())
+            .cseq("4 OPTIONS".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        handle.tx.send(LegMessage::SipInbound {
+            message: options,
+            source: test_transport(),
+        }).await.unwrap();
+
+        // Should timeout — no event expected
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            call_rx.recv(),
+        ).await;
+        assert!(result.is_err(), "expected timeout, got event");
+
+        handle.tx.send(LegMessage::Shutdown).await.unwrap();
+        join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forking_multiple_actors_share_event_channel() {
+        let (call_tx, mut call_rx) = tokio::sync::mpsc::channel(16);
+
+        // Spawn 3 B-leg actors sharing the same event_tx
+        let mut handles = Vec::new();
+        let mut leg_ids = Vec::new();
+        let mut joins = Vec::new();
+        for i in 0..3 {
+            let leg = make_b_leg(i);
+            leg_ids.push(leg.id.clone());
+            let (actor, handle) = LegActor::new(leg, call_tx.clone());
+            joins.push(tokio::spawn(actor.run()));
+            handles.push(handle);
+        }
+
+        // Send different responses to each actor
+        // Leg 0: 180 Ringing
+        let ringing = crate::sip::builder::SipMessageBuilder::new()
+            .response(180, "Ringing".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-f0".to_string())
+            .from("<sip:alice@atlanta.com>;tag=abc".to_string())
+            .to("<sip:bob@biloxi.com>;tag=b0".to_string())
+            .call_id("b2b-bleg0".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build().unwrap();
+        handles[0].tx.send(LegMessage::SipInbound {
+            message: ringing, source: test_transport(),
+        }).await.unwrap();
+
+        // Leg 1: 486 Busy
+        let busy = crate::sip::builder::SipMessageBuilder::new()
+            .response(486, "Busy Here".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-f1".to_string())
+            .from("<sip:alice@atlanta.com>;tag=abc".to_string())
+            .to("<sip:bob@biloxi.com>;tag=b1".to_string())
+            .call_id("b2b-bleg1".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build().unwrap();
+        handles[1].tx.send(LegMessage::SipInbound {
+            message: busy, source: test_transport(),
+        }).await.unwrap();
+
+        // Leg 2: 200 OK
+        let ok = crate::sip::builder::SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-f2".to_string())
+            .from("<sip:alice@atlanta.com>;tag=abc".to_string())
+            .to("<sip:bob@biloxi.com>;tag=b2".to_string())
+            .call_id("b2b-bleg2".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build().unwrap();
+        handles[2].tx.send(LegMessage::SipInbound {
+            message: ok, source: test_transport(),
+        }).await.unwrap();
+
+        // Collect all 3 events — order may vary
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let event = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                call_rx.recv(),
+            ).await.unwrap().unwrap();
+            events.push(event);
+        }
+
+        // Verify all 3 leg_ids are present
+        let event_leg_ids: std::collections::HashSet<String> = events.iter().map(|e| match e {
+            CallEvent::Provisional { leg_id, .. } => leg_id.0.clone(),
+            CallEvent::Answered { leg_id, .. } => leg_id.0.clone(),
+            CallEvent::Failed { leg_id, .. } => leg_id.0.clone(),
+            CallEvent::Terminated { leg_id, .. } => leg_id.0.clone(),
+            CallEvent::Bye { leg_id, .. } => leg_id.0.clone(),
+            CallEvent::ReInvite { leg_id, .. } => leg_id.0.clone(),
+            CallEvent::Refer { leg_id, .. } => leg_id.0.clone(),
+        }).collect();
+
+        for id in &leg_ids {
+            assert!(event_leg_ids.contains(&id.0), "missing event for leg {}", id);
+        }
+
+        // Verify event types
+        assert!(events.iter().any(|e| matches!(e, CallEvent::Provisional { status_code: 180, .. })));
+        assert!(events.iter().any(|e| matches!(e, CallEvent::Failed { status_code: 486, .. })));
+        assert!(events.iter().any(|e| matches!(e, CallEvent::Answered { .. })));
+
+        // Shutdown all
+        for handle in &handles {
+            let _ = handle.tx.send(LegMessage::Shutdown).await;
+        }
+        for join in joins {
+            let _ = join.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_actors_terminates_running_tasks() {
+        let (call_tx, _call_rx) = tokio::sync::mpsc::channel(16);
+
+        let mut call = CallActor::new(make_a_leg());
+        call.add_b_leg(make_b_leg(0));
+        call.add_b_leg(make_b_leg(1));
+
+        let mut joins = Vec::new();
+        for i in 0..2 {
+            let leg = make_b_leg(i);
+            let (actor, handle) = LegActor::new(leg, call_tx.clone());
+            joins.push(tokio::spawn(actor.run()));
+            call.set_b_leg_handle(i, handle);
+        }
+
+        // All actors should be running
+        for join in &joins {
+            assert!(!join.is_finished());
+        }
+
+        // shutdown_actors sends Shutdown to all
+        call.shutdown_actors();
+
+        // All tasks should complete within timeout
+        for join in joins {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                join,
+            ).await.expect("actor did not terminate").unwrap();
         }
     }
 }

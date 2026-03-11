@@ -3478,19 +3478,7 @@ fn b2bua_send_b_leg_invite(
         },
     );
     state.call_actors.add_b_leg(call_id, b_leg.clone());
-
-    // Spawn a LegActor for this B-leg to classify inbound SIP messages.
-    if let Some(call) = state.call_actors.get_call(call_id) {
-        if let Some(event_tx) = &call.event_tx {
-            let (actor, handle) = LegActor::new(b_leg, event_tx.clone());
-            let b_leg_index = call.b_legs.len().saturating_sub(1);
-            drop(call);
-            tokio::spawn(actor.run());
-            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                call.set_b_leg_handle(b_leg_index, handle);
-            }
-        }
-    }
+    spawn_b_leg_actor(call_id, &b_leg, state);
 
     let data = Bytes::from(b_leg_invite.to_bytes());
 
@@ -3502,6 +3490,24 @@ fn b2bua_send_b_leg_invite(
 
     // Send via pool for TCP/TLS, direct channel for UDP
     send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
+}
+
+/// Spawn a [`LegActor`] for a B-leg and store its handle in the call.
+///
+/// The actor classifies inbound SIP messages into [`CallEvent`]s.
+/// Call this after `add_b_leg` — uses the last B-leg index.
+fn spawn_b_leg_actor(call_id: &str, b_leg: &Leg, state: &DispatcherState) {
+    if let Some(call) = state.call_actors.get_call(call_id) {
+        if let Some(event_tx) = &call.event_tx {
+            let (actor, handle) = LegActor::new(b_leg.clone(), event_tx.clone());
+            let b_leg_index = call.b_legs.len().saturating_sub(1);
+            drop(call);
+            tokio::spawn(actor.run());
+            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                call.set_b_leg_handle(b_leg_index, handle);
+            }
+        }
+    }
 }
 
 /// Handle a response to an outbound registration (z9hG4bK-reg- branch).
@@ -3627,25 +3633,8 @@ fn handle_b2bua_response(
         }
     };
 
-    // Route response through the B-leg actor for classification.
-    // The actor updates dialog state (e.g. remote_tag) and emits a CallEvent.
-    if let Some(handle_tx) = &b_leg_handle_tx {
-        let leg_transport = b_leg_dest.map(|(addr, transport)| LegTransport {
-            remote_addr: addr,
-            connection_id: ConnectionId::default(),
-            transport,
-        }).unwrap_or_else(|| LegTransport {
-            remote_addr: state.local_addr,
-            connection_id: ConnectionId::default(),
-            transport: Transport::Udp,
-        });
-        let _ = handle_tx.try_send(crate::b2bua::actor::LegMessage::SipInbound {
-            message: message.clone(),
-            source: leg_transport,
-        });
-    }
-
     // Detect re-INVITE responses: target_uri starts with "reinvite:".
+    // Re-INVITE tracking legs don't have actors — handled directly below.
     let reinvite_direction = b_leg_target.as_deref().and_then(|t| t.strip_prefix("reinvite:"));
 
     if let Some(direction) = reinvite_direction {
@@ -3785,6 +3774,83 @@ fn handle_b2bua_response(
         return;
     }
 
+    // Route response through B-leg actor for classification.
+    // The actor classifies the SIP response into a CallEvent (Provisional,
+    // Answered, Failed). We send the message, block-recv the event, then
+    // use the event to drive response handling below.
+    // Re-INVITE tracking legs and retry legs may not have actors — fall
+    // back to raw status_code classification in that case.
+    let actor_event: Option<CallEvent> = if let Some(handle_tx) = &b_leg_handle_tx {
+        let leg_transport = b_leg_dest.map(|(addr, transport)| LegTransport {
+            remote_addr: addr,
+            connection_id: ConnectionId::default(),
+            transport,
+        }).unwrap_or_else(|| LegTransport {
+            remote_addr: state.local_addr,
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        });
+        match handle_tx.try_send(crate::b2bua::actor::LegMessage::SipInbound {
+            message: message.clone(),
+            source: leg_transport,
+        }) {
+            Ok(()) => {
+                // Temporarily extract receiver to block on it.
+                // Safe: dispatcher processes messages sequentially.
+                if let Some((_, mut rx)) = state.call_event_receivers.remove(call_id) {
+                    let event = rx.blocking_recv();
+                    state.call_event_receivers.insert(call_id.to_string(), rx);
+                    event
+                } else {
+                    None
+                }
+            }
+            Err(_) => {
+                debug!(call_id = %call_id, "B2BUA: actor mailbox full, classifying directly");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // On 2xx: sync remote_tag from response back to canonical CallActor.
+    // The LegActor extracts this on its clone, but we need to update the
+    // authoritative copy in the CallActorStore.
+    if matches!(&actor_event, Some(CallEvent::Answered { .. })) {
+        if let Some(to_tag) = crate::b2bua::actor::extract_to_tag(message) {
+            if let Some(idx) = b_leg_index {
+                if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                    if let Some(b_leg) = call.b_legs.get_mut(idx) {
+                        b_leg.dialog.remote_tag = Some(to_tag);
+                    }
+                }
+            }
+        }
+    }
+
+    // Event-driven response classification.
+    // Actor events are authoritative when available; fall back to status_code.
+    #[derive(Debug)]
+    enum ResponseClass { Answered, Provisional, Failed }
+
+    let class = match &actor_event {
+        Some(CallEvent::Answered { .. }) => ResponseClass::Answered,
+        Some(CallEvent::Provisional { status_code: code, .. }) if *code >= 180 => {
+            ResponseClass::Provisional
+        }
+        Some(CallEvent::Failed { .. }) => ResponseClass::Failed,
+        _ => {
+            // No actor, filtered provisional (<180), or unexpected event
+            if (200..300).contains(&status_code) { ResponseClass::Answered }
+            else if (180..200).contains(&status_code) { ResponseClass::Provisional }
+            else if status_code >= 300 { ResponseClass::Failed }
+            else { return; } // 100 Trying from B-leg — absorb
+        }
+    };
+
+    match class { ResponseClass::Answered => {
+    // --- 2xx answer handling ---
     if (200..300).contains(&status_code) {
         // Absorb 200 OK retransmissions: if the call is already answered,
         // this is a retransmit from the B-leg (it hasn't received our ACK yet).
@@ -4072,7 +4138,11 @@ fn handle_b2bua_response(
                 }
             }
         }
-    } else if (180..200).contains(&status_code) {
+    } // end 2xx guard
+
+    } ResponseClass::Provisional => {
+    // --- 1xx provisional handling ---
+    {
         // 1xx provisional — forward to A-leg
         state.call_actors.set_state(call_id, CallState::Ringing);
         // Rewrite B-leg dialog headers back to A-leg identifiers
@@ -4101,7 +4171,11 @@ fn handle_b2bua_response(
             a_leg.transport.connection_id,
             state,
         );
-    } else if status_code >= 300 {
+    }
+
+    } ResponseClass::Failed => {
+    // --- 3xx+ error handling ---
+    {
         // RFC 4028: 422 "Session Interval Too Small" — retry with higher Session-Expires
         if status_code == 422 {
             if let Some(ref timer_config) = state.session_timer_config {
@@ -4180,7 +4254,8 @@ fn handle_b2bua_response(
                                         transport,
                                     },
                                 );
-                                state.call_actors.add_b_leg(call_id, b_leg);
+                                state.call_actors.add_b_leg(call_id, b_leg.clone());
+                                spawn_b_leg_actor(call_id, &b_leg, state);
 
                                 let data = Bytes::from(retry.to_bytes());
                                 send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
@@ -4286,7 +4361,8 @@ fn handle_b2bua_response(
                                         transport,
                                     },
                                 );
-                                state.call_actors.add_b_leg(call_id, b_leg);
+                                state.call_actors.add_b_leg(call_id, b_leg.clone());
+                                spawn_b_leg_actor(call_id, &b_leg, state);
 
                                 let data = Bytes::from(retry.to_bytes());
                                 send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
@@ -4390,6 +4466,9 @@ fn handle_b2bua_response(
         state.call_actors.remove_call(call_id);
         state.call_event_receivers.remove(call_id);
     }
+
+    } // end ResponseClass::Failed
+    } // end match class
 }
 
 /// Handle a BYE for a B2BUA call — bridge to the other leg.

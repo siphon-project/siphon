@@ -735,86 +735,6 @@ fn session_timer_state_lifecycle() {
     assert!(store.get_call(&call_id).is_none());
 }
 
-#[test]
-fn session_timer_headers_in_b_leg_invite() {
-    // Verify that Session-Expires, Min-SE, and Supported:timer headers
-    // are injected into the B-leg INVITE SIP message.
-    let invite = SipMessageBuilder::new()
-        .request(
-            Method::Invite,
-            SipUri::new("biloxi.com".to_string()).with_user("bob".to_string()),
-        )
-        .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-st-test".to_string())
-        .from("<sip:alice@atlanta.com>;tag=st-test".to_string())
-        .to("<sip:bob@biloxi.com>".to_string())
-        .call_id("session-timer-test@10.0.0.1".to_string())
-        .cseq("1 INVITE".to_string())
-        .content_length(0)
-        .build()
-        .unwrap();
-
-    // Simulate what b2bua_send_b_leg_invite does: clone the invite and add headers
-    let mut b_leg_invite = invite.clone();
-    let session_expires = 1800u32;
-    let min_se = 90u32;
-
-    b_leg_invite.headers.add("Supported", "timer".to_string());
-    b_leg_invite.headers.add(
-        "Session-Expires",
-        format!("{};refresher=uac", session_expires),
-    );
-    b_leg_invite.headers.add("Min-SE", min_se.to_string());
-
-    // Verify headers are present and correct
-    assert_eq!(
-        b_leg_invite.headers.get("Supported"),
-        Some(&"timer".to_string())
-    );
-    assert_eq!(
-        b_leg_invite.headers.get("Session-Expires"),
-        Some(&"1800;refresher=uac".to_string())
-    );
-    assert_eq!(
-        b_leg_invite.headers.get("Min-SE"),
-        Some(&"90".to_string())
-    );
-
-    // Verify the serialized message includes the headers
-    let serialized = b_leg_invite.to_bytes();
-    let serialized_str = String::from_utf8_lossy(&serialized);
-    assert!(serialized_str.contains("Session-Expires: 1800;refresher=uac"));
-    assert!(serialized_str.contains("Min-SE: 90"));
-    assert!(serialized_str.contains("Supported: timer"));
-}
-
-#[test]
-fn reinvite_detection_by_to_tag() {
-    // Test that re-INVITE detection works by checking To-tag presence
-    // and matching Call-ID against the call actor store.
-    let store = CallActorStore::new();
-    let a_leg = make_a_leg("reinvite-detect@test");
-    let _call_id = store.create_call(a_leg);
-
-    // Simulate checking if an INVITE with a To-tag and matching Call-ID is a re-INVITE
-    let sip_call_id = "reinvite-detect@test";
-    let to_tag = Some("bob-tag".to_string());
-
-    let is_reinvite = to_tag.is_some()
-        && store.find_by_sip_call_id(sip_call_id).is_some();
-
-    assert!(is_reinvite, "INVITE with To-tag and matching Call-ID should be detected as re-INVITE");
-
-    // Initial INVITE (no To-tag) should NOT be detected as re-INVITE
-    let to_tag_none: Option<String> = None;
-    let is_initial = to_tag_none.is_some()
-        && store.find_by_sip_call_id(sip_call_id).is_some();
-    assert!(!is_initial, "INVITE without To-tag should not be a re-INVITE");
-
-    // Unknown Call-ID should NOT be detected as re-INVITE
-    let is_unknown = to_tag.is_some()
-        && store.find_by_sip_call_id("unknown@test").is_some();
-    assert!(!is_unknown, "INVITE with unknown Call-ID should not be a re-INVITE");
-}
 
 #[test]
 fn session_timer_per_call_override_on_call_actor_store() {
@@ -842,93 +762,50 @@ fn session_timer_per_call_override_on_call_actor_store() {
 }
 
 // ---------------------------------------------------------------------------
-// LegActor integration: spawn actor, send SipInbound, verify CallEvent
+// LegActor integration: remove_call terminates spawned actor tasks
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn leg_actor_classifies_sip_response_end_to_end() {
-    // Create a B-leg and wire up actor channels
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<CallEvent>(16);
-    let b_leg = make_b_leg("10.0.0.2:5060");
-    let leg_id = b_leg.id.clone();
-
-    let (actor, handle) = LegActor::new(b_leg, event_tx);
-    let join = tokio::spawn(actor.run());
-
-    // Simulate a 200 OK arriving from the B-leg endpoint
-    let ok_response = SipMessageBuilder::new()
-        .response(200, "OK".to_string())
-        .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-int-test".to_string())
-        .from("<sip:alice@atlanta.com>;tag=int-test".to_string())
-        .to("<sip:bob@biloxi.com>;tag=bob-resp".to_string())
-        .call_id("int-test@host".to_string())
-        .cseq("1 INVITE".to_string())
-        .content_length(0)
-        .build()
-        .unwrap();
-
-    handle.tx.send(LegMessage::SipInbound {
-        message: ok_response,
-        source: TransportInfo {
-            remote_addr: "10.0.0.2:5060".parse().unwrap(),
-            connection_id: ConnectionId::default(),
-            transport: Transport::Udp,
-        },
-    }).await.unwrap();
-
-    // The actor should classify it as Answered
-    let event = event_rx.recv().await.expect("should receive CallEvent");
-    match event {
-        CallEvent::Answered { leg_id: id, message } => {
-            assert_eq!(id, leg_id);
-            assert_eq!(message.status_code(), Some(200));
-        }
-        other => panic!("expected Answered, got {:?}", other),
-    }
-
-    // Clean shutdown
-    handle.tx.send(LegMessage::Shutdown).await.unwrap();
-    join.await.unwrap();
-
-    // Terminated event from shutdown
-    let terminated = event_rx.recv().await.expect("should receive Terminated");
-    assert!(matches!(terminated, CallEvent::Terminated { .. }));
-}
-
-#[tokio::test]
-async fn leg_actor_wired_to_call_actor_store() {
-    // Verify the full wiring: CallActorStore → CallActor → LegActor handles
+async fn remove_call_terminates_actor_tasks() {
     let store = CallActorStore::new();
-    let a_leg = make_a_leg("actor-wiring@test");
+    let a_leg = make_a_leg("actor-terminate@test");
     let call_id = store.create_call(a_leg);
 
-    // Create event channel (as the dispatcher would)
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<CallEvent>(64);
     if let Some(mut call) = store.get_call_mut(&call_id) {
         call.event_tx = Some(event_tx.clone());
     }
 
-    // Add a B-leg and spawn its actor
-    let b_leg = make_b_leg("10.0.0.2:5060");
-    let b_leg_clone = b_leg.clone();
-    store.add_b_leg(&call_id, b_leg);
+    // Spawn two B-leg actors
+    let mut joins = Vec::new();
+    for addr in &["10.0.0.2:5060", "10.0.0.3:5060"] {
+        let b_leg = make_b_leg(addr);
+        let b_leg_clone = b_leg.clone();
+        store.add_b_leg(&call_id, b_leg);
 
-    let (actor, handle) = LegActor::new(b_leg_clone, event_tx);
-    tokio::spawn(actor.run());
+        let (actor, handle) = LegActor::new(b_leg_clone, event_tx.clone());
+        joins.push(tokio::spawn(actor.run()));
 
-    // Store the handle
-    if let Some(mut call) = store.get_call_mut(&call_id) {
-        call.set_b_leg_handle(0, handle);
+        let index = store.get_call(&call_id).unwrap().b_legs.len() - 1;
+        if let Some(mut call) = store.get_call_mut(&call_id) {
+            call.set_b_leg_handle(index, handle);
+        }
     }
 
-    // Verify handle is stored
-    {
-        let call = store.get_call(&call_id).unwrap();
-        assert!(call.b_leg_handles[0].is_some());
-        assert!(call.event_tx.is_some());
+    // Actors should be running
+    for join in &joins {
+        assert!(!join.is_finished());
     }
 
-    // remove_call should shutdown actors cleanly
+    // remove_call sends Shutdown to all actor handles
     store.remove_call(&call_id);
     assert_eq!(store.count(), 0);
+
+    // All actor tasks should terminate
+    for join in joins {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            join,
+        ).await.expect("actor task did not terminate").unwrap();
+    }
 }
