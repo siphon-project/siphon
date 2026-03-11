@@ -686,6 +686,15 @@ impl CallActorStore {
         }
     }
 
+    /// Update the target_uri of a B-leg (used to mark re-INVITE entries as done).
+    pub fn set_b_leg_target_uri(&self, call_id: &str, index: usize, target_uri: String) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            if let Some(b_leg) = call.b_legs.get_mut(index) {
+                b_leg.dialog.target_uri = Some(target_uri);
+            }
+        }
+    }
+
     /// Look up internal call ID by SIP Call-ID.
     pub fn find_by_sip_call_id(&self, sip_call_id: &str) -> Option<String> {
         self.registry.lookup_call_id(sip_call_id)

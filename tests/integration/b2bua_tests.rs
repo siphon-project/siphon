@@ -809,3 +809,150 @@ async fn remove_call_terminates_actor_tasks() {
         ).await.expect("actor task did not terminate").unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// B2BUA re-INVITE B-leg lifecycle (target_uri marking + cleanup)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reinvite_b_leg_non2xx_removed() {
+    // When a re-INVITE gets a non-2xx response (e.g. 491 Request Pending),
+    // the re-INVITE B-leg entry should be removed after ACKing.
+    let store = CallActorStore::new();
+
+    let call_id = store.create_call(make_a_leg("reinvite-non2xx@test"));
+    let b_leg = make_b_leg("10.0.0.2:5060");
+    store.add_b_leg(&call_id, b_leg);
+    store.set_winner(&call_id, 0);
+
+    // Simulate a re-INVITE by adding a tracking B-leg entry
+    let reinvite_branch = TransactionKey::generate_branch();
+    let reinvite_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "reinvite:a2b".to_string(),
+        reinvite_branch.clone(),
+        TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    store.add_b_leg(&call_id, reinvite_leg);
+
+    // Verify re-INVITE entry exists at index 1
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.b_legs.len(), 2);
+        assert_eq!(call.b_legs[1].dialog.target_uri.as_deref(), Some("reinvite:a2b"));
+    }
+
+    // Simulate non-2xx response → remove re-INVITE entry
+    store.remove_b_leg(&call_id, 1);
+
+    // Verify only the winning B-leg remains
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.b_legs.len(), 1);
+        assert_eq!(call.winner, Some(0));
+    }
+}
+
+#[test]
+fn reinvite_b_leg_2xx_marked_done() {
+    // When a re-INVITE gets a 2xx response, the B-leg entry should be
+    // marked as "reinvite_done:" instead of removed, so retransmitted
+    // 200 OKs can still be matched and re-ACKed.
+    let store = CallActorStore::new();
+
+    let call_id = store.create_call(make_a_leg("reinvite-2xx@test"));
+    let b_leg = make_b_leg("10.0.0.2:5060");
+    let b_branch = b_leg.branch.clone();
+    store.add_b_leg(&call_id, b_leg);
+    store.set_winner(&call_id, 0);
+
+    // Simulate a re-INVITE tracking entry
+    let reinvite_branch = TransactionKey::generate_branch();
+    let reinvite_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "reinvite:b2a".to_string(),
+        reinvite_branch.clone(),
+        TransportInfo {
+            remote_addr: "10.0.0.1:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    store.add_b_leg(&call_id, reinvite_leg);
+
+    // Simulate 2xx response → mark as done (not removed)
+    store.set_b_leg_target_uri(&call_id, 1, "reinvite_done:b2a".to_string());
+
+    // Verify the entry still exists for retransmission matching
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.b_legs.len(), 2);
+        assert_eq!(call.b_legs[1].dialog.target_uri.as_deref(), Some("reinvite_done:b2a"));
+        assert_eq!(call.b_legs[1].branch, reinvite_branch);
+    }
+
+    // The branch should still be resolvable to the call
+    assert_eq!(store.call_id_for_branch(&reinvite_branch), Some(call_id.clone()));
+
+    // Winner index unaffected
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.winner, Some(0));
+        assert_eq!(call.b_legs[0].branch, b_branch);
+    }
+}
+
+#[test]
+fn reinvite_done_entry_cleaned_on_call_removal() {
+    // Marked "reinvite_done:" entries should be cleaned up when the call ends.
+    let store = CallActorStore::new();
+
+    let call_id = store.create_call(make_a_leg("reinvite-cleanup@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    // Add and mark a re-INVITE entry as done
+    let reinvite_branch = TransactionKey::generate_branch();
+    let reinvite_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "reinvite:a2b".to_string(),
+        reinvite_branch.clone(),
+        TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    store.add_b_leg(&call_id, reinvite_leg);
+    store.set_b_leg_target_uri(&call_id, 1, "reinvite_done:a2b".to_string());
+
+    // remove_call should clean up everything including the done entry
+    store.remove_call(&call_id);
+    assert_eq!(store.count(), 0);
+    assert!(store.call_id_for_branch(&reinvite_branch).is_none());
+}
+
+#[test]
+fn set_b_leg_target_uri_no_panic_on_invalid_index() {
+    // Setting target_uri on a non-existent index should be a no-op.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("target-uri-invalid@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+
+    // Index 5 doesn't exist — should not panic
+    store.set_b_leg_target_uri(&call_id, 5, "reinvite_done:a2b".to_string());
+
+    // Original B-leg unaffected
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.b_legs.len(), 1);
+        assert!(call.b_legs[0].dialog.target_uri.as_deref().unwrap().starts_with("sip:"));
+    }
+}

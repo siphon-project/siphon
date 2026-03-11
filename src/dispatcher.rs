@@ -3718,6 +3718,69 @@ fn handle_b2bua_response(
         }
     };
 
+    // Handle retransmitted 200 OK for already-completed re-INVITEs.
+    // The entry was marked "reinvite_done:<dir>" after the first 200 OK was processed.
+    // Just re-ACK the responder to stop retransmissions — don't forward again.
+    if let Some(done_direction) = b_leg_target.as_deref().and_then(|t| t.strip_prefix("reinvite_done:")) {
+        if (200..300).contains(&status_code) {
+            let is_a2b = done_direction == "a2b";
+            if let Some((responder_dest, responder_transport)) = b_leg_dest {
+                if let Some((ref responder_cid, ref _responder_ftag)) = b_leg_dialog {
+                    let transport_str = format!("{}", responder_transport).to_uppercase();
+                    let outbound_port = state.listen_addrs.get(&responder_transport)
+                        .map(|a| a.port())
+                        .unwrap_or(state.local_addr.port());
+                    let cseq_num = message.headers.cseq()
+                        .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "1".to_string());
+                    let from = message.headers.from().cloned().unwrap_or_default();
+                    let to = message.headers.to().cloned().unwrap_or_default();
+                    let ack_uri = SipUri::new(responder_dest.ip().to_string())
+                        .with_port(responder_dest.port());
+                    let ack = match SipMessageBuilder::new()
+                        .request(Method::Ack, ack_uri)
+                        .via(format!(
+                            "SIP/2.0/{} {}:{};branch={}",
+                            transport_str,
+                            format_sip_host(&state.local_addr.ip().to_string()),
+                            outbound_port,
+                            TransactionKey::generate_branch(),
+                        ))
+                        .from(from.to_string())
+                        .to(to.to_string())
+                        .call_id(responder_cid.clone())
+                        .cseq(format!("{} ACK", cseq_num))
+                        .header("Max-Forwards", "70".to_string())
+                        .content_length(0)
+                        .build()
+                    {
+                        Ok(ack) => ack,
+                        Err(error) => {
+                            error!("B2BUA ACK for re-INVITE 2xx retransmit build failed: {error}");
+                            return;
+                        }
+                    };
+                    if is_a2b {
+                        send_b2bua_to_bleg(ack, responder_transport, responder_dest, state);
+                    } else {
+                        send_message(ack, responder_transport, responder_dest, a_leg.transport.connection_id, state);
+                    }
+                    debug!(
+                        call_id = %call_id,
+                        "B2BUA: re-ACKed retransmitted 200 OK for completed re-INVITE"
+                    );
+                }
+            }
+        } else {
+            debug!(
+                call_id = %call_id,
+                status = status_code,
+                "B2BUA: absorbing retransmitted non-2xx for completed re-INVITE"
+            );
+        }
+        return;
+    }
+
     // Detect re-INVITE responses: target_uri starts with "reinvite:".
     // Re-INVITE tracking legs don't have actors — handled directly below.
     let reinvite_direction = b_leg_target.as_deref().and_then(|t| t.strip_prefix("reinvite:"));
@@ -3786,8 +3849,10 @@ fn handle_b2bua_response(
 
         sanitize_b2bua_response(message, state, resp_transport);
 
-        // ACK the responder for 2xx re-INVITE responses
-        if (200..300).contains(&status_code) {
+        // Helper: build and send ACK to the responder of the re-INVITE.
+        // For 2xx: ACK uses a NEW branch (end-to-end, RFC 3261 §13.2.2.4).
+        // For non-2xx: ACK uses the SAME branch (hop-by-hop, RFC 3261 §17.1.1.3).
+        let send_reinvite_ack = |ack_branch: String, state: &DispatcherState| {
             if let Some((responder_dest, responder_transport)) = b_leg_dest {
                 if let Some((ref responder_cid, ref _responder_ftag)) = b_leg_dialog {
                     let transport_str = format!("{}", responder_transport).to_uppercase();
@@ -3797,7 +3862,6 @@ fn handle_b2bua_response(
                     let cseq_num = message.headers.cseq()
                         .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
                         .unwrap_or_else(|| "1".to_string());
-                    // Use the responder's dialog identifiers (from the re-INVITE B-leg entry)
                     let from = message.headers.from().cloned().unwrap_or_default();
                     let to = message.headers.to().cloned().unwrap_or_default();
                     let ack_uri = SipUri::new(responder_dest.ip().to_string())
@@ -3809,7 +3873,7 @@ fn handle_b2bua_response(
                             transport_str,
                             format_sip_host(&state.local_addr.ip().to_string()),
                             outbound_port,
-                            TransactionKey::generate_branch(),
+                            ack_branch,
                         ))
                         .from(from.to_string())
                         .to(to.to_string())
@@ -3821,29 +3885,50 @@ fn handle_b2bua_response(
                     {
                         Ok(ack) => ack,
                         Err(error) => {
-                            error!("B2BUA ACK for re-INVITE 2xx build failed: {error}");
+                            error!("B2BUA ACK for re-INVITE build failed: {error}");
                             return;
                         }
                     };
                     if is_a2b {
-                        // A→B: ACK goes to B-leg (responder)
                         send_b2bua_to_bleg(ack, responder_transport, responder_dest, state);
                     } else {
-                        // B→A: ACK goes to A-leg (responder) via its connection
                         send_message(ack, responder_transport, responder_dest, a_leg.transport.connection_id, state);
                     }
-                    debug!(
-                        call_id = %call_id,
-                        direction = direction,
-                        "B2BUA: sent ACK to responder for re-INVITE 200 OK"
-                    );
                 }
             }
+        };
+
+        if (200..300).contains(&status_code) {
+            // ACK the responder with a new branch (end-to-end ACK for 2xx)
+            send_reinvite_ack(TransactionKey::generate_branch(), state);
+            debug!(
+                call_id = %call_id,
+                direction = direction,
+                "B2BUA: sent ACK to responder for re-INVITE 2xx"
+            );
 
             // Reset session timer on successful re-INVITE
             state.call_actors.reset_session_timer(call_id);
 
-            // Remove the re-INVITE B-leg entry to prevent retransmission loops.
+            // Mark the re-INVITE B-leg entry as done (not removed!) so that
+            // retransmitted 200 OKs can still be matched and re-ACKed.
+            // The entry will be cleaned up when the call terminates.
+            if let Some(idx) = b_leg_index {
+                state.call_actors.set_b_leg_target_uri(call_id, idx, format!("reinvite_done:{}", direction));
+            }
+        } else if status_code >= 300 {
+            // Non-2xx: ACK is hop-by-hop — reuse the SAME branch as the
+            // forwarded re-INVITE (RFC 3261 §17.1.1.3).
+            send_reinvite_ack(branch.to_string(), state);
+            debug!(
+                call_id = %call_id,
+                direction = direction,
+                status = status_code,
+                "B2BUA: sent ACK to responder for re-INVITE non-2xx"
+            );
+
+            // Remove the re-INVITE B-leg entry — no retransmission expected
+            // since the IST will transition Completed→Confirmed on our ACK.
             if let Some(idx) = b_leg_index {
                 state.call_actors.remove_b_leg(call_id, idx);
             }
