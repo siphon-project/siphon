@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use pyo3::prelude::*;
 use tracing::{debug, error, info, warn};
 
-use crate::b2bua::manager::{ALeg, BLeg, CallManager, CallState};
+use crate::b2bua::actor::{CallActorStore, CallEvent, CallState, Leg, LegActor, TransportInfo as LegTransport};
 use crate::dns::SipResolver;
 use crate::config::Config;
 use crate::proxy::core;
@@ -80,8 +80,8 @@ struct DispatcherState {
     user_agent_header: Option<String>,
     /// Transaction timeout for pending branch TTL.
     transaction_timeout: std::time::Duration,
-    /// B2BUA call manager (active when script has @b2bua handlers).
-    call_manager: Arc<CallManager>,
+    /// B2BUA call actor store (active when script has @b2bua handlers).
+    call_actors: Arc<CallActorStore>,
     /// Transaction state machine manager.
     transaction_manager: Arc<TransactionManager>,
     /// Timer wheel — keyed by a unique timer ID string.
@@ -118,6 +118,10 @@ struct DispatcherState {
     crlf_pong_tracker: Option<Arc<crate::transport::crlf_keepalive::CrlfPongTracker>>,
     /// Name used in SDP `o=` and `s=` lines (from media.sdp_name config).
     sdp_name: String,
+    /// Per-call event receivers from B-leg actors.
+    /// Keyed by internal call ID; the receiver gets [`CallEvent`]s from all
+    /// B-leg actors belonging to that call.
+    call_event_receivers: Arc<DashMap<String, tokio::sync::mpsc::Receiver<CallEvent>>>,
 }
 
 /// Run the core dispatcher loop.
@@ -221,7 +225,7 @@ pub async fn run(
         server_header,
         user_agent_header,
         transaction_timeout,
-        call_manager: Arc::new(CallManager::new()),
+        call_actors: Arc::new(CallActorStore::new()),
         transaction_manager,
         timer_wheel: Arc::new(DashMap::new()),
         session_store: Arc::new(ProxySessionStore::new()),
@@ -241,6 +245,7 @@ pub async fn run(
         sdp_name: config.media.as_ref()
             .and_then(|m| m.sdp_name.clone())
             .unwrap_or_else(|| "SIPhon".to_string()),
+        call_event_receivers: Arc::new(DashMap::new()),
     });
 
     // Spawn background task: fire transaction timers + sweep stale entries
@@ -642,7 +647,7 @@ fn handle_request(
                     // B2BUA: absorb the A-leg's ACK. We already ACK'd the B-leg
                     // ourselves on receiving 200 OK — the A-leg ACK is for our
                     // dialog with the A-leg and must not be relayed.
-                    if let Some(internal_id) = state.call_manager.find_by_sip_call_id(cid) {
+                    if let Some(internal_id) = state.call_actors.find_by_sip_call_id(cid) {
                         debug!(
                             call_id = %internal_id,
                             "B2BUA: absorbed A-leg ACK for 2xx (B-leg already ACK'd)"
@@ -710,7 +715,7 @@ fn handle_request(
 
         let is_reinvite = to_tag.is_some()
             && sip_call_id.as_ref()
-                .map(|cid| state.call_manager.find_by_sip_call_id(cid).is_some())
+                .map(|cid| state.call_actors.find_by_sip_call_id(cid).is_some())
                 .unwrap_or(false);
 
         if is_reinvite {
@@ -727,7 +732,7 @@ fn handle_request(
         // Check if this BYE belongs to a B2BUA call
         let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
         if let Some(ref sip_call_id) = sip_call_id {
-            if state.call_manager.find_by_sip_call_id(sip_call_id).is_some() {
+            if state.call_actors.find_by_sip_call_id(sip_call_id).is_some() {
                 drop(engine_state);
                 handle_b2bua_bye(inbound, message, state);
                 return;
@@ -1527,7 +1532,7 @@ fn handle_response(
     };
 
     // Check if this response belongs to a B2BUA call
-    if let Some(call_id) = state.call_manager.call_id_for_branch(&branch) {
+    if let Some(call_id) = state.call_actors.call_id_for_branch(&branch) {
         handle_b2bua_response(&call_id, &branch, &mut message, status_code, state);
         return;
     }
@@ -2840,7 +2845,7 @@ fn handle_cancel(
     if engine_state.has_b2bua_handlers() {
         let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
         if let Some(ref sip_call_id) = sip_call_id {
-            if state.call_manager.find_by_sip_call_id(sip_call_id).is_some() {
+            if state.call_actors.find_by_sip_call_id(sip_call_id).is_some() {
                 drop(engine_state);
                 handle_b2bua_cancel(inbound, message, state);
                 return;
@@ -3037,7 +3042,7 @@ fn handle_b2bua_cancel(
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let call_id = match state.call_manager.find_by_sip_call_id(&sip_call_id) {
+    let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
         Some(id) => id,
         None => {
             warn!(sip_call_id = %sip_call_id, "B2BUA CANCEL: no matching call");
@@ -3047,7 +3052,7 @@ fn handle_b2bua_cancel(
         }
     };
 
-    let call = match state.call_manager.get_call(&call_id) {
+    let call = match state.call_actors.get_call(&call_id) {
         Some(c) => c,
         None => return,
     };
@@ -3082,22 +3087,22 @@ fn handle_b2bua_cancel(
         );
 
         // Build CANCEL for the B-leg (same Request-URI as the B-leg INVITE)
-        let cancel_uri = match parse_uri_standalone(&b_leg.target_uri) {
+        let cancel_uri = match parse_uri_standalone(&b_leg.dialog.target_uri.clone().unwrap_or_default()) {
             Ok(uri) => uri,
             Err(_) => continue,
         };
         let cancel_request = SipMessageBuilder::new()
             .request(crate::sip::message::Method::Cancel, cancel_uri)
             .via(via_value)
-            .header("Call-ID", b_leg.call_id.clone())
+            .header("Call-ID", b_leg.dialog.call_id.clone())
             .content_length(0);
 
         // Copy From (with B-leg From-tag), To, CSeq from original
         let cancel_msg = if let Some(from) = message.headers.from() {
             // Rewrite From-tag from A-leg to B-leg
             let b_from = from.replace(
-                &format!("tag={}", call.a_leg.from_tag),
-                &format!("tag={}", b_leg.from_tag),
+                &format!("tag={}", call.a_leg.dialog.remote_tag.as_deref().unwrap_or("")),
+                &format!("tag={}", b_leg.dialog.local_tag),
             );
             cancel_request.from(b_from)
         } else {
@@ -3123,14 +3128,19 @@ fn handle_b2bua_cancel(
             let data = Bytes::from(cancel_built.to_bytes());
             let outbound_message = OutboundMessage {
                 connection_id: ConnectionId::default(),
-                transport: b_leg.transport,
-                destination: b_leg.destination,
+                transport: b_leg.transport.transport,
+                destination: b_leg.transport.remote_addr,
                 data,
             };
             if let Err(error) = state.outbound.send(outbound_message) {
                 error!(call_id = %call_id, "B2BUA: failed to send CANCEL to B-leg: {error}");
             }
         }
+    }
+
+    // Send Cancel to all B-leg actor handles
+    for handle in call.b_leg_handles.iter().flatten() {
+        let _ = handle.tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
     }
 
     // Send 487 Request Terminated to A-leg for the original INVITE
@@ -3140,14 +3150,16 @@ fn handle_b2bua_cancel(
     let response_487 = build_response(&message, 487, "Request Terminated", state.server_header.as_deref());
     send_message(
         response_487,
-        a_leg.transport,
-        a_leg.source_addr,
-        a_leg.connection_id,
+        a_leg.transport.transport,
+        a_leg.transport.remote_addr,
+        a_leg.transport.connection_id,
         state,
     );
 
-    state.call_manager.set_state(&call_id, CallState::Terminated);
-    state.call_manager.remove_call(&call_id);
+    state.call_actors.set_state(&call_id, CallState::Terminated);
+    // remove_call sends Shutdown to any remaining actors and cleans up registry
+    state.call_actors.remove_call(&call_id);
+    state.call_event_receivers.remove(&call_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -3183,7 +3195,7 @@ fn handle_b2bua_invite(
     // SIP Call-ID, this is a retransmission — absorb it silently.
     // Without this check, each UDP retransmission would create a new call and
     // spawn duplicate B-leg INVITEs.
-    if state.call_manager.find_by_sip_call_id(&sip_call_id).is_some() {
+    if state.call_actors.find_by_sip_call_id(&sip_call_id).is_some() {
         debug!(
             call_id = %sip_call_id,
             "B2BUA: absorbing INVITE retransmission (call already exists)"
@@ -3203,15 +3215,25 @@ fn handle_b2bua_invite(
     );
 
     // Create the call in the manager
-    let a_leg = ALeg {
-        source_addr: inbound.remote_addr,
-        connection_id: inbound.connection_id,
-        transport: inbound.transport,
-        branch: via_branch,
-        call_id: sip_call_id.clone(),
+    let a_leg = Leg::new_a_leg(
+        sip_call_id.clone(),
         from_tag,
-    };
-    let call_id = state.call_manager.create_call(a_leg);
+        via_branch,
+        LegTransport {
+            remote_addr: inbound.remote_addr,
+            connection_id: inbound.connection_id,
+            transport: inbound.transport,
+        },
+    );
+    let call_id = state.call_actors.create_call(a_leg);
+
+    // Create the event channel for B-leg actors → dispatcher.
+    // All B-leg actors for this call share the same sender.
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<CallEvent>(64);
+    if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
+        call.event_tx = Some(event_tx);
+    }
+    state.call_event_receivers.insert(call_id.clone(), event_rx);
 
     // Invoke @b2bua.on_invite
     let message_arc = Arc::new(std::sync::Mutex::new(message));
@@ -3261,11 +3283,11 @@ fn handle_b2bua_invite(
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
-    state.call_manager.set_a_leg_invite(&call_id, Arc::clone(&message_arc));
+    state.call_actors.set_a_leg_invite(&call_id, Arc::clone(&message_arc));
 
     // Store per-call overrides from script
     if timer_override.is_some() || credentials.is_some() || recording_srs.is_some() || preserve_call_id {
-        if let Some(mut call) = state.call_manager.get_call_mut(&call_id) {
+        if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
             if let Some(override_config) = timer_override {
                 call.session_timer_override = Some(override_config);
             }
@@ -3284,13 +3306,15 @@ fn handle_b2bua_invite(
     match action {
         CallAction::None => {
             debug!(call_id = %call_id, "B2BUA: silent drop (no action from script)");
-            state.call_manager.remove_call(&call_id);
+            state.call_actors.remove_call(&call_id);
+            state.call_event_receivers.remove(&call_id);
         }
         CallAction::Reject { code, reason } => {
             debug!(call_id = %call_id, code, "B2BUA: rejecting call");
             let response = build_response(&message_guard, code, &reason, state.server_header.as_deref());
             send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
-            state.call_manager.remove_call(&call_id);
+            state.call_actors.remove_call(&call_id);
+            state.call_event_receivers.remove(&call_id);
         }
         CallAction::Dial { target, timeout: _ } => {
             debug!(call_id = %call_id, target = %target, "B2BUA: dialling B-leg");
@@ -3304,7 +3328,8 @@ fn handle_b2bua_invite(
         }
         CallAction::Terminate => {
             debug!(call_id = %call_id, "B2BUA: terminate on invite (unusual)");
-            state.call_manager.remove_call(&call_id);
+            state.call_actors.remove_call(&call_id);
+            state.call_event_receivers.remove(&call_id);
         }
         CallAction::AcceptRefer => {
             debug!(call_id = %call_id, "B2BUA: AcceptRefer during INVITE (no-op)");
@@ -3360,12 +3385,12 @@ fn b2bua_send_b_leg_invite(
     // Call-ID is new by default unless the script called call.preserve_call_id().
     // From-tag is always unique per B-leg regardless.
     let (per_call_override, preserve_call_id, a_leg_call_id, a_leg_from_tag) =
-        match state.call_manager.get_call(call_id) {
+        match state.call_actors.get_call(call_id) {
             Some(c) => (
                 c.session_timer_override.clone(),
                 c.preserve_call_id,
-                c.a_leg.call_id.clone(),
-                c.a_leg.from_tag.clone(),
+                c.a_leg.dialog.call_id.clone(),
+                c.a_leg.dialog.remote_tag.clone().unwrap_or_default(),
             ),
             None => (None, false, String::new(), String::new()),
         };
@@ -3373,9 +3398,9 @@ fn b2bua_send_b_leg_invite(
     let b_leg_call_id = if preserve_call_id {
         a_leg_call_id
     } else {
-        crate::b2bua::manager::generate_b_leg_call_id()
+        crate::b2bua::actor::generate_call_id()
     };
-    let b_leg_from_tag = crate::b2bua::manager::generate_b_leg_from_tag();
+    let b_leg_from_tag = crate::b2bua::actor::generate_tag();
 
     // Rewrite Call-ID for B-leg dialog
     b_leg_invite.headers.set("Call-ID", b_leg_call_id.clone());
@@ -3441,16 +3466,31 @@ fn b2bua_send_b_leg_invite(
     sanitize_sdp_identity(&mut b_leg_invite.body, &state.sdp_name);
 
     // Register B-leg with call manager
-    let b_leg = BLeg {
-        destination,
-        transport: outbound_transport,
-        branch: branch.clone(),
-        target_uri: target_uri.to_string(),
-        call_id: b_leg_call_id,
-        from_tag: b_leg_from_tag,
-        stored_vias: vec![],
-    };
-    state.call_manager.add_b_leg(call_id, b_leg);
+    let b_leg = Leg::new_b_leg(
+        b_leg_call_id,
+        b_leg_from_tag,
+        target_uri.to_string(),
+        branch.clone(),
+        LegTransport {
+            remote_addr: destination,
+            connection_id: ConnectionId::default(),
+            transport: outbound_transport,
+        },
+    );
+    state.call_actors.add_b_leg(call_id, b_leg.clone());
+
+    // Spawn a LegActor for this B-leg to classify inbound SIP messages.
+    if let Some(call) = state.call_actors.get_call(call_id) {
+        if let Some(event_tx) = &call.event_tx {
+            let (actor, handle) = LegActor::new(b_leg, event_tx.clone());
+            let b_leg_index = call.b_legs.len().saturating_sub(1);
+            drop(call);
+            tokio::spawn(actor.run());
+            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                call.set_b_leg_handle(b_leg_index, handle);
+            }
+        }
+    }
 
     let data = Bytes::from(b_leg_invite.to_bytes());
 
@@ -3567,21 +3607,43 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, call_state, outbound_credentials, recording_srs) = match state.call_manager.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, call_state, outbound_credentials, recording_srs, b_leg_handle_tx) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
-            let target = matching_b.map(|b| b.target_uri.clone());
-            let dialog = matching_b.map(|b| (b.call_id.clone(), b.from_tag.clone()));
-            let dest = matching_b.map(|b| (b.destination, b.transport));
+            let target = matching_b.map(|b| b.dialog.target_uri.clone().unwrap_or_default());
+            let dialog = matching_b.map(|b| (b.dialog.call_id.clone(), b.dialog.local_tag.clone()));
+            let dest = matching_b.map(|b| (b.transport.remote_addr, b.transport.transport));
             let stored_vias = matching_b.map(|b| b.stored_vias.clone()).unwrap_or_default();
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, dialog, dest, matching_b_idx, stored_vias, call.state.clone(), call.outbound_credentials.clone(), call.recording_srs.clone())
+            let handle_tx = matching_b_idx
+                .and_then(|i| call.b_leg_handles.get(i))
+                .and_then(|h| h.as_ref())
+                .map(|h| h.tx.clone());
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, dialog, dest, matching_b_idx, stored_vias, call.state.clone(), call.outbound_credentials.clone(), call.recording_srs.clone(), handle_tx)
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
             return;
         }
     };
+
+    // Route response through the B-leg actor for classification.
+    // The actor updates dialog state (e.g. remote_tag) and emits a CallEvent.
+    if let Some(handle_tx) = &b_leg_handle_tx {
+        let leg_transport = b_leg_dest.map(|(addr, transport)| LegTransport {
+            remote_addr: addr,
+            connection_id: ConnectionId::default(),
+            transport,
+        }).unwrap_or_else(|| LegTransport {
+            remote_addr: state.local_addr,
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        });
+        let _ = handle_tx.try_send(crate::b2bua::actor::LegMessage::SipInbound {
+            message: message.clone(),
+            source: leg_transport,
+        });
+    }
 
     // Detect re-INVITE responses: target_uri starts with "reinvite:".
     let reinvite_direction = b_leg_target.as_deref().and_then(|t| t.strip_prefix("reinvite:"));
@@ -3593,14 +3655,14 @@ fn handle_b2bua_response(
         // A→B re-INVITE: response goes to A-leg, rewrite B-leg→A-leg headers
         // B→A re-INVITE: response goes to B-leg, rewrite A-leg→B-leg headers
         let (resp_dest, resp_transport, resp_conn_id) = if is_a2b {
-            (a_leg.source_addr, a_leg.transport, a_leg.connection_id)
+            (a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.connection_id)
         } else {
             // B→A: send response to winning B-leg
-            match state.call_manager.get_call(call_id) {
+            match state.call_actors.get_call(call_id) {
                 Some(call) => {
                     let winner = call.winner.and_then(|i| call.b_legs.get(i));
                     if let Some(b) = winner {
-                        (b.destination, b.transport, ConnectionId::default())
+                        (b.transport.remote_addr, b.transport.transport, ConnectionId::default())
                     } else {
                         warn!(call_id = %call_id, "B2BUA re-INVITE response: no winning B-leg");
                         return;
@@ -3613,16 +3675,16 @@ fn handle_b2bua_response(
         if is_a2b {
             // A→B: response from B-leg → rewrite B-leg identifiers back to A-leg
             if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
-                crate::b2bua::manager::rewrite_dialog_headers(
-                    message, &a_leg.call_id, b_ftag, &a_leg.from_tag,
+                crate::b2bua::actor::Dialog::rewrite_headers(
+                    message, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 );
             }
         } else {
             // B→A: response from A-leg → rewrite A-leg identifiers back to B-leg
-            if let Some(call) = state.call_manager.get_call(call_id) {
+            if let Some(call) = state.call_actors.get_call(call_id) {
                 if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
-                    crate::b2bua::manager::rewrite_dialog_headers(
-                        message, &winner.call_id, &a_leg.from_tag, &winner.from_tag,
+                    crate::b2bua::actor::Dialog::rewrite_headers(
+                        message, &winner.dialog.call_id, a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &winner.dialog.local_tag,
                     );
                 }
             }
@@ -3688,7 +3750,7 @@ fn handle_b2bua_response(
                         send_b2bua_to_bleg(ack, responder_transport, responder_dest, state);
                     } else {
                         // B→A: ACK goes to A-leg (responder) via its connection
-                        send_message(ack, responder_transport, responder_dest, a_leg.connection_id, state);
+                        send_message(ack, responder_transport, responder_dest, a_leg.transport.connection_id, state);
                     }
                     debug!(
                         call_id = %call_id,
@@ -3699,11 +3761,11 @@ fn handle_b2bua_response(
             }
 
             // Reset session timer on successful re-INVITE
-            state.call_manager.reset_session_timer(call_id);
+            state.call_actors.reset_session_timer(call_id);
 
             // Remove the re-INVITE B-leg entry to prevent retransmission loops.
             if let Some(idx) = b_leg_index {
-                state.call_manager.remove_b_leg(call_id, idx);
+                state.call_actors.remove_b_leg(call_id, idx);
             }
         }
 
@@ -3761,7 +3823,7 @@ fn handle_b2bua_response(
                     ack.headers.set("Call-ID", b_cid.clone());
                     if let Some(from) = ack.headers.from() {
                         let new_from = from.replace(
-                            &format!("tag={}", a_leg.from_tag),
+                            &format!("tag={}", a_leg.dialog.remote_tag.as_deref().unwrap_or("")),
                             &format!("tag={}", b_ftag),
                         );
                         ack.headers.set("From", new_from);
@@ -3779,9 +3841,9 @@ fn handle_b2bua_response(
         }
 
         // 2xx — call answered; record the winning B-leg
-        state.call_manager.set_state(call_id, CallState::Answered);
+        state.call_actors.set_state(call_id, CallState::Answered);
         if let Some(idx) = b_leg_index {
-            state.call_manager.set_winner(call_id, idx);
+            state.call_actors.set_winner(call_id, idx);
         }
 
         // Wrap the 200 OK in Arc<Mutex<>> so Python handlers can modify SDP in-place
@@ -3796,7 +3858,7 @@ fn handle_b2bua_response(
                 let py_call = PyCall::new(
                     call_id.to_string(),
                     Arc::clone(invite_arc),
-                    a_leg.source_addr.ip().to_string(),
+                    a_leg.transport.remote_addr.ip().to_string(),
                 );
                 let py_reply = PyReply::new(Arc::clone(&response_arc))
                     .with_a_leg(Arc::clone(invite_arc));
@@ -3867,12 +3929,12 @@ fn handle_b2bua_response(
                     };
                 drop(response_lock);
 
-                let timer_state = crate::b2bua::manager::SessionTimerState {
+                let timer_state = crate::b2bua::actor::SessionTimerState {
                     session_expires: negotiated_expires,
                     refresher: negotiated_refresher.clone(),
                     last_refresh: std::time::Instant::now(),
                 };
-                state.call_manager.set_session_timer(call_id, timer_state);
+                state.call_actors.set_session_timer(call_id, timer_state);
 
                 debug!(
                     call_id = %call_id,
@@ -3906,8 +3968,8 @@ fn handle_b2bua_response(
 
         // Rewrite B-leg dialog headers back to A-leg identifiers
         if let Some((ref b_cid, ref b_ftag)) = b_leg_dialog {
-            crate::b2bua::manager::rewrite_dialog_headers(
-                &mut response, &a_leg.call_id, b_ftag, &a_leg.from_tag,
+            crate::b2bua::actor::Dialog::rewrite_headers(
+                &mut response, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
             );
             let _ = (b_cid,); // Call-ID already set by rewrite_dialog_headers
         }
@@ -3926,7 +3988,7 @@ fn handle_b2bua_response(
         }
 
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(&mut response, state, a_leg.transport);
+        sanitize_b2bua_response(&mut response, state, a_leg.transport.transport);
 
         // Send ACK to B-leg immediately — in B2BUA mode we terminate the
         // B-leg dialog ourselves rather than waiting for the A-leg's ACK.
@@ -3973,9 +4035,9 @@ fn handle_b2bua_response(
 
         send_message(
             response,
-            a_leg.transport,
-            a_leg.source_addr,
-            a_leg.connection_id,
+            a_leg.transport.transport,
+            a_leg.transport.remote_addr,
+            a_leg.transport.connection_id,
             state,
         );
 
@@ -4012,11 +4074,11 @@ fn handle_b2bua_response(
         }
     } else if (180..200).contains(&status_code) {
         // 1xx provisional — forward to A-leg
-        state.call_manager.set_state(call_id, CallState::Ringing);
+        state.call_actors.set_state(call_id, CallState::Ringing);
         // Rewrite B-leg dialog headers back to A-leg identifiers
         if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
-            crate::b2bua::manager::rewrite_dialog_headers(
-                message, &a_leg.call_id, b_ftag, &a_leg.from_tag,
+            crate::b2bua::actor::Dialog::rewrite_headers(
+                message, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
             );
         }
         // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
@@ -4031,12 +4093,12 @@ fn handle_b2bua_response(
             }
         }
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(message, state, a_leg.transport);
+        sanitize_b2bua_response(message, state, a_leg.transport.transport);
         send_message(
             message.clone(),
-            a_leg.transport,
-            a_leg.source_addr,
-            a_leg.connection_id,
+            a_leg.transport.transport,
+            a_leg.transport.remote_addr,
+            a_leg.transport.connection_id,
             state,
         );
     } else if status_code >= 300 {
@@ -4102,21 +4164,23 @@ fn handle_b2bua_response(
 
                                 // Reuse B-leg dialog identifiers from the failed attempt
                                 let (retry_call_id, retry_from_tag) = b_leg_dialog.clone()
-                                    .unwrap_or_else(|| (a_leg.call_id.clone(), a_leg.from_tag.clone()));
-                                crate::b2bua::manager::rewrite_dialog_headers(
-                                    &mut retry, &retry_call_id, &a_leg.from_tag, &retry_from_tag,
+                                    .unwrap_or_else(|| (a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()));
+                                crate::b2bua::actor::Dialog::rewrite_headers(
+                                    &mut retry, &retry_call_id, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &retry_from_tag,
                                 );
 
-                                let b_leg = BLeg {
-                                    destination,
-                                    transport,
-                                    branch: new_branch,
-                                    target_uri: target_uri.clone(),
-                                    call_id: retry_call_id,
-                                    from_tag: retry_from_tag,
-                                    stored_vias: vec![],
-                                };
-                                state.call_manager.add_b_leg(call_id, b_leg);
+                                let b_leg = Leg::new_b_leg(
+                                    retry_call_id,
+                                    retry_from_tag,
+                                    target_uri.clone(),
+                                    new_branch,
+                                    LegTransport {
+                                        remote_addr: destination,
+                                        connection_id: ConnectionId::default(),
+                                        transport,
+                                    },
+                                );
+                                state.call_actors.add_b_leg(call_id, b_leg);
 
                                 let data = Bytes::from(retry.to_bytes());
                                 send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
@@ -4206,21 +4270,23 @@ fn handle_b2bua_response(
 
                                 // Reuse B-leg dialog identifiers from the failed attempt
                                 let (retry_call_id, retry_from_tag) = b_leg_dialog.clone()
-                                    .unwrap_or_else(|| (a_leg.call_id.clone(), a_leg.from_tag.clone()));
-                                crate::b2bua::manager::rewrite_dialog_headers(
-                                    &mut retry, &retry_call_id, &a_leg.from_tag, &retry_from_tag,
+                                    .unwrap_or_else(|| (a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()));
+                                crate::b2bua::actor::Dialog::rewrite_headers(
+                                    &mut retry, &retry_call_id, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &retry_from_tag,
                                 );
 
-                                let b_leg = BLeg {
-                                    destination,
-                                    transport,
-                                    branch: new_branch,
-                                    target_uri: target_uri.clone(),
-                                    call_id: retry_call_id,
-                                    from_tag: retry_from_tag,
-                                    stored_vias: vec![],
-                                };
-                                state.call_manager.add_b_leg(call_id, b_leg);
+                                let b_leg = Leg::new_b_leg(
+                                    retry_call_id,
+                                    retry_from_tag,
+                                    target_uri.clone(),
+                                    new_branch,
+                                    LegTransport {
+                                        remote_addr: destination,
+                                        connection_id: ConnectionId::default(),
+                                        transport,
+                                    },
+                                );
+                                state.call_actors.add_b_leg(call_id, b_leg);
 
                                 let data = Bytes::from(retry.to_bytes());
                                 send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
@@ -4245,7 +4311,7 @@ fn handle_b2bua_response(
                 let py_call = PyCall::new(
                     call_id.to_string(),
                     Arc::clone(invite_arc),
-                    a_leg.source_addr.ip().to_string(),
+                    a_leg.transport.remote_addr.ip().to_string(),
                 );
 
                 Python::attach(|python| {
@@ -4297,8 +4363,8 @@ fn handle_b2bua_response(
 
         // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg
         if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
-            crate::b2bua::manager::rewrite_dialog_headers(
-                message, &a_leg.call_id, b_ftag, &a_leg.from_tag,
+            crate::b2bua::actor::Dialog::rewrite_headers(
+                message, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
             );
         }
         // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
@@ -4313,15 +4379,16 @@ fn handle_b2bua_response(
             }
         }
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(message, state, a_leg.transport);
+        sanitize_b2bua_response(message, state, a_leg.transport.transport);
         send_message(
             message.clone(),
-            a_leg.transport,
-            a_leg.source_addr,
-            a_leg.connection_id,
+            a_leg.transport.transport,
+            a_leg.transport.remote_addr,
+            a_leg.transport.connection_id,
             state,
         );
-        state.call_manager.remove_call(call_id);
+        state.call_actors.remove_call(call_id);
+        state.call_event_receivers.remove(call_id);
     }
 }
 
@@ -4335,7 +4402,7 @@ fn handle_b2bua_bye(
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let call_id = match state.call_manager.find_by_sip_call_id(&sip_call_id) {
+    let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
         Some(id) => id,
         None => {
             warn!(sip_call_id = %sip_call_id, "B2BUA BYE: no matching call");
@@ -4344,10 +4411,10 @@ fn handle_b2bua_bye(
     };
 
     // Extract everything from the DashMap ref and drop it before entering Python
-    let (from_a_leg, a_leg_invite, a_leg_source_ip) = match state.call_manager.get_call(&call_id) {
+    let (from_a_leg, a_leg_invite, a_leg_source_ip) = match state.call_actors.get_call(&call_id) {
         Some(call) => {
-            let from_a = inbound.remote_addr == call.a_leg.source_addr;
-            (from_a, call.a_leg_invite.clone(), call.a_leg.source_addr.ip().to_string())
+            let from_a = inbound.remote_addr == call.a_leg.transport.remote_addr;
+            (from_a, call.a_leg_invite.clone(), call.a_leg.transport.remote_addr.ip().to_string())
         }
         None => return,
     };
@@ -4404,7 +4471,7 @@ fn handle_b2bua_bye(
     }
 
     // Re-acquire the call ref for BYE bridging
-    let call = match state.call_manager.get_call(&call_id) {
+    let call = match state.call_actors.get_call(&call_id) {
         Some(c) => c,
         None => return,
     };
@@ -4425,8 +4492,8 @@ fn handle_b2bua_bye(
         if let Some(winner_index) = call.winner {
             if let Some(b_leg) = call.b_legs.get(winner_index) {
                 let branch = TransactionKey::generate_branch();
-                let transport_str = format!("{}", b_leg.transport).to_uppercase();
-                let outbound_port = state.listen_addrs.get(&b_leg.transport)
+                let transport_str = format!("{}", b_leg.transport.transport).to_uppercase();
+                let outbound_port = state.listen_addrs.get(&b_leg.transport.transport)
                     .map(|a| a.port())
                     .unwrap_or(state.local_addr.port());
                 let via_value = format!(
@@ -4440,10 +4507,10 @@ fn handle_b2bua_bye(
                 bye.headers.remove("Via");
                 bye.headers.add("Via", via_value);
                 // Rewrite A-leg dialog headers → B-leg dialog headers
-                crate::b2bua::manager::rewrite_dialog_headers(
-                    &mut bye, &b_leg.call_id, &call.a_leg.from_tag, &b_leg.from_tag,
+                crate::b2bua::actor::Dialog::rewrite_headers(
+                    &mut bye, &b_leg.dialog.call_id, call.a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &b_leg.dialog.local_tag,
                 );
-                send_b2bua_to_bleg(bye, b_leg.transport, b_leg.destination, state);
+                send_b2bua_to_bleg(bye, b_leg.transport.transport, b_leg.transport.remote_addr, state);
             }
         }
     } else {
@@ -4452,16 +4519,16 @@ fn handle_b2bua_bye(
         // Rewrite B-leg dialog headers → A-leg dialog headers
         if let Some(winner_index) = call.winner {
             if let Some(b_leg) = call.b_legs.get(winner_index) {
-                crate::b2bua::manager::rewrite_dialog_headers(
-                    &mut bye, &call.a_leg.call_id, &b_leg.from_tag, &call.a_leg.from_tag,
+                crate::b2bua::actor::Dialog::rewrite_headers(
+                    &mut bye, &call.a_leg.dialog.call_id, &b_leg.dialog.local_tag, call.a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 );
             }
         }
         send_message(
             bye,
-            call.a_leg.transport,
-            call.a_leg.source_addr,
-            call.a_leg.connection_id,
+            call.a_leg.transport.transport,
+            call.a_leg.transport.remote_addr,
+            call.a_leg.transport.connection_id,
             state,
         );
     }
@@ -4498,8 +4565,10 @@ fn handle_b2bua_bye(
         }
     }
 
-    state.call_manager.set_state(&call_id, CallState::Terminated);
-    state.call_manager.remove_call(&call_id);
+    state.call_actors.set_state(&call_id, CallState::Terminated);
+    // remove_call sends Shutdown to any remaining actors and cleans up registry
+    state.call_actors.remove_call(&call_id);
+    state.call_event_receivers.remove(&call_id);
 }
 
 /// Sweep all active calls for session timer expiry (RFC 4028).
@@ -4515,7 +4584,7 @@ fn session_timer_sweep(state: &DispatcherState) {
     let mut calls_to_terminate: Vec<String> = Vec::new();
 
     // Iterate all calls — only look at Answered calls with a session timer
-    for entry in state.call_manager.iter_calls() {
+    for entry in state.call_actors.iter_calls() {
         let call = entry.value();
         if call.state != CallState::Answered {
             continue;
@@ -4549,11 +4618,11 @@ fn session_timer_sweep(state: &DispatcherState) {
 
 /// Send a B2BUA-initiated refresh re-INVITE to the B-leg.
 fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
-    let (a_leg_invite, a_leg_from_tag, winner_b_leg, session_expires) = match state.call_manager.get_call(call_id) {
+    let (a_leg_invite, a_leg_from_tag, winner_b_leg, session_expires) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
             let se = call.session_timer.as_ref().map(|t| t.session_expires).unwrap_or(1800);
-            (call.a_leg_invite.clone(), call.a_leg.from_tag.clone(), b_leg, se)
+            (call.a_leg_invite.clone(), call.a_leg.dialog.remote_tag.clone().unwrap_or_default(), b_leg, se)
         }
         None => return,
     };
@@ -4572,8 +4641,8 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
 
     // New Via/branch
     let branch = TransactionKey::generate_branch();
-    let transport_str = format!("{}", b_leg.transport).to_uppercase();
-    let outbound_port = state.listen_addrs.get(&b_leg.transport)
+    let transport_str = format!("{}", b_leg.transport.transport).to_uppercase();
+    let outbound_port = state.listen_addrs.get(&b_leg.transport.transport)
         .map(|a| a.port())
         .unwrap_or(state.local_addr.port());
     let via_value = format!(
@@ -4587,8 +4656,9 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     reinvite.headers.add("Via", via_value);
 
     // Update Request-URI to B-leg target
-    if !b_leg.target_uri.is_empty() {
-        if let Ok(target_parsed) = parse_uri_standalone(&b_leg.target_uri) {
+    let b_leg_target_uri = b_leg.dialog.target_uri.clone().unwrap_or_default();
+    if !b_leg_target_uri.is_empty() {
+        if let Ok(target_parsed) = parse_uri_standalone(&b_leg_target_uri) {
             reinvite.start_line = StartLine::Request(crate::sip::message::RequestLine {
                 method: crate::sip::message::Method::Invite,
                 request_uri: target_parsed,
@@ -4598,8 +4668,8 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     }
 
     // Rewrite A-leg dialog headers → B-leg dialog headers
-    crate::b2bua::manager::rewrite_dialog_headers(
-        &mut reinvite, &b_leg.call_id, &a_leg_from_tag, &b_leg.from_tag,
+    crate::b2bua::actor::Dialog::rewrite_headers(
+        &mut reinvite, &b_leg.dialog.call_id, &a_leg_from_tag, &b_leg.dialog.local_tag,
     );
 
     // Set session timer headers
@@ -4618,30 +4688,33 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
 
     // Register new branch for response routing (reuse B-leg dialog identifiers)
     // Mark as re-INVITE so the response handler doesn't absorb it as a retransmission
-    let new_b_leg = BLeg {
-        destination: b_leg.destination,
-        transport: b_leg.transport,
-        branch: branch.clone(),
-        target_uri: "reinvite:a2b".to_string(),
-        call_id: b_leg.call_id.clone(),
-        from_tag: b_leg.from_tag.clone(),
-        stored_vias: vec![],
-    };
-    state.call_manager.add_b_leg(call_id, new_b_leg);
+    let mut new_b_leg = Leg::new_b_leg(
+        b_leg.dialog.call_id.clone(),
+        b_leg.dialog.local_tag.clone(),
+        "reinvite:a2b".to_string(),
+        branch.clone(),
+        LegTransport {
+            remote_addr: b_leg.transport.remote_addr,
+            connection_id: ConnectionId::default(),
+            transport: b_leg.transport.transport,
+        },
+    );
+    new_b_leg.stored_vias = vec![];
+    state.call_actors.add_b_leg(call_id, new_b_leg);
 
     // Reset timer preemptively (will be confirmed on 200 OK)
-    state.call_manager.reset_session_timer(call_id);
+    state.call_actors.reset_session_timer(call_id);
 
     debug!(call_id = %call_id, "B2BUA: sending session timer refresh re-INVITE");
-    send_b2bua_to_bleg(reinvite, b_leg.transport, b_leg.destination, state);
+    send_b2bua_to_bleg(reinvite, b_leg.transport.transport, b_leg.transport.remote_addr, state);
 }
 
 /// Terminate a call due to session timer expiry — send BYE to both legs.
 fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
-    let (a_leg, winner_b_leg, sip_call_id) = match state.call_manager.get_call(call_id) {
+    let (a_leg, winner_b_leg, sip_call_id) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
-            (call.a_leg.clone(), b_leg, call.a_leg.call_id.clone())
+            (call.a_leg.clone(), b_leg, call.a_leg.dialog.call_id.clone())
         }
         None => return,
     };
@@ -4651,25 +4724,25 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
     let bye_a = SipMessageBuilder::new()
         .request(
             crate::sip::message::Method::Bye,
-            crate::sip::uri::SipUri::new(a_leg.source_addr.ip().to_string())
-                .with_port(a_leg.source_addr.port()),
+            crate::sip::uri::SipUri::new(a_leg.transport.remote_addr.ip().to_string())
+                .with_port(a_leg.transport.remote_addr.port()),
         )
         .via(format!(
             "SIP/2.0/{} {}:{};branch={}",
-            format!("{}", a_leg.transport).to_uppercase(),
+            format!("{}", a_leg.transport.transport).to_uppercase(),
             format_sip_host(&state.local_addr.ip().to_string()),
-            state.listen_addrs.get(&a_leg.transport).map(|a| a.port()).unwrap_or(state.local_addr.port()),
+            state.listen_addrs.get(&a_leg.transport.transport).map(|a| a.port()).unwrap_or(state.local_addr.port()),
             bye_branch_a,
         ))
         .call_id(sip_call_id.clone())
         .from(format!("<sip:siphon@{}>;tag=session-timer", state.local_addr))
-        .to(format!("<sip:endpoint@{}>;tag={}", a_leg.source_addr, a_leg.from_tag))
+        .to(format!("<sip:endpoint@{}>;tag={}", a_leg.transport.remote_addr, a_leg.dialog.remote_tag.as_deref().unwrap_or("")))
         .cseq("1 BYE".to_string())
         .content_length(0)
         .build();
 
     if let Ok(bye_msg) = bye_a {
-        send_message(bye_msg, a_leg.transport, a_leg.source_addr, a_leg.connection_id, state);
+        send_message(bye_msg, a_leg.transport.transport, a_leg.transport.remote_addr, a_leg.transport.connection_id, state);
     }
 
     // BYE to B-leg (use B-leg Call-ID and From-tag)
@@ -4678,25 +4751,25 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
         let bye_b = SipMessageBuilder::new()
             .request(
                 crate::sip::message::Method::Bye,
-                crate::sip::uri::SipUri::new(b_leg.destination.ip().to_string())
-                    .with_port(b_leg.destination.port()),
+                crate::sip::uri::SipUri::new(b_leg.transport.remote_addr.ip().to_string())
+                    .with_port(b_leg.transport.remote_addr.port()),
             )
             .via(format!(
                 "SIP/2.0/{} {}:{};branch={}",
-                format!("{}", b_leg.transport).to_uppercase(),
+                format!("{}", b_leg.transport.transport).to_uppercase(),
                 format_sip_host(&state.local_addr.ip().to_string()),
-                state.listen_addrs.get(&b_leg.transport).map(|a| a.port()).unwrap_or(state.local_addr.port()),
+                state.listen_addrs.get(&b_leg.transport.transport).map(|a| a.port()).unwrap_or(state.local_addr.port()),
                 bye_branch_b,
             ))
-            .call_id(b_leg.call_id.clone())
-            .from(format!("<sip:siphon@{}>;tag={}", state.local_addr, b_leg.from_tag))
-            .to(format!("<sip:endpoint@{}>", b_leg.destination))
+            .call_id(b_leg.dialog.call_id.clone())
+            .from(format!("<sip:siphon@{}>;tag={}", state.local_addr, b_leg.dialog.local_tag))
+            .to(format!("<sip:endpoint@{}>", b_leg.transport.remote_addr))
             .cseq("1 BYE".to_string())
             .content_length(0)
             .build();
 
         if let Ok(bye_msg) = bye_b {
-            send_b2bua_to_bleg(bye_msg, b_leg.transport, b_leg.destination, state);
+            send_b2bua_to_bleg(bye_msg, b_leg.transport.transport, b_leg.transport.remote_addr, state);
         }
     }
 
@@ -4714,8 +4787,9 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
         }
     }
 
-    state.call_manager.set_state(call_id, CallState::Terminated);
-    state.call_manager.remove_call(call_id);
+    state.call_actors.set_state(call_id, CallState::Terminated);
+    state.call_actors.remove_call(call_id);
+    state.call_event_receivers.remove(call_id);
 }
 
 /// Handle a mid-dialog re-INVITE for a B2BUA call.
@@ -4731,7 +4805,7 @@ fn handle_b2bua_reinvite(
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let call_id = match state.call_manager.find_by_sip_call_id(&sip_call_id) {
+    let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
         Some(id) => id,
         None => {
             warn!(sip_call_id = %sip_call_id, "B2BUA re-INVITE: no matching call");
@@ -4740,9 +4814,9 @@ fn handle_b2bua_reinvite(
     };
 
     // Determine direction and extract routing info
-    let (from_a_leg, a_leg, winner_b_leg) = match state.call_manager.get_call(&call_id) {
+    let (from_a_leg, a_leg, winner_b_leg) = match state.call_actors.get_call(&call_id) {
         Some(call) => {
-            let from_a = inbound.remote_addr == call.a_leg.source_addr;
+            let from_a = inbound.remote_addr == call.a_leg.transport.remote_addr;
             let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
             (from_a, call.a_leg.clone(), b_leg)
         }
@@ -4775,10 +4849,10 @@ fn handle_b2bua_reinvite(
     let reinvite_target = if from_a_leg {
         // A→B: forward to winning B-leg, rewrite A-leg → B-leg dialog headers
         if let Some(b_leg) = &winner_b_leg {
-            crate::b2bua::manager::rewrite_dialog_headers(
-                &mut forwarded, &b_leg.call_id, &a_leg.from_tag, &b_leg.from_tag,
+            crate::b2bua::actor::Dialog::rewrite_headers(
+                &mut forwarded, &b_leg.dialog.call_id, a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &b_leg.dialog.local_tag,
             );
-            Some((b_leg.destination, b_leg.transport, b_leg.call_id.clone(), b_leg.from_tag.clone()))
+            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
         } else {
             warn!(call_id = %call_id, "B2BUA re-INVITE: no winning B-leg");
             return;
@@ -4786,11 +4860,11 @@ fn handle_b2bua_reinvite(
     } else {
         // B→A: forward to A-leg, rewrite B-leg → A-leg dialog headers
         if let Some(b_leg) = &winner_b_leg {
-            crate::b2bua::manager::rewrite_dialog_headers(
-                &mut forwarded, &a_leg.call_id, &b_leg.from_tag, &a_leg.from_tag,
+            crate::b2bua::actor::Dialog::rewrite_headers(
+                &mut forwarded, &a_leg.dialog.call_id, &b_leg.dialog.local_tag, a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
             );
         }
-        Some((a_leg.source_addr, a_leg.transport, a_leg.call_id.clone(), a_leg.from_tag.clone()))
+        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
     };
 
     if let Some((destination, transport, leg_call_id, leg_from_tag)) = reinvite_target {
@@ -4815,16 +4889,19 @@ fn handle_b2bua_reinvite(
         let originator_vias = message.headers.get_all("Via")
             .map(|v| v.to_vec())
             .unwrap_or_default();
-        let reinvite_leg = BLeg {
-            destination,
-            transport,
-            branch: branch.clone(),
-            target_uri: direction.to_string(),
-            call_id: leg_call_id,
-            from_tag: leg_from_tag,
-            stored_vias: originator_vias,
-        };
-        state.call_manager.add_b_leg(&call_id, reinvite_leg);
+        let mut reinvite_leg = Leg::new_b_leg(
+            leg_call_id,
+            leg_from_tag,
+            direction.to_string(),
+            branch.clone(),
+            LegTransport {
+                remote_addr: destination,
+                connection_id: ConnectionId::default(),
+                transport,
+            },
+        );
+        reinvite_leg.stored_vias = originator_vias;
+        state.call_actors.add_b_leg(&call_id, reinvite_leg);
 
         send_b2bua_to_bleg(forwarded, transport, destination, state);
     }
@@ -5136,15 +5213,17 @@ mod tests {
 
     #[test]
     fn call_manager_create_and_cancel() {
-        let manager = CallManager::new();
-        let a_leg = ALeg {
-            source_addr: "10.0.0.1:5060".parse().unwrap(),
-            connection_id: ConnectionId::default(),
-            transport: Transport::Udp,
-            branch: "z9hG4bK-a1".to_string(),
-            call_id: "call-1".to_string(),
-            from_tag: "tag-1".to_string(),
-        };
+        let manager = CallActorStore::new();
+        let a_leg = Leg::new_a_leg(
+            "call-1".to_string(),
+            "tag-1".to_string(),
+            "z9hG4bK-a1".to_string(),
+            LegTransport {
+                remote_addr: "10.0.0.1:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+            },
+        );
         let call_id = manager.create_call(a_leg);
         assert_eq!(manager.count(), 1);
 
@@ -5156,26 +5235,30 @@ mod tests {
 
     #[test]
     fn call_manager_b_leg_response_routing() {
-        let manager = CallManager::new();
-        let a_leg = ALeg {
-            source_addr: "10.0.0.1:5060".parse().unwrap(),
-            connection_id: ConnectionId::default(),
-            transport: Transport::Udp,
-            branch: "z9hG4bK-a1".to_string(),
-            call_id: "call-1".to_string(),
-            from_tag: "tag-1".to_string(),
-        };
+        let manager = CallActorStore::new();
+        let a_leg = Leg::new_a_leg(
+            "call-1".to_string(),
+            "tag-1".to_string(),
+            "z9hG4bK-a1".to_string(),
+            LegTransport {
+                remote_addr: "10.0.0.1:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+            },
+        );
         let call_id = manager.create_call(a_leg);
 
-        let b_leg = BLeg {
-            destination: "10.0.0.2:5060".parse().unwrap(),
-            transport: Transport::Udp,
-            branch: "z9hG4bK-b1".to_string(),
-            target_uri: "sip:bob@10.0.0.2".to_string(),
-            call_id: "b2b-test-1".to_string(),
-            from_tag: "sb-test-1".to_string(),
-            stored_vias: vec![],
-        };
+        let b_leg = Leg::new_b_leg(
+            "b2b-test-1".to_string(),
+            "sb-test-1".to_string(),
+            "sip:bob@10.0.0.2".to_string(),
+            "z9hG4bK-b1".to_string(),
+            LegTransport {
+                remote_addr: "10.0.0.2:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+            },
+        );
         manager.add_b_leg(&call_id, b_leg);
 
         // Can route response via B-leg branch
@@ -5218,15 +5301,17 @@ mod tests {
     /// Bug 1: INVITE retransmissions should be detected via find_by_sip_call_id.
     #[test]
     fn retransmission_guard_detects_duplicate_call_id() {
-        let manager = CallManager::new();
-        let a_leg = ALeg {
-            source_addr: "10.0.0.1:5060".parse().unwrap(),
-            connection_id: ConnectionId::default(),
-            transport: Transport::Udp,
-            branch: "z9hG4bK-orig".to_string(),
-            call_id: "retransmit-test@host".to_string(),
-            from_tag: "tag-orig".to_string(),
-        };
+        let manager = CallActorStore::new();
+        let a_leg = Leg::new_a_leg(
+            "retransmit-test@host".to_string(),
+            "tag-orig".to_string(),
+            "z9hG4bK-orig".to_string(),
+            LegTransport {
+                remote_addr: "10.0.0.1:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+            },
+        );
         let _call_id = manager.create_call(a_leg);
 
         // Second INVITE with same SIP Call-ID (retransmission) should be detected
@@ -5288,36 +5373,42 @@ mod tests {
     /// Bug 3: Winner is recorded and can be used to find the winning B-leg for ACK bridging.
     #[test]
     fn winner_tracks_answered_b_leg_for_ack_bridging() {
-        let manager = CallManager::new();
-        let a_leg = ALeg {
-            source_addr: "10.0.0.1:5060".parse().unwrap(),
-            connection_id: ConnectionId::default(),
-            transport: Transport::Udp,
-            branch: "z9hG4bK-a1".to_string(),
-            call_id: "ack-bridge-test@host".to_string(),
-            from_tag: "a-tag".to_string(),
-        };
+        let manager = CallActorStore::new();
+        let a_leg = Leg::new_a_leg(
+            "ack-bridge-test@host".to_string(),
+            "a-tag".to_string(),
+            "z9hG4bK-a1".to_string(),
+            LegTransport {
+                remote_addr: "10.0.0.1:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+            },
+        );
         let call_id = manager.create_call(a_leg);
 
         // Add two B-legs (forked call)
-        let b_leg_0 = BLeg {
-            destination: "10.0.0.2:5060".parse().unwrap(),
-            transport: Transport::Udp,
-            branch: "z9hG4bK-b0".to_string(),
-            target_uri: "sip:bob@10.0.0.2".to_string(),
-            call_id: "b-cid-0".to_string(),
-            from_tag: "b-ftag-0".to_string(),
-            stored_vias: vec![],
-        };
-        let b_leg_1 = BLeg {
-            destination: "10.0.0.3:5060".parse().unwrap(),
-            transport: Transport::Udp,
-            branch: "z9hG4bK-b1".to_string(),
-            target_uri: "sip:bob@10.0.0.3".to_string(),
-            call_id: "b-cid-1".to_string(),
-            from_tag: "b-ftag-1".to_string(),
-            stored_vias: vec![],
-        };
+        let b_leg_0 = Leg::new_b_leg(
+            "b-cid-0".to_string(),
+            "b-ftag-0".to_string(),
+            "sip:bob@10.0.0.2".to_string(),
+            "z9hG4bK-b0".to_string(),
+            LegTransport {
+                remote_addr: "10.0.0.2:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+            },
+        );
+        let b_leg_1 = Leg::new_b_leg(
+            "b-cid-1".to_string(),
+            "b-ftag-1".to_string(),
+            "sip:bob@10.0.0.3".to_string(),
+            "z9hG4bK-b1".to_string(),
+            LegTransport {
+                remote_addr: "10.0.0.3:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+            },
+        );
         manager.add_b_leg(&call_id, b_leg_0);
         manager.add_b_leg(&call_id, b_leg_1);
 
@@ -5328,9 +5419,9 @@ mod tests {
         let call = manager.get_call(&call_id).unwrap();
         assert_eq!(call.winner, Some(1));
         let winner = &call.b_legs[call.winner.unwrap()];
-        assert_eq!(winner.call_id, "b-cid-1");
-        assert_eq!(winner.from_tag, "b-ftag-1");
-        assert_eq!(winner.destination, "10.0.0.3:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(winner.dialog.call_id, "b-cid-1");
+        assert_eq!(winner.dialog.local_tag, "b-ftag-1");
+        assert_eq!(winner.transport.remote_addr, "10.0.0.3:5060".parse::<SocketAddr>().unwrap());
 
         // ACK bridging would use find_by_sip_call_id to locate the call
         assert_eq!(

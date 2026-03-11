@@ -3,9 +3,12 @@
 //! Tests cross-module interactions: dialog store management during B2BUA call flows,
 //! registrar lookups for routing B2BUA calls, and transaction key handling.
 
-use siphon::b2bua::manager::{ALeg, BLeg, CallManager, CallState};
+use siphon::b2bua::actor::{
+    CallActorStore, CallEvent, CallState, Leg, LegActor, LegMessage, TransportInfo,
+    SessionTimerState, generate_call_id, generate_tag,
+};
 use siphon::dialog::{Dialog, DialogId, DialogStore, DialogState};
-use siphon::registrar::{Registrar, RegistrarConfig};
+use siphon::registrar::Registrar;
 use siphon::sip::builder::SipMessageBuilder;
 use siphon::sip::uri::SipUri;
 use siphon::sip::message::Method;
@@ -219,69 +222,73 @@ fn dialog_id_reversal_for_perspective_switch() {
 // B2BUA full call flow: INVITE → 180 → 200 → BYE
 // ---------------------------------------------------------------------------
 
-fn make_a_leg(call_id: &str) -> ALeg {
-    ALeg {
-        source_addr: "10.0.0.1:5060".parse().unwrap(),
-        connection_id: ConnectionId::default(),
-        transport: Transport::Udp,
-        branch: "z9hG4bK-aleg".to_string(),
-        call_id: call_id.to_string(),
-        from_tag: "alice-tag".to_string(),
-    }
+fn make_a_leg(call_id: &str) -> Leg {
+    Leg::new_a_leg(
+        call_id.to_string(),
+        "alice-tag".to_string(),
+        "z9hG4bK-aleg".to_string(),
+        TransportInfo {
+            remote_addr: "10.0.0.1:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    )
 }
 
-fn make_b_leg(target: &str) -> BLeg {
+fn make_b_leg(target: &str) -> Leg {
     let addr: SocketAddr = target.parse().unwrap_or("10.0.0.2:5060".parse().unwrap());
-    BLeg {
-        destination: addr,
-        transport: Transport::Udp,
-        branch: TransactionKey::generate_branch(),
-        target_uri: format!("sip:bob@{}", target),
-        call_id: siphon::b2bua::manager::generate_b_leg_call_id(),
-        from_tag: siphon::b2bua::manager::generate_b_leg_from_tag(),
-        stored_vias: vec![],
-    }
+    Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        format!("sip:bob@{}", target),
+        TransactionKey::generate_branch(),
+        TransportInfo {
+            remote_addr: addr,
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    )
 }
 
 #[test]
 fn b2bua_full_call_lifecycle() {
-    let manager = CallManager::new();
+    let store = CallActorStore::new();
 
     // 1. INVITE arrives → create call
     let a_leg = make_a_leg("call-lifecycle@test");
-    let call_id = manager.create_call(a_leg);
-    assert_eq!(manager.count(), 1);
+    let call_id = store.create_call(a_leg);
+    assert_eq!(store.count(), 1);
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.state, CallState::Calling);
     }
 
     // 2. Script dials → add B-leg
     let b_leg = make_b_leg("10.0.0.2:5060");
     let b_branch = b_leg.branch.clone();
-    manager.add_b_leg(&call_id, b_leg);
-    assert_eq!(manager.call_id_for_branch(&b_branch), Some(call_id.clone()));
+    store.add_b_leg(&call_id, b_leg);
+    assert_eq!(store.call_id_for_branch(&b_branch), Some(call_id.clone()));
 
     // 3. B-leg sends 180 Ringing → state changes to Ringing
-    manager.set_state(&call_id, CallState::Ringing);
+    store.set_state(&call_id, CallState::Ringing);
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.state, CallState::Ringing);
     }
 
     // 4. B-leg sends 200 OK → call answered, winner set
-    manager.set_winner(&call_id, 0);
+    store.set_winner(&call_id, 0);
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.state, CallState::Answered);
         assert_eq!(call.winner, Some(0));
     }
 
     // 5. BYE received → terminate and cleanup
-    manager.set_state(&call_id, CallState::Terminated);
-    manager.remove_call(&call_id);
-    assert_eq!(manager.count(), 0);
-    assert!(manager.call_id_for_branch(&b_branch).is_none());
+    store.set_state(&call_id, CallState::Terminated);
+    store.remove_call(&call_id);
+    assert_eq!(store.count(), 0);
+    assert!(store.call_id_for_branch(&b_branch).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -290,21 +297,21 @@ fn b2bua_full_call_lifecycle() {
 
 #[test]
 fn b2bua_error_propagation() {
-    let manager = CallManager::new();
+    let store = CallActorStore::new();
 
-    let call_id = manager.create_call(make_a_leg("call-error@test"));
+    let call_id = store.create_call(make_a_leg("call-error@test"));
     let b_leg = make_b_leg("10.0.0.2:5060");
     let b_branch = b_leg.branch.clone();
-    manager.add_b_leg(&call_id, b_leg);
+    store.add_b_leg(&call_id, b_leg);
 
     // B-leg returns 486 Busy Here → remove call
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.state, CallState::Calling);
     }
-    manager.remove_call(&call_id);
-    assert_eq!(manager.count(), 0);
-    assert!(manager.call_id_for_branch(&b_branch).is_none());
+    store.remove_call(&call_id);
+    assert_eq!(store.count(), 0);
+    assert!(store.call_id_for_branch(&b_branch).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -313,53 +320,53 @@ fn b2bua_error_propagation() {
 
 #[test]
 fn b2bua_bye_from_a_leg_bridges_to_b_leg() {
-    let manager = CallManager::new();
+    let store = CallActorStore::new();
 
     let a_leg = make_a_leg("call-bye-a@test");
-    let call_id = manager.create_call(a_leg);
+    let call_id = store.create_call(a_leg);
     let b_leg = make_b_leg("10.0.0.2:5060");
-    let b_destination = b_leg.destination;
-    manager.add_b_leg(&call_id, b_leg);
-    manager.set_winner(&call_id, 0);
+    let b_destination = b_leg.transport.remote_addr;
+    store.add_b_leg(&call_id, b_leg);
+    store.set_winner(&call_id, 0);
 
-    // BYE from A-leg (source matches a_leg.source_addr)
-    let call = manager.get_call(&call_id).unwrap();
-    let from_a = call.a_leg.source_addr == "10.0.0.1:5060".parse::<SocketAddr>().unwrap();
+    // BYE from A-leg (source matches a_leg transport addr)
+    let call = store.get_call(&call_id).unwrap();
+    let from_a = call.a_leg.transport.remote_addr == "10.0.0.1:5060".parse::<SocketAddr>().unwrap();
     assert!(from_a);
 
     // Verify we can find the B-leg winner to forward BYE to
     assert_eq!(call.winner, Some(0));
-    assert_eq!(call.b_legs[0].destination, b_destination);
+    assert_eq!(call.b_legs[0].transport.remote_addr, b_destination);
     drop(call);
 
-    manager.set_state(&call_id, CallState::Terminated);
-    manager.remove_call(&call_id);
-    assert_eq!(manager.count(), 0);
+    store.set_state(&call_id, CallState::Terminated);
+    store.remove_call(&call_id);
+    assert_eq!(store.count(), 0);
 }
 
 #[test]
 fn b2bua_bye_from_b_leg_bridges_to_a_leg() {
-    let manager = CallManager::new();
+    let store = CallActorStore::new();
 
     let a_leg = make_a_leg("call-bye-b@test");
-    let a_source = a_leg.source_addr;
-    let call_id = manager.create_call(a_leg);
-    manager.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
-    manager.set_winner(&call_id, 0);
+    let a_source = a_leg.transport.remote_addr;
+    let call_id = store.create_call(a_leg);
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
 
-    // BYE from B-leg (source is NOT a_leg.source_addr)
+    // BYE from B-leg (source is NOT a_leg transport addr)
     let b_leg_source: SocketAddr = "10.0.0.2:5060".parse().unwrap();
-    let call = manager.get_call(&call_id).unwrap();
-    let from_a = b_leg_source == call.a_leg.source_addr;
+    let call = store.get_call(&call_id).unwrap();
+    let from_a = b_leg_source == call.a_leg.transport.remote_addr;
     assert!(!from_a); // This is from B-leg
 
     // Forward to A-leg
-    assert_eq!(call.a_leg.source_addr, a_source);
+    assert_eq!(call.a_leg.transport.remote_addr, a_source);
     drop(call);
 
-    manager.set_state(&call_id, CallState::Terminated);
-    manager.remove_call(&call_id);
-    assert_eq!(manager.count(), 0);
+    store.set_state(&call_id, CallState::Terminated);
+    store.remove_call(&call_id);
+    assert_eq!(store.count(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -368,35 +375,35 @@ fn b2bua_bye_from_b_leg_bridges_to_a_leg() {
 
 #[test]
 fn b2bua_cancel_removes_call() {
-    let manager = CallManager::new();
+    let store = CallActorStore::new();
 
-    let call_id = manager.create_call(make_a_leg("call-cancel@test"));
+    let call_id = store.create_call(make_a_leg("call-cancel@test"));
     let b_leg = make_b_leg("10.0.0.2:5060");
-    manager.add_b_leg(&call_id, b_leg);
+    store.add_b_leg(&call_id, b_leg);
 
     // Call is in Calling state — CANCEL should terminate it
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.state, CallState::Calling);
     }
 
     // CANCEL → set terminated, remove
-    manager.set_state(&call_id, CallState::Terminated);
-    manager.remove_call(&call_id);
-    assert_eq!(manager.count(), 0);
+    store.set_state(&call_id, CallState::Terminated);
+    store.remove_call(&call_id);
+    assert_eq!(store.count(), 0);
 }
 
 #[test]
 fn b2bua_cancel_ignored_after_answer() {
-    let manager = CallManager::new();
+    let store = CallActorStore::new();
 
-    let call_id = manager.create_call(make_a_leg("call-cancel-late@test"));
-    manager.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
-    manager.set_winner(&call_id, 0);
+    let call_id = store.create_call(make_a_leg("call-cancel-late@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
 
     // Call is Answered — CANCEL should not change state
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.state, CallState::Answered);
     }
 
@@ -410,39 +417,41 @@ fn b2bua_cancel_ignored_after_answer() {
 
 #[test]
 fn b2bua_multi_leg_forking() {
-    let manager = CallManager::new();
-    let call_id = manager.create_call(make_a_leg("call-fork@test"));
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("call-fork@test"));
 
     // Fork to 3 B-legs
     for i in 0..3 {
-        let b_leg = BLeg {
-            destination: format!("10.0.0.{}:5060", i + 2).parse().unwrap(),
-            transport: Transport::Udp,
-            branch: TransactionKey::generate_branch(),
-            target_uri: format!("sip:bob@10.0.0.{}", i + 2),
-            call_id: siphon::b2bua::manager::generate_b_leg_call_id(),
-            from_tag: siphon::b2bua::manager::generate_b_leg_from_tag(),
-            stored_vias: vec![],
-        };
-        manager.add_b_leg(&call_id, b_leg);
+        let b_leg = Leg::new_b_leg(
+            generate_call_id(),
+            generate_tag(),
+            format!("sip:bob@10.0.0.{}", i + 2),
+            TransactionKey::generate_branch(),
+            TransportInfo {
+                remote_addr: format!("10.0.0.{}:5060", i + 2).parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+            },
+        );
+        store.add_b_leg(&call_id, b_leg);
     }
 
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.b_legs.len(), 3);
     }
 
     // Second B-leg answers first
-    manager.set_winner(&call_id, 1);
+    store.set_winner(&call_id, 1);
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.winner, Some(1));
         assert_eq!(call.state, CallState::Answered);
     }
 
     // Cleanup
-    manager.remove_call(&call_id);
-    assert_eq!(manager.count(), 0);
+    store.remove_call(&call_id);
+    assert_eq!(store.count(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -562,11 +571,11 @@ fn server_transaction_lifecycle_options() {
 
 #[test]
 fn b2bua_a_leg_invite_stored_and_available_through_lifecycle() {
-    let manager = CallManager::new();
+    let store = CallActorStore::new();
 
     // Create call
     let a_leg = make_a_leg("call-invite-store@test");
-    let call_id = manager.create_call(a_leg);
+    let call_id = store.create_call(a_leg);
 
     // Build and store an INVITE with SDP body
     let invite = SipMessageBuilder::new()
@@ -583,15 +592,15 @@ fn b2bua_a_leg_invite_stored_and_available_through_lifecycle() {
         .build()
         .unwrap();
     let invite_arc = Arc::new(Mutex::new(invite));
-    manager.set_a_leg_invite(&call_id, Arc::clone(&invite_arc));
+    store.set_a_leg_invite(&call_id, Arc::clone(&invite_arc));
 
     // Add B-leg, answer the call
-    manager.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
-    manager.set_winner(&call_id, 0);
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
 
     // A-leg INVITE should still be available after answer (for on_answer handler)
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.state, CallState::Answered);
         let stored_invite = call.a_leg_invite.as_ref().expect("a_leg_invite should be stored");
         let msg = stored_invite.lock().unwrap();
@@ -599,15 +608,15 @@ fn b2bua_a_leg_invite_stored_and_available_through_lifecycle() {
     }
 
     // A-leg INVITE should still be available at BYE time (for on_bye handler)
-    manager.set_state(&call_id, CallState::Terminated);
+    store.set_state(&call_id, CallState::Terminated);
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert!(call.a_leg_invite.is_some());
     }
 
     // After removal, everything is cleaned up
-    manager.remove_call(&call_id);
-    assert_eq!(manager.count(), 0);
+    store.remove_call(&call_id);
+    assert_eq!(store.count(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -676,37 +685,20 @@ session_timer:
 
 #[test]
 fn session_timer_state_lifecycle() {
-    use siphon::b2bua::manager::SessionTimerState;
-
-    let manager = CallManager::new();
-    let a_leg = ALeg {
-        source_addr: "10.0.0.1:5060".parse().unwrap(),
-        connection_id: ConnectionId::default(),
-        transport: Transport::Udp,
-        branch: "z9hG4bK-timer-test".to_string(),
-        call_id: "timer-lifecycle@test".to_string(),
-        from_tag: "alice-tag".to_string(),
-    };
-    let call_id = manager.create_call(a_leg);
+    let store = CallActorStore::new();
+    let a_leg = make_a_leg("timer-lifecycle@test");
+    let call_id = store.create_call(a_leg);
 
     // No timer initially
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert!(call.session_timer.is_none());
     }
 
     // Add B-leg and set to Answered
-    let b_leg = BLeg {
-        destination: "10.0.0.2:5060".parse().unwrap(),
-        transport: Transport::Udp,
-        branch: "z9hG4bK-bleg-timer".to_string(),
-        target_uri: "sip:bob@10.0.0.2".to_string(),
-        call_id: "b2b-timer-test".to_string(),
-        from_tag: "sb-timer-test".to_string(),
-        stored_vias: vec![],
-    };
-    manager.add_b_leg(&call_id, b_leg);
-    manager.set_winner(&call_id, 0);
+    let b_leg = make_b_leg("10.0.0.2:5060");
+    store.add_b_leg(&call_id, b_leg);
+    store.set_winner(&call_id, 0);
 
     // Activate session timer (simulating 200 OK processing)
     let timer = SessionTimerState {
@@ -714,11 +706,11 @@ fn session_timer_state_lifecycle() {
         refresher: "b2bua".to_string(),
         last_refresh: std::time::Instant::now(),
     };
-    manager.set_session_timer(&call_id, timer);
+    store.set_session_timer(&call_id, timer);
 
     // Verify timer is active
     {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.state, CallState::Answered);
         let timer = call.session_timer.as_ref().unwrap();
         assert_eq!(timer.session_expires, 1800);
@@ -727,20 +719,20 @@ fn session_timer_state_lifecycle() {
 
     // Reset timer (simulating successful refresh)
     let before = {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         call.session_timer.as_ref().unwrap().last_refresh
     };
     std::thread::sleep(std::time::Duration::from_millis(10));
-    manager.reset_session_timer(&call_id);
+    store.reset_session_timer(&call_id);
     let after = {
-        let call = manager.get_call(&call_id).unwrap();
+        let call = store.get_call(&call_id).unwrap();
         call.session_timer.as_ref().unwrap().last_refresh
     };
     assert!(after > before);
 
     // Remove call cleans up timer
-    manager.remove_call(&call_id);
-    assert!(manager.get_call(&call_id).is_none());
+    store.remove_call(&call_id);
+    assert!(store.get_call(&call_id).is_none());
 }
 
 #[test]
@@ -798,57 +790,42 @@ fn session_timer_headers_in_b_leg_invite() {
 #[test]
 fn reinvite_detection_by_to_tag() {
     // Test that re-INVITE detection works by checking To-tag presence
-    // and matching Call-ID against the call manager.
-    let manager = CallManager::new();
-    let a_leg = ALeg {
-        source_addr: "10.0.0.1:5060".parse().unwrap(),
-        connection_id: ConnectionId::default(),
-        transport: Transport::Udp,
-        branch: "z9hG4bK-reinvite-test".to_string(),
-        call_id: "reinvite-detect@test".to_string(),
-        from_tag: "alice-tag".to_string(),
-    };
-    let _call_id = manager.create_call(a_leg);
+    // and matching Call-ID against the call actor store.
+    let store = CallActorStore::new();
+    let a_leg = make_a_leg("reinvite-detect@test");
+    let _call_id = store.create_call(a_leg);
 
     // Simulate checking if an INVITE with a To-tag and matching Call-ID is a re-INVITE
     let sip_call_id = "reinvite-detect@test";
     let to_tag = Some("bob-tag".to_string());
 
     let is_reinvite = to_tag.is_some()
-        && manager.find_by_sip_call_id(sip_call_id).is_some();
+        && store.find_by_sip_call_id(sip_call_id).is_some();
 
     assert!(is_reinvite, "INVITE with To-tag and matching Call-ID should be detected as re-INVITE");
 
     // Initial INVITE (no To-tag) should NOT be detected as re-INVITE
     let to_tag_none: Option<String> = None;
     let is_initial = to_tag_none.is_some()
-        && manager.find_by_sip_call_id(sip_call_id).is_some();
+        && store.find_by_sip_call_id(sip_call_id).is_some();
     assert!(!is_initial, "INVITE without To-tag should not be a re-INVITE");
 
     // Unknown Call-ID should NOT be detected as re-INVITE
     let is_unknown = to_tag.is_some()
-        && manager.find_by_sip_call_id("unknown@test").is_some();
+        && store.find_by_sip_call_id("unknown@test").is_some();
     assert!(!is_unknown, "INVITE with unknown Call-ID should not be a re-INVITE");
 }
 
 #[test]
-fn session_timer_per_call_override_on_call_manager() {
+fn session_timer_per_call_override_on_call_actor_store() {
     use siphon::script::api::call::SessionTimerOverride;
 
-    // Test that per-call session timer overrides are stored on the CallManager
-    let manager = CallManager::new();
-    let a_leg = ALeg {
-        source_addr: "10.0.0.1:5060".parse().unwrap(),
-        connection_id: ConnectionId::default(),
-        transport: Transport::Udp,
-        branch: "z9hG4bK-override-mgr".to_string(),
-        call_id: "override-mgr@test".to_string(),
-        from_tag: "tag-override".to_string(),
-    };
-    let call_id = manager.create_call(a_leg);
+    let store = CallActorStore::new();
+    let a_leg = make_a_leg("override-mgr@test");
+    let call_id = store.create_call(a_leg);
 
     // Store override on the call
-    if let Some(mut call_ref) = manager.get_call_mut(&call_id) {
+    if let Some(mut call_ref) = store.get_call_mut(&call_id) {
         call_ref.session_timer_override = Some(SessionTimerOverride {
             session_expires: 3600,
             min_se: 120,
@@ -857,9 +834,101 @@ fn session_timer_per_call_override_on_call_manager() {
     }
 
     // Verify override persists
-    let call_ref = manager.get_call(&call_id).unwrap();
+    let call_ref = store.get_call(&call_id).unwrap();
     let stored = call_ref.session_timer_override.as_ref().unwrap();
     assert_eq!(stored.session_expires, 3600);
     assert_eq!(stored.min_se, 120);
     assert_eq!(stored.refresher, "uas");
+}
+
+// ---------------------------------------------------------------------------
+// LegActor integration: spawn actor, send SipInbound, verify CallEvent
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn leg_actor_classifies_sip_response_end_to_end() {
+    // Create a B-leg and wire up actor channels
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<CallEvent>(16);
+    let b_leg = make_b_leg("10.0.0.2:5060");
+    let leg_id = b_leg.id.clone();
+
+    let (actor, handle) = LegActor::new(b_leg, event_tx);
+    let join = tokio::spawn(actor.run());
+
+    // Simulate a 200 OK arriving from the B-leg endpoint
+    let ok_response = SipMessageBuilder::new()
+        .response(200, "OK".to_string())
+        .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-int-test".to_string())
+        .from("<sip:alice@atlanta.com>;tag=int-test".to_string())
+        .to("<sip:bob@biloxi.com>;tag=bob-resp".to_string())
+        .call_id("int-test@host".to_string())
+        .cseq("1 INVITE".to_string())
+        .content_length(0)
+        .build()
+        .unwrap();
+
+    handle.tx.send(LegMessage::SipInbound {
+        message: ok_response,
+        source: TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    }).await.unwrap();
+
+    // The actor should classify it as Answered
+    let event = event_rx.recv().await.expect("should receive CallEvent");
+    match event {
+        CallEvent::Answered { leg_id: id, message } => {
+            assert_eq!(id, leg_id);
+            assert_eq!(message.status_code(), Some(200));
+        }
+        other => panic!("expected Answered, got {:?}", other),
+    }
+
+    // Clean shutdown
+    handle.tx.send(LegMessage::Shutdown).await.unwrap();
+    join.await.unwrap();
+
+    // Terminated event from shutdown
+    let terminated = event_rx.recv().await.expect("should receive Terminated");
+    assert!(matches!(terminated, CallEvent::Terminated { .. }));
+}
+
+#[tokio::test]
+async fn leg_actor_wired_to_call_actor_store() {
+    // Verify the full wiring: CallActorStore → CallActor → LegActor handles
+    let store = CallActorStore::new();
+    let a_leg = make_a_leg("actor-wiring@test");
+    let call_id = store.create_call(a_leg);
+
+    // Create event channel (as the dispatcher would)
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<CallEvent>(64);
+    if let Some(mut call) = store.get_call_mut(&call_id) {
+        call.event_tx = Some(event_tx.clone());
+    }
+
+    // Add a B-leg and spawn its actor
+    let b_leg = make_b_leg("10.0.0.2:5060");
+    let b_leg_clone = b_leg.clone();
+    store.add_b_leg(&call_id, b_leg);
+
+    let (actor, handle) = LegActor::new(b_leg_clone, event_tx);
+    tokio::spawn(actor.run());
+
+    // Store the handle
+    if let Some(mut call) = store.get_call_mut(&call_id) {
+        call.set_b_leg_handle(0, handle);
+    }
+
+    // Verify handle is stored
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert!(call.b_leg_handles[0].is_some());
+        assert!(call.event_tx.is_some());
+    }
+
+    // remove_call should shutdown actors cleanly
+    store.remove_call(&call_id);
+    assert_eq!(store.count(), 0);
 }
