@@ -125,6 +125,28 @@ struct DispatcherState {
     call_event_receivers: Arc<DashMap<String, tokio::sync::mpsc::Receiver<CallEvent>>>,
 }
 
+impl DispatcherState {
+    /// Return the host (IP or hostname) to use in Via headers for the given transport.
+    ///
+    /// Prefers the per-transport advertised address (public IP) when configured,
+    /// falling back to the local bind address.  The result is already formatted
+    /// for SIP (IPv6 addresses are bracketed).
+    fn via_host(&self, transport: &Transport) -> String {
+        self.advertised_addrs
+            .get(transport)
+            .map(|h| format_sip_host(h))
+            .unwrap_or_else(|| format_sip_host(&self.local_addr.ip().to_string()))
+    }
+
+    /// Return the port to use in Via/Contact headers for the given transport.
+    fn via_port(&self, transport: &Transport) -> u16 {
+        self.listen_addrs
+            .get(transport)
+            .map(|a| a.port())
+            .unwrap_or(self.local_addr.port())
+    }
+}
+
 /// Run the core dispatcher loop.
 ///
 /// Reads inbound messages from transport, parses, invokes Python handlers,
@@ -1166,8 +1188,8 @@ fn relay_request(
     let branch = core::add_via(
         &mut relayed.headers,
         &transport_str,
-        &format_sip_host(&state.local_addr.ip().to_string()),
-        Some(state.local_addr.port()),
+        &state.via_host(&outbound_transport),
+        Some(state.via_port(&outbound_transport)),
     );
 
     // Add Record-Route if the script requested it.
@@ -1387,8 +1409,8 @@ fn relay_fork_branch(
     let branch = core::add_via(
         &mut relayed.headers,
         &transport_str,
-        &format_sip_host(&state.local_addr.ip().to_string()),
-        Some(state.local_addr.port()),
+        &state.via_host(&outbound_transport),
+        Some(state.via_port(&outbound_transport)),
     );
 
     if record_routed {
@@ -1556,6 +1578,59 @@ fn handle_response(
     if let Some(call_id) = state.call_actors.call_id_for_branch(&branch) {
         handle_b2bua_response(&call_id, &branch, &mut message, status_code, state);
         return;
+    }
+
+    // Post-teardown: re-ACK retransmitted re-INVITE 200 OKs for calls already
+    // torn down by BYE. The zombie map holds destination info for B-leg entries
+    // that had active re-INVITE tracking when the call was removed.
+    if (200..300).contains(&status_code) {
+        if let Some(cseq_raw) = message.headers.get("CSeq") {
+            if cseq_raw.contains("INVITE") {
+                if let Some(sip_call_id) = message.headers.call_id() {
+                    if let Some(zombie) = state.call_actors.get_zombie_reinvite(sip_call_id) {
+                        let transport_str = format!("{}", zombie.transport).to_uppercase();
+                        let outbound_port = state.listen_addrs.get(&zombie.transport)
+                            .map(|a| a.port())
+                            .unwrap_or(state.local_addr.port());
+                        let cseq_num = cseq_raw.split_whitespace().next()
+                            .unwrap_or("1").to_string();
+                        let from = message.headers.from().cloned().unwrap_or_default();
+                        let to = message.headers.to().cloned().unwrap_or_default();
+                        let ack_uri = SipUri::new(zombie.destination.ip().to_string())
+                            .with_port(zombie.destination.port());
+                        let ack = match SipMessageBuilder::new()
+                            .request(Method::Ack, ack_uri)
+                            .via(format!(
+                                "SIP/2.0/{} {}:{};branch={}",
+                                transport_str,
+                                format_sip_host(&state.local_addr.ip().to_string()),
+                                outbound_port,
+                                TransactionKey::generate_branch(),
+                            ))
+                            .from(from.to_string())
+                            .to(to.to_string())
+                            .call_id(sip_call_id.to_string())
+                            .cseq(format!("{} ACK", cseq_num))
+                            .header("Max-Forwards", "70".to_string())
+                            .content_length(0)
+                            .build()
+                        {
+                            Ok(ack) => ack,
+                            Err(error) => {
+                                error!("B2BUA zombie ACK build failed: {error}");
+                                return;
+                            }
+                        };
+                        send_b2bua_to_bleg(ack, zombie.transport, zombie.destination, state);
+                        debug!(
+                            call_id = sip_call_id,
+                            "B2BUA: zombie re-ACK for post-teardown re-INVITE 200 OK retransmission"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     // Parse CSeq once for both transaction processing and session routing.
@@ -2788,8 +2863,8 @@ fn cancel_other_fork_branches(
             let via_value = format!(
                 "SIP/2.0/{} {}:{};branch={}",
                 transport_str.to_uppercase(),
-                state.local_addr.ip(),
-                state.local_addr.port(),
+                state.via_host(&client_branch.transport),
+                state.via_port(&client_branch.transport),
                 cancel_branch,
             );
 
@@ -2982,14 +3057,11 @@ fn handle_ack_via_session(
             // Strip all existing Via headers, add our own
             ack_downstream.headers.remove("Via");
             let transport_str = format!("{}", client_branch.transport);
-            let outbound_port = state.listen_addrs.get(&client_branch.transport)
-                .map(|a| a.port())
-                .unwrap_or(state.local_addr.port());
             let via_value = format!(
                 "SIP/2.0/{} {}:{};branch={}",
                 transport_str.to_uppercase(),
-                format_sip_host(&state.local_addr.ip().to_string()),
-                outbound_port,
+                state.via_host(&client_branch.transport),
+                state.via_port(&client_branch.transport),
                 TransactionKey::generate_branch(),
             );
             ack_downstream.headers.add("Via", via_value);
@@ -3064,8 +3136,8 @@ fn handle_cancel_via_session(
             let via_value = format!(
                 "SIP/2.0/{} {}:{};branch={}",
                 transport_str.to_uppercase(),
-                state.local_addr.ip(),
-                state.local_addr.port(),
+                state.via_host(&client_branch.transport),
+                state.via_port(&client_branch.transport),
                 cancel_branch,
             );
             cancel_downstream.headers.add("Via", via_value);
@@ -3160,10 +3232,12 @@ fn handle_b2bua_cancel(
     // Send CANCEL to all pending B-legs
     for b_leg in &call.b_legs {
         let cancel_branch = TransactionKey::generate_branch();
+        let b_transport = b_leg.transport.transport;
         let via_value = format!(
-            "SIP/2.0/UDP {}:{};branch={}",
-            state.local_addr.ip(),
-            state.local_addr.port(),
+            "SIP/2.0/{} {}:{};branch={}",
+            format!("{}", b_transport).to_uppercase(),
+            state.via_host(&b_transport),
+            state.via_port(&b_transport),
             cancel_branch,
         );
 
@@ -3453,8 +3527,8 @@ fn b2bua_send_b_leg_invite(
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",
         outbound_transport,
-        state.local_addr.ip(),
-        state.local_addr.port(),
+        state.via_host(&outbound_transport),
+        state.via_port(&outbound_transport),
         branch,
     );
 
@@ -3495,13 +3569,28 @@ fn b2bua_send_b_leg_invite(
     // Rewrite Call-ID for B-leg dialog
     b_leg_invite.headers.set("Call-ID", b_leg_call_id.clone());
 
-    // Rewrite From-tag for B-leg dialog (keep display name and URI, replace tag)
+    // Rewrite From for B-leg dialog:
+    //  - Replace the tag with a fresh B-leg tag
+    //  - Rewrite the URI host to the B2BUA's own domain (mask A-leg identity)
     if let Some(from) = b_leg_invite.headers.get("From")
         .or_else(|| b_leg_invite.headers.get("f"))
     {
         let old_pattern = format!("tag={}", a_leg_from_tag);
         let new_pattern = format!("tag={}", b_leg_from_tag);
-        let new_from = from.replace(&old_pattern, &new_pattern);
+        let mut new_from = from.replace(&old_pattern, &new_pattern);
+
+        // Rewrite the host in the From URI to the B2BUA's advertised address.
+        // From header format: ["Display" ]<sip:user@host[:port][;params]>[;tag=...]
+        let b2bua_host = state.via_host(&outbound_transport);
+        if let Some(at_pos) = new_from.find('@') {
+            // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
+            let after_at = &new_from[at_pos + 1..];
+            let host_end = after_at.find(|c: char| c == '>' || c == ';' || c == ':')
+                .unwrap_or(after_at.len());
+            let end_pos = at_pos + 1 + host_end;
+            new_from = format!("{}{}{}", &new_from[..at_pos + 1], b2bua_host, &new_from[end_pos..]);
+        }
+
         b_leg_invite.headers.set("From", new_from);
     }
 
@@ -4237,14 +4326,11 @@ fn handle_b2bua_response(
                     .and_then(|uri| parse_uri_standalone(uri).ok())
                     .unwrap_or_else(|| SipUri::new("invalid".to_string()));
                 let transport_str = format!("{}", b_transport).to_uppercase();
-                let outbound_port = state.listen_addrs.get(&b_transport)
-                    .map(|a| a.port())
-                    .unwrap_or(state.local_addr.port());
                 let via_value = format!(
                     "SIP/2.0/{} {}:{};branch={}",
                     transport_str,
-                    format_sip_host(&state.local_addr.ip().to_string()),
-                    outbound_port,
+                    state.via_host(&b_transport),
+                    state.via_port(&b_transport),
                     TransactionKey::generate_branch(),
                 );
                 let cseq_num = message.headers.cseq()
@@ -4393,8 +4479,8 @@ fn handle_b2bua_response(
                                 let via_value = format!(
                                     "SIP/2.0/{} {}:{};branch={}",
                                     transport,
-                                    state.local_addr.ip(),
-                                    state.local_addr.port(),
+                                    state.via_host(&transport),
+                                    state.via_port(&transport),
                                     new_branch,
                                 );
                                 retry.headers.remove("Via");
@@ -4508,8 +4594,8 @@ fn handle_b2bua_response(
                                 let via_value = format!(
                                     "SIP/2.0/{} {}:{};branch={}",
                                     transport,
-                                    state.local_addr.ip(),
-                                    state.local_addr.port(),
+                                    state.via_host(&transport),
+                                    state.via_port(&transport),
                                     new_branch,
                                 );
                                 retry.headers.remove("Via");
@@ -4658,6 +4744,29 @@ fn handle_b2bua_response(
     } // end match class
 }
 
+/// Schedule cleanup of zombie re-INVITE entries after Timer H (32 seconds).
+///
+/// Called after `remove_call()` which may have moved `reinvite_done:` or
+/// `reinvite:` B-leg entries to the zombie map. After 32 seconds the remote
+/// UAS stops retransmitting per RFC 3261 §17.2.1, so the entries are no longer needed.
+fn schedule_zombie_reinvite_cleanup(call_actors: &crate::b2bua::actor::CallActorStore) {
+    if call_actors.zombie_reinvites.is_empty() {
+        return;
+    }
+    let zombie_map = call_actors.zombie_reinvites.clone();
+    let zombie_keys: Vec<String> = zombie_map.iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    if !zombie_keys.is_empty() {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+            for key in zombie_keys {
+                zombie_map.remove(&key);
+            }
+        });
+    }
+}
+
 /// Handle a BYE for a B2BUA call — bridge to the other leg.
 fn handle_b2bua_bye(
     inbound: InboundMessage,
@@ -4759,14 +4868,11 @@ fn handle_b2bua_bye(
             if let Some(b_leg) = call.b_legs.get(winner_index) {
                 let branch = TransactionKey::generate_branch();
                 let transport_str = format!("{}", b_leg.transport.transport).to_uppercase();
-                let outbound_port = state.listen_addrs.get(&b_leg.transport.transport)
-                    .map(|a| a.port())
-                    .unwrap_or(state.local_addr.port());
                 let via_value = format!(
                     "SIP/2.0/{} {}:{};branch={}",
                     transport_str,
-                    format_sip_host(&state.local_addr.ip().to_string()),
-                    outbound_port,
+                    state.via_host(&b_leg.transport.transport),
+                    state.via_port(&b_leg.transport.transport),
                     branch,
                 );
                 let mut bye = message.clone();
@@ -4832,9 +4938,11 @@ fn handle_b2bua_bye(
     }
 
     state.call_actors.set_state(&call_id, CallState::Terminated);
-    // remove_call sends Shutdown to any remaining actors and cleans up registry
+    // remove_call sends Shutdown to any remaining actors, cleans up registry,
+    // and moves re-INVITE tracking entries to the zombie map
     state.call_actors.remove_call(&call_id);
     state.call_event_receivers.remove(&call_id);
+    schedule_zombie_reinvite_cleanup(&state.call_actors);
 }
 
 /// Sweep all active calls for session timer expiry (RFC 4028).
@@ -4911,14 +5019,11 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     // New Via/branch
     let branch = TransactionKey::generate_branch();
     let transport_str = format!("{}", b_leg.transport.transport).to_uppercase();
-    let outbound_port = state.listen_addrs.get(&b_leg.transport.transport)
-        .map(|a| a.port())
-        .unwrap_or(state.local_addr.port());
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",
         transport_str,
-        format_sip_host(&state.local_addr.ip().to_string()),
-        outbound_port,
+        state.via_host(&b_leg.transport.transport),
+        state.via_port(&b_leg.transport.transport),
         branch,
     );
     reinvite.headers.remove("Via");
@@ -5059,6 +5164,7 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
     state.call_actors.set_state(call_id, CallState::Terminated);
     state.call_actors.remove_call(call_id);
     state.call_event_receivers.remove(call_id);
+    schedule_zombie_reinvite_cleanup(&state.call_actors);
 }
 
 /// Handle a mid-dialog re-INVITE for a B2BUA call.
@@ -5139,14 +5245,11 @@ fn handle_b2bua_reinvite(
     if let Some((destination, transport, leg_call_id, leg_from_tag)) = reinvite_target {
         // Set Via with correct transport for the target leg
         let transport_str = format!("{}", transport).to_uppercase();
-        let outbound_port = state.listen_addrs.get(&transport)
-            .map(|a| a.port())
-            .unwrap_or(state.local_addr.port());
         let via_value = format!(
             "SIP/2.0/{} {}:{};branch={}",
             transport_str,
-            format_sip_host(&state.local_addr.ip().to_string()),
-            outbound_port,
+            state.via_host(&transport),
+            state.via_port(&transport),
             branch,
         );
         forwarded.headers.add("Via", via_value);
