@@ -2581,14 +2581,21 @@ fn sanitize_b2bua_response(
     response.headers.remove("Require");
     response.headers.remove("Content-Disposition");
 
-    // Sanitize SDP: mask B-leg identity in o= and s= lines
-    sanitize_sdp_identity(&mut response.body, &state.sdp_name);
+    // Sanitize SDP: mask B-leg identity in o= and s= lines, and rewrite
+    // the o= address to our advertised address for topology hiding.
+    let sdp_addr = state.via_host(&a_leg_transport);
+    sanitize_sdp_identity(&mut response.body, &state.sdp_name, Some(&sdp_addr));
 }
 
 /// Rewrite `o=` and `s=` lines in an SDP body to hide the remote endpoint's
-/// identity.  Replaces the username in `o=` and the session name in `s=` with
-/// "SIPhon" so that neither leg leaks the other's software name or hostname.
-fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str) {
+/// identity.  Replaces the username and IP address in `o=` and the session
+/// name in `s=` so that neither leg leaks the other's software name, hostname,
+/// or network topology.
+///
+/// When `addr` is `Some(ip)`, the address field in the `o=` line is also
+/// rewritten to `ip` (topology hiding).  When `None`, only the username is
+/// replaced (backward-compatible behaviour).
+fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
     if body.is_empty() {
         return;
     }
@@ -2599,13 +2606,32 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str) {
     let mut result = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
         if line.starts_with("o=") {
-            // o=<username> <sess-id> <sess-version> <nettype> <addrtype> <addr>
-            // Replace username only, keep the rest.
+            // o=<username> <sess-id> <sess-version> <nettype> <addrtype> <addr>[\r\n]
+            // Replace username, and optionally the trailing address.
             if let Some(rest) = line.strip_prefix("o=") {
                 if let Some(space_pos) = rest.find(' ') {
-                    result.push_str("o=");
-                    result.push_str(name);
-                    result.push_str(&rest[space_pos..]);
+                    let after_username = &rest[space_pos..];
+                    // Optionally rewrite the address (last field)
+                    if let Some(sdp_addr) = addr {
+                        // Find the last space before the trailing \r\n
+                        let trimmed = after_username.trim_end_matches(|c| c == '\r' || c == '\n');
+                        if let Some(last_space) = trimmed.rfind(' ') {
+                            let line_ending = &after_username[trimmed.len()..];
+                            result.push_str("o=");
+                            result.push_str(name);
+                            result.push_str(&trimmed[..last_space + 1]);
+                            result.push_str(sdp_addr);
+                            result.push_str(line_ending);
+                        } else {
+                            result.push_str("o=");
+                            result.push_str(name);
+                            result.push_str(after_username);
+                        }
+                    } else {
+                        result.push_str("o=");
+                        result.push_str(name);
+                        result.push_str(after_username);
+                    }
                     changed = true;
                     continue;
                 }
@@ -3371,7 +3397,7 @@ fn handle_b2bua_invite(
     );
 
     // Create the call in the manager
-    let a_leg = Leg::new_a_leg(
+    let mut a_leg = Leg::new_a_leg(
         sip_call_id.clone(),
         from_tag,
         via_branch,
@@ -3381,6 +3407,25 @@ fn handle_b2bua_invite(
             transport: inbound.transport,
         },
     );
+
+    // Store our Contact for the A-leg direction (what we advertise to the caller)
+    let a_listen = state.listen_addrs.get(&inbound.transport).copied().unwrap_or(state.local_addr);
+    let a_contact_host = state.advertised_addrs.get(&inbound.transport)
+        .map(|h| format_sip_host(h))
+        .unwrap_or_else(|| format_sip_host(&a_listen.ip().to_string()));
+    a_leg.dialog.local_contact = Some(format!(
+        "<sip:{}:{};transport={}>",
+        a_contact_host, a_listen.port(),
+        inbound.transport.to_string().to_lowercase(),
+    ));
+
+    // Capture the caller's Contact URI (remote_contact for A-leg)
+    if let Some(contact) = message.headers.get("Contact")
+        .or_else(|| message.headers.get("m"))
+    {
+        a_leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(&contact));
+    }
+
     let call_id = state.call_actors.create_call(a_leg);
 
     // Create the event channel for B-leg actors → dispatcher.
@@ -3622,6 +3667,25 @@ fn b2bua_send_b_leg_invite(
         }
     }
 
+    // Regenerate CSeq for B-leg dialog (independent CSeq space, RFC 3261)
+    b_leg_invite.headers.set("CSeq", "1 INVITE".to_string());
+
+    // Decrement Max-Forwards (RFC 7332 — B2BUAs MUST decrement)
+    let _ = crate::proxy::core::decrement_max_forwards(&mut b_leg_invite.headers);
+
+    // Rewrite P-Asserted-Identity host to our advertised address (topology hiding).
+    // The PAI user part is kept as-is (it's the asserted identity), but the host
+    // must not leak the A-leg's internal/private IP to the B-leg.
+    {
+        let b2bua_host = state.via_host(&outbound_transport);
+        if let Some(pai) = b_leg_invite.headers.get("P-Asserted-Identity") {
+            b_leg_invite.headers.set(
+                "P-Asserted-Identity",
+                crate::b2bua::actor::rewrite_uri_host(&pai, &b2bua_host),
+            );
+        }
+    }
+
     // Inject RFC 4028 session timer headers if configured.
     // Per-call override (from call.session_timer()) takes precedence over global config.
     if let Some(ref override_config) = per_call_override {
@@ -3642,11 +3706,18 @@ fn b2bua_send_b_leg_invite(
         }
     }
 
-    // Sanitize SDP: mask A-leg identity in o= and s= lines
-    sanitize_sdp_identity(&mut b_leg_invite.body, &state.sdp_name);
+    // Sanitize SDP: mask A-leg identity in o= and s= lines, and rewrite
+    // the o= address to our advertised address for topology hiding.
+    let sdp_addr = state.via_host(&outbound_transport);
+    sanitize_sdp_identity(&mut b_leg_invite.body, &state.sdp_name, Some(&sdp_addr));
 
     // Register B-leg with call manager
-    let b_leg = Leg::new_b_leg(
+    let b_contact_value = format!(
+        "<sip:{}:{};transport={}>",
+        b_contact_host, b_listen.port(),
+        outbound_transport.to_string().to_lowercase(),
+    );
+    let mut b_leg = Leg::new_b_leg(
         b_leg_call_id,
         b_leg_from_tag,
         target_uri.to_string(),
@@ -3657,6 +3728,7 @@ fn b2bua_send_b_leg_invite(
             transport: outbound_transport,
         },
     );
+    b_leg.dialog.local_contact = Some(b_contact_value);
     state.call_actors.add_b_leg(call_id, b_leg.clone());
     spawn_b_leg_actor(call_id, &b_leg, state);
 
@@ -3793,11 +3865,13 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, call_state, outbound_credentials, recording_srs, b_leg_handle_tx) = match state.call_actors.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, call_state, outbound_credentials, recording_srs, b_leg_handle_tx) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
             let target = matching_b.map(|b| b.dialog.target_uri.clone().unwrap_or_default());
+            let remote_contact = matching_b.and_then(|b| b.dialog.remote_contact.clone());
+            let local_contact = matching_b.and_then(|b| b.dialog.local_contact.clone());
             let dialog = matching_b.map(|b| (b.dialog.call_id.clone(), b.dialog.local_tag.clone()));
             let dest = matching_b.map(|b| (b.transport.remote_addr, b.transport.transport));
             let stored_vias = matching_b.map(|b| b.stored_vias.clone()).unwrap_or_default();
@@ -3805,7 +3879,7 @@ fn handle_b2bua_response(
                 .and_then(|i| call.b_leg_handles.get(i))
                 .and_then(|h| h.as_ref())
                 .map(|h| h.tx.clone());
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, dialog, dest, matching_b_idx, stored_vias, call.state.clone(), call.outbound_credentials.clone(), call.recording_srs.clone(), handle_tx)
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, call.state.clone(), call.outbound_credentials.clone(), call.recording_srs.clone(), handle_tx)
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -3830,8 +3904,16 @@ fn handle_b2bua_response(
                         .unwrap_or_else(|| "1".to_string());
                     let from = message.headers.from().cloned().unwrap_or_default();
                     let to = message.headers.to().cloned().unwrap_or_default();
-                    let ack_uri = SipUri::new(responder_dest.ip().to_string())
-                        .with_port(responder_dest.port());
+                    // RURI: use responder's remote Contact, fallback to IP:port
+                    let ack_uri = if is_a2b {
+                        b_leg_remote_contact.as_deref()
+                            .or(b_leg_target.as_deref())
+                            .and_then(|u| parse_uri_standalone(u).ok())
+                    } else {
+                        a_leg.dialog.remote_contact.as_deref()
+                            .and_then(|u| parse_uri_standalone(u).ok())
+                    }.unwrap_or_else(|| SipUri::new(responder_dest.ip().to_string())
+                        .with_port(responder_dest.port()));
                     let ack = match SipMessageBuilder::new()
                         .request(Method::Ack, ack_uri)
                         .via(format!(
@@ -3947,8 +4029,16 @@ fn handle_b2bua_response(
                         .unwrap_or_else(|| "1".to_string());
                     let from = message.headers.from().cloned().unwrap_or_default();
                     let to = message.headers.to().cloned().unwrap_or_default();
-                    let ack_uri = SipUri::new(responder_dest.ip().to_string())
-                        .with_port(responder_dest.port());
+                    // RURI: use responder's remote Contact (RFC 3261 §12.2.1.1), fallback to IP:port
+                    let ack_uri = if is_a2b {
+                        b_leg_remote_contact.as_deref()
+                            .or(b_leg_target.as_deref())
+                            .and_then(|u| parse_uri_standalone(u).ok())
+                    } else {
+                        a_leg.dialog.remote_contact.as_deref()
+                            .and_then(|u| parse_uri_standalone(u).ok())
+                    }.unwrap_or_else(|| SipUri::new(responder_dest.ip().to_string())
+                        .with_port(responder_dest.port()));
                     let ack = match SipMessageBuilder::new()
                         .request(Method::Ack, ack_uri)
                         .via(format!(
@@ -4073,15 +4163,23 @@ fn handle_b2bua_response(
         None
     };
 
-    // On 2xx: sync remote_tag from response back to canonical CallActor.
+    // On 2xx: sync remote_tag and remote_contact from response back to canonical CallActor.
     // The LegActor extracts this on its clone, but we need to update the
     // authoritative copy in the CallActorStore.
     if matches!(&actor_event, Some(CallEvent::Answered { .. })) {
-        if let Some(to_tag) = crate::b2bua::actor::extract_to_tag(message) {
-            if let Some(idx) = b_leg_index {
-                if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                    if let Some(b_leg) = call.b_legs.get_mut(idx) {
+        if let Some(idx) = b_leg_index {
+            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                if let Some(b_leg) = call.b_legs.get_mut(idx) {
+                    if let Some(to_tag) = crate::b2bua::actor::extract_to_tag(message) {
                         b_leg.dialog.remote_tag = Some(to_tag);
+                    }
+                    // Capture B-leg's remote Contact (RFC 3261 §12.1.2: remote target from 2xx)
+                    if let Some(contact) = message.headers.get("Contact")
+                        .or_else(|| message.headers.get("m"))
+                    {
+                        b_leg.dialog.remote_contact = Some(
+                            crate::b2bua::actor::extract_contact_uri(&contact),
+                        );
                     }
                 }
             }
@@ -4123,8 +4221,9 @@ fn handle_b2bua_response(
             if let Some((b_dest, b_transport)) = b_leg_dest {
                 if let Some((ref b_cid, ref b_ftag)) = b_leg_dialog {
                     let mut ack = message.clone();
-                    // Build ACK from the 200 OK
-                    let request_uri = b_leg_target.as_deref()
+                    // Build ACK — RURI is remote Contact (RFC 3261 §12.2.1.1), fallback to target
+                    let request_uri = b_leg_remote_contact.as_deref()
+                        .or(b_leg_target.as_deref())
                         .and_then(|uri| parse_uri_standalone(uri).ok())
                         .unwrap_or_else(|| SipUri::new("invalid".to_string()));
                     ack.start_line = StartLine::Request(crate::sip::message::RequestLine {
@@ -4323,7 +4422,8 @@ fn handle_b2bua_response(
         // This stops the B-leg from retransmitting the 200 OK.
         if let Some((b_dest, b_transport)) = b_leg_dest {
             if let Some((ref b_cid, ref _b_ftag)) = b_leg_dialog {
-                let ack_uri = b_leg_target.as_deref()
+                let ack_uri = b_leg_remote_contact.as_deref()
+                    .or(b_leg_target.as_deref())
                     .and_then(|uri| parse_uri_standalone(uri).ok())
                     .unwrap_or_else(|| SipUri::new("invalid".to_string()));
                 let transport_str = format!("{}", b_transport).to_uppercase();
@@ -4923,7 +5023,11 @@ fn handle_b2bua_bye(
         state,
     );
 
-    // Forward BYE to the other leg with dialog header rewriting
+    // Forward BYE to the other leg with full B2BUA header rewriting:
+    // - Dialog headers (Call-ID, From/To tags)
+    // - From URI host (topology hiding)
+    // - CSeq (independent per dialog, RFC 3261)
+    // - Max-Forwards (decrement per RFC 7332)
     if from_a_leg {
         // BYE from A → forward to B-leg(s)
         if let Some(winner_index) = call.winner {
@@ -4944,6 +5048,30 @@ fn handle_b2bua_bye(
                 crate::b2bua::actor::Dialog::rewrite_headers(
                     &mut bye, &b_leg.dialog.call_id, call.a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &b_leg.dialog.local_tag,
                 );
+                // Rewrite From URI host to our advertised address (topology hiding)
+                let b2bua_host = state.via_host(&b_leg.transport.transport);
+                if let Some(from) = bye.headers.get("From").or_else(|| bye.headers.get("f")) {
+                    bye.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
+                }
+                // Regenerate CSeq for B-leg dialog
+                let b_leg_cseq = b_leg.dialog.local_cseq;
+                bye.headers.set("CSeq", format!("{} BYE", b_leg_cseq));
+                // Decrement Max-Forwards (RFC 7332)
+                let _ = crate::proxy::core::decrement_max_forwards(&mut bye.headers);
+                // Rewrite RURI to B-leg's remote Contact (RFC 3261 §12.2.1.1)
+                if let Some(ref uri_str) = b_leg.dialog.remote_contact {
+                    if let Ok(parsed) = parse_uri_standalone(uri_str) {
+                        bye.start_line = StartLine::Request(crate::sip::message::RequestLine {
+                            method: Method::Bye,
+                            request_uri: parsed,
+                            version: crate::sip::message::Version::sip_2_0(),
+                        });
+                    }
+                }
+                // Rewrite Contact to what we advertised to B-leg
+                if let Some(ref contact) = b_leg.dialog.local_contact {
+                    bye.headers.set("Contact", contact.clone());
+                }
                 send_b2bua_to_bleg(bye, b_leg.transport.transport, b_leg.transport.remote_addr, state);
             }
         }
@@ -4956,7 +5084,42 @@ fn handle_b2bua_bye(
                 crate::b2bua::actor::Dialog::rewrite_headers(
                     &mut bye, &call.a_leg.dialog.call_id, &b_leg.dialog.local_tag, call.a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 );
+                // Rewrite From URI host to our advertised address (topology hiding)
+                let b2bua_host = state.via_host(&call.a_leg.transport.transport);
+                if let Some(from) = bye.headers.get("From").or_else(|| bye.headers.get("f")) {
+                    bye.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
+                }
             }
+        }
+        // Regenerate CSeq for A-leg dialog
+        let a_leg_cseq = call.a_leg.dialog.local_cseq;
+        bye.headers.set("CSeq", format!("{} BYE", a_leg_cseq));
+        // New Via for A-leg direction
+        let transport_str = format!("{}", call.a_leg.transport.transport).to_uppercase();
+        let branch = TransactionKey::generate_branch();
+        bye.headers.remove("Via");
+        bye.headers.add("Via", format!(
+            "SIP/2.0/{} {}:{};branch={}",
+            transport_str,
+            state.via_host(&call.a_leg.transport.transport),
+            state.via_port(&call.a_leg.transport.transport),
+            branch,
+        ));
+        // Decrement Max-Forwards (RFC 7332)
+        let _ = crate::proxy::core::decrement_max_forwards(&mut bye.headers);
+        // Rewrite RURI to A-leg's remote Contact (RFC 3261 §12.2.1.1)
+        if let Some(ref uri_str) = call.a_leg.dialog.remote_contact {
+            if let Ok(parsed) = parse_uri_standalone(uri_str) {
+                bye.start_line = StartLine::Request(crate::sip::message::RequestLine {
+                    method: Method::Bye,
+                    request_uri: parsed,
+                    version: crate::sip::message::Version::sip_2_0(),
+                });
+            }
+        }
+        // Rewrite Contact to what we advertised to A-leg
+        if let Some(ref contact) = call.a_leg.dialog.local_contact {
+            bye.headers.set("Contact", contact.clone());
         }
         send_message(
             bye,
@@ -5091,10 +5254,13 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     reinvite.headers.remove("Via");
     reinvite.headers.add("Via", via_value);
 
-    // Update Request-URI to B-leg target
-    let b_leg_target_uri = b_leg.dialog.target_uri.clone().unwrap_or_default();
-    if !b_leg_target_uri.is_empty() {
-        if let Ok(target_parsed) = parse_uri_standalone(&b_leg_target_uri) {
+    // Update Request-URI to B-leg's remote Contact (RFC 3261 §12.2.1.1),
+    // falling back to the original dial target if Contact is not yet captured.
+    let reinvite_ruri = b_leg.dialog.remote_contact.as_deref()
+        .or(b_leg.dialog.target_uri.as_deref())
+        .unwrap_or_default();
+    if !reinvite_ruri.is_empty() {
+        if let Ok(target_parsed) = parse_uri_standalone(reinvite_ruri) {
             reinvite.start_line = StartLine::Request(crate::sip::message::RequestLine {
                 method: crate::sip::message::Method::Invite,
                 request_uri: target_parsed,
@@ -5107,6 +5273,23 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     crate::b2bua::actor::Dialog::rewrite_headers(
         &mut reinvite, &b_leg.dialog.call_id, &a_leg_from_tag, &b_leg.dialog.local_tag,
     );
+
+    // Rewrite From URI host to our advertised address (topology hiding)
+    let b2bua_host = state.via_host(&b_leg.transport.transport);
+    if let Some(from) = reinvite.headers.get("From").or_else(|| reinvite.headers.get("f")) {
+        reinvite.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
+    }
+
+    // Regenerate CSeq for B-leg dialog
+    reinvite.headers.set("CSeq", format!("{} INVITE", b_leg.dialog.local_cseq));
+
+    // Decrement Max-Forwards (RFC 7332)
+    let _ = crate::proxy::core::decrement_max_forwards(&mut reinvite.headers);
+
+    // Set Contact to what we advertised to B-leg
+    if let Some(ref contact) = b_leg.dialog.local_contact {
+        reinvite.headers.set("Contact", contact.clone());
+    }
 
     // Set session timer headers
     reinvite.headers.remove("Session-Expires");
@@ -5143,6 +5326,15 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
 
     debug!(call_id = %call_id, "B2BUA: sending session timer refresh re-INVITE");
     send_b2bua_to_bleg(reinvite, b_leg.transport.transport, b_leg.transport.remote_addr, state);
+
+    // Increment B-leg CSeq after sending
+    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+        if let Some(winner_idx) = call.winner {
+            if let Some(b_leg) = call.b_legs.get_mut(winner_idx) {
+                b_leg.dialog.local_cseq += 1;
+            }
+        }
+    }
 }
 
 /// Terminate a call due to session timer expiry — send BYE to both legs.
@@ -5157,12 +5349,12 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
 
     // Build a BYE message for each leg
     let bye_branch_a = TransactionKey::generate_branch();
+    let a_bye_uri = a_leg.dialog.remote_contact.as_deref()
+        .and_then(|u| parse_uri_standalone(u).ok())
+        .unwrap_or_else(|| crate::sip::uri::SipUri::new(a_leg.transport.remote_addr.ip().to_string())
+            .with_port(a_leg.transport.remote_addr.port()));
     let bye_a = SipMessageBuilder::new()
-        .request(
-            crate::sip::message::Method::Bye,
-            crate::sip::uri::SipUri::new(a_leg.transport.remote_addr.ip().to_string())
-                .with_port(a_leg.transport.remote_addr.port()),
-        )
+        .request(crate::sip::message::Method::Bye, a_bye_uri)
         .via(format!(
             "SIP/2.0/{} {}:{};branch={}",
             format!("{}", a_leg.transport.transport).to_uppercase(),
@@ -5184,12 +5376,12 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
     // BYE to B-leg (use B-leg Call-ID and From-tag)
     if let Some(b_leg) = &winner_b_leg {
         let bye_branch_b = TransactionKey::generate_branch();
+        let b_bye_uri = b_leg.dialog.remote_contact.as_deref()
+            .and_then(|u| parse_uri_standalone(u).ok())
+            .unwrap_or_else(|| crate::sip::uri::SipUri::new(b_leg.transport.remote_addr.ip().to_string())
+                .with_port(b_leg.transport.remote_addr.port()));
         let bye_b = SipMessageBuilder::new()
-            .request(
-                crate::sip::message::Method::Bye,
-                crate::sip::uri::SipUri::new(b_leg.transport.remote_addr.ip().to_string())
-                    .with_port(b_leg.transport.remote_addr.port()),
-            )
+            .request(crate::sip::message::Method::Bye, b_bye_uri)
             .via(format!(
                 "SIP/2.0/{} {}:{};branch={}",
                 format!("{}", b_leg.transport.transport).to_uppercase(),
@@ -5250,7 +5442,7 @@ fn handle_b2bua_reinvite(
         }
     };
 
-    // Determine direction and extract routing info
+    // Determine direction and extract routing info + per-leg contacts
     let (from_a_leg, a_leg, winner_b_leg) = match state.call_actors.get_call(&call_id) {
         Some(call) => {
             let from_a = inbound.remote_addr == call.a_leg.transport.remote_addr;
@@ -5258,6 +5450,16 @@ fn handle_b2bua_reinvite(
             (from_a, call.a_leg.clone(), b_leg)
         }
         None => return,
+    };
+
+    // Per-leg Contact URIs for RURI and Contact rewriting (RFC 3261 §12.2.1.1)
+    let (target_remote_contact, target_local_contact) = if from_a_leg {
+        // A→B: target is B-leg
+        winner_b_leg.as_ref().map(|b| (b.dialog.remote_contact.clone(), b.dialog.local_contact.clone()))
+            .unwrap_or((None, None))
+    } else {
+        // B→A: target is A-leg
+        (a_leg.dialog.remote_contact.clone(), a_leg.dialog.local_contact.clone())
     };
 
     debug!(
@@ -5331,8 +5533,44 @@ fn handle_b2bua_reinvite(
         // P-Asserted-Identity from the other leg must not cross the B2BUA boundary.
         forwarded.headers.remove("P-Asserted-Identity");
 
-        // Sanitize SDP: mask other leg's identity in o= and s= lines
-        sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name);
+        // Rewrite From URI host to our advertised address (topology hiding)
+        let b2bua_host = state.via_host(&transport);
+        if let Some(from) = forwarded.headers.get("From").or_else(|| forwarded.headers.get("f")) {
+            forwarded.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
+        }
+
+        // Regenerate CSeq for the target leg's dialog (RFC 3261 — independent CSeq per dialog)
+        let target_cseq = if from_a_leg {
+            winner_b_leg.as_ref().map(|b| b.dialog.local_cseq).unwrap_or(1)
+        } else {
+            a_leg.dialog.local_cseq
+        };
+        forwarded.headers.set("CSeq", format!("{} INVITE", target_cseq));
+
+        // Decrement Max-Forwards (RFC 7332 — B2BUAs MUST decrement)
+        let _ = crate::proxy::core::decrement_max_forwards(&mut forwarded.headers);
+
+        // Sanitize SDP: mask other leg's identity in o= and s= lines, and
+        // rewrite the o= address for topology hiding.
+        let sdp_addr = state.via_host(&transport);
+        sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
+
+        // Rewrite RURI to target leg's remote Contact (RFC 3261 §12.2.1.1).
+        // In-dialog requests MUST use the remote target from the last 2xx/INVITE.
+        if let Some(ref uri_str) = target_remote_contact {
+            if let Ok(parsed) = parse_uri_standalone(uri_str) {
+                forwarded.start_line = StartLine::Request(crate::sip::message::RequestLine {
+                    method: crate::sip::message::Method::Invite,
+                    request_uri: parsed,
+                    version: crate::sip::message::Version::sip_2_0(),
+                });
+            }
+        }
+
+        // Rewrite Contact to what we advertised to the target leg
+        if let Some(ref contact) = target_local_contact {
+            forwarded.headers.set("Contact", contact.clone());
+        }
 
         // Track the re-INVITE branch → call_id for response routing.
         // Encode the direction so the response handler knows where to relay.
@@ -5356,6 +5594,19 @@ fn handle_b2bua_reinvite(
         state.call_actors.add_b_leg(&call_id, reinvite_leg);
 
         send_b2bua_to_bleg(forwarded, transport, destination, state);
+
+        // Increment the target leg's local CSeq after sending the re-INVITE
+        if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
+            if from_a_leg {
+                if let Some(winner_idx) = call.winner {
+                    if let Some(b_leg) = call.b_legs.get_mut(winner_idx) {
+                        b_leg.dialog.local_cseq += 1;
+                    }
+                }
+            } else {
+                call.a_leg.dialog.local_cseq += 1;
+            }
+        }
     }
 
     // Reset session timer on successful re-INVITE (timer reset happens on 200 OK
@@ -5886,7 +6137,7 @@ mod tests {
     fn sanitize_sdp_identity_rewrites_o_and_s_lines() {
         let sdp = "v=0\r\no=FreeSWITCH 123 456 IN IP4 10.0.0.1\r\ns=FreeSWITCH\r\nt=0 0\r\nm=audio 8000 RTP/AVP 0\r\n";
         let mut body = sdp.as_bytes().to_vec();
-        sanitize_sdp_identity(&mut body, "Invenio SBC");
+        sanitize_sdp_identity(&mut body, "Invenio SBC", None);
         let result = std::str::from_utf8(&body).unwrap();
         assert!(result.contains("o=Invenio SBC 123 456 IN IP4 10.0.0.1\r\n"));
         assert!(result.contains("s=Invenio SBC\r\n"));
@@ -5897,9 +6148,21 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_sdp_identity_rewrites_o_line_address() {
+        let sdp = "v=0\r\no=FreeSWITCH 123 456 IN IP4 10.0.0.1\r\ns=FreeSWITCH\r\nt=0 0\r\nm=audio 8000 RTP/AVP 0\r\n";
+        let mut body = sdp.as_bytes().to_vec();
+        sanitize_sdp_identity(&mut body, "SIPhon", Some("203.0.113.1"));
+        let result = std::str::from_utf8(&body).unwrap();
+        assert!(result.contains("o=SIPhon 123 456 IN IP4 203.0.113.1\r\n"), "o= line should have rewritten address, got: {result}");
+        assert!(result.contains("s=SIPhon\r\n"));
+        assert!(!result.contains("10.0.0.1"));
+        assert!(!result.contains("FreeSWITCH"));
+    }
+
+    #[test]
     fn sanitize_sdp_identity_no_op_on_empty_body() {
         let mut body = Vec::new();
-        sanitize_sdp_identity(&mut body, "SIPhon");
+        sanitize_sdp_identity(&mut body, "SIPhon", None);
         assert!(body.is_empty());
     }
 

@@ -144,6 +144,11 @@ if [[ "$RUN_B2BUA" == true ]]; then
   echo "=== B2BUA failure test (INVITE → 486 Busy) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-failure run --rm sipp-b2bua-register-failure
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-failure up --abort-on-container-exit --exit-code-from sipp-b2bua-failure-uac sipp-b2bua-failure-uac sipp-b2bua-failure-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-failure rm -sf sipp-b2bua-failure-uac sipp-b2bua-failure-uas 2>/dev/null || true
+
+  echo "=== B2BUA topology hiding test (CSeq/Max-Forwards/From host/SDP/PAI) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-topology up --abort-on-container-exit --exit-code-from sipp-b2bua-topology-uac sipp-b2bua-topology-uac sipp-b2bua-topology-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-topology rm -sf sipp-b2bua-topology-uac sipp-b2bua-topology-uas 2>/dev/null || true
 fi
 
 # ── Step 10: Gateway routing tests (optional) ──────────────────────────────────

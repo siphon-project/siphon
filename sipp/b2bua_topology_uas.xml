@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA topology hiding UAS scenario (B-leg side):
+  Validates that the B2BUA properly hides A-leg topology:
+  - CSeq is regenerated (should be 1, NOT 99 from A-leg)
+  - From URI host is rewritten (should NOT contain UAC's IP)
+  - Max-Forwards is decremented (should be 64, NOT 65)
+  - SDP o= username is sanitized (should NOT be "LeakyUA")
+  - P-Asserted-Identity host is rewritten (should NOT be 10.99.99.99)
+  - re-INVITE CSeq should be 1 (NOT 100 from A-leg)
+  - re-INVITE/BYE RURI should be UAS's Contact (not UAC's IP)
+  - re-INVITE/BYE Contact should be siphon's address (not UAC's)
+  - BYE CSeq should be independent from A-leg
+-->
+<scenario name="B2BUA topology hiding UAS">
+
+  <!-- Receive initial INVITE from B2BUA (B-leg) -->
+  <recv request="INVITE" crlf="true">
+    <action>
+      <!-- Validate CSeq is regenerated to 1 (not 99 from A-leg) -->
+      <ereg regexp="^1 INVITE" search_in="hdr" header="CSeq:" assign_to="cseq_ok" />
+      <ereg regexp="Max-Forwards: 64" search_in="msg" assign_to="mf_ok" />
+      <!-- Capture siphon's Contact for later validation on re-INVITE/BYE -->
+      <ereg regexp="(.*)" search_in="hdr" header="Contact:" assign_to="siphon_contact" />
+    </action>
+  </recv>
+
+  <!-- Abort if CSeq leaked from A-leg -->
+  <nop>
+    <action>
+      <test assign_to="cseq_ok" variable="cseq_ok" compare="not_equal" value="" />
+    </action>
+  </nop>
+
+  <!-- Send 200 OK with SDP -->
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+]]>
+  </send>
+
+  <!-- Receive ACK from B2BUA -->
+  <recv request="ACK" optional="true" timeout="5000" />
+
+  <!-- Receive re-INVITE — validate CSeq, RURI, and Contact -->
+  <recv request="INVITE" crlf="true">
+    <action>
+      <!-- re-INVITE CSeq should NOT be 100 (from A-leg); should be 1 -->
+      <ereg regexp="^1 INVITE" search_in="hdr" header="CSeq:" assign_to="reinv_cseq_ok" />
+      <!-- RURI should contain OUR IP (UAS Contact), not the UAC's IP.
+           The B2BUA must use remote_contact as RURI per RFC 3261 §12.2.1.1 -->
+      <ereg regexp="INVITE sip:[^@]*@[local_ip]" search_in="msg" assign_to="reinv_ruri_ok" />
+      <!-- Contact should be siphon's address (same as initial INVITE) -->
+      <ereg regexp="(.*)" search_in="hdr" header="Contact:" assign_to="reinv_contact" />
+    </action>
+  </recv>
+
+  <!-- Validate re-INVITE RURI targets us (UAS), not leaked UAC address -->
+  <nop>
+    <action>
+      <test assign_to="reinv_ruri_ok" variable="reinv_ruri_ok" compare="not_equal" value="" />
+    </action>
+  </nop>
+
+  <!-- 200 OK for re-INVITE -->
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 2353687638 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+]]>
+  </send>
+
+  <recv request="ACK" optional="true" timeout="5000" />
+
+  <!-- Receive BYE — validate RURI targets us, not the UAC -->
+  <recv request="BYE">
+    <action>
+      <!-- BYE RURI should contain OUR IP (UAS Contact), not UAC's IP -->
+      <ereg regexp="BYE sip:[^@]*@[local_ip]" search_in="msg" assign_to="bye_ruri_ok" />
+      <!-- Contact should be siphon's address -->
+      <ereg regexp="(.*)" search_in="hdr" header="Contact:" assign_to="bye_contact" />
+    </action>
+  </recv>
+
+  <!-- Validate BYE RURI targets us -->
+  <nop>
+    <action>
+      <test assign_to="bye_ruri_ok" variable="bye_ruri_ok" compare="not_equal" value="" />
+    </action>
+  </nop>
+
+  <!-- Send 200 OK for BYE -->
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

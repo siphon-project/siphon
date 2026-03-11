@@ -101,6 +101,10 @@ pub struct Dialog {
     pub remote_cseq: Option<u32>,
     /// Target URI for this leg (Request-URI for outbound INVITEs).
     pub target_uri: Option<String>,
+    /// Contact URI we advertised to the remote side for this leg.
+    pub local_contact: Option<String>,
+    /// Contact URI the remote side advertised (from INVITE Contact or 200 OK Contact).
+    pub remote_contact: Option<String>,
 }
 
 impl Dialog {
@@ -113,6 +117,8 @@ impl Dialog {
             local_cseq: 1,
             remote_cseq: None,
             target_uri: Some(target_uri),
+            local_contact: None,
+            remote_contact: None,
         }
     }
 
@@ -126,6 +132,8 @@ impl Dialog {
             local_cseq: 1,
             remote_cseq: None,
             target_uri: None,
+            local_contact: None,
+            remote_contact: None,
         }
     }
 
@@ -155,6 +163,46 @@ impl Dialog {
                 message.headers.set("To", new_to);
             }
         }
+    }
+}
+
+/// Extract the bare SIP URI from a Contact header value.
+///
+/// Handles angle-bracket syntax: `<sip:user@host:5060;transport=tcp>;expires=3600`
+/// → `sip:user@host:5060;transport=tcp`. Without brackets, returns the full value
+/// trimmed of whitespace.
+pub fn extract_contact_uri(header_value: &str) -> String {
+    let trimmed = header_value.trim();
+    if let Some(start) = trimmed.find('<') {
+        if let Some(end) = trimmed[start..].find('>') {
+            return trimmed[start + 1..start + end].to_string();
+        }
+    }
+    // No angle brackets — take the URI part (before any header params separated by ';'
+    // that are NOT URI params). For bare URIs like "sip:user@host:5060;transport=tcp",
+    // the entire value is the URI.
+    trimmed.to_string()
+}
+
+/// Rewrite the host part of a SIP URI in a From/To header value.
+///
+/// Given a header value like `<sip:user@old-host:5060;params>;tag=...`,
+/// replaces `old-host` with `new_host`. Works for both From and To headers.
+pub fn rewrite_uri_host(header_value: &str, new_host: &str) -> String {
+    if let Some(at_pos) = header_value.find('@') {
+        let after_at = &header_value[at_pos + 1..];
+        let host_end = after_at
+            .find(|c: char| c == '>' || c == ';' || c == ':')
+            .unwrap_or(after_at.len());
+        let end_pos = at_pos + 1 + host_end;
+        format!(
+            "{}{}{}",
+            &header_value[..at_pos + 1],
+            new_host,
+            &header_value[end_pos..],
+        )
+    } else {
+        header_value.to_string()
     }
 }
 
@@ -1574,6 +1622,51 @@ mod tests {
 
         handle.tx.send(LegMessage::Shutdown).await.unwrap();
         join.await.unwrap();
+    }
+
+    // --- rewrite_uri_host tests ---
+
+    #[test]
+    fn rewrite_uri_host_standard_from() {
+        let from = "<sip:alice@10.0.0.1:5060>;tag=abc123";
+        let result = rewrite_uri_host(from, "203.0.113.1");
+        assert_eq!(result, "<sip:alice@203.0.113.1:5060>;tag=abc123");
+    }
+
+    #[test]
+    fn rewrite_uri_host_no_port() {
+        let from = "<sip:alice@10.0.0.1>;tag=abc123";
+        let result = rewrite_uri_host(from, "sbc.example.com");
+        assert_eq!(result, "<sip:alice@sbc.example.com>;tag=abc123");
+    }
+
+    #[test]
+    fn rewrite_uri_host_with_params() {
+        let from = "<sip:alice@10.0.0.1;transport=udp>;tag=abc123";
+        let result = rewrite_uri_host(from, "203.0.113.1");
+        assert_eq!(result, "<sip:alice@203.0.113.1;transport=udp>;tag=abc123");
+    }
+
+    #[test]
+    fn rewrite_uri_host_display_name() {
+        let from = "\"Alice\" <sip:alice@192.168.1.1:5060>;tag=xyz";
+        let result = rewrite_uri_host(from, "pub.example.com");
+        assert_eq!(result, "\"Alice\" <sip:alice@pub.example.com:5060>;tag=xyz");
+    }
+
+    #[test]
+    fn rewrite_uri_host_no_at_sign() {
+        let from = "<sip:192.168.1.1:5060>;tag=abc";
+        let result = rewrite_uri_host(from, "203.0.113.1");
+        // No @ sign — should return unchanged
+        assert_eq!(result, from);
+    }
+
+    #[test]
+    fn rewrite_uri_host_pai_with_display() {
+        let pai = "\"Outbound Call\" <sip:W5LeMb7O@172.31.47.238>";
+        let result = rewrite_uri_host(pai, "63.176.27.178");
+        assert_eq!(result, "\"Outbound Call\" <sip:W5LeMb7O@63.176.27.178>");
     }
 
     #[tokio::test]

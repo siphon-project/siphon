@@ -1042,3 +1042,174 @@ fn set_b_leg_target_uri_no_panic_on_invalid_index() {
         assert!(call.b_legs[0].dialog.target_uri.as_deref().unwrap().starts_with("sip:"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// B2BUA topology hiding — rewrite_uri_host
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rewrite_uri_host_hides_private_ip_in_from() {
+    use siphon::b2bua::actor::rewrite_uri_host;
+
+    // Simulates BYE forwarding: A-leg From has private IP, must be rewritten
+    let from = "<sip:+alice@10.101.5.124>;tag=sb-17291b99bc2d";
+    let rewritten = rewrite_uri_host(from, "63.176.27.178");
+    assert_eq!(rewritten, "<sip:+alice@63.176.27.178>;tag=sb-17291b99bc2d");
+    assert!(!rewritten.contains("10.101.5.124"), "private IP must not leak");
+}
+
+#[test]
+fn rewrite_uri_host_hides_private_ip_in_pai() {
+    use siphon::b2bua::actor::rewrite_uri_host;
+
+    // Simulates PAI from A-leg: has RTT's private AWS IP
+    let pai = "<sip:+i52wkmRMaZ4u@172.31.47.238>";
+    let rewritten = rewrite_uri_host(pai, "63.176.27.178");
+    assert_eq!(rewritten, "<sip:+i52wkmRMaZ4u@63.176.27.178>");
+    assert!(!rewritten.contains("172.31.47.238"), "private IP must not leak");
+}
+
+#[test]
+fn b2bua_cseq_independent_per_leg() {
+    // Verify that Dialog tracks independent CSeq counters
+    use siphon::b2bua::actor::Dialog;
+
+    let mut a_dialog = Dialog::from_inbound("call-a@host".into(), "remote-tag".into());
+    let mut b_dialog = Dialog::new_outbound("b2b-call@host".into(), "local-tag".into(), "sip:bob@10.0.0.2".into());
+
+    // A-leg and B-leg start with independent CSeq = 1
+    assert_eq!(a_dialog.local_cseq, 1);
+    assert_eq!(b_dialog.local_cseq, 1);
+
+    // Incrementing B-leg CSeq does not affect A-leg
+    b_dialog.local_cseq += 1;
+    b_dialog.local_cseq += 1;
+    assert_eq!(b_dialog.local_cseq, 3);
+    assert_eq!(a_dialog.local_cseq, 1);
+
+    // Incrementing A-leg CSeq does not affect B-leg
+    a_dialog.local_cseq += 1;
+    assert_eq!(a_dialog.local_cseq, 2);
+    assert_eq!(b_dialog.local_cseq, 3);
+}
+
+// ---------------------------------------------------------------------------
+// B2BUA per-leg Contact storage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dialog_local_and_remote_contact_storage() {
+    use siphon::b2bua::actor::{Dialog, extract_contact_uri};
+
+    let mut a_dialog = Dialog::from_inbound("call-a@host".into(), "remote-tag".into());
+    let mut b_dialog = Dialog::new_outbound(
+        "b2b-call@host".into(),
+        "local-tag".into(),
+        "sip:bob@10.0.0.2:5060;transport=tcp".into(),
+    );
+
+    // Initially both contacts are None
+    assert!(a_dialog.local_contact.is_none());
+    assert!(a_dialog.remote_contact.is_none());
+    assert!(b_dialog.local_contact.is_none());
+    assert!(b_dialog.remote_contact.is_none());
+
+    // Set A-leg contacts (siphon's Contact to caller + caller's Contact)
+    a_dialog.local_contact = Some("<sip:203.0.113.1:5060;transport=udp>".to_string());
+    a_dialog.remote_contact = Some(
+        extract_contact_uri("<sip:alice@10.0.0.1:5060;transport=udp>;expires=3600"),
+    );
+
+    // Set B-leg contacts (siphon's Contact to callee + callee's Contact from 200 OK)
+    b_dialog.local_contact = Some("<sip:203.0.113.1:5060;transport=tcp>".to_string());
+    b_dialog.remote_contact = Some(
+        extract_contact_uri("<sip:bob@192.168.1.100:5060;transport=tcp>"),
+    );
+
+    // Verify extract_contact_uri strips angle brackets and header params
+    assert_eq!(a_dialog.remote_contact.as_deref().unwrap(), "sip:alice@10.0.0.1:5060;transport=udp");
+    assert_eq!(b_dialog.remote_contact.as_deref().unwrap(), "sip:bob@192.168.1.100:5060;transport=tcp");
+
+    // Each leg is independent — contacts don't leak between legs
+    assert_ne!(a_dialog.local_contact, b_dialog.local_contact);
+    assert_ne!(a_dialog.remote_contact, b_dialog.remote_contact);
+}
+
+#[test]
+fn extract_contact_uri_formats() {
+    use siphon::b2bua::actor::extract_contact_uri;
+
+    // Angle brackets with header params
+    assert_eq!(
+        extract_contact_uri("<sip:alice@10.0.0.1:5060;transport=tcp>;expires=3600"),
+        "sip:alice@10.0.0.1:5060;transport=tcp"
+    );
+
+    // Angle brackets without header params
+    assert_eq!(
+        extract_contact_uri("<sip:bob@192.168.1.1>"),
+        "sip:bob@192.168.1.1"
+    );
+
+    // Bare URI (no angle brackets)
+    assert_eq!(
+        extract_contact_uri("sip:carol@example.com:5060"),
+        "sip:carol@example.com:5060"
+    );
+
+    // With display name
+    assert_eq!(
+        extract_contact_uri("\"Alice\" <sip:alice@10.0.0.1:5060>"),
+        "sip:alice@10.0.0.1:5060"
+    );
+
+    // Whitespace trimming
+    assert_eq!(
+        extract_contact_uri("  <sip:alice@10.0.0.1>  "),
+        "sip:alice@10.0.0.1"
+    );
+}
+
+#[test]
+fn per_leg_contact_on_call_actor_store() {
+    let store = CallActorStore::new();
+
+    // Create A-leg with contacts populated
+    let mut a_leg = make_a_leg("contact-test@host");
+    a_leg.dialog.local_contact = Some("<sip:203.0.113.1:5060;transport=udp>".to_string());
+    a_leg.dialog.remote_contact = Some("sip:alice@10.0.0.1:5060".to_string());
+    let call_id = store.create_call(a_leg);
+
+    // Create B-leg with local_contact
+    let mut b_leg = make_b_leg("10.0.0.2:5060");
+    b_leg.dialog.local_contact = Some("<sip:203.0.113.1:5060;transport=tcp>".to_string());
+    store.add_b_leg(&call_id, b_leg);
+
+    // Simulate 200 OK: set B-leg remote_contact
+    {
+        let mut call = store.get_call_mut(&call_id).unwrap();
+        if let Some(b) = call.b_legs.get_mut(0) {
+            b.dialog.remote_contact = Some("sip:bob@192.168.1.100:5060;transport=tcp".to_string());
+            b.dialog.remote_tag = Some("bob-tag".to_string());
+        }
+    }
+
+    // Verify contacts are stored and retrievable
+    let call = store.get_call(&call_id).unwrap();
+
+    // A-leg contacts
+    assert_eq!(call.a_leg.dialog.local_contact.as_deref(), Some("<sip:203.0.113.1:5060;transport=udp>"));
+    assert_eq!(call.a_leg.dialog.remote_contact.as_deref(), Some("sip:alice@10.0.0.1:5060"));
+
+    // B-leg contacts
+    let b = &call.b_legs[0];
+    assert_eq!(b.dialog.local_contact.as_deref(), Some("<sip:203.0.113.1:5060;transport=tcp>"));
+    assert_eq!(b.dialog.remote_contact.as_deref(), Some("sip:bob@192.168.1.100:5060;transport=tcp"));
+
+    // For in-dialog re-INVITE A→B:
+    //   RURI = B-leg remote_contact = "sip:bob@192.168.1.100:5060;transport=tcp"
+    //   Contact = B-leg local_contact = "<sip:203.0.113.1:5060;transport=tcp>"
+    // For in-dialog BYE B→A:
+    //   RURI = A-leg remote_contact = "sip:alice@10.0.0.1:5060"
+    //   Contact = A-leg local_contact = "<sip:203.0.113.1:5060;transport=udp>"
+}
