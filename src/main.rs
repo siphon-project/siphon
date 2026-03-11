@@ -40,7 +40,8 @@ async fn main() {
     let _log_guard = init_logging(&config.log);
 
     info!(
-        "SIPhon starting — script: {}, domain: {:?}",
+        "SIPhon v{} starting — script: {}, domain: {:?}",
+        env!("CARGO_PKG_VERSION"),
         config.script.path,
         config.domain.local
     );
