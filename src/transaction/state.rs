@@ -583,7 +583,8 @@ impl Ict {
         match (&self.state, event) {
             // -- Calling --
             (IctState::Calling, IctEvent::TimerA) => {
-                self.timer_a_interval *= 2;
+                // FIX: Cap at T2 using next_retransmit (RFC 3261 §17.1.1.2)
+                self.timer_a_interval = self.timers.next_retransmit(self.timer_a_interval);
                 vec![
                     Action::SendMessage(self.request.clone()),
                     Action::StartTimer(TimerName::A, self.timer_a_interval),
@@ -628,12 +629,22 @@ impl Ict {
             }
 
             // -- Proceeding --
+            (IctState::Proceeding, IctEvent::TimerA) => {
+                // FIX: Handle Timer A in Proceeding state (RFC 3261 §17.1.1.2)
+                // Retransmit INVITE and restart Timer A (capped at T2)
+                self.timer_a_interval = self.timers.next_retransmit(self.timer_a_interval);
+                vec![
+                    Action::SendMessage(self.request.clone()),
+                    Action::StartTimer(TimerName::A, self.timer_a_interval),
+                ]
+            }
             (IctState::Proceeding, IctEvent::Provisional(response)) => {
                 vec![Action::PassToTu(response)]
             }
             (IctState::Proceeding, IctEvent::Response2xx(response)) => {
                 self.state = IctState::Terminated;
                 vec![
+                    Action::CancelTimer(TimerName::A),
                     Action::CancelTimer(TimerName::B),
                     Action::PassToTu(response),
                     Action::Terminated,
@@ -646,6 +657,8 @@ impl Ict {
                     Transport::Reliable => self.timers.timer_d_tcp(),
                 };
                 let mut actions = vec![
+                    // FIX: Cancel Timer A on non-2xx in Proceeding (RFC 3261 §17.1.1.2)
+                    Action::CancelTimer(TimerName::A),
                     Action::CancelTimer(TimerName::B),
                     Action::PassToTu(response),
                 ];
@@ -747,6 +760,10 @@ mod tests {
 
     fn has_timer(actions: &[Action], name: TimerName) -> bool {
         has_action(actions, |a| matches!(a, Action::StartTimer(n, _) if *n == name))
+    }
+
+    fn has_cancel_timer(actions: &[Action], name: TimerName) -> bool {
+        has_action(actions, |a| matches!(a, Action::CancelTimer(n) if *n == name))
     }
 
     // =======================================================================
@@ -1145,6 +1162,87 @@ mod tests {
         ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(603, "Decline")));
         assert_eq!(ict.state, IctState::Completed);
+        assert!(has_pass_to_tu(&actions));
+    }
+
+    // =======================================================================
+    // ICT RFC 3261 §17.1.1.2 bug fix tests
+    // =======================================================================
+
+    /// Verify Timer A interval is capped at T2 (4000ms) and does not grow
+    /// beyond it, per RFC 3261 §17.1.1.2.
+    #[test]
+    fn ict_timer_a_capped_at_t2() {
+        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        // Default T1=500ms, T2=4000ms
+        // Intervals: 500 → 1000 → 2000 → 4000 → 4000 (capped)
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(500));
+
+        ict.process(IctEvent::TimerA);
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(1000));
+
+        ict.process(IctEvent::TimerA);
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(2000));
+
+        ict.process(IctEvent::TimerA);
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(4000)); // T2 cap
+
+        ict.process(IctEvent::TimerA);
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(4000)); // stays at T2
+
+        ict.process(IctEvent::TimerA);
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(4000)); // still capped
+    }
+
+    /// Verify Timer A fires in Proceeding state: retransmits the INVITE
+    /// and restarts Timer A with a T2-capped interval.
+    #[test]
+    fn ict_proceeding_timer_a_retransmits() {
+        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(500));
+
+        // Enter Proceeding
+        ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
+        assert_eq!(ict.state, IctState::Proceeding);
+
+        // Timer A should retransmit in Proceeding
+        let actions = ict.process(IctEvent::TimerA);
+        assert!(has_send(&actions));
+        assert!(has_timer(&actions, TimerName::A));
+        // Interval doubled: 500 → 1000
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(1000));
+
+        // Fire again — should still retransmit
+        let actions = ict.process(IctEvent::TimerA);
+        assert!(has_send(&actions));
+        assert!(has_timer(&actions, TimerName::A));
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(2000));
+
+        // Verify T2 capping works in Proceeding too
+        ict.process(IctEvent::TimerA);
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(4000));
+
+        ict.process(IctEvent::TimerA);
+        assert_eq!(ict.timer_a_interval, Duration::from_millis(4000)); // capped at T2
+    }
+
+    /// Verify Timer A is cancelled when a non-2xx final response arrives
+    /// in Proceeding state (RFC 3261 §17.1.1.2).
+    #[test]
+    fn ict_proceeding_non2xx_cancels_timer_a() {
+        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+
+        // Enter Proceeding
+        ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
+        assert_eq!(ict.state, IctState::Proceeding);
+
+        // Receive non-2xx final
+        let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
+        assert_eq!(ict.state, IctState::Completed);
+
+        // Both Timer A and Timer B must be cancelled
+        assert!(has_cancel_timer(&actions, TimerName::A));
+        assert!(has_cancel_timer(&actions, TimerName::B));
         assert!(has_pass_to_tu(&actions));
     }
 }

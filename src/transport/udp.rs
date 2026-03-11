@@ -39,7 +39,13 @@ pub async fn listen(
         let acl = Arc::clone(&acl);
 
         tokio::spawn(async move {
-            let socket = Arc::new(create_reusable_udp_socket(local_addr));
+            let socket = match create_reusable_udp_socket(local_addr) {
+                Ok(socket) => Arc::new(socket),
+                Err(error) => {
+                    error!("[udp-worker-{}] failed to create socket: {}", worker_index, error);
+                    return;
+                }
+            };
 
             loop {
                 // Use a reasonably large initial buffer; we'll grow it if needed.
@@ -80,7 +86,11 @@ pub async fn listen(
                         match outbound_result {
                             Ok(outbound) => {
                                 let dest = SockAddr::from(outbound.destination);
-                                if let Err(e) = socket.send_to(&outbound.data, &dest.as_socket().unwrap()).await {
+                                let Some(dest_addr) = dest.as_socket() else {
+                                    warn!("[udp-worker-{}] invalid destination: {}", worker_index, outbound.destination);
+                                    continue;
+                                };
+                                if let Err(e) = socket.send_to(&outbound.data, &dest_addr).await {
                                     warn!("[udp-worker-{}] send_to {} failed: {}", worker_index, outbound.destination, e);
                                 }
                             }
@@ -104,7 +114,7 @@ fn udp_connection_id(local: SocketAddr, remote: SocketAddr) -> ConnectionId {
     ConnectionId(hasher.finish())
 }
 
-fn create_reusable_udp_socket(local_addr: SocketAddr) -> UdpSocket {
+fn create_reusable_udp_socket(local_addr: SocketAddr) -> std::io::Result<UdpSocket> {
     let socket = match local_addr {
         SocketAddr::V4(_) => socket2::Socket::new(
             socket2::Domain::IPV4,
@@ -116,24 +126,15 @@ fn create_reusable_udp_socket(local_addr: SocketAddr) -> UdpSocket {
             socket2::Type::DGRAM,
             Some(socket2::Protocol::UDP),
         ),
-    }
-    .expect("failed to create UDP socket");
+    }?;
 
-    socket
-        .set_reuse_address(true)
-        .expect("failed to set SO_REUSEADDR");
+    socket.set_reuse_address(true)?;
     #[cfg(not(target_os = "windows"))]
-    socket
-        .set_reuse_port(true)
-        .expect("failed to set SO_REUSEPORT");
-    socket
-        .set_nonblocking(true)
-        .expect("failed to set non-blocking");
-    socket
-        .bind(&SockAddr::from(local_addr))
-        .expect("failed to bind UDP socket");
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SockAddr::from(local_addr))?;
 
-    UdpSocket::from_std(socket.into()).expect("failed to convert to tokio UdpSocket")
+    UdpSocket::from_std(socket.into())
 }
 
 #[cfg(test)]

@@ -240,9 +240,12 @@ pub fn ensure_registry(python: Python<'_>) -> Result<()> {
         }
     }
 
-    let registry_source = CString::new(include_str!("registry.py")).unwrap();
-    let file_name = CString::new("_siphon_registry.py").unwrap();
-    let module_cname = CString::new(registry_name).unwrap();
+    let registry_source = CString::new(include_str!("registry.py"))
+        .map_err(|error| SiphonError::Script(format!("registry source CString: {error}")))?;
+    let file_name = CString::new("_siphon_registry.py")
+        .map_err(|error| SiphonError::Script(format!("registry file name CString: {error}")))?;
+    let module_cname = CString::new(registry_name)
+        .map_err(|error| SiphonError::Script(format!("registry module name CString: {error}")))?;
     let module = PyModule::from_code(python, &registry_source, &file_name, &module_cname)
         .map_err(|error| {
             SiphonError::Script(format!("registry module: {error}"))
@@ -261,9 +264,12 @@ pub fn ensure_registry(python: Python<'_>) -> Result<()> {
 /// registered via `set_rust_singletons()`, they replace the Python stubs
 /// before any user script can import them.
 pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
-    let source = CString::new(include_str!("siphon_package.py")).unwrap();
-    let file_name = CString::new("siphon/__init__.py").unwrap();
-    let module_name = CString::new("siphon").unwrap();
+    let source = CString::new(include_str!("siphon_package.py"))
+        .map_err(|error| SiphonError::Script(format!("siphon package source CString: {error}")))?;
+    let file_name = CString::new("siphon/__init__.py")
+        .map_err(|error| SiphonError::Script(format!("siphon file name CString: {error}")))?;
+    let module_name = CString::new("siphon")
+        .map_err(|error| SiphonError::Script(format!("siphon module name CString: {error}")))?;
 
     let module = PyModule::from_code(python, &source, &file_name, &module_name)
         .map_err(|error| {

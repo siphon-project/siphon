@@ -52,15 +52,30 @@ pub async fn listen(
         // This allows the outbound connection pool to also bind to this address,
         // enabling outbound connections from the well-known SIP port.
         let socket = if local_addr.is_ipv6() {
-            tokio::net::TcpSocket::new_v6().expect("failed to create TCP socket")
+            match tokio::net::TcpSocket::new_v6() {
+                Ok(socket) => socket,
+                Err(error) => { error!("failed to create TCP socket: {error}"); return; }
+            }
         } else {
-            tokio::net::TcpSocket::new_v4().expect("failed to create TCP socket")
+            match tokio::net::TcpSocket::new_v4() {
+                Ok(socket) => socket,
+                Err(error) => { error!("failed to create TCP socket: {error}"); return; }
+            }
         };
-        socket.set_reuseaddr(true).expect("failed to set SO_REUSEADDR");
+        if let Err(error) = socket.set_reuseaddr(true) {
+            error!("failed to set SO_REUSEADDR: {error}"); return;
+        }
         #[cfg(unix)]
-        socket.set_reuseport(true).expect("failed to set SO_REUSEPORT");
-        socket.bind(local_addr).expect("failed to bind TCP listener");
-        let listener = socket.listen(1024).expect("failed to listen on TCP socket");
+        if let Err(error) = socket.set_reuseport(true) {
+            error!("failed to set SO_REUSEPORT: {error}"); return;
+        }
+        if let Err(error) = socket.bind(local_addr) {
+            error!("failed to bind TCP listener to {local_addr}: {error}"); return;
+        }
+        let listener = match socket.listen(1024) {
+            Ok(listener) => listener,
+            Err(error) => { error!("failed to listen on TCP socket: {error}"); return; }
+        };
         info!("TCP listener on {}", local_addr);
 
         loop {
@@ -85,28 +100,38 @@ pub async fn listen(
                         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
                         connection_map.insert(connection_id, outbound_tx);
 
-                        // Read task with idle timeout
+                        // Read task with idle timeout and SIP stream framing (RFC 3261 §18.3)
                         let inbound_tx_clone = inbound_tx.clone();
                         let read_task = tokio::spawn(async move {
-                            let mut buffer = BytesMut::zeroed(65536);
+                            let mut accumulator = BytesMut::with_capacity(65536);
+                            let mut read_buf = [0u8; 8192];
                             loop {
-                                match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.read(&mut buffer)).await {
+                                match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.read(&mut read_buf)).await {
                                     Ok(Ok(0)) => {
                                         debug!("TCP connection {:?} closed by peer", connection_id);
                                         break;
                                     }
                                     Ok(Ok(size)) => {
-                                        let data = Bytes::copy_from_slice(&buffer[..size]);
-                                        let message = InboundMessage {
-                                            connection_id,
-                                            transport: Transport::Tcp,
-                                            local_addr,
-                                            remote_addr,
-                                            data,
-                                        };
-                                        if let Err(e) = inbound_tx_clone.send_async(message).await {
-                                            error!("TCP inbound enqueue failed: {}", e);
-                                            break;
+                                        accumulator.extend_from_slice(&read_buf[..size]);
+
+                                        // Extract all complete SIP messages from the buffer
+                                        loop {
+                                            let message_len = match extract_sip_message_length(&accumulator) {
+                                                Some(len) if len <= accumulator.len() => len,
+                                                _ => break, // incomplete message, need more data
+                                            };
+                                            let data = accumulator.split_to(message_len).freeze();
+                                            let message = InboundMessage {
+                                                connection_id,
+                                                transport: Transport::Tcp,
+                                                local_addr,
+                                                remote_addr,
+                                                data,
+                                            };
+                                            if let Err(e) = inbound_tx_clone.send_async(message).await {
+                                                error!("TCP inbound enqueue failed: {}", e);
+                                                return;
+                                            }
                                         }
                                     }
                                     Ok(Err(e)) => {
@@ -147,6 +172,48 @@ pub async fn listen(
             }
         }
     });
+}
+
+/// Determine the total length of a complete SIP message in the buffer.
+///
+/// Scans for the end-of-headers marker (`\r\n\r\n`), then reads
+/// `Content-Length` to compute the full message length (headers + body).
+/// Returns `None` if the headers are not yet complete or if
+/// Content-Length is missing (assumes 0-length body in that case once
+/// the header block is complete).
+pub(crate) fn extract_sip_message_length(buffer: &[u8]) -> Option<usize> {
+    // Find end of headers
+    let header_end = buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")?;
+    let headers_len = header_end + 4; // include the \r\n\r\n
+
+    // Parse Content-Length from header block
+    let header_block = &buffer[..header_end];
+    let content_length = extract_content_length(header_block).unwrap_or(0);
+
+    Some(headers_len + content_length)
+}
+
+/// Extract Content-Length value from raw header bytes.
+/// Handles both full name and compact form (`l:`).
+fn extract_content_length(headers: &[u8]) -> Option<usize> {
+    // Search line-by-line for Content-Length or compact form "l:"
+    for line in headers.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // Case-insensitive prefix match
+        let (name, value) = line.split_at(
+            line.iter().position(|&b| b == b':')?
+        );
+        let value = &value[1..]; // skip the ':'
+        let name_lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+        let name_trimmed = name_lower.trim_ascii();
+        if name_trimmed == b"content-length" || name_trimmed == b"l" {
+            let value_str = std::str::from_utf8(value).ok()?;
+            return value_str.trim().parse().ok();
+        }
+    }
+    None
 }
 
 #[cfg(test)]

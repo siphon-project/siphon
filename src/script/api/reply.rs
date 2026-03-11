@@ -32,7 +32,11 @@ impl PyReply {
     /// # Panics
     /// Panics if the message is not a response (has no `StatusLine`).
     pub fn new(message: Arc<Mutex<SipMessage>>) -> Self {
-        debug_assert!(message.lock().unwrap().is_response());
+        if cfg!(debug_assertions) {
+            if let Ok(guard) = message.lock() {
+                debug_assert!(guard.is_response());
+            }
+        }
         Self {
             message,
             forwarded: false,

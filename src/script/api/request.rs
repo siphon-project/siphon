@@ -171,7 +171,13 @@ impl PyRequest {
 
     /// SIP method string for CDR.
     pub fn cdr_method(&self) -> String {
-        let message = self.message.lock().unwrap();
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_method, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
         match &message.start_line {
             StartLine::Request(request_line) => request_line.method.as_str().to_string(),
             _ => "UNKNOWN".to_string(),
@@ -180,13 +186,25 @@ impl PyRequest {
 
     /// Call-ID for CDR.
     pub fn cdr_call_id(&self) -> String {
-        let message = self.message.lock().unwrap();
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_call_id, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
         message.headers.call_id().cloned().unwrap_or_default()
     }
 
     /// From URI string for CDR.
     pub fn cdr_from_uri(&self) -> String {
-        let message = self.message.lock().unwrap();
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_from_uri, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
         message.headers.from()
             .and_then(|v| NameAddr::parse(v).ok())
             .map(|na| na.uri.to_string())
@@ -195,7 +213,13 @@ impl PyRequest {
 
     /// To URI string for CDR.
     pub fn cdr_to_uri(&self) -> String {
-        let message = self.message.lock().unwrap();
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_to_uri, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
         message.headers.to()
             .and_then(|v| NameAddr::parse(v).ok())
             .map(|na| na.uri.to_string())
@@ -204,7 +228,13 @@ impl PyRequest {
 
     /// Request-URI string for CDR.
     pub fn cdr_ruri(&self) -> String {
-        let message = self.message.lock().unwrap();
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_ruri, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
         match &message.start_line {
             StartLine::Request(request_line) => request_line.request_uri.to_string(),
             _ => String::new(),
@@ -235,7 +265,13 @@ impl PyRequest {
 
     /// From URI for LI target matching.
     pub fn li_from_uri(&self) -> Option<String> {
-        let message = self.message.lock().unwrap();
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in li_from_uri, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
         message.headers.from()
             .and_then(|v| NameAddr::parse(v).ok())
             .map(|na| na.uri.to_string())
@@ -243,7 +279,13 @@ impl PyRequest {
 
     /// To URI for LI target matching.
     pub fn li_to_uri(&self) -> Option<String> {
-        let message = self.message.lock().unwrap();
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in li_to_uri, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
         message.headers.to()
             .and_then(|v| NameAddr::parse(v).ok())
             .map(|na| na.uri.to_string())
@@ -251,7 +293,13 @@ impl PyRequest {
 
     /// Request-URI for LI target matching.
     pub fn li_ruri(&self) -> Option<String> {
-        let message = self.message.lock().unwrap();
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in li_ruri, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
         match &message.start_line {
             StartLine::Request(request_line) => Some(request_line.request_uri.to_string()),
             _ => None,

@@ -81,7 +81,7 @@ impl PyRegistration {
                 // Try adding default port
                 format!("{registrar_host}:5060")
                     .parse()
-                    .unwrap_or_else(|_| "0.0.0.0:5060".parse().unwrap())
+                    .unwrap_or(std::net::SocketAddr::from(([0, 0, 0, 0], 5060)))
             });
 
         let entry = RegistrantEntry::new(

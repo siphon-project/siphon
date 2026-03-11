@@ -28,8 +28,9 @@ pub struct SctpAsyncStream {
 
 impl SctpAsyncStream {
     pub fn new(stream: SctpStream) -> Self {
-        let local_addr = stream.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-        let peer_addr = stream.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        let fallback_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        let local_addr = stream.local_addr().unwrap_or(fallback_addr);
+        let peer_addr = stream.peer_addr().unwrap_or(fallback_addr);
 
         let (read_tx, read_rx) = tokio::io::duplex(65536);
         let (write_tx, write_rx) = tokio::io::duplex(65536);

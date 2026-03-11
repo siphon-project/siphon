@@ -27,7 +27,8 @@ use crate::script::api::request::{LocalDomains, PyRequest, RequestAction};
 use crate::script::engine::{HandlerKind, ScriptEngine};
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::headers::via::Via;
-use crate::sip::message::{Method, SipMessage, StartLine};
+use crate::sip::message::{Method, RequestLine, SipMessage, StartLine, StatusLine, Version};
+use crate::sip::headers::SipHeaders;
 use crate::sip::uri::SipUri;
 use crate::sip::parser::{parse_sip_message, parse_uri_standalone};
 use crate::sip::uri::format_sip_host;
@@ -200,9 +201,13 @@ pub async fn run(
     let timer_config = TimerConfig::default();
     let transaction_manager = Arc::new(TransactionManager::new(timer_config));
 
-    let dns_resolver = Arc::new(
-        SipResolver::from_system().expect("failed to initialize DNS resolver"),
-    );
+    let dns_resolver = Arc::new(match SipResolver::from_system() {
+        Ok(resolver) => resolver,
+        Err(error) => {
+            error!("failed to initialize DNS resolver: {error}");
+            return;
+        }
+    });
 
     let (rtpengine_set, rtpengine_sessions) = pre_rtpengine;
 
@@ -337,12 +342,19 @@ pub async fn run(
                         engine_state.handlers_for(&HandlerKind::RegistrarOnChange);
 
                     pyo3::Python::attach(|python| {
-                        let py_contacts =
-                            pyo3::types::PyList::new(python, contacts.into_iter().map(|contact| {
-                                pyo3::Py::new(python, contact)
-                                    .expect("PyContact creation failed")
-                                    .into_bound(python)
-                            })).expect("PyList creation failed");
+                        let py_items: Vec<_> = contacts.into_iter().filter_map(|contact| {
+                            match pyo3::Py::new(python, contact) {
+                                Ok(py) => Some(py.into_bound(python)),
+                                Err(error) => {
+                                    error!("PyContact creation failed: {error}");
+                                    None
+                                }
+                            }
+                        }).collect();
+                        let Ok(py_contacts) = pyo3::types::PyList::new(python, py_items) else {
+                            error!("PyList creation failed for registrar on_change contacts");
+                            return;
+                        };
 
                         for handler in handlers {
                             let callable = handler.callable.bind(python);
@@ -801,7 +813,13 @@ fn handle_request(
 
     // Call Python handlers
     let (action, record_routed, on_reply_cb, on_failure_cb) = Python::attach(|python| {
-        let py_request = Py::new(python, request).expect("failed to create PyRequest");
+        let py_request = match Py::new(python, request) {
+            Ok(py) => py,
+            Err(error) => {
+                error!("failed to create PyRequest: {error}");
+                return (RequestAction::None, false, None, None);
+            }
+        };
 
         for handler in &handlers {
             let callable = handler.callable.bind(python);
@@ -848,7 +866,10 @@ fn handle_request(
     });
 
     // Process the action
-    let message_guard = message_arc.lock().unwrap();
+    let Ok(message_guard) = message_arc.lock() else {
+        error!("message_arc lock poisoned");
+        return;
+    };
     match &action {
         RequestAction::None => {
             debug!("silent drop (no action from script)");
@@ -1789,7 +1810,10 @@ fn handle_response(
                     crate::proxy::fork::ForkAction::ForwardBestError(best_code) => {
                         debug!(best_code = best_code, "fork: all branches failed");
                         let reason = best_error_reason(best_code);
-                        let session = session_arc.read().unwrap();
+                        let Ok(session) = session_arc.read() else {
+                            error!("session_arc read lock poisoned");
+                            return;
+                        };
                         let original_request = session.original_request.clone();
                         let best_response = build_response(
                             &original_request,
@@ -2326,7 +2350,22 @@ fn build_response(
 
     builder = builder.content_length(0);
 
-    builder.build().expect("response builder should not fail")
+    match builder.build() {
+        Ok(message) => message,
+        Err(error) => {
+            error!("response builder failed (this should not happen): {error}");
+            // Construct a minimal valid response directly
+            SipMessage {
+                start_line: StartLine::Response(StatusLine {
+                    version: Version::sip_2_0(),
+                    status_code: 500,
+                    reason_phrase: "Internal Server Error".to_string(),
+                }),
+                headers: SipHeaders::new(),
+                body: Vec::new(),
+            }
+        }
+    }
 }
 
 /// Build an ACK for a non-2xx final response to INVITE (RFC 3261 §17.1.1.3).
@@ -2391,7 +2430,21 @@ fn build_ack_for_non2xx(
     builder = builder.header("Max-Forwards", "70".to_string());
     builder = builder.content_length(0);
 
-    builder.build().expect("ACK builder should not fail")
+    match builder.build() {
+        Ok(message) => message,
+        Err(error) => {
+            error!("ACK builder failed (this should not happen): {error}");
+            SipMessage {
+                start_line: StartLine::Request(RequestLine {
+                    method: Method::Ack,
+                    request_uri: SipUri::new("invalid".to_string()),
+                    version: Version::sip_2_0(),
+                }),
+                headers: SipHeaders::new(),
+                body: Vec::new(),
+            }
+        }
+    }
 }
 
 /// Build an ACK for a non-2xx B-leg response in B2BUA mode (RFC 3261 §17.1.1.3).
@@ -2547,7 +2600,21 @@ fn build_b2bua_ack_for_non2xx(
     builder = builder.header("Max-Forwards", "70".to_string());
     builder = builder.content_length(0);
 
-    builder.build().expect("B2BUA ACK builder should not fail")
+    match builder.build() {
+        Ok(message) => message,
+        Err(error) => {
+            error!("B2BUA ACK builder failed (this should not happen): {error}");
+            SipMessage {
+                start_line: StartLine::Request(RequestLine {
+                    method: Method::Ack,
+                    request_uri: SipUri::new("invalid".to_string()),
+                    version: Version::sip_2_0(),
+                }),
+                headers: SipHeaders::new(),
+                body: Vec::new(),
+            }
+        }
+    }
 }
 
 /// Serialize a SIP message and send it to a specific destination.
@@ -2613,9 +2680,13 @@ fn send_b2bua_to_bleg(
 /// Create Rust-backed auth, registrar, log, and proxy utility singletons
 /// and inject them into the Python `siphon` module, replacing the Python stubs.
 pub fn inject_python_singletons(config: &Config) {
-    let dns_resolver = Arc::new(
-        SipResolver::from_system().expect("failed to initialize DNS resolver for proxy utils"),
-    );
+    let dns_resolver = Arc::new(match SipResolver::from_system() {
+        Ok(resolver) => resolver,
+        Err(error) => {
+            error!("failed to initialize DNS resolver for proxy utils: {error}");
+            return;
+        }
+    });
     // Build Registrar from config
     let registrar_config = RegistrarConfig {
         default_expires: config.registrar.default_expires,
@@ -2634,7 +2705,9 @@ pub fn inject_python_singletons(config: &Config) {
 
     // Wire HTTP auth backend if configured
     if let Some(http_config) = &config.auth.http {
-        py_auth.set_http_config(http_config.clone());
+        if let Err(error) = py_auth.set_http_config(http_config.clone()) {
+            tracing::error!(%error, "failed to configure HTTP auth backend");
+        }
         info!(
             url = %http_config.url,
             ha1 = http_config.ha1,
@@ -2783,7 +2856,10 @@ fn start_next_fork_branch(
             transport,
             data: Bytes::new(),
         };
-        let mut session_mut = session_arc.write().unwrap();
+        let Ok(mut session_mut) = session_arc.write() else {
+            error!("session_arc write lock poisoned during sequential fork");
+            return;
+        };
         relay_fork_branch(
             &original_request,
             &target_str,
@@ -3247,7 +3323,13 @@ fn handle_b2bua_invite(
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
 
     let (action, timer_override, credentials, recording_srs, preserve_call_id) = Python::attach(|python| {
-        let call_obj = Py::new(python, py_call).expect("failed to create PyCall");
+        let call_obj = match Py::new(python, py_call) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyCall: {error}");
+                return (CallAction::None, None, None, None, false);
+            }
+        };
 
         for handler in &handlers {
             let callable = handler.callable.bind(python);
@@ -3301,7 +3383,10 @@ fn handle_b2bua_invite(
         }
     }
 
-    let message_guard = message_arc.lock().unwrap();
+    let Ok(message_guard) = message_arc.lock() else {
+        error!("message_arc lock poisoned in B2BUA invite handler");
+        return;
+    };
 
     match action {
         CallAction::None => {
@@ -3717,7 +3802,7 @@ fn handle_b2bua_response(
                     let to = message.headers.to().cloned().unwrap_or_default();
                     let ack_uri = SipUri::new(responder_dest.ip().to_string())
                         .with_port(responder_dest.port());
-                    let ack = SipMessageBuilder::new()
+                    let ack = match SipMessageBuilder::new()
                         .request(Method::Ack, ack_uri)
                         .via(format!(
                             "SIP/2.0/{} {}:{};branch={}",
@@ -3733,7 +3818,13 @@ fn handle_b2bua_response(
                         .header("Max-Forwards", "70".to_string())
                         .content_length(0)
                         .build()
-                        .expect("B2BUA ACK for re-INVITE 2xx should not fail");
+                    {
+                        Ok(ack) => ack,
+                        Err(error) => {
+                            error!("B2BUA ACK for re-INVITE 2xx build failed: {error}");
+                            return;
+                        }
+                    };
                     if is_a2b {
                         // A→B: ACK goes to B-leg (responder)
                         send_b2bua_to_bleg(ack, responder_transport, responder_dest, state);
@@ -3978,7 +4069,10 @@ fn handle_b2bua_response(
         if let Some(ref timer_config) = state.session_timer_config {
             if timer_config.enabled {
                 // Parse Session-Expires from 200 OK (e.g. "1800;refresher=uas")
-                let response_lock = response_arc.lock().unwrap();
+                let Ok(response_lock) = response_arc.lock() else {
+                    error!("response_arc lock poisoned during session timer parsing");
+                    return;
+                };
                 let (negotiated_expires, negotiated_refresher) =
                     if let Some(se_header) = response_lock.headers.get("Session-Expires") {
                         let parts: Vec<&str> = se_header.split(';').collect();
@@ -4080,7 +4174,7 @@ fn handle_b2bua_response(
                     .unwrap_or_else(|| "1".to_string());
                 let from = message.headers.from().cloned().unwrap_or_default();
                 let to = message.headers.to().cloned().unwrap_or_default();
-                let ack = SipMessageBuilder::new()
+                let ack = match SipMessageBuilder::new()
                     .request(Method::Ack, ack_uri)
                     .via(via_value)
                     .from(from.to_string())
@@ -4090,7 +4184,13 @@ fn handle_b2bua_response(
                     .header("Max-Forwards", "70".to_string())
                     .content_length(0)
                     .build()
-                    .expect("B2BUA ACK for 2xx should not fail");
+                {
+                    Ok(ack) => ack,
+                    Err(error) => {
+                        error!("B2BUA ACK for 2xx build failed: {error}");
+                        return;
+                    }
+                };
                 send_b2bua_to_bleg(ack, b_transport, b_dest, state);
                 debug!(call_id = %call_id, "B2BUA: sent ACK to B-leg for 200 OK");
             }
@@ -4111,7 +4211,10 @@ fn handle_b2bua_response(
         if let Some(srs_uri) = &effective_recording_srs {
             let sdp = &sdp_body;
             if let Some(invite_arc) = &a_leg_invite {
-                let invite = invite_arc.lock().unwrap();
+                let Ok(invite) = invite_arc.lock() else {
+                    error!(call_id = %call_id, "invite_arc lock poisoned during SIPREC start");
+                    return;
+                };
                 let caller_uri = invite.headers.get("From")
                     .map(|from| from.to_string())
                     .unwrap_or_default();
@@ -4200,7 +4303,10 @@ fn handle_b2bua_response(
                                 let transport = relay_target.transport.unwrap_or(Transport::Udp);
 
                                 // Build retry INVITE from stored A-leg INVITE
-                                let original = invite_arc.lock().unwrap();
+                                let Ok(original) = invite_arc.lock() else {
+                                    error!(call_id = %call_id, "invite_arc lock poisoned during fork retry");
+                                    return;
+                                };
                                 let mut retry = original.clone();
                                 drop(original);
 
@@ -4312,7 +4418,10 @@ fn handle_b2bua_response(
                                 let transport = relay_target.transport.unwrap_or(Transport::Udp);
 
                                 // Build retry INVITE from stored A-leg INVITE
-                                let original = invite_arc.lock().unwrap();
+                                let Ok(original) = invite_arc.lock() else {
+                                    error!(call_id = %call_id, "invite_arc lock poisoned during fork retry");
+                                    return;
+                                };
                                 let mut retry = original.clone();
                                 drop(original);
 
@@ -4714,7 +4823,10 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
         }
     };
 
-    let original = invite_arc.lock().unwrap();
+    let Ok(original) = invite_arc.lock() else {
+        error!(call_id = %call_id, "invite_arc lock poisoned during session timer refresh");
+        return;
+    };
     let mut reinvite = original.clone();
     drop(original);
 

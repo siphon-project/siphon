@@ -292,7 +292,13 @@ impl ProxySessionStore {
         };
 
         let server_key = {
-            let session = session_arc.read().unwrap();
+            let session = match session_arc.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::error!("proxy session RwLock poisoned in remove_client_key, recovering");
+                    poisoned.into_inner()
+                }
+            };
             session.server_key.clone()
         };
 

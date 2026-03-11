@@ -41,8 +41,13 @@ pub async fn listen(
     });
 
     // SctpListener::bind is synchronous
-    let listener = SctpListener::bind(local_addr)
-        .expect("failed to bind SCTP listener");
+    let listener = match SctpListener::bind(local_addr) {
+        Ok(listener) => listener,
+        Err(error) => {
+            error!("failed to bind SCTP listener on {local_addr}: {error}");
+            return;
+        }
+    };
     info!("SCTP listener on {}", local_addr);
 
     tokio::spawn(async move {

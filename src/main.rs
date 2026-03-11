@@ -21,9 +21,13 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     // Install rustls crypto provider before any TLS operations
-    tokio_rustls::rustls::crypto::ring::default_provider()
+    if tokio_rustls::rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("failed to install rustls CryptoProvider");
+        .is_err()
+    {
+        eprintln!("Failed to install rustls CryptoProvider");
+        std::process::exit(1);
+    }
 
     let cli = Cli::parse();
 
@@ -216,7 +220,9 @@ async fn main() {
     spawn_file_watcher(Arc::clone(&engine));
 
     // --- Initialize metrics ---
-    siphon::metrics::init();
+    if let Err(error) = siphon::metrics::init() {
+        tracing::error!("Failed to initialize metrics: {error}");
+    }
 
     // --- Build transport ACL from security config ---
     let transport_acl = {
@@ -225,11 +231,18 @@ async fn main() {
         if let Some(ref sec) = config.security {
             // Start APIBAN poller if configured
             let apiban_set = if let Some(ref apiban_config) = sec.apiban {
-                let client = siphon::apiban::ApiBanClient::new(apiban_config);
-                let banned = client.banned();
-                client.start();
-                info!("APIBAN blocklist poller started");
-                Some(banned)
+                match siphon::apiban::ApiBanClient::new(apiban_config) {
+                    Ok(client) => {
+                        let banned = client.banned();
+                        client.start();
+                        info!("APIBAN blocklist poller started");
+                        Some(banned)
+                    }
+                    Err(error) => {
+                        error!("Failed to create APIBAN client: {error}");
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -429,11 +442,15 @@ async fn main() {
                     siphon::metrics::encode_metrics()
                 }));
                 info!(addr = %listen_addr, path = %path, "Prometheus metrics endpoint started");
-                if let Err(error) = axum::serve(
-                    tokio::net::TcpListener::bind(listen_addr).await.unwrap(),
-                    app,
-                ).await {
-                    error!("metrics HTTP server failed: {error}");
+                match tokio::net::TcpListener::bind(listen_addr).await {
+                    Ok(listener) => {
+                        if let Err(error) = axum::serve(listener, app).await {
+                            error!("metrics HTTP server failed: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        error!(addr = %listen_addr, "failed to bind metrics listener: {error}");
+                    }
                 }
             });
         }
@@ -444,10 +461,13 @@ async fn main() {
 
     // Wire UAC sender into proxy.send_request() Python API
     {
-        let dns_resolver = Arc::new(
-            siphon::dns::SipResolver::from_system()
-                .expect("failed to initialize DNS resolver for proxy.send_request()"),
-        );
+        let dns_resolver = Arc::new(match siphon::dns::SipResolver::from_system() {
+            Ok(resolver) => resolver,
+            Err(error) => {
+                error!("failed to initialize DNS resolver for proxy.send_request(): {error}");
+                std::process::exit(1);
+            }
+        });
         siphon::script::api::proxy_utils::set_uac_sender(
             Arc::clone(&uac_sender),
             dns_resolver,
@@ -510,10 +530,10 @@ async fn main() {
 
                 let destination: std::net::SocketAddr = registrar_host
                     .parse()
-                    .unwrap_or_else(|_| {
-                        format!("{registrar_host}:5060")
-                            .parse()
-                            .unwrap_or_else(|_| "0.0.0.0:5060".parse().unwrap())
+                    .or_else(|_| format!("{registrar_host}:5060").parse())
+                    .unwrap_or_else(|_: std::net::AddrParseError| {
+                        warn!(host = %registrar_host, "invalid registrant host, falling back to 0.0.0.0:5060");
+                        std::net::SocketAddr::from(([0, 0, 0, 0], 5060))
                     });
 
                 let transport_type = match entry_config.transport.as_str() {
@@ -581,7 +601,10 @@ async fn main() {
 
     // --- LI tasks (manager + singleton were created earlier; spawn async tasks now) ---
     if let Some((_li_manager, iri_rx, audit_rx)) = li_state {
-        let li_config = config.lawful_intercept.as_ref().unwrap();
+        let Some(li_config) = config.lawful_intercept.as_ref() else {
+            error!("lawful_intercept config missing despite LI state being initialized");
+            std::process::exit(1);
+        };
 
         // Spawn X2 IRI delivery task if configured
         if let Some(ref x2_config) = li_config.x2 {

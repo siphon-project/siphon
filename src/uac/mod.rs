@@ -70,7 +70,7 @@ impl UacSender {
             transport, self.local_addr, branch
         );
 
-        let message = SipMessageBuilder::new()
+        let message = match SipMessageBuilder::new()
             .request(Method::Options, request_uri.clone())
             .via(via)
             .to(format!("<{request_uri}>"))
@@ -80,7 +80,15 @@ impl UacSender {
             .max_forwards(70)
             .content_length(0)
             .build()
-            .expect("OPTIONS builder should not fail");
+        {
+            Ok(message) => message,
+            Err(error) => {
+                warn!("UAC failed to build OPTIONS message: {error}");
+                let (sender, receiver) = oneshot::channel();
+                let _ = sender.send(UacResult::Timeout);
+                return receiver;
+            }
+        };
 
         let data = Bytes::from(message.to_bytes());
 

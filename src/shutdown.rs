@@ -138,8 +138,27 @@ pub async fn wait_for_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                warn!("Failed to install SIGTERM handler: {error}");
+                // Fall back to ctrl_c only
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    warn!("Ctrl-C handler also failed: {error}");
+                }
+                return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                warn!("Failed to install SIGINT handler: {error}");
+                // Wait on SIGTERM only
+                sigterm.recv().await;
+                info!("Received SIGTERM");
+                return;
+            }
+        };
 
         tokio::select! {
             _ = sigterm.recv() => info!("Received SIGTERM"),
@@ -149,8 +168,11 @@ pub async fn wait_for_signal() {
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.expect("Ctrl-C handler");
-        info!("Received Ctrl-C");
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!("Ctrl-C handler failed: {error}");
+        } else {
+            info!("Received Ctrl-C");
+        }
     }
 }
 

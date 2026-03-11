@@ -247,8 +247,9 @@ impl ScriptEngine {
         let source_cstr = CString::new(source)
             .map_err(|error| SiphonError::Script(format!("source contains null byte: {error}")))?;
         let file_name = CString::new(path.to_str().unwrap_or("<script>"))
-            .unwrap_or_else(|_| CString::new("<script>").unwrap());
-        let module_name = CString::new("siphon_user_script").unwrap();
+            .map_err(|error| SiphonError::Script(format!("file name CString: {error}")))?;
+        let module_name = CString::new("siphon_user_script")
+            .map_err(|error| SiphonError::Script(format!("module name: {error}")))?;
         let _code = PyModule::from_code(
             python,
             &source_cstr,

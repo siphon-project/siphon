@@ -209,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint() {
-        crate::metrics::init();
+        crate::metrics::init().unwrap();
         let app = test_app();
 
         let response = app
@@ -226,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_endpoint() {
-        crate::metrics::init();
+        crate::metrics::init().unwrap();
         let app = test_app();
 
         let response = app
@@ -242,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn stats_endpoint() {
-        crate::metrics::init();
+        crate::metrics::init().unwrap();
         let app = test_app();
 
         let response = app
@@ -259,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn registrations_empty() {
-        crate::metrics::init();
+        crate::metrics::init().unwrap();
         let app = test_app();
 
         let response = app
@@ -279,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_not_found() {
-        crate::metrics::init();
+        crate::metrics::init().unwrap();
         let app = test_app();
 
         let response = app
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_nonexistent_registration() {
-        crate::metrics::init();
+        crate::metrics::init().unwrap();
         let app = test_app();
 
         let response = app

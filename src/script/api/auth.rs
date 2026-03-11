@@ -90,14 +90,18 @@ impl PyAuth {
     }
 
     /// Configure the HTTP auth backend.
-    pub fn set_http_config(&mut self, config: HttpAuthConfig) {
+    ///
+    /// # Errors
+    /// Returns an error if the reqwest client cannot be built.
+    pub fn set_http_config(&mut self, config: HttpAuthConfig) -> std::result::Result<(), String> {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_millis(config.connect_timeout_ms))
             .timeout(std::time::Duration::from_millis(config.timeout_ms))
             .build()
-            .expect("failed to build reqwest client for HTTP auth");
+            .map_err(|error| format!("failed to build reqwest client for HTTP auth: {error}"))?;
         self.http_config = Some(config);
         self.http_client = Some(client);
+        Ok(())
     }
 
     /// Set the Diameter manager for IMS authentication (Cx MAR).

@@ -155,9 +155,13 @@ pub async fn listen(
     spawn_outbound_dispatcher(outbound_rx, connection_map.clone(), "WS");
 
     tokio::spawn(async move {
-        let listener = TcpListener::bind(local_addr)
-            .await
-            .expect("failed to bind WS listener");
+        let listener = match TcpListener::bind(local_addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                error!("failed to bind WS listener on {local_addr}: {error}");
+                return;
+            }
+        };
         info!("WS listener on {}", local_addr);
 
         loop {
@@ -213,9 +217,13 @@ pub async fn listen_secure(
     spawn_outbound_dispatcher(outbound_rx, connection_map.clone(), "WSS");
 
     tokio::spawn(async move {
-        let listener = TcpListener::bind(local_addr)
-            .await
-            .expect("failed to bind WSS listener");
+        let listener = match TcpListener::bind(local_addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                error!("failed to bind WSS listener on {local_addr}: {error}");
+                return;
+            }
+        };
         info!("WSS listener on {}", local_addr);
 
         loop {

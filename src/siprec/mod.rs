@@ -19,6 +19,12 @@ use crate::sip::message::{Method, SipMessage};
 use crate::sip::uri::SipUri;
 use crate::transport::Transport;
 
+/// Fallback destination when SRS URI cannot be parsed to a socket address.
+const FALLBACK_DESTINATION: SocketAddr = SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+    5060,
+);
+
 /// State of a recording session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingState {
@@ -127,11 +133,8 @@ impl RecordingManager {
 
         let destination: SocketAddr = srs_host
             .parse()
-            .unwrap_or_else(|_| {
-                format!("{srs_host}:5060")
-                    .parse()
-                    .unwrap_or_else(|_| "0.0.0.0:5060".parse().unwrap())
-            });
+            .or_else(|_| format!("{srs_host}:5060").parse())
+            .unwrap_or(FALLBACK_DESTINATION);
 
         // Build recording metadata XML
         let metadata_xml = metadata::build_recording_metadata(
@@ -263,11 +266,8 @@ impl RecordingManager {
 
                 let destination: SocketAddr = srs_host
                     .parse()
-                    .unwrap_or_else(|_| {
-                        format!("{srs_host}:5060")
-                            .parse()
-                            .unwrap_or_else(|_| "0.0.0.0:5060".parse().unwrap())
-                    });
+                    .or_else(|_| format!("{srs_host}:5060").parse())
+                    .unwrap_or(FALLBACK_DESTINATION);
 
                 let request_uri = SipUri::new(srs_host.to_string());
                 let branch = format!("z9hG4bK-rec-bye-{}", uuid::Uuid::new_v4());

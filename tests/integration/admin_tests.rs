@@ -192,7 +192,7 @@ async fn response_text(response: axum::http::Response<Body>) -> String {
 
 #[tokio::test]
 async fn health_returns_status_and_uptime() {
-    siphon::metrics::init();
+    siphon::metrics::init().unwrap();
     let state = test_state();
     let app = test_router(state);
 
@@ -212,7 +212,7 @@ async fn health_returns_status_and_uptime() {
 
 #[tokio::test]
 async fn stats_returns_registration_count() {
-    siphon::metrics::init();
+    siphon::metrics::init().unwrap();
     let state = test_state();
     let app = test_router(state);
 
@@ -229,7 +229,7 @@ async fn stats_returns_registration_count() {
 
 #[tokio::test]
 async fn registrations_initially_empty() {
-    siphon::metrics::init();
+    siphon::metrics::init().unwrap();
     let state = test_state();
     let app = test_router(state);
 
@@ -250,7 +250,7 @@ async fn registrations_initially_empty() {
 
 #[tokio::test]
 async fn registrations_lists_saved_contact() {
-    siphon::metrics::init();
+    siphon::metrics::init().unwrap();
     let state = test_state();
     let registrar = state.registrar.clone();
 
@@ -285,7 +285,7 @@ async fn registrations_lists_saved_contact() {
 
 #[tokio::test]
 async fn registration_detail_for_known_aor() {
-    siphon::metrics::init();
+    siphon::metrics::init().unwrap();
     let state = test_state();
     let registrar = state.registrar.clone();
 
@@ -321,7 +321,7 @@ async fn registration_detail_for_known_aor() {
 
 #[tokio::test]
 async fn registration_detail_not_found() {
-    siphon::metrics::init();
+    siphon::metrics::init().unwrap();
     let state = test_state();
     let app = test_router(state);
 
@@ -339,7 +339,7 @@ async fn registration_detail_not_found() {
 
 #[tokio::test]
 async fn delete_registration_removes_aor() {
-    siphon::metrics::init();
+    siphon::metrics::init().unwrap();
     let state = test_state();
     let registrar = state.registrar.clone();
 
@@ -389,7 +389,7 @@ async fn delete_registration_removes_aor() {
 
 #[tokio::test]
 async fn delete_nonexistent_registration_returns_not_found() {
-    siphon::metrics::init();
+    siphon::metrics::init().unwrap();
     let state = test_state();
     let app = test_router(state);
 
@@ -407,7 +407,7 @@ async fn delete_nonexistent_registration_returns_not_found() {
 
 #[tokio::test]
 async fn metrics_endpoint_returns_prometheus_text() {
-    siphon::metrics::init();
+    siphon::metrics::init().unwrap();
     let state = test_state();
     let app = test_router(state);
 

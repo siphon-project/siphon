@@ -206,7 +206,13 @@ pub fn encode_iri_pdu(
         sip_message: raw_sip_message.map(|raw| OctetString::from(raw.to_vec())),
     };
 
-    let iri_bytes = rasn::ber::encode(&iri).expect("IRI-PDU encoding failed");
+    let iri_bytes = match rasn::ber::encode(&iri) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!("IRI-PDU encoding failed: {error}");
+            return Vec::new();
+        }
+    };
 
     let ps_pdu = PsPdu {
         version: Integer::from(1),
@@ -214,7 +220,13 @@ pub fn encode_iri_pdu(
         payload: OctetString::from(iri_bytes),
     };
 
-    rasn::ber::encode(&ps_pdu).expect("PS-PDU encoding failed")
+    match rasn::ber::encode(&ps_pdu) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!("PS-PDU encoding failed: {error}");
+            Vec::new()
+        }
+    }
 }
 
 /// Encode a CC-PDU per ETSI TS 102 232-1, wrapped in a PS-PDU envelope.
@@ -237,7 +249,13 @@ pub fn encode_cc_pdu(
         cc_contents: OctetString::from(payload.to_vec()),
     };
 
-    let cc_bytes = rasn::ber::encode(&cc).expect("CC-PDU encoding failed");
+    let cc_bytes = match rasn::ber::encode(&cc) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!("CC-PDU encoding failed: {error}");
+            return Vec::new();
+        }
+    };
 
     let ps_pdu = PsPdu {
         version: Integer::from(1),
@@ -245,7 +263,13 @@ pub fn encode_cc_pdu(
         payload: OctetString::from(cc_bytes),
     };
 
-    rasn::ber::encode(&ps_pdu).expect("PS-PDU encoding failed")
+    match rasn::ber::encode(&ps_pdu) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!("PS-PDU encoding failed: {error}");
+            Vec::new()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +313,7 @@ fn system_time_to_generalized(timestamp: SystemTime) -> GeneralizedTime {
     chrono::Utc
         .timestamp_opt(secs, nanos)
         .single()
-        .unwrap_or_else(|| chrono::Utc.timestamp_opt(0, 0).unwrap())
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
         .fixed_offset()
 }
 

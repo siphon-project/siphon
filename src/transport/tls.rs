@@ -116,9 +116,13 @@ pub async fn listen(
     });
 
     tokio::spawn(async move {
-        let listener = TcpListener::bind(local_addr)
-            .await
-            .expect("failed to bind TLS listener");
+        let listener = match TcpListener::bind(local_addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                error!("failed to bind TLS listener on {local_addr}: {error}");
+                return;
+            }
+        };
         info!("TLS listener on {}", local_addr);
 
         loop {
@@ -156,28 +160,38 @@ pub async fn listen(
                         connection_map.insert(connection_id, outbound_tx);
                         addr_map.insert(remote_addr, connection_id);
 
-                        // Read task with idle timeout
+                        // Read task with idle timeout and SIP stream framing (RFC 3261 §18.3)
                         let inbound_tx_clone = inbound_tx.clone();
                         let read_task = tokio::spawn(async move {
-                            let mut buffer = BytesMut::zeroed(65536);
+                            let mut accumulator = BytesMut::with_capacity(65536);
+                            let mut read_buf = [0u8; 8192];
                             loop {
-                                match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.read(&mut buffer)).await {
+                                match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.read(&mut read_buf)).await {
                                     Ok(Ok(0)) => {
                                         info!("TLS connection {:?} closed by peer", connection_id);
                                         break;
                                     }
                                     Ok(Ok(size)) => {
-                                        let data = Bytes::copy_from_slice(&buffer[..size]);
-                                        let message = InboundMessage {
-                                            connection_id,
-                                            transport: Transport::Tls,
-                                            local_addr,
-                                            remote_addr,
-                                            data,
-                                        };
-                                        if let Err(error) = inbound_tx_clone.send_async(message).await {
-                                            error!("TLS inbound enqueue failed: {}", error);
-                                            break;
+                                        accumulator.extend_from_slice(&read_buf[..size]);
+
+                                        // Extract all complete SIP messages from the buffer
+                                        loop {
+                                            let message_len = match crate::transport::tcp::extract_sip_message_length(&accumulator) {
+                                                Some(len) if len <= accumulator.len() => len,
+                                                _ => break, // incomplete message, need more data
+                                            };
+                                            let data = accumulator.split_to(message_len).freeze();
+                                            let message = InboundMessage {
+                                                connection_id,
+                                                transport: Transport::Tls,
+                                                local_addr,
+                                                remote_addr,
+                                                data,
+                                            };
+                                            if let Err(error) = inbound_tx_clone.send_async(message).await {
+                                                error!("TLS inbound enqueue failed: {}", error);
+                                                return;
+                                            }
                                         }
                                     }
                                     Ok(Err(error)) => {

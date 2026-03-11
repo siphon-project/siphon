@@ -42,19 +42,18 @@ pub struct ApiBanClient {
 
 impl ApiBanClient {
     /// Create a new client from config. The banned set is empty until `start()` is called.
-    pub fn new(config: &ApiBanConfig) -> Self {
+    pub fn new(config: &ApiBanConfig) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build HTTP client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             api_key: config.api_key.clone(),
             interval: Duration::from_secs(config.interval_secs),
             banned: Arc::new(DashSet::new()),
             client,
-        }
+        })
     }
 
     /// Returns the shared banned IP set for ACL integration.

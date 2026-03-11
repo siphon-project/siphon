@@ -182,11 +182,17 @@ fn parse_request<T: for<'de> Deserialize<'de>>(
 
 /// Build an HTTP response with the appropriate content type.
 fn build_response(body: String, content_type: &str, status: StatusCode) -> Response {
-    Response::builder()
+    match Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::from(body))
-        .unwrap()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("failed to build X1 response: {error}");
+            Response::new(Body::empty())
+        }
+    }
 }
 
 /// Build an error response.
