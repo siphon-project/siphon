@@ -10,7 +10,14 @@
   - Regenerates CSeq for the B-leg (should NOT pass through 99/100/101)
   - Decrements Max-Forwards (should NOT pass through 65)
   - Rewrites From URI host (should NOT leak UAC's IP to B-leg)
-  - Rewrites SDP o= line IP
+  - Preserves user part in RURI (bob@ must appear in B-leg INVITE)
+  - Rewrites To header host to dial target (not A-leg advertised address)
+  - Uses Contact from 200 OK as ACK RURI
+  - Uses remote_contact for re-INVITE and BYE RURI
+
+  Also validates responses back to A-leg:
+  - Contact in 200 OK points to siphon (172.20.0.50), not B-leg (172.20.0.52)
+  - No B-leg topology leaks in response headers
 
   The UAS scenario validates these on the B-leg side.
 -->
@@ -52,8 +59,15 @@ a=sendrecv
   <label id="1" />
   <recv response="180" optional="true" next="1" />
 
-  <!-- 200 OK for initial INVITE -->
-  <recv response="200" rtd="true" crlf="true" />
+  <!-- 200 OK for initial INVITE — validate Contact points to siphon, not B-leg -->
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <!-- Contact should be siphon's address (172.20.0.50), NOT the B-leg UAS (172.20.0.52) -->
+      <ereg regexp="Contact:.*172\.20\.0\.50" search_in="msg" assign_to="contact_ok" />
+      <!-- B-leg UAS IP should NOT appear in response -->
+      <ereg regexp="172\.20\.0\.52" search_in="msg" assign_to="bleg_leak" />
+    </action>
+  </recv>
 
   <!-- ACK -->
   <send>

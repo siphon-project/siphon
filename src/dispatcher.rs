@@ -3582,8 +3582,16 @@ fn b2bua_send_b_leg_invite(
     // Replace Via with our own
     b_leg_invite.headers.remove("Via");
     b_leg_invite.headers.add("Via", via_value);
-    // Update Request-URI to the target
-    if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
+    // Update Request-URI: use dial target for routing (host/port/transport) but
+    // preserve the called party's user part from the A-leg RURI.
+    // The dial target is a routing destination, not the called party.
+    // If the script dials `sip:specific-user@host`, that user is respected.
+    if let Ok(mut target_parsed) = parse_uri_standalone(target_uri) {
+        if target_parsed.user.is_none() {
+            if let StartLine::Request(ref orig_rl) = original_request.start_line {
+                target_parsed.user = orig_rl.request_uri.user.clone();
+            }
+        }
         b_leg_invite.start_line = StartLine::Request(crate::sip::message::RequestLine {
             method: crate::sip::message::Method::Invite,
             request_uri: target_parsed,
@@ -3657,14 +3665,34 @@ fn b2bua_send_b_leg_invite(
         b_leg_invite.headers.set("User-Agent", ua.clone());
     }
 
-    // Strip any To-tag (B-leg INVITE should not have one)
+    // Strip any To-tag (B-leg INVITE should not have one) and rewrite the To URI
+    // host to match the dial target (topology hiding — A-leg advertised address
+    // must not leak to B-leg).
     if let Some(to) = b_leg_invite.headers.get("To")
         .or_else(|| b_leg_invite.headers.get("t"))
     {
-        if let Some(tag_start) = to.find(";tag=") {
-            let new_to = to[..tag_start].to_string();
-            b_leg_invite.headers.set("To", new_to);
+        let mut new_to = to.clone();
+        if let Some(tag_start) = new_to.find(";tag=") {
+            new_to = new_to[..tag_start].to_string();
         }
+        // Rewrite To URI host to the dial target's host
+        if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
+            if let Some(at_pos) = new_to.find('@') {
+                let after_at = &new_to[at_pos + 1..];
+                let host_end = after_at.find(|c: char| c == '>' || c == ';' || c == ':')
+                    .unwrap_or(after_at.len());
+                let end_pos = at_pos + 1 + host_end;
+                let target_host = &target_parsed.host;
+                // Include port if present in target
+                let host_with_port = if let Some(port) = target_parsed.port {
+                    format!("{}:{}", target_host, port)
+                } else {
+                    target_host.clone()
+                };
+                new_to = format!("{}{}{}", &new_to[..at_pos + 1], host_with_port, &new_to[end_pos..]);
+            }
+        }
+        b_leg_invite.headers.set("To", new_to);
     }
 
     // Regenerate CSeq for B-leg dialog (independent CSeq space, RFC 3261)
@@ -4221,10 +4249,17 @@ fn handle_b2bua_response(
             if let Some((b_dest, b_transport)) = b_leg_dest {
                 if let Some((ref b_cid, ref b_ftag)) = b_leg_dialog {
                     let mut ack = message.clone();
-                    // Build ACK — RURI is remote Contact (RFC 3261 §12.2.1.1), fallback to target
-                    let request_uri = b_leg_remote_contact.as_deref()
-                        .or(b_leg_target.as_deref())
-                        .and_then(|uri| parse_uri_standalone(uri).ok())
+                    // Build ACK — extract Contact from the 200 OK message directly
+                    // (RFC 3261 §12.2.1.1), with fallback to stored remote_contact
+                    // then target_uri.
+                    let request_uri = message.headers.get("Contact")
+                        .or_else(|| message.headers.get("m"))
+                        .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
+                        .and_then(|u| parse_uri_standalone(&u).ok())
+                        .or_else(|| b_leg_remote_contact.as_deref()
+                            .and_then(|u| parse_uri_standalone(u).ok()))
+                        .or_else(|| b_leg_target.as_deref()
+                            .and_then(|u| parse_uri_standalone(u).ok()))
                         .unwrap_or_else(|| SipUri::new("invalid".to_string()));
                     ack.start_line = StartLine::Request(crate::sip::message::RequestLine {
                         method: Method::Ack,
@@ -4422,9 +4457,17 @@ fn handle_b2bua_response(
         // This stops the B-leg from retransmitting the 200 OK.
         if let Some((b_dest, b_transport)) = b_leg_dest {
             if let Some((ref b_cid, ref _b_ftag)) = b_leg_dialog {
-                let ack_uri = b_leg_remote_contact.as_deref()
-                    .or(b_leg_target.as_deref())
-                    .and_then(|uri| parse_uri_standalone(uri).ok())
+                // Extract Contact from the 200 OK message directly — stored
+                // remote_contact may be None on the first 200 OK since it's
+                // populated after this extraction point.
+                let ack_uri = message.headers.get("Contact")
+                    .or_else(|| message.headers.get("m"))
+                    .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
+                    .and_then(|u| parse_uri_standalone(&u).ok())
+                    .or_else(|| b_leg_remote_contact.as_deref()
+                        .and_then(|u| parse_uri_standalone(u).ok()))
+                    .or_else(|| b_leg_target.as_deref()
+                        .and_then(|u| parse_uri_standalone(u).ok()))
                     .unwrap_or_else(|| SipUri::new("invalid".to_string()));
                 let transport_str = format!("{}", b_transport).to_uppercase();
                 let via_value = format!(

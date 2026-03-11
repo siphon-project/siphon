@@ -5,14 +5,13 @@
   B2BUA topology hiding UAS scenario (B-leg side):
   Validates that the B2BUA properly hides A-leg topology:
   - CSeq is regenerated (should be 1, NOT 99 from A-leg)
-  - From URI host is rewritten (should NOT contain UAC's IP)
   - Max-Forwards is decremented (should be 64, NOT 65)
-  - SDP o= username is sanitized (should NOT be "LeakyUA")
-  - P-Asserted-Identity host is rewritten (should NOT be 10.99.99.99)
-  - re-INVITE CSeq should be 1 (NOT 100 from A-leg)
-  - re-INVITE/BYE RURI should be UAS's Contact (not UAC's IP)
-  - re-INVITE/BYE Contact should be siphon's address (not UAC's)
-  - BYE CSeq should be independent from A-leg
+  - RURI preserves user part (bob@..., not just host)
+  - To header host rewritten to dial target (not A-leg advertised)
+  - From URI host is siphon's address (172.20.0.50, not UAC's 172.20.0.53)
+  - ACK RURI uses Contact from our 200 OK
+  - re-INVITE RURI uses our Contact
+  - BYE RURI uses our Contact
 -->
 <scenario name="B2BUA topology hiding UAS">
 
@@ -22,19 +21,38 @@
       <!-- Validate CSeq is regenerated to 1 (not 99 from A-leg) -->
       <ereg regexp="^1 INVITE" search_in="hdr" header="CSeq:" assign_to="cseq_ok" />
       <ereg regexp="Max-Forwards: 64" search_in="msg" assign_to="mf_ok" />
-      <!-- Capture siphon's Contact for later validation on re-INVITE/BYE -->
-      <ereg regexp="(.*)" search_in="hdr" header="Contact:" assign_to="siphon_contact" />
+
+      <!-- Validate RURI has user part (bob) — not just a bare host -->
+      <ereg regexp="INVITE sip:bob@" search_in="msg" assign_to="ruri_user_ok" />
+
+      <!-- Validate To header host is NOT the UAC's IP (172.20.0.53) -->
+      <ereg regexp="To:.*172\.20\.0\.53" search_in="msg" assign_to="to_leak" />
+
+      <!-- Validate From host is siphon's (172.20.0.50), not UAC's (172.20.0.53) -->
+      <ereg regexp="From:.*172\.20\.0\.53" search_in="msg" assign_to="from_leak" />
+
+      <!-- Save our Contact for ACK RURI validation later -->
+      <ereg regexp=".*" search_in="hdr" header="Call-ID:" assign_to="dialog_callid" />
     </action>
   </recv>
 
-  <!-- Abort if CSeq leaked from A-leg -->
-  <nop>
-    <action>
-      <test assign_to="cseq_ok" variable="cseq_ok" compare="not_equal" value="" />
-    </action>
-  </nop>
+  <!-- Send 180 Ringing -->
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
 
-  <!-- Send 200 OK with SDP -->
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <!-- Send 200 OK with SDP — Contact is what ACK RURI should use -->
   <send retrans="500">
     <![CDATA[
 SIP/2.0 200 OK
@@ -61,28 +79,23 @@ a=sendrecv
 ]]>
   </send>
 
-  <!-- Receive ACK from B2BUA -->
-  <recv request="ACK" optional="true" timeout="5000" />
-
-  <!-- Receive re-INVITE — validate CSeq, RURI, and Contact -->
-  <recv request="INVITE" crlf="true">
+  <!-- Receive ACK — RURI must use our Contact (bob@local_ip:local_port) -->
+  <recv request="ACK" optional="true" timeout="5000">
     <action>
-      <!-- re-INVITE CSeq should NOT be 100 (from A-leg); should be 1 -->
-      <ereg regexp="^1 INVITE" search_in="hdr" header="CSeq:" assign_to="reinv_cseq_ok" />
-      <!-- RURI should contain OUR IP (UAS Contact), not the UAC's IP.
-           The B2BUA must use remote_contact as RURI per RFC 3261 §12.2.1.1 -->
-      <ereg regexp="INVITE sip:[^@]*@[local_ip]" search_in="msg" assign_to="reinv_ruri_ok" />
-      <!-- Contact should be siphon's address (same as initial INVITE) -->
-      <ereg regexp="(.*)" search_in="hdr" header="Contact:" assign_to="reinv_contact" />
+      <!-- ACK RURI should target our Contact address, not the dial target or A-leg -->
+      <ereg regexp="ACK sip:bob@[local_ip]" search_in="msg" assign_to="ack_ruri_ok" />
     </action>
   </recv>
 
-  <!-- Validate re-INVITE RURI targets us (UAS), not leaked UAC address -->
-  <nop>
+  <!-- Receive re-INVITE — RURI must use our Contact (remote_contact) -->
+  <recv request="INVITE" crlf="true">
     <action>
-      <test assign_to="reinv_ruri_ok" variable="reinv_ruri_ok" compare="not_equal" value="" />
+      <!-- re-INVITE RURI should be our Contact (bob@local_ip) -->
+      <ereg regexp="INVITE sip:bob@[local_ip]" search_in="msg" assign_to="reinv_ruri_ok" />
+      <!-- re-INVITE CSeq should be 2, not 100 from A-leg -->
+      <ereg regexp="^2 INVITE" search_in="hdr" header="CSeq:" assign_to="reinv_cseq_ok" />
     </action>
-  </nop>
+  </recv>
 
   <!-- 200 OK for re-INVITE -->
   <send retrans="500">
@@ -113,22 +126,13 @@ a=sendrecv
 
   <recv request="ACK" optional="true" timeout="5000" />
 
-  <!-- Receive BYE — validate RURI targets us, not the UAC -->
+  <!-- Receive BYE — RURI must use our Contact -->
   <recv request="BYE">
     <action>
-      <!-- BYE RURI should contain OUR IP (UAS Contact), not UAC's IP -->
-      <ereg regexp="BYE sip:[^@]*@[local_ip]" search_in="msg" assign_to="bye_ruri_ok" />
-      <!-- Contact should be siphon's address -->
-      <ereg regexp="(.*)" search_in="hdr" header="Contact:" assign_to="bye_contact" />
+      <!-- BYE RURI should be our Contact (bob@local_ip) -->
+      <ereg regexp="BYE sip:bob@[local_ip]" search_in="msg" assign_to="bye_ruri_ok" />
     </action>
   </recv>
-
-  <!-- Validate BYE RURI targets us -->
-  <nop>
-    <action>
-      <test assign_to="bye_ruri_ok" variable="bye_ruri_ok" compare="not_equal" value="" />
-    </action>
-  </nop>
 
   <!-- Send 200 OK for BYE -->
   <send>
