@@ -50,7 +50,7 @@ a=fmtp:101 0-15
   <!-- Send ACK -->
   <send>
     <![CDATA[
-ACK sip:bob@172.20.0.42:5060 SIP/2.0
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
@@ -69,7 +69,7 @@ Content-Length: 0
   <!-- Send BYE -->
   <send retrans="500">
     <![CDATA[
-BYE sip:bob@172.20.0.42:5060 SIP/2.0
+BYE sip:bob@[remote_ip]:[remote_port] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]

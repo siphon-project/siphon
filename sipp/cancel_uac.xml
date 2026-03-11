@@ -3,17 +3,27 @@
 
 <!--
   CANCEL test UAC scenario:
-  INVITE → 180 Ringing → CANCEL → 200 OK (for CANCEL) → 487 Request Terminated
+  INVITE -> 180 Ringing -> CANCEL -> 200 OK (for CANCEL) -> 487 Request Terminated
 
   Tests that the proxy/B2BUA correctly handles CANCEL propagation.
+
+  RFC 3261 section 9.1: CANCEL MUST have the same branch parameter as the INVITE
+  it is cancelling. We store the branch value and reuse it.
 -->
 <scenario name="CANCEL test UAC">
+
+  <!-- Generate a stable branch for the INVITE transaction -->
+  <nop>
+    <action>
+      <assignstr assign_to="1" value="z9hG4bK-[pid]-[call_number]-invite" />
+    </action>
+  </nop>
 
   <!-- Send INVITE -->
   <send retrans="500">
     <![CDATA[
 INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
-Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[$1]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>
 Call-ID: [call_id]
@@ -41,11 +51,11 @@ a=rtpmap:0 PCMU/8000
   <!-- Brief pause then send CANCEL -->
   <pause milliseconds="500" />
 
-  <!-- Send CANCEL (same branch as INVITE) -->
+  <!-- Send CANCEL — same branch as INVITE per RFC 3261 section 9.1 -->
   <send>
     <![CDATA[
 CANCEL sip:bob@[remote_ip]:[remote_port] SIP/2.0
-Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[$1]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>
 Call-ID: [call_id]
@@ -62,11 +72,11 @@ Content-Length: 0
   <!-- Expect 487 Request Terminated for the original INVITE -->
   <recv response="487" optional="true" />
 
-  <!-- Send ACK for the 487 -->
+  <!-- Send ACK for the 487 — same branch as INVITE per RFC 3261 section 17.1.1.3 -->
   <send>
     <![CDATA[
 ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
-Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[$1]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
 Call-ID: [call_id]

@@ -26,6 +26,7 @@ Call-ID: [call_id]
 CSeq: 1 INVITE
 Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
 P-Preferred-Identity: <sip:alice@[domain]>
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD
 Max-Forwards: 70
 User-Agent: SIPp-IMS/alice
 Content-Type: application/sdp

@@ -17,7 +17,7 @@
 NOTIFY sip:[service]@[remote_ip]:[remote_port] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:voicemail@[local_ip]>;tag=[pid]SIPpTag00[call_number]
-To: <sip:[service]@[remote_ip]>;tag=mwi-endpoint-tag
+To: <sip:[service]@[remote_ip]>
 Call-ID: [call_id]
 CSeq: 1 NOTIFY
 Event: message-summary

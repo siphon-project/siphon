@@ -44,7 +44,6 @@ SIP/2.0 200 OK
 Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
 Supported: timer
 Session-Expires: 1800;refresher=uac
-Require: timer
 Content-Type: application/sdp
 Content-Length: [len]
 

@@ -16,7 +16,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| Stateful proxy (RFC 3261 §16) | **Production** | `script: @proxy.on_request` | Full transaction state machines |
+| Stateful proxy (RFC 3261 §16) | **Production** | `script: @proxy.on_request` | Full transaction state machines; ICT Timer A RFC-compliant (capped at T2, fires in Proceeding, cancelled on final response) |
 | B2BUA (RFC 3261 §6) | Implemented | `script: @b2bua.on_invite` | Two-leg call control, per-leg Call-ID + From-tag, topology hiding |
 | Parallel forking | **Production** | `request.fork()` | Used for AS→subscriber delivery |
 | Sequential forking | Implemented | `request.fork(strategy="sequential")` | |
@@ -31,8 +31,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| TCP | **Production** | `listen.tcp` | AS-facing in current deployment |
-| TLS | **Production** | `listen.tls` | Subscriber-facing, TLS 1.3 validated |
+| TCP | **Production** | `listen.tcp` | AS-facing; RFC 3261 §18.3 stream framing with Content-Length extraction |
+| TLS | **Production** | `listen.tls` | Subscriber-facing, TLS 1.3 validated; RFC 3261 §18.3 stream framing |
 | TLS 1.3 | **Production** | `tls.method: TLSv1_3` | |
 | TLS 1.2 | Implemented | `tls.method: TLSv1_2` | |
 | mTLS (client cert verification) | Implemented | `tls.verify_client: true` | |

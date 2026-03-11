@@ -52,7 +52,7 @@ a=sendrecv
   <!-- ACK for initial INVITE -->
   <send>
     <![CDATA[
-ACK sip:bob@172.20.0.42:5060 SIP/2.0
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
@@ -72,7 +72,7 @@ Content-Length: 0
   <!-- ============================================================ -->
   <send retrans="500">
     <![CDATA[
-INVITE sip:bob@172.20.0.42:5060 SIP/2.0
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
@@ -105,7 +105,7 @@ a=sendonly
   <!-- ACK for hold re-INVITE -->
   <send>
     <![CDATA[
-ACK sip:bob@172.20.0.42:5060 SIP/2.0
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
@@ -125,7 +125,7 @@ Content-Length: 0
   <!-- ============================================================ -->
   <send retrans="500">
     <![CDATA[
-INVITE sip:bob@172.20.0.42:5060 SIP/2.0
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
@@ -158,7 +158,7 @@ a=sendrecv
   <!-- ACK for resume re-INVITE -->
   <send>
     <![CDATA[
-ACK sip:bob@172.20.0.42:5060 SIP/2.0
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
@@ -178,7 +178,7 @@ Content-Length: 0
   <!-- ============================================================ -->
   <send retrans="500">
     <![CDATA[
-BYE sip:bob@172.20.0.42:5060 SIP/2.0
+BYE sip:bob@[remote_ip]:[remote_port] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]

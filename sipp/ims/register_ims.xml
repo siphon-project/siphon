@@ -23,6 +23,7 @@ To: <sip:[service]@[domain]>
 Call-ID: [call_id]
 CSeq: 1 REGISTER
 Contact: <[field0]>;expires=3600
+P-Visited-Network-ID: [domain]
 Max-Forwards: 70
 User-Agent: SIPp-IMS/[service]
 Content-Length: 0
@@ -42,6 +43,7 @@ Call-ID: [call_id]
 CSeq: 2 REGISTER
 Contact: <[field0]>;expires=3600
 [authentication]
+P-Visited-Network-ID: [domain]
 Max-Forwards: 70
 User-Agent: SIPp-IMS/[service]
 Content-Length: 0
