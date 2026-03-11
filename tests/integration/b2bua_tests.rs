@@ -933,10 +933,96 @@ fn reinvite_done_entry_cleaned_on_call_removal() {
     store.add_b_leg(&call_id, reinvite_leg);
     store.set_b_leg_target_uri(&call_id, 1, "reinvite_done:a2b".to_string());
 
-    // remove_call should clean up everything including the done entry
+    // remove_call should clean up the call and move re-INVITE entries to zombie map
+    let reinvite_sip_cid = {
+        let call = store.get_call(&call_id).unwrap();
+        call.b_legs[1].dialog.call_id.clone()
+    };
     store.remove_call(&call_id);
     assert_eq!(store.count(), 0);
     assert!(store.call_id_for_branch(&reinvite_branch).is_none());
+    // Zombie entry should exist for the re-INVITE B-leg
+    let zombie = store.get_zombie_reinvite(&reinvite_sip_cid);
+    assert!(zombie.is_some(), "reinvite_done entry should become a zombie");
+    let zombie = zombie.unwrap();
+    assert_eq!(zombie.destination, "10.0.0.2:5060".parse::<std::net::SocketAddr>().unwrap());
+    assert_eq!(zombie.transport, Transport::Udp);
+}
+
+#[test]
+fn zombie_reinvite_not_created_for_normal_bleg() {
+    // Normal B-legs (no reinvite: prefix) should NOT create zombie entries.
+    let store = CallActorStore::new();
+
+    let call_id = store.create_call(make_a_leg("zombie-normal@test"));
+    let normal_leg = make_b_leg("10.0.0.3:5060");
+    let normal_cid = normal_leg.dialog.call_id.clone();
+    store.add_b_leg(&call_id, normal_leg);
+
+    store.remove_call(&call_id);
+    assert!(store.get_zombie_reinvite(&normal_cid).is_none(),
+        "normal B-leg should not create a zombie entry");
+    assert!(store.zombie_reinvites.is_empty());
+}
+
+#[test]
+fn zombie_reinvite_created_for_pending_reinvite() {
+    // B-legs with "reinvite:" (not yet ACKed) should also become zombies.
+    let store = CallActorStore::new();
+
+    let call_id = store.create_call(make_a_leg("zombie-pending@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    let reinvite_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "reinvite:b2a".to_string(),
+        TransactionKey::generate_branch(),
+        TransportInfo {
+            remote_addr: "10.0.0.5:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    let reinvite_cid = reinvite_leg.dialog.call_id.clone();
+    store.add_b_leg(&call_id, reinvite_leg);
+
+    store.remove_call(&call_id);
+    let zombie = store.get_zombie_reinvite(&reinvite_cid);
+    assert!(zombie.is_some(), "pending reinvite entry should become a zombie");
+    assert_eq!(zombie.unwrap().destination, "10.0.0.5:5060".parse::<std::net::SocketAddr>().unwrap());
+}
+
+#[test]
+fn zombie_reinvite_manual_removal() {
+    // Test manual removal of zombie entries.
+    let store = CallActorStore::new();
+
+    let call_id = store.create_call(make_a_leg("zombie-remove@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    let reinvite_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "reinvite_done:a2b".to_string(),
+        TransactionKey::generate_branch(),
+        TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    let reinvite_cid = reinvite_leg.dialog.call_id.clone();
+    store.add_b_leg(&call_id, reinvite_leg);
+
+    store.remove_call(&call_id);
+    assert!(store.get_zombie_reinvite(&reinvite_cid).is_some());
+
+    store.remove_zombie_reinvite(&reinvite_cid);
+    assert!(store.get_zombie_reinvite(&reinvite_cid).is_none());
+    assert!(store.zombie_reinvites.is_empty());
 }
 
 #[test]

@@ -623,6 +623,19 @@ fn error_priority(code: u16) -> u32 {
 // CallActorStore — manages all active calls
 // ---------------------------------------------------------------------------
 
+/// Lightweight state kept after call teardown so retransmitted re-INVITE
+/// 200 OKs can still be ACKed (RFC 3261 §13.2.2.4).
+///
+/// When BYE removes a call, any `reinvite_done:` B-leg entries are moved
+/// here. Entries auto-expire after 32 seconds (Timer H).
+#[derive(Debug, Clone)]
+pub struct ZombieReInviteEntry {
+    /// Where to send the ACK.
+    pub destination: SocketAddr,
+    /// Transport protocol for the ACK.
+    pub transport: Transport,
+}
+
 /// Manages all active B2BUA calls.
 ///
 /// Stores `CallActor` instances in a concurrent map, indexed by internal
@@ -633,6 +646,8 @@ pub struct CallActorStore {
     calls: DashMap<String, CallActor>,
     /// SIP identifier routing table.
     pub registry: LegRegistry,
+    /// Post-teardown re-INVITE ACK absorber, keyed by B-leg SIP Call-ID.
+    pub zombie_reinvites: DashMap<String, ZombieReInviteEntry>,
 }
 
 impl CallActorStore {
@@ -640,6 +655,7 @@ impl CallActorStore {
         Self {
             calls: DashMap::new(),
             registry: LegRegistry::new(),
+            zombie_reinvites: DashMap::new(),
         }
     }
 
@@ -767,6 +783,8 @@ impl CallActorStore {
     /// Remove a call and clean up all registry entries.
     ///
     /// Sends `Shutdown` to all active B-leg actor handles before removing.
+    /// B-leg entries with `reinvite_done:` or `reinvite:` target_uri are moved
+    /// to `zombie_reinvites` so retransmitted 200 OKs can still be ACKed.
     pub fn remove_call(&self, call_id: &str) {
         if let Some((_, call)) = self.calls.remove(call_id) {
             // Shutdown any active B-leg actors
@@ -774,12 +792,34 @@ impl CallActorStore {
             // Clean up A-leg registry entries
             self.registry.remove_call_id(&call.a_leg.dialog.call_id);
             self.registry.remove_branch(&call.a_leg.branch);
-            // Clean up B-leg registry entries
+            // Clean up B-leg registry entries, preserving re-INVITE state
             for b_leg in &call.b_legs {
                 self.registry.remove_call_id(&b_leg.dialog.call_id);
                 self.registry.remove_branch(&b_leg.branch);
+                // Move re-INVITE tracking entries to zombie map
+                if let Some(ref target) = b_leg.dialog.target_uri {
+                    if target.starts_with("reinvite_done:") || target.starts_with("reinvite:") {
+                        self.zombie_reinvites.insert(
+                            b_leg.dialog.call_id.clone(),
+                            ZombieReInviteEntry {
+                                destination: b_leg.transport.remote_addr,
+                                transport: b_leg.transport.transport,
+                            },
+                        );
+                    }
+                }
             }
         }
+    }
+
+    /// Look up a zombie re-INVITE entry by SIP Call-ID.
+    pub fn get_zombie_reinvite(&self, sip_call_id: &str) -> Option<ZombieReInviteEntry> {
+        self.zombie_reinvites.get(sip_call_id).map(|e| e.clone())
+    }
+
+    /// Remove a zombie re-INVITE entry.
+    pub fn remove_zombie_reinvite(&self, sip_call_id: &str) {
+        self.zombie_reinvites.remove(sip_call_id);
     }
 
     /// Iterate over all active calls (for session timer sweep).

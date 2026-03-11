@@ -590,6 +590,13 @@ services:
       start_period: 10s
     profiles:
       - b2bua
+      - b2bua-session-timer
+      - b2bua-failure
+      - b2bua-reinvite
+      - b2bua-reinvite-bleg
+      - b2bua-reinvite-reject
+      - b2bua-reinvite-breject
+      - b2bua-cancel
 
   # Register bob with Contact pointing to the basic UAS IP (172.20.0.52)
   sipp-b2bua-register:
@@ -619,6 +626,12 @@ services:
       - "10"
     profiles:
       - b2bua
+      - b2bua-session-timer
+      - b2bua-reinvite
+      - b2bua-reinvite-bleg
+      - b2bua-reinvite-reject
+      - b2bua-reinvite-breject
+      - b2bua-cancel
 
   # --- B2BUA basic call test ---
 
@@ -756,6 +769,8 @@ services:
       - b2bua-failure
 
   # Register bob pointing to failure UAS (172.20.0.54)
+  # Uses a different IP than deregister-bob to avoid server transaction
+  # branch collisions (SIPp PID-based branches can collide on same IP).
   sipp-b2bua-register-failure:
     image: ctaloi/sipp:latest
     depends_on:
@@ -765,7 +780,7 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.51
+        ipv4_address: 172.20.0.56
     entrypoint:
       - sipp
       - "172.20.0.50:5060"
@@ -813,6 +828,8 @@ services:
     depends_on:
       siphon-b2bua:
         condition: service_healthy
+      sipp-b2bua-register-failure:
+        condition: service_completed_successfully
       sipp-b2bua-failure-uas:
         condition: service_started
     volumes:
@@ -887,6 +904,171 @@ services:
       - -trace_err
     profiles:
       - b2bua-reinvite
+
+  # --- B2BUA B-leg-initiated re-INVITE test ---
+  # Tests that B2BUA correctly forwards re-INVITEs initiated by the B-leg (UAS)
+  # with correct Via branch. Targets Via branch bug.
+
+  sipp-b2bua-reinvite-bleg-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_bleg_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-bleg
+
+  sipp-b2bua-reinvite-bleg-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-reinvite-bleg-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_bleg_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-bleg
+
+  # --- B2BUA re-INVITE rejected by B-leg test ---
+  # Tests that B2BUA ACKs non-2xx (488) re-INVITE responses from B-leg.
+  # Call must survive after rejected re-INVITE.
+
+  sipp-b2bua-reinvite-reject-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_reject_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-reject
+
+  sipp-b2bua-reinvite-reject-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-reinvite-reject-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_reject_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-reject
+
+  # --- B2BUA B-leg re-INVITE rejected by A-leg test ---
+  # Tests both Via branch correctness AND non-2xx ACK from B-leg direction.
+  # B-leg UAS initiates re-INVITE, A-leg UAC rejects with 488.
+
+  sipp-b2bua-reinvite-breject-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_breject_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-breject
+
+  sipp-b2bua-reinvite-breject-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-reinvite-breject-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_breject_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-breject
 
   # --- B2BUA CANCEL test ---
 
