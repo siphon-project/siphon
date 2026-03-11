@@ -2537,7 +2537,8 @@ fn build_ack_for_non2xx(
 /// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
 /// headers must not leak to the A-leg. This function:
 /// - Replaces Contact with siphon's own address (critical for dialog routing)
-/// - Replaces/removes User-Agent, Server, Allow, Allow-Events, Supported, Require
+/// - Strips User-Agent (UAC header — not for responses), sets Server
+/// - Removes Allow, Allow-Events, Supported, Require
 /// - Strips B-leg-specific P-Asserted-Identity, P-Charging-Vector
 fn sanitize_b2bua_response(
     response: &mut SipMessage,
@@ -2560,11 +2561,9 @@ fn sanitize_b2bua_response(
     );
     response.headers.set("Contact", contact_value);
 
-    // Always set our own User-Agent and Server — we are the B2BUA endpoint.
+    // Remove User-Agent — responses use Server, not User-Agent (RFC 3261 §20.35/§20.41).
+    // Leaving it would leak B-leg topology to the A-leg.
     response.headers.remove("User-Agent");
-    if let Some(ref ua) = state.user_agent_header {
-        response.headers.set("User-Agent", ua.clone());
-    }
     response.headers.remove("Server");
     if let Some(ref srv) = state.server_header {
         response.headers.set("Server", srv.clone());
@@ -2574,9 +2573,11 @@ fn sanitize_b2bua_response(
     // Per RFC 3325 / RFC 3455, these are trust-domain headers that B2BUAs
     // within the trust domain SHOULD forward. Keep them.
 
-    // Strip B-leg capability headers — siphon terminates the dialog
+    // Strip B-leg capability headers — siphon terminates the dialog.
+    // These reveal the remote endpoint's feature set and break topology hiding.
     response.headers.remove("Allow");
     response.headers.remove("Allow-Events");
+    response.headers.remove("Supported");
     response.headers.remove("Require");
     response.headers.remove("Content-Disposition");
 
@@ -5253,6 +5254,24 @@ fn handle_b2bua_reinvite(
             branch,
         );
         forwarded.headers.add("Via", via_value);
+
+        // Sanitize: strip headers that leak the other leg's identity/capabilities.
+        // SIPhon is UAC on the forwarded re-INVITE, so set our own User-Agent.
+        if let Some(ref ua) = state.user_agent_header {
+            forwarded.headers.set("User-Agent", ua.clone());
+        } else {
+            forwarded.headers.remove("User-Agent");
+        }
+        forwarded.headers.remove("Server");
+        forwarded.headers.remove("Allow");
+        forwarded.headers.remove("Allow-Events");
+        forwarded.headers.remove("Supported");
+        forwarded.headers.remove("Require");
+        // P-Asserted-Identity from the other leg must not cross the B2BUA boundary.
+        forwarded.headers.remove("P-Asserted-Identity");
+
+        // Sanitize SDP: mask other leg's identity in o= and s= lines
+        sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name);
 
         // Track the re-INVITE branch → call_id for response routing.
         // Encode the direction so the response handler knows where to relay.
