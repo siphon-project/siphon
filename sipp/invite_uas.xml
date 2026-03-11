@@ -58,8 +58,11 @@ a=fmtp:101 0-15
 ]]>
   </send>
 
-  <!-- Receive ACK -->
-  <recv request="ACK" />
+  <!-- Receive ACK (absorb retransmissions from proxy forwarding 200 OK) -->
+  <recv request="ACK" crlf="true" />
+
+  <label id="ack_absorb" />
+  <recv request="ACK" optional="true" next="ack_absorb" />
 
   <!-- Receive BYE -->
   <recv request="BYE" />

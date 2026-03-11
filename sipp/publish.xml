@@ -43,7 +43,7 @@ Content-Length: [len]
   <!-- Expect 200 OK with SIP-ETag -->
   <recv response="200" rtd="true">
     <action>
-      <ereg regexp="SIP-ETag: (.*)" search_in="msg" header="SIP-ETag:" assign_to="1,2" />
+      <ereg regexp=".*" search_in="hdr" header="SIP-ETag:" assign_to="etag" check_it="true" />
     </action>
   </recv>
 
@@ -60,7 +60,7 @@ Call-ID: [call_id]
 CSeq: 2 PUBLISH
 Event: presence
 Expires: 3600
-SIP-If-Match: [$2]
+SIP-If-Match: [$etag]
 Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
 Content-Type: application/pidf+xml
 Max-Forwards: 70
@@ -94,7 +94,7 @@ Call-ID: [call_id]
 CSeq: 3 PUBLISH
 Event: presence
 Expires: 0
-SIP-If-Match: [$2]
+SIP-If-Match: [$etag]
 Max-Forwards: 70
 User-Agent: SIPp/siphon-test
 Content-Length: 0

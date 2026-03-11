@@ -8,7 +8,7 @@ Handles:
 - CANCEL
 - INVITE / other requests via location lookup with parallel forking
 """
-from siphon import proxy, registrar, auth, log
+from siphon import proxy, registrar, auth, log, presence
 
 DOMAIN = "example.com"
 
@@ -44,7 +44,21 @@ def route(request):
         request.reply(200, "OK")
         return
 
-    # SUBSCRIBE/NOTIFY/PUBLISH/MESSAGE — relay to registered contact like INVITE
+    # PUBLISH — handle locally as Event State Compositor (RFC 3903)
+    if request.method == "PUBLISH":
+        body = request.body
+        if body is not None:
+            body = body.decode("utf-8") if isinstance(body, bytes) else body
+        etag = presence.publish(
+            str(request.ruri),
+            body or "",
+            expires=3600,
+        )
+        request.set_header("SIP-ETag", etag)
+        request.reply(200, "OK")
+        return
+
+    # SUBSCRIBE/NOTIFY/MESSAGE — relay to registered contact like INVITE
     # (A real deployment would have a presence server; here we just proxy them.)
 
     if not request.ruri.user:
