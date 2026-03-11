@@ -2344,6 +2344,11 @@ fn build_response(
         builder = builder.header("Proxy-Authenticate", proxy_auth.clone());
     }
 
+    // Copy SIP-ETag for PUBLISH responses (RFC 3903 §4.1)
+    if let Some(sip_etag) = request.headers.get("SIP-ETag") {
+        builder = builder.header("SIP-ETag", sip_etag.clone());
+    }
+
     if let Some(server) = server_header {
         builder = builder.header("Server", server.to_string());
     }
@@ -3827,24 +3832,12 @@ fn handle_b2bua_response(
             }
         }
 
-        // Replace Via(s) — restore the originator's Via headers.
-        // A→B: restore from stored A-leg INVITE.
-        // B→A: restore from stored_vias captured when the re-INVITE was received.
+        // Replace Via(s) — restore the originator's Via headers from the
+        // re-INVITE (stored_vias), NOT from the initial INVITE.
+        // Both A→B and B→A use stored_vias captured when the re-INVITE arrived.
         message.headers.remove("Via");
-        if is_a2b {
-            if let Some(invite_arc) = &a_leg_invite {
-                if let Ok(invite) = invite_arc.lock() {
-                    if let Some(vias) = invite.headers.get_all("Via") {
-                        for via in vias {
-                            message.headers.add("Via", via.clone());
-                        }
-                    }
-                }
-            }
-        } else {
-            for via in &b_leg_stored_vias {
-                message.headers.add("Via", via.clone());
-            }
+        for via in &b_leg_stored_vias {
+            message.headers.add("Via", via.clone());
         }
 
         sanitize_b2bua_response(message, state, resp_transport);
