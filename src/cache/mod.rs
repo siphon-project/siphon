@@ -265,7 +265,8 @@ mod tests {
     fn make_config(name: &str, ttl_secs: Option<u64>, max_entries: Option<usize>) -> NamedCacheConfig {
         NamedCacheConfig {
             name: name.to_string(),
-            url: "redis://localhost:6379".to_string(),
+            // Use a bogus URL so tests never hit a real Redis instance
+            url: "redis://127.0.0.1:1".to_string(),
             local_ttl_secs: ttl_secs,
             local_max_entries: max_entries,
         }
@@ -286,7 +287,7 @@ mod tests {
     async fn local_lru_ttl_expiry() {
         let configs = [NamedCacheConfig {
             name: "ttl_test".to_string(),
-            url: "redis://localhost:6379".to_string(),
+            url: "redis://127.0.0.1:1".to_string(),
             local_ttl_secs: Some(0), // 0-second TTL = expires immediately
             local_max_entries: Some(100),
         }];

@@ -185,7 +185,8 @@ async fn tls_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl()).await;
+    let addr_map: Arc<DashMap<SocketAddr, ConnectionId>> = Arc::new(DashMap::new());
+    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), addr_map).await;
     tokio::time::sleep(SETTLE).await;
 
     // Build a TLS client that trusts our self-signed cert

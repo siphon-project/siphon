@@ -10,7 +10,7 @@ use siphon::config::NamedCacheConfig;
 fn make_config(name: &str, ttl_secs: u64, max_entries: usize) -> NamedCacheConfig {
     NamedCacheConfig {
         name: name.to_string(),
-        url: "redis://localhost:6379".to_string(),
+        url: "redis://127.0.0.1:1".to_string(),
         local_ttl_secs: Some(ttl_secs),
         local_max_entries: Some(max_entries),
     }
