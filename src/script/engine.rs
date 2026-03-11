@@ -42,6 +42,8 @@ pub enum HandlerKind {
     ProxyRegisterReply,
     /// `@b2bua.on_invite`
     B2buaInvite,
+    /// `@b2bua.on_early_media` — provisional response with SDP (183/180).
+    B2buaEarlyMedia,
     /// `@b2bua.on_answer`
     B2buaAnswer,
     /// `@b2bua.on_failure`
@@ -422,6 +424,7 @@ fn extract_handlers(
             "proxy.on_failure" => HandlerKind::ProxyFailure,
             "proxy.on_register_reply" => HandlerKind::ProxyRegisterReply,
             "b2bua.on_invite" => HandlerKind::B2buaInvite,
+            "b2bua.on_early_media" => HandlerKind::B2buaEarlyMedia,
             "b2bua.on_answer" => HandlerKind::B2buaAnswer,
             "b2bua.on_failure" => HandlerKind::B2buaFailure,
             "b2bua.on_bye" => HandlerKind::B2buaBye,

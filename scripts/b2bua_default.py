@@ -3,6 +3,7 @@ SIPhon default B2BUA script.
 
 Bridges calls between two legs with parallel forking:
 - on_invite: look up all registered contacts, fork to all (ring all)
+- on_early_media: log provisional responses with SDP (183/180 early media)
 - on_answer: both legs connected (first B leg to answer wins)
 - on_failure: all B legs failed — propagate to A leg
 - on_bye: terminate both legs
@@ -41,6 +42,11 @@ def new_call(call):
         strategy="parallel",
         timeout=30,
     )
+
+
+@b2bua.on_early_media
+def early_media(call, reply):
+    log.info(f"Call {call.id} early media ({reply.status_code})")
 
 
 @b2bua.on_answer

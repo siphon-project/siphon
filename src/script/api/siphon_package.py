@@ -115,6 +115,23 @@ class _B2buaNamespace:
         return fn
 
     @staticmethod
+    def on_early_media(fn):
+        """Register handler for provisional response with SDP (183/180).
+
+        Called when the B-leg sends a provisional response containing SDP
+        (early media).  Use this to process the SDP through RTPEngine so
+        early media is anchored correctly.
+
+        Usage:
+            @b2bua.on_early_media
+            async def early_media(call, reply):
+                await rtpengine.answer(reply)
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_early_media", None, fn, is_async)
+        return fn
+
+    @staticmethod
     def on_answer(fn):
         """Register handler for call answered (200 OK on B leg)."""
         is_async = _asyncio.iscoroutinefunction(fn)

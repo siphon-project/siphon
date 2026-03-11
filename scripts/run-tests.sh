@@ -125,6 +125,10 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua up --abort-on-container-exit --exit-code-from sipp-b2bua-uac sipp-b2bua-uac sipp-b2bua-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua rm -sf sipp-b2bua-uac sipp-b2bua-uas 2>/dev/null || true
 
+  echo "=== B2BUA early media test (183 Session Progress with SDP) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-early-media up --abort-on-container-exit --exit-code-from sipp-b2bua-early-media-uac sipp-b2bua-early-media-uac sipp-b2bua-early-media-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-early-media rm -sf sipp-b2bua-early-media-uac sipp-b2bua-early-media-uas 2>/dev/null || true
+
   echo "=== B2BUA session timer test (Session-Expires negotiation) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-session-timer up --abort-on-container-exit --exit-code-from sipp-b2bua-st-uac sipp-b2bua-st-uac sipp-b2bua-st-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-session-timer rm -sf sipp-b2bua-st-uac sipp-b2bua-st-uas 2>/dev/null || true

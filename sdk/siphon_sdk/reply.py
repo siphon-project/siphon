@@ -2,7 +2,8 @@
 Mock SIP Reply object — mirrors ``PyReply`` from the Rust engine.
 
 Passed to ``@proxy.on_reply``, ``@proxy.on_failure``,
-and ``@proxy.on_register_reply`` handlers.
+``@proxy.on_register_reply``, ``@b2bua.on_early_media``,
+and ``@b2bua.on_answer`` handlers.
 """
 
 from __future__ import annotations

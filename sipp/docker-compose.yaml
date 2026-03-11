@@ -597,6 +597,7 @@ services:
       - b2bua-reinvite-reject
       - b2bua-reinvite-breject
       - b2bua-cancel
+      - b2bua-early-media
 
   # Register bob with Contact pointing to the basic UAS IP (172.20.0.52)
   sipp-b2bua-register:
@@ -632,6 +633,7 @@ services:
       - b2bua-reinvite-reject
       - b2bua-reinvite-breject
       - b2bua-cancel
+      - b2bua-early-media
 
   # --- B2BUA basic call test ---
 
@@ -685,6 +687,59 @@ services:
       - -trace_err
     profiles:
       - b2bua
+
+  # --- B2BUA early media test (183 with SDP) ---
+
+  sipp-b2bua-early-media-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_early_media_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-early-media
+
+  sipp-b2bua-early-media-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-early-media-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_early_media_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-early-media
 
   # --- B2BUA session timer test ---
 

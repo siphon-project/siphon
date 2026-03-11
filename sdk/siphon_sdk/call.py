@@ -1,8 +1,8 @@
 """
 Mock B2BUA Call object — mirrors ``PyCall`` from the Rust engine.
 
-Passed to ``@b2bua.on_invite``, ``@b2bua.on_answer``, ``@b2bua.on_failure``,
-and ``@b2bua.on_bye`` handlers.
+Passed to ``@b2bua.on_invite``, ``@b2bua.on_early_media``,
+``@b2bua.on_answer``, ``@b2bua.on_failure``, and ``@b2bua.on_bye`` handlers.
 """
 
 from __future__ import annotations

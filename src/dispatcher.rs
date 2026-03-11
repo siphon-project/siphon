@@ -4413,6 +4413,67 @@ fn handle_b2bua_response(
     {
         // 1xx provisional — forward to A-leg
         state.call_actors.set_state(call_id, CallState::Ringing);
+
+        // Invoke @b2bua.on_early_media handlers when provisional has SDP body.
+        // This lets scripts process early media through RTPEngine before forwarding.
+        let has_sdp_body = !message.body.is_empty();
+        if has_sdp_body {
+            let engine_state = state.engine.state();
+            let handlers = engine_state.handlers_for(&HandlerKind::B2buaEarlyMedia);
+            if !handlers.is_empty() {
+                if let Some(invite_arc) = &a_leg_invite {
+                    let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
+                    let py_call = PyCall::new(
+                        call_id.to_string(),
+                        Arc::clone(invite_arc),
+                        a_leg.transport.remote_addr.ip().to_string(),
+                    );
+                    let py_reply = PyReply::new(Arc::clone(&response_arc))
+                        .with_a_leg(Arc::clone(invite_arc));
+
+                    Python::attach(|python| {
+                        let call_obj = match Py::new(python, py_call) {
+                            Ok(obj) => obj,
+                            Err(error) => {
+                                error!("failed to create PyCall for on_early_media: {error}");
+                                return;
+                            }
+                        };
+                        let reply_obj = match Py::new(python, py_reply) {
+                            Ok(obj) => obj,
+                            Err(error) => {
+                                error!("failed to create PyReply for on_early_media: {error}");
+                                return;
+                            }
+                        };
+
+                        for handler in &handlers {
+                            let callable = handler.callable.bind(python);
+                            match callable.call1((call_obj.bind(python), reply_obj.bind(python))) {
+                                Ok(ret) => {
+                                    if handler.is_async {
+                                        if let Err(error) = run_coroutine(python, &ret) {
+                                            error!("async B2BUA on_early_media handler error: {error}");
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    error!("B2BUA on_early_media handler error: {error}");
+                                }
+                            }
+                        }
+                    });
+
+                    // Replace message with potentially modified version (e.g. RTPEngine-rewritten SDP)
+                    if let Ok(modified) = response_arc.lock() {
+                        *message = modified.clone();
+                    };
+                } else {
+                    warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_early_media");
+                }
+            }
+        }
+
         // Rewrite B-leg dialog headers back to A-leg identifiers
         if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
             crate::b2bua::actor::Dialog::rewrite_headers(
