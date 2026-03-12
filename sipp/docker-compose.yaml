@@ -1151,7 +1151,6 @@ services:
       - "1"
       - -timeout
       - "30"
-      - -trace_err
     profiles:
       - b2bua-topology
 
@@ -1178,7 +1177,6 @@ services:
       - "1"
       - -timeout
       - "30"
-      - -trace_err
     profiles:
       - b2bua-topology
 

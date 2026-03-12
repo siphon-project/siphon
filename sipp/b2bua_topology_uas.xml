@@ -94,6 +94,10 @@ a=sendrecv
       <ereg regexp="INVITE sip:bob@[local_ip]" search_in="msg" assign_to="reinv_ruri_ok" />
       <!-- re-INVITE CSeq should be 2, not 100 from A-leg -->
       <ereg regexp="^2 INVITE" search_in="hdr" header="CSeq:" assign_to="reinv_cseq_ok" />
+      <!-- re-INVITE To header must NOT contain UAC's IP (topology leak) -->
+      <ereg regexp="To:.*172\.20\.0\.53" search_in="msg" assign_to="reinv_to_leak" />
+      <!-- re-INVITE must NOT leak A-leg User-Agent -->
+      <ereg regexp="User-Agent:.*SIPp" search_in="msg" assign_to="reinv_ua_leak" />
     </action>
   </recv>
 
@@ -131,6 +135,10 @@ a=sendrecv
     <action>
       <!-- BYE RURI should be our Contact (bob@local_ip) -->
       <ereg regexp="BYE sip:bob@[local_ip]" search_in="msg" assign_to="bye_ruri_ok" />
+      <!-- BYE To header must NOT contain UAC's IP (topology leak) -->
+      <ereg regexp="To:.*172\.20\.0\.53" search_in="msg" assign_to="bye_to_leak" />
+      <!-- BYE must NOT leak A-leg User-Agent -->
+      <ereg regexp="User-Agent:.*SIPp" search_in="msg" assign_to="bye_ua_leak" />
     </action>
   </recv>
 
