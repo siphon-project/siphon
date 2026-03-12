@@ -103,8 +103,10 @@ struct DispatcherState {
     session_timer_config: Option<crate::config::SessionTimerConfig>,
     /// Outbound registration manager (None when registrant is not configured).
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
-    /// SIPREC recording manager.
+    /// SIPREC recording manager (SRC role — sends recordings to external SRS).
     recording_manager: Arc<crate::siprec::RecordingManager>,
+    /// SRS — Session Recording Server manager (receives SIPREC INVITEs from external SRCs).
+    srs_manager: Option<Arc<crate::srs::SrsManager>>,
     /// IPsec SA manager (None when ipsec is not configured).
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     /// IPsec config (P-CSCF ports).
@@ -264,6 +266,9 @@ pub async fn run(
         session_timer_config: config.session_timer.clone(),
         registrant_manager,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new()),
+        srs_manager: config.srs.as_ref()
+            .filter(|srs_config| srs_config.enabled)
+            .map(|srs_config| Arc::new(crate::srs::SrsManager::new(srs_config.clone()))),
         ipsec_manager,
         ipsec_config,
         connection_pool,
@@ -561,7 +566,7 @@ fn sweep_stale_entries(state: &DispatcherState) {
 }
 
 /// Handle a single inbound SIP message (request or response).
-fn handle_inbound(inbound: InboundMessage, state: &DispatcherState) {
+fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
     // Parse bytes to string
     let raw = match std::str::from_utf8(&inbound.data) {
         Ok(s) => s,
@@ -618,7 +623,7 @@ fn handle_request(
     inbound: InboundMessage,
     message: SipMessage,
     method: String,
-    state: &DispatcherState,
+    state: &Arc<DispatcherState>,
 ) {
     // --- Extract the UAC's Via branch and sent-by ---
     let uac_via = message
@@ -736,6 +741,23 @@ fn handle_request(
         remote = %inbound.remote_addr,
         "processing request"
     );
+
+    // --- SRS: detect inbound SIPREC INVITEs and BYEs ---
+    if let Some(ref srs_manager) = state.srs_manager {
+        if method == "INVITE" && is_siprec_invite(&message) {
+            handle_srs_invite(inbound, message, Arc::clone(srs_manager), state);
+            return;
+        }
+        if method == "BYE" {
+            let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
+            if let Some(ref call_id) = sip_call_id {
+                if srs_manager.is_srs_session(call_id) {
+                    handle_srs_bye(inbound, message, call_id, Arc::clone(srs_manager), state);
+                    return;
+                }
+            }
+        }
+    }
 
     // Check if B2BUA mode should handle this INVITE
     let engine_state = state.engine.state();
@@ -5727,6 +5749,357 @@ fn handle_b2bua_reinvite(
 
     // Reset session timer on successful re-INVITE (timer reset happens on 200 OK
     // via handle_b2bua_response which calls set_state — we reset the timer there)
+}
+
+// ---------------------------------------------------------------------------
+// SRS — Session Recording Server handlers
+// ---------------------------------------------------------------------------
+
+/// Check if an incoming INVITE is a SIPREC recording request.
+///
+/// Detection: Content-Type is `multipart/mixed` AND the body contains
+/// `application/rs-metadata+xml`.
+fn is_siprec_invite(message: &SipMessage) -> bool {
+    let content_type = match message.headers.get("Content-Type") {
+        Some(content_type) => content_type,
+        None => return false,
+    };
+
+    if !content_type.to_ascii_lowercase().contains("multipart/mixed") {
+        return false;
+    }
+
+    // Quick check: does the body contain the metadata content type?
+    if message.body.is_empty() {
+        return false;
+    }
+    let body_str = String::from_utf8_lossy(&message.body);
+    body_str.contains("application/rs-metadata+xml")
+}
+
+/// Handle an inbound SIPREC INVITE (SRC → SRS).
+///
+/// Parses the multipart body, extracts SDP and recording metadata,
+/// creates an SRS session, optionally sets up RTPEngine recording,
+/// and sends 200 OK back to the SRC.
+fn handle_srs_invite(
+    inbound: InboundMessage,
+    message: SipMessage,
+    srs_manager: Arc<crate::srs::SrsManager>,
+    state: &Arc<DispatcherState>,
+) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let call_id = message.headers.get("Call-ID")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let from_tag = message.headers.get("From")
+            .and_then(|from| from.split("tag=").nth(1))
+            .map(|tag| tag.split(';').next().unwrap_or(tag).trim().to_string())
+            .unwrap_or_default();
+
+        info!(
+            call_id = %call_id,
+            remote = %inbound.remote_addr,
+            "SRS: received SIPREC INVITE"
+        );
+
+        // Parse the multipart body.
+        let content_type = match message.headers.get("Content-Type") {
+            Some(content_type) => content_type.clone(),
+            None => {
+                warn!(call_id = %call_id, "SRS: SIPREC INVITE missing Content-Type");
+                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref());
+                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                return;
+            }
+        };
+
+        if message.body.is_empty() {
+            warn!(call_id = %call_id, "SRS: SIPREC INVITE has no body");
+            let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref());
+            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+            return;
+        }
+        let body = message.body.clone();
+
+        let parts = match crate::siprec::multipart::parse_multipart(&content_type, &body) {
+            Ok(parts) => parts,
+            Err(error) => {
+                warn!(call_id = %call_id, error = %error, "SRS: failed to parse multipart body");
+                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref());
+                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                return;
+            }
+        };
+
+        // Extract SDP and metadata parts.
+        let sdp_part = crate::siprec::multipart::find_part(&parts, "application/sdp");
+        let metadata_part = crate::siprec::multipart::find_part(&parts, "application/rs-metadata");
+
+        let metadata_xml = match metadata_part {
+            Some(part) => String::from_utf8_lossy(&part.body).to_string(),
+            None => {
+                warn!(call_id = %call_id, "SRS: no rs-metadata+xml part in SIPREC INVITE");
+                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref());
+                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                return;
+            }
+        };
+
+        // Parse the recording metadata XML.
+        let metadata = match crate::siprec::metadata::parse_recording_metadata(&metadata_xml) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warn!(call_id = %call_id, error = %error, "SRS: failed to parse recording metadata");
+                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref());
+                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                return;
+            }
+        };
+
+        info!(
+            call_id = %call_id,
+            session_id = %metadata.session_id,
+            participants = metadata.participants.len(),
+            streams = metadata.streams.len(),
+            "SRS: parsed SIPREC metadata"
+        );
+
+        // Invoke Python @srs.on_invite handler if registered.
+        let should_accept = {
+            let engine_state = state.engine.state();
+            let srs_handlers = engine_state.handlers_for(&HandlerKind::SrsOnInvite);
+            if !srs_handlers.is_empty() {
+                let py_metadata = crate::script::api::srs::PyRecordingMetadata::from_metadata(&metadata);
+                let result = pyo3::Python::attach(|python| {
+                    let py_meta = match pyo3::Py::new(python, py_metadata) {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            warn!(call_id = %call_id, error = %error, "SRS: failed to create PyRecordingMetadata");
+                            return true; // Accept on error
+                        }
+                    };
+                    for handler in &srs_handlers {
+                        match handler.callable.call1(python, (py_meta.clone_ref(python),)) {
+                            Ok(result) => {
+                                if let Ok(accepted) = result.extract::<bool>(python) {
+                                    if !accepted {
+                                        return false;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                warn!(call_id = %call_id, error = %error, "SRS: on_invite handler error");
+                            }
+                        }
+                    }
+                    true
+                });
+                drop(engine_state);
+                result
+            } else {
+                drop(engine_state);
+                true
+            }
+        };
+
+        if !should_accept {
+            info!(call_id = %call_id, "SRS: recording rejected by script");
+            let response = build_response(&message, 403, "Forbidden", state.server_header.as_deref());
+            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+            return;
+        }
+
+        // Create the SRS session.
+        let (session_id, to_tag) = match srs_manager.create_session(&call_id, &from_tag, metadata) {
+            Some(result) => result,
+            None => {
+                warn!(call_id = %call_id, "SRS: session creation failed (max sessions?)");
+                let response = build_response(&message, 503, "Service Unavailable", state.server_header.as_deref());
+                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                return;
+            }
+        };
+
+        // Set up RTPEngine recording if available.
+        let answer_sdp = if let (Some(ref rtpengine_set), Some(sdp_part)) = (&state.rtpengine_set, sdp_part) {
+            let profile_name = srs_manager.rtpengine_profile();
+            let profile_registry = crate::rtpengine::profile::ProfileRegistry::new();
+            let profile = profile_registry.get(profile_name);
+
+            if let Some(profile) = profile {
+                // Create recording directory for RTPEngine.
+                if let Some(recording_dir) = srs_manager.recording_dir(&session_id) {
+                    let _ = tokio::fs::create_dir_all(&recording_dir).await;
+
+                    // Build flags with record-path pointing to the session directory.
+                    let mut offer_flags = profile.offer.clone();
+                    offer_flags.record_path = Some(recording_dir.display().to_string());
+
+                    match rtpengine_set.offer(&call_id, &from_tag, &sdp_part.body, &offer_flags).await {
+                        Ok(rewritten_sdp) => {
+                            srs_manager.activate_session(&session_id);
+                            Some(rewritten_sdp)
+                        }
+                        Err(error) => {
+                            warn!(
+                                call_id = %call_id,
+                                session_id = %session_id,
+                                error = %error,
+                                "SRS: RTPEngine offer failed"
+                            );
+                            srs_manager.fail_session(&session_id, &error.to_string());
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                warn!(
+                    call_id = %call_id,
+                    profile = %profile_name,
+                    "SRS: unknown RTPEngine profile"
+                );
+                None
+            }
+        } else {
+            // No RTPEngine — accept without media anchoring.
+            srs_manager.activate_session(&session_id);
+            None
+        };
+
+        // Build 200 OK response.
+        let mut response_builder = SipMessageBuilder::new()
+            .response(200, "OK".to_string());
+
+        // Copy Via, From headers.
+        if let Some(vias) = message.headers.get_all("Via") {
+            for via in vias {
+                response_builder = response_builder.via(via.clone());
+            }
+        }
+        if let Some(from) = message.headers.from() {
+            response_builder = response_builder.from(from.clone());
+        }
+
+        // Set To with our generated tag.
+        if let Some(to) = message.headers.to() {
+            let to_with_tag = if to.contains("tag=") {
+                to.clone()
+            } else {
+                format!("{to};tag={to_tag}")
+            };
+            response_builder = response_builder.to(to_with_tag);
+        }
+
+        if let Some(call_id_header) = message.headers.get("Call-ID") {
+            response_builder = response_builder.call_id(call_id_header.clone());
+        }
+        if let Some(cseq) = message.headers.get("CSeq") {
+            response_builder = response_builder.cseq(cseq.clone());
+        }
+
+        // Add Contact header.
+        response_builder = response_builder.header(
+            "Contact",
+            format!("<sip:srs@{}>", state.local_addr),
+        );
+
+        // Add SDP body (from RTPEngine or echo back original).
+        if let Some(sdp) = answer_sdp {
+            response_builder = response_builder
+                .header("Content-Type", "application/sdp".to_string())
+                .body(sdp);
+        } else if let Some(sdp_part) = sdp_part {
+            response_builder = response_builder
+                .header("Content-Type", "application/sdp".to_string())
+                .body(sdp_part.body.clone());
+        } else {
+            response_builder = response_builder.content_length(0);
+        }
+
+        if let Some(ref server) = state.server_header {
+            response_builder = response_builder.header("Server", server.clone());
+        }
+
+        match response_builder.build() {
+            Ok(response) => {
+                info!(
+                    call_id = %call_id,
+                    session_id = %session_id,
+                    "SRS: sending 200 OK to SRC"
+                );
+                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+            }
+            Err(error) => {
+                error!(call_id = %call_id, error = %error, "SRS: failed to build 200 OK");
+                srs_manager.fail_session(&session_id, &error.to_string());
+            }
+        }
+    });
+}
+
+/// Handle a BYE for an active SRS recording session.
+fn handle_srs_bye(
+    inbound: InboundMessage,
+    message: SipMessage,
+    call_id: &str,
+    srs_manager: Arc<crate::srs::SrsManager>,
+    state: &Arc<DispatcherState>,
+) {
+    let call_id = call_id.to_string();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        info!(call_id = %call_id, "SRS: received BYE from SRC");
+
+        // Stop recording via RTPEngine.
+        if let Some(ref rtpengine_set) = state.rtpengine_set {
+            let from_tag = message.headers.get("From")
+                .and_then(|from| from.split("tag=").nth(1))
+                .map(|tag| tag.split(';').next().unwrap_or(tag).trim().to_string())
+                .unwrap_or_default();
+
+            if let Err(error) = rtpengine_set.delete(&call_id, &from_tag).await {
+                warn!(
+                    call_id = %call_id,
+                    error = %error,
+                    "SRS: RTPEngine delete failed (session may have already ended)"
+                );
+            }
+        }
+
+        // Stop the SRS session and get the recording record.
+        let record = srs_manager.stop_session(&call_id);
+
+        // Send 200 OK for the BYE.
+        let response = build_response(&message, 200, "OK", state.server_header.as_deref());
+        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+
+        // Store recording metadata via configured backend.
+        if let Some(record) = record {
+            // Invoke @srs.on_session_end hook.
+            {
+                let engine_state = state.engine.state();
+                let end_handlers = engine_state.handlers_for(&HandlerKind::SrsOnSessionEnd);
+                if !end_handlers.is_empty() {
+                    let py_session = crate::script::api::srs::PySrsSession::from_record(&record);
+                    pyo3::Python::attach(|python| {
+                        if let Ok(py_sess) = pyo3::Py::new(python, py_session) {
+                            for handler in &end_handlers {
+                                if let Err(error) = handler.callable.call1(python, (py_sess.clone_ref(python),)) {
+                                    warn!(call_id = %call_id, error = %error, "SRS: on_session_end handler error");
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
+            crate::srs::storage::store_recording(srs_manager.config(), &record).await;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

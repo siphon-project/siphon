@@ -47,3 +47,6 @@ mod presence_tests;
 
 #[path = "integration/media_tests.rs"]
 mod media_tests;
+
+#[path = "integration/srs_tests.rs"]
+mod srs_tests;

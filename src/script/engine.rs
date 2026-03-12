@@ -54,6 +54,10 @@ pub enum HandlerKind {
     B2buaRefer,
     /// `@registrar.on_change` — registration state change callback.
     RegistrarOnChange,
+    /// `@srs.on_invite` — inbound SIPREC INVITE to SRS.
+    SrsOnInvite,
+    /// `@srs.on_session_end` — recording session completed.
+    SrsOnSessionEnd,
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +434,8 @@ fn extract_handlers(
             "b2bua.on_bye" => HandlerKind::B2buaBye,
             "b2bua.on_refer" => HandlerKind::B2buaRefer,
             "registrar.on_change" => HandlerKind::RegistrarOnChange,
+            "srs.on_invite" => HandlerKind::SrsOnInvite,
+            "srs.on_session_end" => HandlerKind::SrsOnSessionEnd,
             other => {
                 warn!(kind = other, "unknown handler kind, skipping");
                 continue;

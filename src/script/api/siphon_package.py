@@ -392,3 +392,50 @@ class _PresenceNamespace:
 
 
 presence = _PresenceNamespace()
+
+
+# ---------------------------------------------------------------------------
+# SRS namespace (Session Recording Server — accepts SIPREC INVITEs)
+# ---------------------------------------------------------------------------
+
+class _SrsNamespace:
+    """Namespace for SRS (Session Recording Server) event handlers."""
+
+    @staticmethod
+    def on_invite(fn):
+        """Register handler for incoming SIPREC INVITE (recording request).
+
+        The handler receives (request, metadata) where:
+          - request: Request object (the SIPREC INVITE)
+          - metadata: RecordingMetadata (parsed XML — participants, streams, session_id)
+
+        Return True to accept the recording, False to reject (403).
+
+        Usage:
+            @srs.on_invite
+            async def on_recording(request, metadata):
+                log.info(f"Recording: {metadata.session_id}")
+                return True
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("srs.on_invite", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_session_end(fn):
+        """Register handler called when a recording session ends.
+
+        The handler receives (session,) where:
+          - session: SrsSession (session_id, participants, duration, recording_dir)
+
+        Usage:
+            @srs.on_session_end
+            async def on_recording_end(session):
+                log.info(f"Recording {session.session_id} done, {session.duration}s")
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("srs.on_session_end", None, fn, is_async)
+        return fn
+
+
+srs = _SrsNamespace()

@@ -13,3 +13,4 @@ mod gateway_tests;
 mod cdr_tests;
 mod presence_tests;
 mod media_tests;
+mod srs_tests;

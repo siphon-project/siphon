@@ -351,6 +351,32 @@ auth:
 #   cdr.write(request, extra={"billing_id": "B-12345", "trunk": "carrier-a"})
 
 # ---------------------------------------------------------------------------
+# SRS — Session Recording Server (RFC 7866 SIPREC)
+# ---------------------------------------------------------------------------
+# Enables Siphon to act as an SRS (Session Recording Server), accepting
+# inbound SIPREC INVITEs from external SRCs (Session Recording Clients).
+# Parses RFC 7866 metadata XML, captures audio per leg via RTPEngine's
+# record-call feature, and stores recordings + metadata grouped by call ID.
+#
+# Python script hooks:
+#   from siphon import srs
+#   @srs.on_invite                    # accept/reject incoming recording
+#   @srs.on_session_end               # post-processing after recording ends
+#
+# srs:
+#   enabled: false                    # master switch (disabled by default)
+#   recording_dir: "/var/lib/siphon/recordings"  # base directory for recordings
+#   max_sessions: 1000                # maximum concurrent recording sessions
+#   rtpengine_profile: "srs_recording"  # RTPEngine media profile to use
+#   backend: file                     # storage backend: "file" or "http"
+#   file:
+#     base_dir: "/var/lib/siphon/recordings"
+#   http:
+#     url: "https://api.example.com/recordings"
+#     auth_header: "Bearer tok123"    # optional Authorization header
+#     upload_audio: false             # upload audio files with metadata
+
+# ---------------------------------------------------------------------------
 # Lawful Intercept — ETSI X1/X2/X3 + SIPREC (RFC 7866)
 # ---------------------------------------------------------------------------
 # Implements the three ETSI LI interfaces:

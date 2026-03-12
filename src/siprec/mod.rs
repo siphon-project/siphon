@@ -6,6 +6,7 @@
 //! - Part 2: RFC 7866 recording metadata XML
 
 pub mod metadata;
+pub mod multipart;
 
 use std::fmt;
 use std::net::SocketAddr;

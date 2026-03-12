@@ -22,6 +22,7 @@ pub mod reply;
 pub mod request;
 pub mod rtpengine;
 pub mod sip_uri;
+pub mod srs;
 
 use std::ffi::CString;
 use std::sync::OnceLock;

@@ -1789,6 +1789,131 @@ class MockPresence:
         self._next_sub_id = 0
 
 
+class MockSrs:
+    """Mock ``srs`` namespace — Session Recording Server hooks for testing.
+
+    Pre-configure accept/reject behavior::
+
+        from siphon_sdk.mock_module import get_srs
+        srs = get_srs()
+        srs.accept_all = False          # reject all recordings
+
+    Register handlers as in production::
+
+        from siphon import srs
+
+        @srs.on_invite
+        async def on_recording(metadata):
+            return True
+
+        @srs.on_session_end
+        async def on_recording_end(session):
+            pass
+
+    Inspect events after test::
+
+        srs = get_srs()
+        assert len(srs.sessions) == 1
+    """
+
+    def __init__(self) -> None:
+        self._accept_all: bool = True
+        self._sessions: list[dict[str, Any]] = []
+        self._invite_events: list[dict[str, Any]] = []
+
+    @property
+    def accept_all(self) -> bool:
+        """Whether mock auto-accepts all recordings (default ``True``)."""
+        return self._accept_all
+
+    @accept_all.setter
+    def accept_all(self, value: bool) -> None:
+        self._accept_all = value
+
+    @property
+    def sessions(self) -> list[dict[str, Any]]:
+        """List of completed recording sessions (for test assertions)."""
+        return self._sessions
+
+    @property
+    def invite_events(self) -> list[dict[str, Any]]:
+        """List of on_invite calls received (for test assertions)."""
+        return self._invite_events
+
+    def on_invite(self, fn: Any) -> Any:
+        """Register handler for incoming SIPREC INVITE (recording request).
+
+        The handler receives ``(metadata,)`` where metadata is a
+        :class:`~siphon_sdk.srs.RecordingMetadata` object.
+
+        Return ``True`` to accept the recording, ``False`` to reject (403).
+
+        Example::
+
+            @srs.on_invite
+            async def on_recording(metadata):
+                log.info(f"Recording: {metadata.session_id}")
+                return True
+        """
+        _registry.register("srs.on_invite", None, fn, asyncio.iscoroutinefunction(fn))
+        return fn
+
+    def on_session_end(self, fn: Any) -> Any:
+        """Register handler for recording session completion.
+
+        The handler receives ``(session,)`` where session is a
+        :class:`~siphon_sdk.srs.SrsSession` object.
+
+        Example::
+
+            @srs.on_session_end
+            async def on_recording_end(session):
+                log.info(f"Recording {session.session_id} done")
+        """
+        _registry.register("srs.on_session_end", None, fn, asyncio.iscoroutinefunction(fn))
+        return fn
+
+    def record_invite(self, session_id: str, participants: list[str] | None = None) -> None:
+        """Test helper: simulate an inbound SIPREC INVITE event.
+
+        Args:
+            session_id: Recording session identifier.
+            participants: List of participant AoRs.
+        """
+        self._invite_events.append({
+            "session_id": session_id,
+            "participants": participants or [],
+        })
+
+    def record_session_end(
+        self,
+        session_id: str,
+        recording_call_id: str = "",
+        duration_secs: int = 0,
+        recording_dir: str | None = None,
+    ) -> None:
+        """Test helper: simulate a completed recording session.
+
+        Args:
+            session_id: Recording session identifier.
+            recording_call_id: Call-ID of the SIPREC dialog.
+            duration_secs: Recording duration in seconds.
+            recording_dir: Path where recordings were written.
+        """
+        self._sessions.append({
+            "session_id": session_id,
+            "recording_call_id": recording_call_id,
+            "duration_secs": duration_secs,
+            "recording_dir": recording_dir,
+        })
+
+    def clear(self) -> None:
+        """Reset all mock state (test helper)."""
+        self._accept_all = True
+        self._sessions.clear()
+        self._invite_events.clear()
+
+
 # ---------------------------------------------------------------------------
 # Module installation
 # ---------------------------------------------------------------------------
@@ -1807,6 +1932,7 @@ _li = MockLi()
 _registration = MockRegistration()
 _diameter = MockDiameter()
 _presence = MockPresence()
+_srs = MockSrs()
 
 
 def install() -> ModuleType:
@@ -1836,6 +1962,7 @@ def install() -> ModuleType:
     mod.registration = _registration  # type: ignore[attr-defined]
     mod.diameter = _diameter  # type: ignore[attr-defined]
     mod.presence = _presence  # type: ignore[attr-defined]
+    mod.srs = _srs  # type: ignore[attr-defined]
 
     # Also install the _siphon_registry mock
     registry_mod = ModuleType("_siphon_registry")
@@ -1862,6 +1989,7 @@ def reset() -> None:
     _registration.clear()
     _diameter.clear()
     _presence.clear()
+    _srs.clear()
     _auth._allow = False
     _auth._credentials.clear()
     _proxy._utils._rate_limit_allow = True
@@ -1933,3 +2061,8 @@ def get_diameter() -> MockDiameter:
 def get_presence() -> MockPresence:
     """Access the mock presence singleton."""
     return _presence
+
+
+def get_srs() -> MockSrs:
+    """Access the mock SRS singleton."""
+    return _srs
