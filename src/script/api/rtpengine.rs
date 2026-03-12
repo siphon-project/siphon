@@ -283,6 +283,43 @@ fn lock_message(
     })
 }
 
+/// Extract the SDP body from a SIP message, handling multipart/mixed bodies.
+///
+/// If the Content-Type is `multipart/mixed`, extracts the `application/sdp`
+/// part from the multipart body. Otherwise returns the raw body as-is.
+fn extract_sdp_body(message: &SipMessage) -> PyResult<Vec<u8>> {
+    let body = &message.body;
+    if body.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "message has no SDP body",
+        ));
+    }
+
+    let empty_string = String::new();
+    let content_type = message.headers.get("Content-Type")
+        .or_else(|| message.headers.get("c"))
+        .unwrap_or(&empty_string);
+
+    if content_type.to_ascii_lowercase().contains("multipart/mixed") {
+        // Parse multipart body and extract the SDP part.
+        let parts = crate::siprec::multipart::parse_multipart(content_type, body)
+            .map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "failed to parse multipart body: {error}"
+                ))
+            })?;
+        let sdp_part = crate::siprec::multipart::find_part(&parts, "application/sdp")
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "multipart body has no application/sdp part"
+                )
+            })?;
+        Ok(sdp_part.body.clone())
+    } else {
+        Ok(body.clone())
+    }
+}
+
 /// Extract call-id, from-tag, and SDP body from a SIP message (offer direction).
 fn extract_offer_params(
     message: &Arc<Mutex<SipMessage>>,
@@ -310,12 +347,7 @@ fn extract_offer_params(
         pyo3::exceptions::PyValueError::new_err("From header missing tag parameter")
     })?;
 
-    let sdp = message.body.clone();
-    if sdp.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "message has no SDP body",
-        ));
-    }
+    let sdp = extract_sdp_body(&message)?;
 
     Ok((call_id, from_tag, sdp))
 }
@@ -359,12 +391,7 @@ fn extract_answer_params(
         pyo3::exceptions::PyValueError::new_err("To header missing tag parameter")
     })?;
 
-    let sdp = message.body.clone();
-    if sdp.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "message has no SDP body",
-        ));
-    }
+    let sdp = extract_sdp_body(&message)?;
 
     Ok((call_id, from_tag, to_tag, sdp))
 }
@@ -478,5 +505,79 @@ mod tests {
             extract_tag("<sip:alice@atlanta.com>;Tag=ABC"),
             Some("ABC".to_string())
         );
+    }
+
+    /// Helper to build a minimal SIP message for testing.
+    fn test_message(content_type: Option<&str>, body: &[u8]) -> SipMessage {
+        use crate::sip::message::{RequestLine, StartLine, Version, Method};
+        use crate::sip::uri::SipUri;
+        use crate::sip::headers::SipHeaders;
+
+        let mut headers = SipHeaders::new();
+        if let Some(content_type) = content_type {
+            headers.set("Content-Type", content_type.to_string());
+        }
+
+        SipMessage {
+            start_line: StartLine::Request(RequestLine {
+                method: Method::Invite,
+                request_uri: SipUri::new("10.0.0.1".to_string()),
+                version: Version::sip_2_0(),
+            }),
+            headers,
+            body: body.to_vec(),
+        }
+    }
+
+    #[test]
+    fn extract_sdp_body_plain() {
+        let body = b"v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\n";
+        let message = test_message(Some("application/sdp"), body);
+
+        let sdp = extract_sdp_body(&message).unwrap();
+        assert_eq!(sdp, body);
+    }
+
+    #[test]
+    fn extract_sdp_body_multipart() {
+        let multipart_body = concat!(
+            "--srec-abc123\r\n",
+            "Content-Type: application/sdp\r\n",
+            "\r\n",
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=recvonly\r\n",
+            "\r\n",
+            "--srec-abc123\r\n",
+            "Content-Type: application/rs-metadata+xml\r\n",
+            "\r\n",
+            "<recording xmlns='urn:ietf:params:xml:ns:recording:1'/>\r\n",
+            "\r\n",
+            "--srec-abc123--\r\n",
+        );
+
+        let message = test_message(
+            Some("multipart/mixed;boundary=srec-abc123"),
+            multipart_body.as_bytes(),
+        );
+
+        let sdp = extract_sdp_body(&message).unwrap();
+        let sdp_str = String::from_utf8_lossy(&sdp);
+
+        // Should contain only the SDP, not the multipart boundaries or XML.
+        assert!(sdp_str.starts_with("v=0"));
+        assert!(sdp_str.contains("a=recvonly"));
+        assert!(!sdp_str.contains("--srec-abc123"));
+        assert!(!sdp_str.contains("recording"));
+    }
+
+    #[test]
+    fn extract_sdp_body_empty() {
+        let message = test_message(None, b"");
+        assert!(extract_sdp_body(&message).is_err());
     }
 }

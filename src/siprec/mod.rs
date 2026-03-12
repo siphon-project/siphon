@@ -126,21 +126,56 @@ impl RecordingManager {
         let from_tag = format!("rec-{}", &session_id[..8]);
         let cseq = self.cseq_counter.fetch_add(1, Ordering::Relaxed);
 
-        // Parse SRS URI to get destination — strip scheme and user part
+        // Parse SRS URI properly — extract host, port, transport, and URI params.
+        // Example: "sip:srs@10.0.0.5:5080;transport=TCP"
+        //   -> host="10.0.0.5", port=5080, transport=TCP
         let srs_host_part = srs_uri
             .strip_prefix("sip:")
             .or_else(|| srs_uri.strip_prefix("sips:"))
             .unwrap_or(srs_uri);
         // Strip user@ if present (e.g. "srs@10.0.0.5:5060" -> "10.0.0.5:5060")
-        let srs_host = if let Some(at_pos) = srs_host_part.find('@') {
+        let srs_host_with_params = if let Some(at_pos) = srs_host_part.find('@') {
             &srs_host_part[at_pos + 1..]
         } else {
             srs_host_part
         };
 
-        let destination: SocketAddr = srs_host
+        // Split host:port from URI parameters (;transport=TCP, etc.)
+        let (srs_hostport, uri_params) = match srs_host_with_params.find(';') {
+            Some(pos) => (&srs_host_with_params[..pos], &srs_host_with_params[pos..]),
+            None => (srs_host_with_params, ""),
+        };
+
+        // Detect transport from URI parameters.
+        let transport = if uri_params.to_ascii_lowercase().contains("transport=tcp") {
+            Transport::Tcp
+        } else if uri_params.to_ascii_lowercase().contains("transport=tls") {
+            Transport::Tls
+        } else {
+            Transport::Udp
+        };
+
+        let transport_name = match transport {
+            Transport::Tcp => "TCP",
+            Transport::Tls => "TLS",
+            _ => "UDP",
+        };
+
+        // Parse host and port separately for proper SipUri construction.
+        let (srs_host, srs_port) = if let Some(colon_pos) = srs_hostport.rfind(':') {
+            let potential_port = &srs_hostport[colon_pos + 1..];
+            if let Ok(port) = potential_port.parse::<u16>() {
+                (&srs_hostport[..colon_pos], Some(port))
+            } else {
+                (srs_hostport, None)
+            }
+        } else {
+            (srs_hostport, None)
+        };
+
+        let destination_port = srs_port.unwrap_or(5060);
+        let destination: SocketAddr = format!("{srs_host}:{destination_port}")
             .parse()
-            .or_else(|_| format!("{srs_host}:5060").parse())
             .unwrap_or(FALLBACK_DESTINATION);
 
         // Build recording metadata XML
@@ -160,8 +195,18 @@ impl RecordingManager {
         let boundary = format!("srec-{}", &session_id[..8]);
         let multipart_body = build_multipart_body(&boundary, &recording_sdp, &metadata_xml);
 
-        let request_uri = SipUri::new(srs_host.to_string());
-        let via = format!("SIP/2.0/UDP {};branch={}", local_addr, branch);
+        // Build proper SipUri with separate host, port, and transport param.
+        let mut request_uri = SipUri::new(srs_host.to_string());
+        if let Some(port) = srs_port {
+            request_uri = request_uri.with_port(port);
+        }
+        if transport != Transport::Udp {
+            request_uri = request_uri.with_param(
+                "transport".to_string(),
+                Some(transport_name.to_string()),
+            );
+        }
+        let via = format!("SIP/2.0/{} {};branch={}", transport_name, local_addr, branch);
 
         let message = SipMessageBuilder::new()
             .request(Method::Invite, request_uri)
@@ -173,6 +218,7 @@ impl RecordingManager {
             .header("Contact", format!("<sip:recorder@{local_addr}>"))
             .header("Content-Type", format!("multipart/mixed;boundary={boundary}"))
             .header("Require", "siprec".to_string())
+            .header("User-Agent", "SIPhon".to_string())
             .max_forwards(70)
             .body(multipart_body)
             .build();
@@ -213,7 +259,7 @@ impl RecordingManager {
             "SIPREC: starting recording"
         );
 
-        Some((session_id, message, destination, Transport::Udp))
+        Some((session_id, message, destination, transport))
     }
 
     /// Handle a 200 OK from the SRS — recording is now active.
@@ -276,24 +322,64 @@ impl RecordingManager {
                 session.state = RecordingState::Stopped;
                 let cseq = session.cseq.fetch_add(1, Ordering::Relaxed);
 
+                // Parse SRS URI — extract host, port, transport (same logic as start_recording).
                 let srs_host_part = session.srs_uri
                     .strip_prefix("sip:")
                     .or_else(|| session.srs_uri.strip_prefix("sips:"))
                     .unwrap_or(&session.srs_uri);
-                let srs_host = if let Some(at_pos) = srs_host_part.find('@') {
+                let srs_host_with_params = if let Some(at_pos) = srs_host_part.find('@') {
                     &srs_host_part[at_pos + 1..]
                 } else {
                     srs_host_part
                 };
 
-                let destination: SocketAddr = srs_host
+                let (srs_hostport, uri_params) = match srs_host_with_params.find(';') {
+                    Some(pos) => (&srs_host_with_params[..pos], &srs_host_with_params[pos..]),
+                    None => (srs_host_with_params, ""),
+                };
+
+                let bye_transport = if uri_params.to_ascii_lowercase().contains("transport=tcp") {
+                    Transport::Tcp
+                } else if uri_params.to_ascii_lowercase().contains("transport=tls") {
+                    Transport::Tls
+                } else {
+                    Transport::Udp
+                };
+
+                let transport_name = match bye_transport {
+                    Transport::Tcp => "TCP",
+                    Transport::Tls => "TLS",
+                    _ => "UDP",
+                };
+
+                let (host_str, port_opt) = if let Some(colon_pos) = srs_hostport.rfind(':') {
+                    let potential_port = &srs_hostport[colon_pos + 1..];
+                    if let Ok(port) = potential_port.parse::<u16>() {
+                        (&srs_hostport[..colon_pos], Some(port))
+                    } else {
+                        (srs_hostport, None)
+                    }
+                } else {
+                    (srs_hostport, None)
+                };
+
+                let destination_port = port_opt.unwrap_or(5060);
+                let destination: SocketAddr = format!("{host_str}:{destination_port}")
                     .parse()
-                    .or_else(|_| format!("{srs_host}:5060").parse())
                     .unwrap_or(FALLBACK_DESTINATION);
 
-                let request_uri = SipUri::new(srs_host.to_string());
+                let mut request_uri = SipUri::new(host_str.to_string());
+                if let Some(port) = port_opt {
+                    request_uri = request_uri.with_port(port);
+                }
+                if bye_transport != Transport::Udp {
+                    request_uri = request_uri.with_param(
+                        "transport".to_string(),
+                        Some(transport_name.to_string()),
+                    );
+                }
                 let branch = format!("z9hG4bK-rec-bye-{}", uuid::Uuid::new_v4());
-                let via = format!("SIP/2.0/UDP {};branch={}", local_addr, branch);
+                let via = format!("SIP/2.0/{} {};branch={}", transport_name, local_addr, branch);
 
                 let mut to_value = format!("<{}>", session.srs_uri);
                 if let Some(ref to_tag) = session.to_tag {
@@ -311,7 +397,7 @@ impl RecordingManager {
                     .content_length(0)
                     .build()
                 {
-                    bye_messages.push((bye, destination, Transport::Udp));
+                    bye_messages.push((bye, destination, bye_transport));
                     debug!(
                         session_id = %session_id,
                         "SIPREC: sending BYE to SRS"
@@ -726,5 +812,144 @@ mod tests {
         let bye_messages = manager.stop_recording("call-1", "10.0.0.1:5060".parse().unwrap());
         assert_eq!(bye_messages.len(), 2);
         assert_eq!(manager.active_count(), 0);
+    }
+
+    #[test]
+    fn start_recording_transport_tcp() {
+        let manager = RecordingManager::new();
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=sendrecv\r\n",
+        );
+
+        let (_, message, destination, transport) = manager.start_recording(
+            "call-1",
+            "sip:10.0.0.5:5080;transport=TCP",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            sdp.as_bytes(),
+            "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+        ).unwrap();
+
+        // Transport should be TCP, not UDP.
+        assert_eq!(transport, Transport::Tcp);
+        // Destination should correctly parse host:port without ;transport=TCP.
+        assert_eq!(destination, "10.0.0.5:5080".parse::<SocketAddr>().unwrap());
+
+        // RURI should be properly formatted (no brackets around IPv4).
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(raw.contains("INVITE sip:10.0.0.5:5080;transport=TCP SIP/2.0"));
+        // Via should use TCP transport.
+        assert!(raw.contains("SIP/2.0/TCP"));
+        assert!(raw.contains("User-Agent: SIPhon"));
+    }
+
+    #[test]
+    fn start_recording_uri_no_transport_param() {
+        let manager = RecordingManager::new();
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=sendrecv\r\n",
+        );
+
+        let (_, message, destination, transport) = manager.start_recording(
+            "call-1",
+            "sip:srs@10.0.0.5:5060",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            sdp.as_bytes(),
+            "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+        ).unwrap();
+
+        // Default transport should be UDP.
+        assert_eq!(transport, Transport::Udp);
+        assert_eq!(destination, "10.0.0.5:5060".parse::<SocketAddr>().unwrap());
+
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        // RURI should not have transport param when UDP.
+        assert!(raw.contains("INVITE sip:10.0.0.5:5060 SIP/2.0"));
+        assert!(raw.contains("SIP/2.0/UDP"));
+    }
+
+    #[test]
+    fn start_recording_uri_default_port() {
+        let manager = RecordingManager::new();
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=sendrecv\r\n",
+        );
+
+        let (_, _, destination, _) = manager.start_recording(
+            "call-1",
+            "sip:10.0.0.5",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            sdp.as_bytes(),
+            "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+        ).unwrap();
+
+        // Should default to port 5060.
+        assert_eq!(destination, "10.0.0.5:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn stop_recording_bye_uses_correct_transport() {
+        let manager = RecordingManager::new();
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=sendrecv\r\n",
+        );
+
+        let (session_id, _, _, _) = manager.start_recording(
+            "call-1",
+            "sip:10.0.0.5:5080;transport=TCP",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            sdp.as_bytes(),
+            "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+        ).unwrap();
+
+        manager.handle_success(&session_id, Some("srs-tag-1".to_string()));
+
+        let bye_messages = manager.stop_recording("call-1", "10.0.0.1:5060".parse().unwrap());
+        assert_eq!(bye_messages.len(), 1);
+
+        let (bye, destination, transport) = &bye_messages[0];
+        assert_eq!(*transport, Transport::Tcp);
+        assert_eq!(*destination, "10.0.0.5:5080".parse::<SocketAddr>().unwrap());
+
+        let bytes = bye.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(raw.contains("SIP/2.0/TCP"));
     }
 }
