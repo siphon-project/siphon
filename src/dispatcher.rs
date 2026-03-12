@@ -6029,8 +6029,10 @@ fn handle_srs_invite(
                 if let Some(recording_dir) = srs_manager.recording_dir(&session_id) {
                     let _ = tokio::fs::create_dir_all(&recording_dir).await;
 
-                    // Build flags with record-path pointing to the session directory.
+                    // Build flags with record-call enabled and record-path pointing
+                    // to the session directory so RTPEngine writes the media files.
                     let mut offer_flags = profile.offer.clone();
+                    offer_flags.record_call = true;
                     offer_flags.record_path = Some(recording_dir.display().to_string());
 
                     match rtpengine_set.offer(&call_id, &from_tag, &sdp_part.body, &offer_flags).await {
