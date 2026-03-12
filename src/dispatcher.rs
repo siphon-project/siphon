@@ -692,6 +692,11 @@ fn handle_request(
                     // ourselves on receiving 200 OK — the A-leg ACK is for our
                     // dialog with the A-leg and must not be relayed.
                     if let Some(internal_id) = state.call_actors.find_by_sip_call_id(cid) {
+                        // Mark A-leg as ACKed — re-INVITEs toward the A-leg are
+                        // now safe to forward (prevents 491 glare).
+                        if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
+                            call.a_leg.initial_acked = true;
+                        }
                         debug!(
                             call_id = %internal_id,
                             "B2BUA: absorbed A-leg ACK for 2xx (B-leg already ACK'd)"
@@ -2612,6 +2617,11 @@ fn sanitize_b2bua_response(
     // the o= address to our advertised address for topology hiding.
     let sdp_addr = state.via_host(&a_leg_transport);
     sanitize_sdp_identity(&mut response.body, &state.sdp_name, Some(&sdp_addr));
+
+    // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
+    if !response.body.is_empty() {
+        response.headers.set("Content-Length", response.body.len().to_string());
+    }
 }
 
 /// Rewrite `o=` and `s=` lines in an SDP body to hide the remote endpoint's
@@ -3778,6 +3788,11 @@ fn b2bua_send_b_leg_invite(
     let sdp_addr = state.via_host(&outbound_transport);
     sanitize_sdp_identity(&mut b_leg_invite.body, &state.sdp_name, Some(&sdp_addr));
 
+    // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
+    if !b_leg_invite.body.is_empty() {
+        b_leg_invite.headers.set("Content-Length", b_leg_invite.body.len().to_string());
+    }
+
     // Register B-leg with call manager
     let b_contact_value = format!(
         "<sip:{}:{};transport={}>",
@@ -3818,6 +3833,14 @@ fn b2bua_send_b_leg_invite(
 
     // Send via pool for TCP/TLS, direct channel for UDP
     send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
+
+    // Increment B-leg local CSeq after sending initial INVITE (CSeq 1 is now used).
+    // Subsequent requests (re-INVITE, BYE) on this leg will use CSeq >= 2.
+    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+        if let Some(b_leg) = call.b_legs.last_mut() {
+            b_leg.dialog.local_cseq += 1;
+        }
+    }
 }
 
 /// Spawn a [`LegActor`] for a B-leg and store its handle in the call.
@@ -3941,7 +3964,7 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, call_state, outbound_credentials, li_record, b_leg_handle_tx) = match state.call_actors.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, call_state, outbound_credentials, li_record, b_leg_handle_tx) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
@@ -3951,11 +3974,12 @@ fn handle_b2bua_response(
             let dialog = matching_b.map(|b| (b.dialog.call_id.clone(), b.dialog.local_tag.clone()));
             let dest = matching_b.map(|b| (b.transport.remote_addr, b.transport.transport));
             let stored_vias = matching_b.map(|b| b.stored_vias.clone()).unwrap_or_default();
+            let stored_cseq = matching_b.and_then(|b| b.stored_cseq.clone());
             let handle_tx = matching_b_idx
                 .and_then(|i| call.b_leg_handles.get(i))
                 .and_then(|h| h.as_ref())
                 .map(|h| h.tx.clone());
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx)
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, stored_cseq, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx)
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -4085,12 +4109,17 @@ fn handle_b2bua_response(
             }
         }
 
-        // Replace Via(s) — restore the originator's Via headers from the
-        // re-INVITE (stored_vias), NOT from the initial INVITE.
-        // Both A→B and B→A use stored_vias captured when the re-INVITE arrived.
+        // Replace Via(s) and CSeq — restore the originator's Via headers and CSeq
+        // from the re-INVITE (stored_vias/stored_cseq), NOT from the initial INVITE.
+        // Both A→B and B→A use stored values captured when the re-INVITE arrived.
         message.headers.remove("Via");
         for via in &b_leg_stored_vias {
             message.headers.add("Via", via.clone());
+        }
+        // Restore originator's CSeq (RFC 3261 §8.2.6.2 — response CSeq MUST
+        // match the request being responded to, which is the originator's re-INVITE).
+        if let Some(ref cseq) = b_leg_stored_cseq {
+            message.headers.set("CSeq", cseq.clone());
         }
 
         sanitize_b2bua_response(message, state, resp_transport);
@@ -4488,6 +4517,9 @@ fn handle_b2bua_response(
 
         // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
         // The B-leg response only carries our Via; the A-leg caller expects its own.
+        // Also restore the A-leg's original CSeq (RFC 3261 §8.2.6.2 — response
+        // CSeq MUST equal the request CSeq). The B-leg response carries the B-leg
+        // CSeq which is in an independent numbering space.
         response.headers.remove("Via");
         if let Some(invite_arc) = &a_leg_invite {
             if let Ok(invite) = invite_arc.lock() {
@@ -4495,6 +4527,9 @@ fn handle_b2bua_response(
                     for via in vias {
                         response.headers.add("Via", via.clone());
                     }
+                }
+                if let Some(cseq) = invite.headers.cseq() {
+                    response.headers.set("CSeq", cseq.clone());
                 }
             }
         }
@@ -4551,6 +4586,15 @@ fn handle_b2bua_response(
                 };
                 send_b2bua_to_bleg(ack, b_transport, b_dest, state);
                 debug!(call_id = %call_id, "B2BUA: sent ACK to B-leg for 200 OK");
+
+                // Mark B-leg as ACKed — re-INVITEs toward this B-leg are now safe.
+                if let Some(idx) = b_leg_index {
+                    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                        if let Some(b_leg) = call.b_legs.get_mut(idx) {
+                            b_leg.initial_acked = true;
+                        }
+                    }
+                }
             }
         }
 
@@ -4674,7 +4718,8 @@ fn handle_b2bua_response(
                 message, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
             );
         }
-        // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
+        // Replace B-leg Via(s) and CSeq with A-leg originals from stored INVITE
+        // (RFC 3261 §8.2.6.2 — response CSeq MUST equal request CSeq).
         message.headers.remove("Via");
         if let Some(invite_arc) = &a_leg_invite {
             if let Ok(invite) = invite_arc.lock() {
@@ -4682,6 +4727,9 @@ fn handle_b2bua_response(
                     for via in vias {
                         message.headers.add("Via", via.clone());
                     }
+                }
+                if let Some(cseq) = invite.headers.cseq() {
+                    message.headers.set("CSeq", cseq.clone());
                 }
             }
         }
@@ -5590,6 +5638,24 @@ fn handle_b2bua_reinvite(
         (a_leg.dialog.remote_contact.clone(), a_leg.dialog.local_contact.clone(), a_leg.dialog.remote_aor_host.clone())
     };
 
+    // Glare prevention: don't forward re-INVITE if target hasn't ACKed initial INVITE.
+    // Responding 491 tells the originator to retry after a random delay (RFC 3261 §14.1).
+    let target_acked = if from_a_leg {
+        winner_b_leg.as_ref().map(|b| b.initial_acked).unwrap_or(false)
+    } else {
+        a_leg.initial_acked
+    };
+    if !target_acked {
+        debug!(
+            call_id = %call_id,
+            from_a_leg = from_a_leg,
+            "B2BUA: rejecting re-INVITE with 491 — target leg not yet ACKed"
+        );
+        let response = build_response(&message, 491, "Request Pending", state.server_header.as_deref());
+        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+        return;
+    }
+
     debug!(
         call_id = %call_id,
         from_a_leg = from_a_leg,
@@ -5692,6 +5758,11 @@ fn handle_b2bua_reinvite(
         let sdp_addr = state.via_host(&transport);
         sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
 
+        // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
+        if !forwarded.body.is_empty() {
+            forwarded.headers.set("Content-Length", forwarded.body.len().to_string());
+        }
+
         // Rewrite RURI to target leg's remote Contact (RFC 3261 §12.2.1.1).
         // In-dialog requests MUST use the remote target from the last 2xx/INVITE.
         if let Some(ref uri_str) = target_remote_contact {
@@ -5728,6 +5799,7 @@ fn handle_b2bua_reinvite(
             },
         );
         reinvite_leg.stored_vias = originator_vias;
+        reinvite_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
         state.call_actors.add_b_leg(&call_id, reinvite_leg);
 
         send_b2bua_to_bleg(forwarded, transport, destination, state);

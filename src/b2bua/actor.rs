@@ -261,6 +261,10 @@ pub struct Leg {
     pub branch: String,
     /// Stored Via headers from re-INVITE originator (for response routing).
     pub stored_vias: Vec<String>,
+    /// Stored CSeq from re-INVITE originator (for response CSeq restoration).
+    pub stored_cseq: Option<String>,
+    /// Whether the initial INVITE on this leg has been ACKed.
+    pub initial_acked: bool,
 }
 
 impl Leg {
@@ -278,6 +282,8 @@ impl Leg {
             transport,
             branch,
             stored_vias: Vec::new(),
+            stored_cseq: None,
+            initial_acked: false,
         }
     }
 
@@ -296,6 +302,8 @@ impl Leg {
             transport,
             branch,
             stored_vias: Vec::new(),
+            stored_cseq: None,
+            initial_acked: false,
         }
     }
 }
