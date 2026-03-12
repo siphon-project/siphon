@@ -687,20 +687,34 @@ fn handle_request(
                         return;
                     }
 
-                    // B2BUA: bridge ACK to the winning B-leg.
-                    // B2BUA: absorb the A-leg's ACK. We already ACK'd the B-leg
-                    // ourselves on receiving 200 OK — the A-leg ACK is for our
-                    // dialog with the A-leg and must not be relayed.
+                    // B2BUA late ACK: absorb A-leg's ACK, then send deferred
+                    // ACK to the winning B-leg. This completes both legs of the
+                    // INVITE transaction simultaneously (RFC 3261 §14.1).
                     if let Some(internal_id) = state.call_actors.find_by_sip_call_id(cid) {
-                        // Mark A-leg as ACKed — re-INVITEs toward the A-leg are
-                        // now safe to forward (prevents 491 glare).
-                        if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
+                        // Take the pending ACK and mark both legs as ACKed
+                        let pending_ack = if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
                             call.a_leg.initial_acked = true;
+                            if let Some(b_leg) = call.winner.and_then(|i| call.b_legs.get_mut(i)) {
+                                b_leg.initial_acked = true;
+                            }
+                            call.pending_b_leg_ack.take()
+                        } else {
+                            None
+                        };
+
+                        // Send the pre-built ACK to B-leg
+                        if let Some((ack, b_transport, b_dest)) = pending_ack {
+                            send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                            debug!(
+                                call_id = %internal_id,
+                                "B2BUA: sent deferred ACK to B-leg (A-leg ACKed)"
+                            );
+                        } else {
+                            debug!(
+                                call_id = %internal_id,
+                                "B2BUA: absorbed A-leg ACK (no pending B-leg ACK)"
+                            );
                         }
-                        debug!(
-                            call_id = %internal_id,
-                            "B2BUA: absorbed A-leg ACK for 2xx (B-leg already ACK'd)"
-                        );
                         return;
                     }
                 }
@@ -752,16 +766,20 @@ fn handle_request(
         "processing request"
     );
 
-    // --- SRS: detect inbound SIPREC INVITEs and BYEs ---
+    // --- SRS: detect inbound SIPREC INVITEs, ACKs, and BYEs ---
     if let Some(ref srs_manager) = state.srs_manager {
         if method == "INVITE" && is_siprec_invite(&message) {
             handle_srs_invite(inbound, message, Arc::clone(srs_manager), state);
             return;
         }
-        if method == "BYE" {
-            let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
-            if let Some(ref call_id) = sip_call_id {
-                if srs_manager.is_srs_session(call_id) {
+        let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
+        if let Some(ref call_id) = sip_call_id {
+            if srs_manager.is_srs_session(call_id) {
+                if method == "ACK" {
+                    debug!(call_id = %call_id, "SRS: absorbed ACK for recording session");
+                    return;
+                }
+                if method == "BYE" {
                     handle_srs_bye(inbound, message, call_id, Arc::clone(srs_manager), state);
                     return;
                 }
@@ -4332,8 +4350,21 @@ fn handle_b2bua_response(
     if (200..300).contains(&status_code) {
         // Absorb 200 OK retransmissions: if the call is already answered,
         // this is a retransmit from the B-leg (it hasn't received our ACK yet).
-        // Re-send ACK to B-leg but don't re-forward or re-fire on_answer.
+        // Only re-ACK if the B-leg has been ACKed (late ACK complete).
+        // If still waiting for A-leg ACK, absorb silently.
         if call_state == CallState::Answered {
+            // Check if B-leg has been ACKed yet (late ACK pattern)
+            let b_leg_acked = b_leg_index
+                .and_then(|idx| state.call_actors.get_call(call_id)
+                    .and_then(|call| call.b_legs.get(idx).map(|b| b.initial_acked)))
+                .unwrap_or(false);
+            if !b_leg_acked {
+                debug!(
+                    call_id = %call_id,
+                    "B2BUA: absorbing 200 OK retransmission (waiting for A-leg ACK)"
+                );
+                return;
+            }
             debug!(
                 call_id = %call_id,
                 "B2BUA: absorbing 200 OK retransmission (already answered)"
@@ -4543,14 +4574,14 @@ fn handle_b2bua_response(
         // Sanitize B-leg headers before forwarding to A-leg
         sanitize_b2bua_response(&mut response, state, a_leg.transport.transport);
 
-        // Send ACK to B-leg immediately — in B2BUA mode we terminate the
-        // B-leg dialog ourselves rather than waiting for the A-leg's ACK.
-        // This stops the B-leg from retransmitting the 200 OK.
+        // Late ACK pattern (RFC 3261 §14.1 compliant): do NOT ACK the B-leg
+        // immediately. Instead, forward the 200 OK to A-leg and wait for A-leg's
+        // ACK before ACKing B-leg. This keeps the B-leg INVITE transaction alive,
+        // preventing the B-leg from sending re-INVITEs before the A-leg has ACKed.
+        // The B-leg will retransmit 200 OK (Timer G) — we absorb those silently
+        // until A-leg ACKs and we send our ACK to B-leg.
         if let Some((b_dest, b_transport)) = b_leg_dest {
             if let Some((ref b_cid, ref _b_ftag)) = b_leg_dialog {
-                // Extract Contact from the 200 OK message directly — stored
-                // remote_contact may be None on the first 200 OK since it's
-                // populated after this extraction point.
                 let ack_uri = message.headers.get("Contact")
                     .or_else(|| message.headers.get("m"))
                     .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
@@ -4561,21 +4592,20 @@ fn handle_b2bua_response(
                         .and_then(|u| parse_uri_standalone(u).ok()))
                     .unwrap_or_else(|| SipUri::new("invalid".to_string()));
                 let transport_str = format!("{}", b_transport).to_uppercase();
-                let via_value = format!(
-                    "SIP/2.0/{} {}:{};branch={}",
-                    transport_str,
-                    state.via_host(&b_transport),
-                    state.via_port(&b_transport),
-                    TransactionKey::generate_branch(),
-                );
                 let cseq_num = message.headers.cseq()
                     .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
                     .unwrap_or_else(|| "1".to_string());
                 let from = message.headers.from().cloned().unwrap_or_default();
                 let to = message.headers.to().cloned().unwrap_or_default();
-                let ack = match SipMessageBuilder::new()
+                if let Ok(ack) = SipMessageBuilder::new()
                     .request(Method::Ack, ack_uri)
-                    .via(via_value)
+                    .via(format!(
+                        "SIP/2.0/{} {}:{};branch={}",
+                        transport_str,
+                        state.via_host(&b_transport),
+                        state.via_port(&b_transport),
+                        TransactionKey::generate_branch(),
+                    ))
                     .from(from.to_string())
                     .to(to.to_string())
                     .call_id(b_cid.clone())
@@ -4584,22 +4614,11 @@ fn handle_b2bua_response(
                     .content_length(0)
                     .build()
                 {
-                    Ok(ack) => ack,
-                    Err(error) => {
-                        error!("B2BUA ACK for 2xx build failed: {error}");
-                        return;
-                    }
-                };
-                send_b2bua_to_bleg(ack, b_transport, b_dest, state);
-                debug!(call_id = %call_id, "B2BUA: sent ACK to B-leg for 200 OK");
-
-                // Mark B-leg as ACKed — re-INVITEs toward this B-leg are now safe.
-                if let Some(idx) = b_leg_index {
+                    // Store the pre-built ACK — will be sent when A-leg ACKs
                     if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                        if let Some(b_leg) = call.b_legs.get_mut(idx) {
-                            b_leg.initial_acked = true;
-                        }
+                        call.pending_b_leg_ack = Some((ack, b_transport, b_dest));
                     }
+                    debug!(call_id = %call_id, "B2BUA: deferred B-leg ACK until A-leg ACKs");
                 }
             }
         }
@@ -6085,14 +6104,19 @@ fn handle_srs_invite(
         );
 
         // Add SDP body (from RTPEngine or echo back original).
-        if let Some(sdp) = answer_sdp {
+        // Sanitize o=/s= lines to hide the SRC's identity (e.g. "FreeSWITCH").
+        let local_ip = state.local_addr.ip().to_string();
+        if let Some(mut sdp) = answer_sdp {
+            sanitize_sdp_identity(&mut sdp, "siphon", Some(&local_ip));
             response_builder = response_builder
                 .header("Content-Type", "application/sdp".to_string())
                 .body(sdp);
         } else if let Some(sdp_part) = sdp_part {
+            let mut sdp = sdp_part.body.clone();
+            sanitize_sdp_identity(&mut sdp, "siphon", Some(&local_ip));
             response_builder = response_builder
                 .header("Content-Type", "application/sdp".to_string())
-                .body(sdp_part.body.clone());
+                .body(sdp);
         } else {
             response_builder = response_builder.content_length(0);
         }

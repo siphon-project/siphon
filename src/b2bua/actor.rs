@@ -480,6 +480,9 @@ pub struct CallActor {
     pub li_record: bool,
     /// When true, copy the A-leg Call-ID to B-leg(s).
     pub preserve_call_id: bool,
+    /// Pre-built ACK for the winning B-leg, deferred until A-leg ACKs (late ACK pattern).
+    /// Contains (ACK message, transport, destination address).
+    pub pending_b_leg_ack: Option<(SipMessage, crate::transport::Transport, std::net::SocketAddr)>,
 }
 
 impl CallActor {
@@ -502,6 +505,7 @@ impl CallActor {
             outbound_credentials: None,
             li_record: false,
             preserve_call_id: false,
+            pending_b_leg_ack: None,
         }
     }
 
@@ -747,7 +751,13 @@ impl CallActorStore {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.add_b_leg(leg);
             self.registry.register_branch(&branch, call_id);
-            self.registry.register_call_id(&sip_call_id, call_id);
+            // Only register Call-ID if not already mapped to this call.
+            // Re-INVITE tracking legs reuse the A-leg or B-leg Call-ID;
+            // re-registering would overwrite the original mapping, and
+            // remove_b_leg would then delete it, breaking BYE routing.
+            if self.registry.lookup_call_id(&sip_call_id).as_deref() != Some(call_id) {
+                self.registry.register_call_id(&sip_call_id, call_id);
+            }
             true
         } else {
             false
@@ -759,7 +769,15 @@ impl CallActorStore {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             if let Some(removed) = call.remove_b_leg(index) {
                 self.registry.remove_branch(&removed.branch);
-                self.registry.remove_call_id(&removed.dialog.call_id);
+                // Only remove Call-ID mapping if no other leg uses it.
+                // Re-INVITE tracking legs share the A-leg or winning B-leg
+                // Call-ID; removing it here would break BYE/in-dialog routing.
+                let cid = &removed.dialog.call_id;
+                let still_used = call.a_leg.dialog.call_id == *cid
+                    || call.b_legs.iter().any(|b| b.dialog.call_id == *cid);
+                if !still_used {
+                    self.registry.remove_call_id(cid);
+                }
             }
         }
     }
