@@ -104,20 +104,12 @@ def handle_request(request):
     if request.method in ("REGISTER", "OPTIONS"):
         return  # handled above
 
-    if request.max_forwards == 0:
-        request.reply(483, "Too Many Hops")
-        return
-
     # In-dialog requests follow the route set.
     if request.in_dialog:
         if request.loose_route():
             request.relay()
         else:
             request.reply(404, "Not Here")
-        return
-
-    if request.method == "CANCEL":
-        request.relay()
         return
 
     # Initial request — find the serving S-CSCF via Cx LIR.

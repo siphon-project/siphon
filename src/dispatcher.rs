@@ -105,6 +105,8 @@ struct DispatcherState {
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     /// SIPREC recording manager (SRC role — sends recordings to external SRS).
     recording_manager: Arc<crate::siprec::RecordingManager>,
+    /// SRS URI from lawful_intercept.siprec config (used when li.record() is called).
+    li_siprec_srs_uri: Option<String>,
     /// SRS — Session Recording Server manager (receives SIPREC INVITEs from external SRCs).
     srs_manager: Option<Arc<crate::srs::SrsManager>>,
     /// IPsec SA manager (None when ipsec is not configured).
@@ -266,6 +268,9 @@ pub async fn run(
         session_timer_config: config.session_timer.clone(),
         registrant_manager,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new()),
+        li_siprec_srs_uri: config.lawful_intercept.as_ref()
+            .and_then(|li| li.siprec.as_ref())
+            .map(|siprec| siprec.srs_uri.clone()),
         srs_manager: config.srs.as_ref()
             .filter(|srs_config| srs_config.enabled)
             .map(|srs_config| Arc::new(crate::srs::SrsManager::new(srs_config.clone()))),
@@ -3481,12 +3486,12 @@ fn handle_b2bua_invite(
     let engine_state = state.engine.state();
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
 
-    let (action, timer_override, credentials, recording_srs, preserve_call_id) = Python::attach(|python| {
+    let (action, timer_override, credentials, li_record, preserve_call_id) = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall: {error}");
-                return (CallAction::None, None, None, None, false);
+                return (CallAction::None, None, None, false, false);
             }
         };
 
@@ -3500,7 +3505,7 @@ fn handle_b2bua_invite(
                             return (CallAction::Reject {
                                 code: 500,
                                 reason: "Script Error".to_string(),
-                            }, None, None, None, false);
+                            }, None, None, false, false);
                         }
                     }
                 }
@@ -3509,7 +3514,7 @@ fn handle_b2bua_invite(
                     return (CallAction::Reject {
                         code: 500,
                         reason: "Script Error".to_string(),
-                    }, None, None, None, false);
+                    }, None, None, false, false);
                 }
             }
         }
@@ -3518,16 +3523,16 @@ fn handle_b2bua_invite(
         let action = borrowed.action().clone();
         let timer_override = borrowed.session_timer_override().cloned();
         let credentials = borrowed.outbound_credentials().map(|(u, p)| (u.to_string(), p.to_string()));
-        let recording_srs = borrowed.record_srs().map(|s| s.to_string());
+        let li_record = borrowed.li_record();
         let preserve_cid = borrowed.preserve_call_id();
-        (action, timer_override, credentials, recording_srs, preserve_cid)
+        (action, timer_override, credentials, li_record, preserve_cid)
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
     state.call_actors.set_a_leg_invite(&call_id, Arc::clone(&message_arc));
 
     // Store per-call overrides from script
-    if timer_override.is_some() || credentials.is_some() || recording_srs.is_some() || preserve_call_id {
+    if timer_override.is_some() || credentials.is_some() || li_record || preserve_call_id {
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
             if let Some(override_config) = timer_override {
                 call.session_timer_override = Some(override_config);
@@ -3535,8 +3540,8 @@ fn handle_b2bua_invite(
             if credentials.is_some() {
                 call.outbound_credentials = credentials;
             }
-            if recording_srs.is_some() {
-                call.recording_srs = recording_srs;
+            if li_record {
+                call.li_record = true;
             }
             call.preserve_call_id = preserve_call_id;
         }
@@ -3936,7 +3941,7 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, call_state, outbound_credentials, recording_srs, b_leg_handle_tx) = match state.call_actors.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, call_state, outbound_credentials, li_record, b_leg_handle_tx) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
@@ -3950,7 +3955,7 @@ fn handle_b2bua_response(
                 .and_then(|i| call.b_leg_handles.get(i))
                 .and_then(|h| h.as_ref())
                 .map(|h| h.tx.clone());
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, call.state.clone(), call.outbound_credentials.clone(), call.recording_srs.clone(), handle_tx)
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx)
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -4363,7 +4368,6 @@ fn handle_b2bua_response(
         // Invoke @b2bua.on_answer handlers with (PyCall, PyReply)
         let engine_state = state.engine.state();
         let handlers = engine_state.handlers_for(&HandlerKind::B2buaAnswer);
-        let mut answer_recording_srs: Option<String> = None;
         if !handlers.is_empty() {
             if let Some(invite_arc) = &a_leg_invite {
                 let py_call = PyCall::new(
@@ -4374,19 +4378,19 @@ fn handle_b2bua_response(
                 let py_reply = PyReply::new(Arc::clone(&response_arc))
                     .with_a_leg(Arc::clone(invite_arc));
 
-                answer_recording_srs = Python::attach(|python| {
+                Python::attach(|python| {
                     let call_obj = match Py::new(python, py_call) {
                         Ok(obj) => obj,
                         Err(error) => {
                             error!("failed to create PyCall for on_answer: {error}");
-                            return None;
+                            return;
                         }
                     };
                     let reply_obj = match Py::new(python, py_reply) {
                         Ok(obj) => obj,
                         Err(error) => {
                             error!("failed to create PyReply for on_answer: {error}");
-                            return None;
+                            return;
                         }
                     };
 
@@ -4405,19 +4409,13 @@ fn handle_b2bua_response(
                             }
                         }
                     }
-
-                    // Extract record_srs set by on_answer handler (e.g. call.record("sip:srs@..."))
-                    let borrowed = call_obj.borrow(python);
-                    let result = borrowed.record_srs().map(|s| s.to_string());
-                    drop(borrowed);
-                    result
                 });
             } else {
                 warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_answer");
             }
         }
-        // Merge: on_answer recording takes priority, fall back to on_invite recording
-        let effective_recording_srs = answer_recording_srs.or(recording_srs);
+        // Resolve SRS URI from config when li.record() was called
+        let li_srs_uri = if li_record { state.li_siprec_srs_uri.as_deref() } else { None };
 
         // RFC 4028: Activate session timer from negotiated 200 OK headers
         if let Some(ref timer_config) = state.session_timer_config {
@@ -4568,7 +4566,7 @@ fn handle_b2bua_response(
         );
 
         // SIPREC: start recording if configured for this call
-        if let Some(srs_uri) = &effective_recording_srs {
+        if let Some(srs_uri) = li_srs_uri {
             let sdp = &sdp_body;
             if let Some(invite_arc) = &a_leg_invite {
                 let Ok(invite) = invite_arc.lock() else {
@@ -4586,6 +4584,7 @@ fn handle_b2bua_response(
                 if let Some((_session_id, rec_invite, destination, transport)) =
                     state.recording_manager.start_recording(
                         call_id, srs_uri, &caller_uri, &callee_uri, sdp, state.local_addr,
+                        None, None,
                     )
                 {
                     let data = Bytes::from(rec_invite.to_bytes());

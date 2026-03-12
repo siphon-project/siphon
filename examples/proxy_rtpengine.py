@@ -11,10 +11,6 @@ DOMAIN = "siphon.test"
 
 @proxy.on_request
 async def route(request):
-    if request.max_forwards == 0:
-        request.reply(483, "Too Many Hops")
-        return
-
     # Local OPTIONS ping
     if request.method == "OPTIONS" and request.ruri.is_local and not request.ruri.user:
         request.reply(200, "OK")
@@ -34,10 +30,6 @@ async def route(request):
             request.relay()
         else:
             request.reply(404, "Not Here")
-        return
-
-    if request.method == "CANCEL":
-        request.relay()
         return
 
     if request.method == "REGISTER":

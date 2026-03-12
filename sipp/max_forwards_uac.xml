@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Max-Forwards enforcement test (RFC 3261 §16.3):
+  Send INVITE with Max-Forwards: 0, expect 483 Too Many Hops.
+
+  The proxy MUST reject requests with Max-Forwards == 0 before any script
+  processing. This is enforced by the Rust dispatcher, not by Python scripts.
+-->
+<scenario name="Max-Forwards enforcement">
+
+  <!-- Send INVITE with Max-Forwards: 0 -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=z9hG4bK-[pid]-[call_number]-mf0
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 0
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Expect 483 Too Many Hops -->
+  <recv response="483" rtd="true" />
+
+  <!-- ACK the error response -->
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=z9hG4bK-[pid]-[call_number]-mf0
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

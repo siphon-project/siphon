@@ -180,10 +180,6 @@ def handle_request(request):
     if request.method in ("REGISTER", "SUBSCRIBE", "OPTIONS"):
         return  # handled above
 
-    if request.max_forwards == 0:
-        request.reply(483, "Too Many Hops")
-        return
-
     # In-dialog requests (re-INVITE, BYE, UPDATE, PRACK, etc.)
     if request.in_dialog:
         if request.loose_route():
@@ -191,10 +187,6 @@ def handle_request(request):
             request.relay()
         else:
             request.reply(404, "Not Here")
-        return
-
-    if request.method == "CANCEL":
-        request.relay()
         return
 
     # --- Originating / Terminating call processing ---

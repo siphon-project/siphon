@@ -1265,18 +1265,34 @@ class MockLi:
             self._events.append(("intercept", target))
         return True
 
-    def record(self, request: Any) -> bool:
-        """Start SIPREC recording for a request (without full LI).
+    def record(self, target: Any) -> bool:
+        """Start SIPREC recording for a request or call.
+
+        Accepts either a ``Request`` (proxy mode) or ``Call`` (B2BUA mode).
+        In B2BUA mode, the dispatcher will start SIPREC recording on answer
+        using the SRS URI from ``lawful_intercept.siprec.srs_uri`` config.
 
         Args:
-            request: The SIP request object.
+            target: A ``Request`` or ``Call`` object.
 
         Returns:
             ``True`` if recording was initiated.
+
+        Example::
+
+            @b2bua.on_invite
+            def on_invite(call):
+                li.record(call)       # B2BUA mode
+                call.dial("sip:bob@example.com")
+
+            @proxy.on_request("INVITE")
+            def on_invite(request):
+                li.record(request)    # proxy mode
+                request.relay()
         """
         if not self._enabled:
             return False
-        call_id = getattr(request, "call_id", "unknown")
+        call_id = getattr(target, "call_id", "unknown")
         self._events.append(("record", call_id))
         return True
 
@@ -1303,18 +1319,20 @@ class MockLi:
             self._events.append(("stop_intercept", target))
         return True
 
-    def stop_recording(self, request: Any) -> bool:
-        """Stop SIPREC recording for a request.
+    def stop_recording(self, target: Any) -> bool:
+        """Stop SIPREC recording for a request or call.
+
+        Accepts either a ``Request`` or ``Call`` object.
 
         Args:
-            request: The SIP request object.
+            target: A ``Request`` or ``Call`` object.
 
         Returns:
             ``True`` if a stop event was emitted.
         """
         if not self._enabled:
             return False
-        call_id = getattr(request, "call_id", "unknown")
+        call_id = getattr(target, "call_id", "unknown")
         self._events.append(("stop_recording", call_id))
         return True
 

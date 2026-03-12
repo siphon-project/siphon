@@ -71,6 +71,10 @@ pub struct RecordingSession {
     pub from_tag: String,
     /// To-tag from the SRS 200 OK (set after answer).
     pub to_tag: Option<String>,
+    /// Original call's From-tag (for RTPEngine subscribe correlation).
+    pub original_from_tag: Option<String>,
+    /// Original call's To-tag (for RTPEngine subscribe correlation).
+    pub original_to_tag: Option<String>,
 }
 
 /// Manages all active recording sessions.
@@ -113,6 +117,8 @@ impl RecordingManager {
         callee_uri: &str,
         sdp: &[u8],
         local_addr: SocketAddr,
+        recording_sdp_override: Option<&[u8]>,
+        original_tags: Option<(&str, &str)>,
     ) -> Option<(String, SipMessage, SocketAddr, Transport)> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let sip_call_id = format!("siprec-{}", uuid::Uuid::new_v4());
@@ -144,8 +150,11 @@ impl RecordingManager {
             callee_uri,
         );
 
-        // Build recvonly SDP from the call's SDP
-        let recording_sdp = build_recording_sdp(sdp, local_addr);
+        // Use override SDP (from RTPEngine subscribe) or build recvonly SDP
+        let recording_sdp = match recording_sdp_override {
+            Some(override_sdp) => override_sdp.to_vec(),
+            None => build_recording_sdp(sdp, local_addr),
+        };
 
         // Build multipart/mixed body
         let boundary = format!("srec-{}", &session_id[..8]);
@@ -186,6 +195,8 @@ impl RecordingManager {
             cseq: AtomicU32::new(cseq + 1),
             from_tag,
             to_tag: None,
+            original_from_tag: original_tags.map(|(ft, _)| ft.to_string()),
+            original_to_tag: original_tags.map(|(_, tt)| tt.to_string()),
         };
 
         self.sessions.insert(session_id.clone(), session);
@@ -229,6 +240,16 @@ impl RecordingManager {
                 "SIPREC: recording failed"
             );
         }
+    }
+
+    /// Get the original call tags for a recording session (for RTPEngine subscribe).
+    pub fn original_call_tags(&self, session_id: &str) -> Option<(String, String)> {
+        self.sessions.get(session_id).and_then(|session| {
+            match (&session.original_from_tag, &session.original_to_tag) {
+                (Some(from_tag), Some(to_tag)) => Some((from_tag.clone(), to_tag.clone())),
+                _ => None,
+            }
+        })
     }
 
     /// Stop recording a call by sending BYE to SRS.
@@ -439,6 +460,8 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
         );
 
         assert!(result.is_some());
@@ -483,6 +506,8 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
         ).unwrap();
 
         manager.handle_success(&session_id, Some("srs-tag-1".to_string()));
@@ -513,6 +538,8 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
         ).unwrap();
 
         manager.handle_failure(&session_id, 503);
@@ -541,6 +568,8 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
         ).unwrap();
 
         manager.handle_success(&session_id, Some("srs-tag-1".to_string()));
@@ -587,6 +616,8 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
         ).unwrap();
 
         // Extract branch from the message
@@ -668,6 +699,8 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
         ).unwrap();
 
         let (session_id_2, _, _, _) = manager.start_recording(
@@ -677,6 +710,8 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
         ).unwrap();
 
         assert_ne!(session_id_1, session_id_2);

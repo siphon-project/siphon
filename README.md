@@ -401,6 +401,20 @@ log.info("Processing call from " + request.from_uri.user)
 
 Both sync and async handlers are supported — async is auto-detected at registration time.
 
+### What the framework handles automatically
+
+The Rust core enforces these before any Python script runs — **do not duplicate them in scripts**:
+
+| Behavior | RFC | What happens |
+|----------|-----|-------------|
+| **Max-Forwards == 0** | RFC 3261 §16.3 | Automatic `483 Too Many Hops` |
+| **Max-Forwards decrement** | RFC 3261 §16.6 | Decremented on `relay()` / `fork()` (default 70 if absent) |
+| **CANCEL matching** | RFC 3261 §9.2 | Forwarded to the INVITE's relay target — never reaches Python |
+| **Retransmission absorption** | RFC 3261 §17 | Handled by the transaction layer |
+| **ACK for non-2xx** | RFC 3261 §17.2.1 | Absorbed by the server transaction |
+
+Scripts only need to handle policy decisions: authentication, routing, header manipulation, and request disposition (`reply()`, `relay()`, `fork()`).
+
 ### Included example scripts
 
 | Script | Role | Description |

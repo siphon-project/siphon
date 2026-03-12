@@ -127,10 +127,6 @@ def handle_request(request):
     if request.method in ("REGISTER", "OPTIONS", "SUBSCRIBE", "PUBLISH"):
         return  # handled above
 
-    if request.max_forwards == 0:
-        request.reply(483, "Too Many Hops")
-        return
-
     # In-dialog requests (re-INVITE, BYE, UPDATE, PRACK, etc.)
     if request.in_dialog:
         if not request.loose_route():
@@ -150,10 +146,6 @@ def handle_request(request):
                 log.info(f"Rx STR for call {request.call_id}: "
                          f"result_code={result}")
 
-        request.relay()
-        return
-
-    if request.method == "CANCEL":
         request.relay()
         return
 

@@ -139,8 +139,8 @@ pub struct PyCall {
     refer_replaces_info: Option<crate::sip::headers::refer::Replaces>,
     /// Credentials for B-leg digest auth retry (set by Python script).
     outbound_credentials: Option<(String, String)>,
-    /// SRS URI for SIPREC recording (set by Python script).
-    record_srs_uri: Option<String>,
+    /// Whether li.record() was called for this call.
+    li_record_flag: bool,
     /// When true, copy the A-leg Call-ID to B-leg instead of generating a new one.
     preserve_call_id_flag: bool,
 }
@@ -162,7 +162,7 @@ impl PyCall {
             refer_to_uri: None,
             refer_replaces_info: None,
             outbound_credentials: None,
-            record_srs_uri: None,
+            li_record_flag: false,
             preserve_call_id_flag: false,
         }
     }
@@ -199,9 +199,71 @@ impl PyCall {
             .map(|(user, password)| (user.as_str(), password.as_str()))
     }
 
-    /// Get the SRS URI for SIPREC recording.
-    pub fn record_srs(&self) -> Option<&str> {
-        self.record_srs_uri.as_deref()
+    /// Whether li.record() was called for this call.
+    pub fn li_record(&self) -> bool {
+        self.li_record_flag
+    }
+
+    /// Set the li_record flag (called by li.record(call)).
+    pub fn set_li_record(&mut self) {
+        self.li_record_flag = true;
+    }
+
+    // --- LI helper accessors (Rust-side, no PyResult) ---
+
+    /// SIP method for LI (always INVITE for B2BUA calls).
+    pub fn li_method(&self) -> String {
+        "INVITE".to_string()
+    }
+
+    /// Call-ID for LI correlation.
+    pub fn li_call_id(&self) -> String {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        message.headers.call_id().cloned().unwrap_or_default()
+    }
+
+    /// From URI for LI target matching.
+    pub fn li_from_uri(&self) -> Option<String> {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        message.headers.from()
+            .and_then(|v| crate::sip::headers::nameaddr::NameAddr::parse(v).ok())
+            .map(|na| na.uri.to_string())
+    }
+
+    /// To URI for LI target matching.
+    pub fn li_to_uri(&self) -> Option<String> {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        message.headers.to()
+            .and_then(|v| crate::sip::headers::nameaddr::NameAddr::parse(v).ok())
+            .map(|na| na.uri.to_string())
+    }
+
+    /// Request-URI for LI target matching.
+    pub fn li_ruri(&self) -> Option<String> {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match &message.start_line {
+            crate::sip::message::StartLine::Request(request_line) => {
+                Some(request_line.request_uri.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Source IP for LI target matching.
+    pub fn li_source_ip(&self) -> Option<std::net::IpAddr> {
+        self.source_ip.parse().ok()
     }
 
     /// Whether the script wants to preserve the A-leg Call-ID on the B-leg.
@@ -469,19 +531,6 @@ impl PyCall {
     ///   call.set_credentials("alice", "secret123")
     fn set_credentials(&mut self, username: &str, password: &str) {
         self.outbound_credentials = Some((username.to_string(), password.to_string()));
-    }
-
-    /// Start SIPREC recording to a Session Recording Server.
-    ///
-    /// Usage in Python:
-    ///   call.record("sip:srs@recorder.example.com")
-    fn record(&mut self, srs_uri: &str) {
-        self.record_srs_uri = Some(srs_uri.to_string());
-    }
-
-    /// Stop SIPREC recording.
-    fn stop_recording(&mut self) {
-        self.record_srs_uri = None;
     }
 
     /// Copy the A-leg Call-ID to the B-leg instead of generating a new one.

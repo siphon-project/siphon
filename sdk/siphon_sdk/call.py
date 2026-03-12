@@ -274,32 +274,6 @@ class Call:
             extras={"expires": expires, "min_se": min_se, "refresher": refresher},
         ))
 
-    def record(self, srs_uri: str) -> None:
-        """Start SIPREC recording (RFC 7866) for this call.
-
-        Args:
-            srs_uri: URI of the Session Recording Server.
-
-        Example::
-
-            @b2bua.on_answer
-            def call_answered(call):
-                call.record("sip:recorder@srs.example.com")
-        """
-        self._actions.append(Action(kind="record", extras={"srs_uri": srs_uri}))
-
-    def stop_recording(self) -> None:
-        """Stop SIPREC recording for this call.
-
-        Example::
-
-            @b2bua.on_bye
-            def call_ended(call, initiator):
-                call.stop_recording()
-                call.terminate()
-        """
-        self._actions.append(Action(kind="stop_recording"))
-
     def keep_call_id(self) -> None:
         """Copy the A-leg Call-ID to the B-leg instead of generating a new one.
 

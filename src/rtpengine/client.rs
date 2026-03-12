@@ -129,6 +129,74 @@ impl RtpEngineClient {
         self.send_command(BencodeValue::dict(pairs)).await
     }
 
+    /// Send a `subscribe request` command for SIPREC media forking.
+    ///
+    /// Creates a subscription on an existing call's media, returning SDP
+    /// for the recording leg. Used to fork RTP to a Session Recording Server.
+    pub async fn subscribe_request(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+        sdp: Option<&[u8]>,
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        let mut pairs: Vec<(&str, BencodeValue)> = vec![
+            ("command", BencodeValue::string("subscribe request")),
+            ("call-id", BencodeValue::string(call_id)),
+            ("from-tag", BencodeValue::string(from_tag)),
+            ("to-tag", BencodeValue::string(to_tag)),
+        ];
+        if let Some(sdp_bytes) = sdp {
+            pairs.push(("sdp", BencodeValue::String(sdp_bytes.to_vec())));
+        }
+        pairs.extend(flags.to_bencode_pairs());
+
+        let response = self.send_command(BencodeValue::dict(pairs)).await?;
+        self.extract_sdp_response(&response)
+    }
+
+    /// Send a `subscribe answer` command to complete SIPREC media subscription.
+    pub async fn subscribe_answer(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+        sdp: &[u8],
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        let mut pairs: Vec<(&str, BencodeValue)> = vec![
+            ("command", BencodeValue::string("subscribe answer")),
+            ("call-id", BencodeValue::string(call_id)),
+            ("from-tag", BencodeValue::string(from_tag)),
+            ("to-tag", BencodeValue::string(to_tag)),
+            ("sdp", BencodeValue::String(sdp.to_vec())),
+        ];
+        pairs.extend(flags.to_bencode_pairs());
+
+        let response = self.send_command(BencodeValue::dict(pairs)).await?;
+        self.extract_sdp_response(&response)
+    }
+
+    /// Send an `unsubscribe` command to stop SIPREC media forking.
+    pub async fn unsubscribe(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        let pairs: Vec<(&str, BencodeValue)> = vec![
+            ("command", BencodeValue::string("unsubscribe")),
+            ("call-id", BencodeValue::string(call_id)),
+            ("from-tag", BencodeValue::string(from_tag)),
+            ("to-tag", BencodeValue::string(to_tag)),
+        ];
+
+        let response = self.send_command(BencodeValue::dict(pairs)).await?;
+        self.check_result(&response)?;
+        Ok(())
+    }
+
     /// Send a `ping` command — health check.
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
         let pairs: Vec<(&str, BencodeValue)> = vec![
@@ -435,6 +503,43 @@ impl RtpEngineSet {
         client.query(call_id, from_tag).await
     }
 
+    /// Send a `subscribe request` command to the affinity-bound instance.
+    pub async fn subscribe_request(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+        sdp: Option<&[u8]>,
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        let client = self.select(call_id);
+        client.subscribe_request(call_id, from_tag, to_tag, sdp, flags).await
+    }
+
+    /// Send a `subscribe answer` command to the affinity-bound instance.
+    pub async fn subscribe_answer(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+        sdp: &[u8],
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        let client = self.select(call_id);
+        client.subscribe_answer(call_id, from_tag, to_tag, sdp, flags).await
+    }
+
+    /// Send an `unsubscribe` command to the affinity-bound instance.
+    pub async fn unsubscribe(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        let client = self.select(call_id);
+        client.unsubscribe(call_id, from_tag, to_tag).await
+    }
+
     /// Ping all instances. Returns Ok only if all respond.
     pub async fn ping_all(&self) -> Result<(), RtpEngineError> {
         for client in &self.clients {
@@ -728,7 +833,7 @@ mod tests {
                             let mut pairs = vec![
                                 ("result", BencodeValue::string("ok")),
                             ];
-                            if cmd_name == "offer" || cmd_name == "answer" {
+                            if cmd_name == "offer" || cmd_name == "answer" || cmd_name == "subscribe request" || cmd_name == "subscribe answer" {
                                 pairs.push(("sdp", BencodeValue::string("v=0\r\nc=IN IP4 203.0.113.1\r\n")));
                             }
                             BencodeValue::dict(pairs)
@@ -797,5 +902,97 @@ mod tests {
     async fn set_empty_instances_rejected() {
         let result = RtpEngineSet::new(vec![]).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn subscribe_request_roundtrip_with_mock() {
+        let mock_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buffer = BytesMut::zeroed(65535);
+            if let Ok((size, source)) = mock_socket.recv_from(&mut buffer).await {
+                let data = &buffer[..size];
+                let space = data.iter().position(|&b| b == b' ').unwrap();
+                let cookie = std::str::from_utf8(&data[..space]).unwrap();
+
+                let payload = &data[space + 1..];
+                let command = bencode::decode_full_dict(payload).unwrap();
+                assert_eq!(command.dict_get_str("command"), Some("subscribe request"));
+                assert_eq!(command.dict_get_str("call-id"), Some("call-1"));
+                assert_eq!(command.dict_get_str("from-tag"), Some("tag-a"));
+                assert_eq!(command.dict_get_str("to-tag"), Some("tag-b"));
+
+                let response = BencodeValue::dict(vec![
+                    ("result", BencodeValue::string("ok")),
+                    ("sdp", BencodeValue::string("v=0\r\nc=IN IP4 203.0.113.1\r\nm=audio 40000 RTP/AVP 0\r\n")),
+                ]);
+                let encoded = bencode::encode(&response);
+                let mut reply = Vec::new();
+                reply.extend_from_slice(cookie.as_bytes());
+                reply.push(b' ');
+                reply.extend_from_slice(&encoded);
+                mock_socket.send_to(&reply, source).await.unwrap();
+            }
+        });
+
+        let client = RtpEngineClient::new(mock_addr, 2000).await.unwrap();
+        let flags = NgFlags::default();
+        let result = client
+            .subscribe_request("call-1", "tag-a", "tag-b", None, &flags)
+            .await
+            .unwrap();
+        let result_str = std::str::from_utf8(&result).unwrap();
+        assert!(result_str.contains("203.0.113.1"));
+        assert!(result_str.contains("40000"));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_roundtrip_with_mock() {
+        let mock_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buffer = BytesMut::zeroed(65535);
+            if let Ok((size, source)) = mock_socket.recv_from(&mut buffer).await {
+                let data = &buffer[..size];
+                let space = data.iter().position(|&b| b == b' ').unwrap();
+                let cookie = std::str::from_utf8(&data[..space]).unwrap();
+
+                let payload = &data[space + 1..];
+                let command = bencode::decode_full_dict(payload).unwrap();
+                assert_eq!(command.dict_get_str("command"), Some("unsubscribe"));
+
+                let response = BencodeValue::dict(vec![
+                    ("result", BencodeValue::string("ok")),
+                ]);
+                let encoded = bencode::encode(&response);
+                let mut reply = Vec::new();
+                reply.extend_from_slice(cookie.as_bytes());
+                reply.push(b' ');
+                reply.extend_from_slice(&encoded);
+                mock_socket.send_to(&reply, source).await.unwrap();
+            }
+        });
+
+        let client = RtpEngineClient::new(mock_addr, 2000).await.unwrap();
+        client.unsubscribe("call-1", "tag-a", "tag-b").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_subscribe_uses_affinity() {
+        let addr = spawn_mock_rtpengine().await;
+        let set = RtpEngineSet::new(vec![(addr, 2000, 1)]).await.unwrap();
+        let flags = NgFlags::default();
+
+        // First offer to bind affinity.
+        set.offer("call-sub", "tag-a", b"v=0\r\n", &flags).await.unwrap();
+
+        // subscribe_request uses the same instance via affinity.
+        let result = set
+            .subscribe_request("call-sub", "tag-a", "tag-b", None, &flags)
+            .await
+            .unwrap();
+        assert!(!result.is_empty());
     }
 }

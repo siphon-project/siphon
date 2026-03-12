@@ -5,7 +5,6 @@ Handles:
 - OPTIONS keepalive (local)
 - REGISTER with digest auth
 - In-dialog sequential requests (loose routing)
-- CANCEL
 - INVITE / other requests via location lookup with parallel forking
 """
 from siphon import proxy, registrar, auth, log, presence
@@ -15,10 +14,6 @@ DOMAIN = "example.com"
 
 @proxy.on_request
 def route(request):
-    if request.max_forwards == 0:
-        request.reply(483, "Too Many Hops")
-        return
-
     # Local OPTIONS ping (e.g. from SBC/gateway keepalive)
     if request.method == "OPTIONS" and request.ruri.is_local and not request.ruri.user:
         request.reply(200, "OK")
@@ -30,11 +25,6 @@ def route(request):
             request.relay()
         else:
             request.reply(404, "Not Here")
-        return
-
-    # CANCEL is matched to its transaction by the core
-    if request.method == "CANCEL":
-        request.relay()
         return
 
     if request.method == "REGISTER":

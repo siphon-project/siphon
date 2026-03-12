@@ -468,8 +468,8 @@ pub struct CallActor {
     pub transfer: Option<super::transfer::TransferContext>,
     /// Outbound digest credentials for B-leg 401/407 retry.
     pub outbound_credentials: Option<(String, String)>,
-    /// SIPREC recording session URI.
-    pub recording_srs: Option<String>,
+    /// Whether li.record() was called — SIPREC recording via config SRS URI.
+    pub li_record: bool,
     /// When true, copy the A-leg Call-ID to B-leg(s).
     pub preserve_call_id: bool,
 }
@@ -492,7 +492,7 @@ impl CallActor {
             session_timer_override: None,
             transfer: None,
             outbound_credentials: None,
-            recording_srs: None,
+            li_record: false,
             preserve_call_id: false,
         }
     }

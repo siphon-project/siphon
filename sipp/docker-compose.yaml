@@ -361,6 +361,33 @@ services:
     profiles:
       - auth
 
+  # ── Max-Forwards enforcement test ─────────────────────────────────────────
+  # Sends INVITE with Max-Forwards: 0, expects 483 Too Many Hops.
+  # Verifies RFC 3261 §16.3 enforcement at the dispatcher level (no UAS needed).
+
+  sipp-max-forwards:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.33
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/max_forwards_uac.xml
+      - -m
+      - "5"
+      - -l
+      - "1"
+      - -timeout
+      - "10"
+      - -trace_err
+
   # ── RTPEngine proxy test ──────────────────────────────────────────────────
   # Tests media anchoring through a mock RTPEngine via proxy script.
   # Requires the "rtpengine" profile.

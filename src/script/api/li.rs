@@ -7,8 +7,10 @@
 //! if li.is_target(request):
 //!     li.intercept(request)    # emit IRI + start X3/SIPREC
 //!
-//! li.record(request)           # start SIPREC recording
+//! li.record(request)           # start SIPREC recording (proxy mode)
+//! li.record(call)              # start SIPREC recording (B2BUA mode)
 //! li.stop_recording(request)   # stop SIPREC for this call
+//! li.stop_recording(call)      # stop SIPREC for this call
 //! ```
 
 use pyo3::prelude::*;
@@ -25,6 +27,62 @@ pub struct PyLiNamespace {
 impl PyLiNamespace {
     pub fn new(manager: LiManager) -> Self {
         Self { manager }
+    }
+
+    /// Emit an IRI-Report event for recording start.
+    fn emit_recording_iri(
+        &self,
+        call_id: String,
+        method: String,
+        from_uri: Option<String>,
+        to_uri: Option<String>,
+        ruri: Option<String>,
+        source_ip: Option<std::net::IpAddr>,
+    ) {
+        let event = IriEvent {
+            liid: format!("SIPREC-{call_id}"),
+            correlation_id: call_id,
+            event_type: IriEventType::Report,
+            timestamp: std::time::SystemTime::now(),
+            sip_method: method,
+            status_code: None,
+            from_uri: from_uri.unwrap_or_default(),
+            to_uri: to_uri.unwrap_or_default(),
+            request_uri: ruri,
+            source_ip,
+            destination_ip: None,
+            delivery_type: DeliveryType::IriAndCc,
+            raw_message: None,
+        };
+        self.manager.emit_iri(event);
+    }
+
+    /// Emit an IRI-End event for recording stop.
+    fn emit_stop_recording_iri(
+        &self,
+        call_id: String,
+        method: String,
+        from_uri: Option<String>,
+        to_uri: Option<String>,
+        ruri: Option<String>,
+        source_ip: Option<std::net::IpAddr>,
+    ) {
+        let event = IriEvent {
+            liid: format!("SIPREC-{call_id}"),
+            correlation_id: call_id,
+            event_type: IriEventType::End,
+            timestamp: std::time::SystemTime::now(),
+            sip_method: method,
+            status_code: None,
+            from_uri: from_uri.unwrap_or_default(),
+            to_uri: to_uri.unwrap_or_default(),
+            request_uri: ruri,
+            source_ip,
+            destination_ip: None,
+            delivery_type: DeliveryType::IriAndCc,
+            raw_message: None,
+        };
+        self.manager.emit_iri(event);
     }
 }
 
@@ -104,36 +162,50 @@ impl PyLiNamespace {
         true
     }
 
-    /// Start SIPREC recording for a request (without full LI).
+    /// Start SIPREC recording for a request or call.
+    ///
+    /// Accepts either a Request (proxy mode) or Call (B2BUA mode).
+    /// In B2BUA mode, sets the li_record flag on the call so that the
+    /// dispatcher will start SIPREC recording on answer.
     ///
     /// Args:
-    ///     request: The SIP request object.
+    ///     target: A Request or Call object.
     ///
     /// Returns:
     ///     True if recording was initiated.
-    fn record(&self, request: &super::request::PyRequest) -> bool {
+    fn record(&self, target: &Bound<'_, PyAny>) -> PyResult<bool> {
         if !self.manager.is_enabled() {
-            return false;
+            return Ok(false);
         }
 
-        // Emit IRI-Report to signal recording start (even without X1 target).
-        let event = IriEvent {
-            liid: format!("SIPREC-{}", request.li_call_id()),
-            correlation_id: request.li_call_id(),
-            event_type: IriEventType::Report,
-            timestamp: std::time::SystemTime::now(),
-            sip_method: request.li_method(),
-            status_code: None,
-            from_uri: request.li_from_uri().unwrap_or_default(),
-            to_uri: request.li_to_uri().unwrap_or_default(),
-            request_uri: request.li_ruri(),
-            source_ip: request.li_source_ip(),
-            destination_ip: None,
-            delivery_type: DeliveryType::IriAndCc,
-            raw_message: None,
-        };
-        self.manager.emit_iri(event);
-        true
+        // Try PyCall first (B2BUA mode).
+        if let Ok(mut call) = target.cast::<super::call::PyCall>().map(|c| c.borrow_mut()) {
+            let call_id = call.li_call_id();
+            let from_uri = call.li_from_uri();
+            let to_uri = call.li_to_uri();
+            let ruri = call.li_ruri();
+            let source_ip = call.li_source_ip();
+            call.set_li_record();
+            self.emit_recording_iri(call_id, "INVITE".to_string(), from_uri, to_uri, ruri, source_ip);
+            return Ok(true);
+        }
+
+        // Try PyRequest (proxy mode).
+        if let Ok(request) = target.cast::<super::request::PyRequest>().map(|r| r.borrow()) {
+            self.emit_recording_iri(
+                request.li_call_id(),
+                request.li_method(),
+                request.li_from_uri(),
+                request.li_to_uri(),
+                request.li_ruri(),
+                request.li_source_ip(),
+            );
+            return Ok(true);
+        }
+
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "record() expects a Request or Call object",
+        ))
     }
 
     /// Stop interception for a request.
@@ -180,34 +252,49 @@ impl PyLiNamespace {
         true
     }
 
-    /// Stop SIPREC recording for a request.
+    /// Stop SIPREC recording for a request or call.
+    ///
+    /// Accepts either a Request or Call object.
     ///
     /// Args:
-    ///     request: The SIP request object.
+    ///     target: A Request or Call object.
     ///
     /// Returns:
     ///     True if a stop event was emitted.
-    fn stop_recording(&self, request: &super::request::PyRequest) -> bool {
+    fn stop_recording(&self, target: &Bound<'_, PyAny>) -> PyResult<bool> {
         if !self.manager.is_enabled() {
-            return false;
+            return Ok(false);
         }
-        let event = IriEvent {
-            liid: format!("SIPREC-{}", request.li_call_id()),
-            correlation_id: request.li_call_id(),
-            event_type: IriEventType::End,
-            timestamp: std::time::SystemTime::now(),
-            sip_method: request.li_method(),
-            status_code: None,
-            from_uri: request.li_from_uri().unwrap_or_default(),
-            to_uri: request.li_to_uri().unwrap_or_default(),
-            request_uri: request.li_ruri(),
-            source_ip: request.li_source_ip(),
-            destination_ip: None,
-            delivery_type: DeliveryType::IriAndCc,
-            raw_message: None,
-        };
-        self.manager.emit_iri(event);
-        true
+
+        // Try PyCall first.
+        if let Ok(call) = target.cast::<super::call::PyCall>().map(|c| c.borrow()) {
+            self.emit_stop_recording_iri(
+                call.li_call_id(),
+                "BYE".to_string(),
+                call.li_from_uri(),
+                call.li_to_uri(),
+                call.li_ruri(),
+                call.li_source_ip(),
+            );
+            return Ok(true);
+        }
+
+        // Try PyRequest.
+        if let Ok(request) = target.cast::<super::request::PyRequest>().map(|r| r.borrow()) {
+            self.emit_stop_recording_iri(
+                request.li_call_id(),
+                request.li_method(),
+                request.li_from_uri(),
+                request.li_to_uri(),
+                request.li_ruri(),
+                request.li_source_ip(),
+            );
+            return Ok(true);
+        }
+
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "stop_recording() expects a Request or Call object",
+        ))
     }
 
     /// Check if the LI subsystem is enabled.
