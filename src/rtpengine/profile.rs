@@ -32,13 +32,14 @@ pub struct ProfileRegistry {
 }
 
 impl ProfileRegistry {
-    /// Create a registry containing only the four built-in profiles.
+    /// Create a registry containing only the built-in profiles.
     pub fn new() -> Self {
         let mut profiles = HashMap::new();
         profiles.insert("srtp_to_rtp".into(), Self::builtin_srtp_to_rtp());
         profiles.insert("ws_to_rtp".into(), Self::builtin_ws_to_rtp());
         profiles.insert("wss_to_rtp".into(), Self::builtin_wss_to_rtp());
         profiles.insert("rtp_passthrough".into(), Self::builtin_rtp_passthrough());
+        profiles.insert("srs_recording".into(), Self::builtin_srs_recording());
         Self { profiles }
     }
 
@@ -81,6 +82,8 @@ impl ProfileRegistry {
                 replace: vec!["origin".into(), "session-connection".into()],
                 flags: vec![],
                 direction: vec!["external".into(), "internal".into()],
+                record_call: false,
+                record_path: None,
             },
             answer: NgFlags {
                 transport_protocol: Some("RTP/AVP".into()),
@@ -89,6 +92,8 @@ impl ProfileRegistry {
                 replace: vec!["origin".into(), "session-connection".into()],
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
+                record_call: false,
+                record_path: None,
             },
         }
     }
@@ -102,6 +107,8 @@ impl ProfileRegistry {
                 replace: vec!["origin".into(), "session-connection".into()],
                 flags: vec![],
                 direction: vec!["external".into(), "internal".into()],
+                record_call: false,
+                record_path: None,
             },
             answer: NgFlags {
                 transport_protocol: Some("RTP/AVP".into()),
@@ -110,6 +117,8 @@ impl ProfileRegistry {
                 replace: vec!["origin".into(), "session-connection".into()],
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
+                record_call: false,
+                record_path: None,
             },
         }
     }
@@ -123,6 +132,8 @@ impl ProfileRegistry {
                 replace: vec!["origin".into(), "session-connection".into()],
                 flags: vec![],
                 direction: vec!["external".into(), "internal".into()],
+                record_call: false,
+                record_path: None,
             },
             answer: NgFlags {
                 transport_protocol: Some("RTP/AVP".into()),
@@ -131,6 +142,33 @@ impl ProfileRegistry {
                 replace: vec!["origin".into(), "session-connection".into()],
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
+                record_call: false,
+                record_path: None,
+            },
+        }
+    }
+
+    fn builtin_srs_recording() -> ProfileEntry {
+        ProfileEntry {
+            offer: NgFlags {
+                transport_protocol: None,
+                ice: Some("remove".into()),
+                dtls: None,
+                replace: vec!["origin".into(), "session-connection".into()],
+                flags: vec!["trust-address".into()],
+                direction: vec![],
+                record_call: true,
+                record_path: None,
+            },
+            answer: NgFlags {
+                transport_protocol: None,
+                ice: Some("remove".into()),
+                dtls: None,
+                replace: vec!["origin".into(), "session-connection".into()],
+                flags: vec!["trust-address".into()],
+                direction: vec![],
+                record_call: false,
+                record_path: None,
             },
         }
     }
@@ -144,6 +182,8 @@ impl ProfileRegistry {
                 replace: vec!["origin".into(), "session-connection".into()],
                 flags: vec!["trust-address".into()],
                 direction: vec![],
+                record_call: false,
+                record_path: None,
             },
             answer: NgFlags {
                 transport_protocol: None,
@@ -152,6 +192,8 @@ impl ProfileRegistry {
                 replace: vec!["origin".into(), "session-connection".into()],
                 flags: vec!["trust-address".into()],
                 direction: vec![],
+                record_call: false,
+                record_path: None,
             },
         }
     }
@@ -178,6 +220,10 @@ pub struct NgFlags {
     pub flags: Vec<String>,
     /// Direction pair for NAT traversal: ["external", "internal"].
     pub direction: Vec<String>,
+    /// Enable call recording in RTPEngine.
+    pub record_call: bool,
+    /// Directory path for RTPEngine to write recording files.
+    pub record_path: Option<String>,
 }
 
 impl NgFlags {
@@ -190,6 +236,8 @@ impl NgFlags {
             replace: config.replace.clone(),
             flags: config.flags.clone(),
             direction: config.direction.clone(),
+            record_call: config.record_call,
+            record_path: config.record_path.clone(),
         }
     }
 
@@ -223,6 +271,14 @@ impl NgFlags {
             let items: Vec<&str> = self.direction.iter().map(|s| s.as_str()).collect();
             pairs.push(("direction", BencodeValue::string_list(&items)));
         }
+        if self.record_call {
+            pairs.push(("record call", BencodeValue::string("yes")));
+        }
+        if let Some(record_path) = &self.record_path {
+            pairs.push(("metadata", BencodeValue::dict(vec![
+                ("record-path", BencodeValue::string(record_path)),
+            ])));
+        }
 
         pairs
     }
@@ -243,6 +299,7 @@ mod tests {
         assert!(registry.get("ws_to_rtp").is_some());
         assert!(registry.get("wss_to_rtp").is_some());
         assert!(registry.get("rtp_passthrough").is_some());
+        assert!(registry.get("srs_recording").is_some());
     }
 
     #[test]
@@ -256,10 +313,11 @@ mod tests {
     fn profile_names_sorted() {
         let registry = ProfileRegistry::new();
         let names = registry.profile_names();
-        assert_eq!(names.len(), 4);
+        assert_eq!(names.len(), 5);
         // Sorted alphabetically
         assert_eq!(names[0], "rtp_passthrough");
-        assert_eq!(names[3], "wss_to_rtp");
+        assert_eq!(names[1], "srs_recording");
+        assert_eq!(names[4], "wss_to_rtp");
     }
 
     #[test]
@@ -275,6 +333,8 @@ mod tests {
                     replace: vec!["origin".into()],
                     flags: vec![],
                     direction: vec!["external".into(), "internal".into()],
+                    record_call: false,
+                    record_path: None,
                 },
                 answer: NgFlagsConfig {
                     transport_protocol: Some("RTP/AVP".into()),
@@ -283,6 +343,8 @@ mod tests {
                     replace: vec!["origin".into()],
                     flags: vec![],
                     direction: vec!["internal".into(), "external".into()],
+                    record_call: false,
+                    record_path: None,
                 },
             },
         );
@@ -293,7 +355,7 @@ mod tests {
         assert_eq!(entry.answer.dtls.as_deref(), Some("off"));
         // Built-ins still exist
         assert!(registry.get("srtp_to_rtp").is_some());
-        assert_eq!(registry.profile_names().len(), 5);
+        assert_eq!(registry.profile_names().len(), 6);
     }
 
     #[test]
@@ -309,6 +371,8 @@ mod tests {
                     replace: vec![],
                     flags: vec![],
                     direction: vec![],
+                    record_call: false,
+                    record_path: None,
                 },
                 answer: NgFlagsConfig {
                     transport_protocol: Some("CUSTOM/ANSWER".into()),
@@ -317,6 +381,8 @@ mod tests {
                     replace: vec![],
                     flags: vec![],
                     direction: vec![],
+                    record_call: false,
+                    record_path: None,
                 },
             },
         );

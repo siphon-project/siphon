@@ -105,6 +105,10 @@ pub struct Dialog {
     pub local_contact: Option<String>,
     /// Contact URI the remote side advertised (from INVITE Contact or 200 OK Contact).
     pub remote_contact: Option<String>,
+    /// Remote party's AoR (Address of Record) — the To URI host from the
+    /// initial INVITE. Used in in-dialog To headers (not the Contact/RURI
+    /// which changes per RFC 3261 §12.2.1.1).
+    pub remote_aor_host: Option<String>,
 }
 
 impl Dialog {
@@ -119,6 +123,7 @@ impl Dialog {
             target_uri: Some(target_uri),
             local_contact: None,
             remote_contact: None,
+            remote_aor_host: None,
         }
     }
 
@@ -134,6 +139,7 @@ impl Dialog {
             target_uri: None,
             local_contact: None,
             remote_contact: None,
+            remote_aor_host: None,
         }
     }
 

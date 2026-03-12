@@ -3426,6 +3426,18 @@ fn handle_b2bua_invite(
         a_leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(&contact));
     }
 
+    // Store A-leg's remote AoR host (caller's From URI host) for in-dialog To headers.
+    if let Some(from) = message.headers.from() {
+        let from_str = crate::b2bua::actor::extract_contact_uri(&from);
+        if let Ok(parsed) = parse_uri_standalone(&from_str) {
+            a_leg.dialog.remote_aor_host = Some(if let Some(port) = parsed.port {
+                format!("{}:{}", parsed.host, port)
+            } else {
+                parsed.host.clone()
+            });
+        }
+    }
+
     let call_id = state.call_actors.create_call(a_leg);
 
     // Create the event channel for B-leg actors → dispatcher.
@@ -3757,6 +3769,15 @@ fn b2bua_send_b_leg_invite(
         },
     );
     b_leg.dialog.local_contact = Some(b_contact_value);
+    // Store the B-leg's remote AoR host (from dial target) for in-dialog To headers.
+    // In-dialog To uses the original AoR, NOT the remote Contact (which is for RURI).
+    if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
+        b_leg.dialog.remote_aor_host = Some(if let Some(port) = target_parsed.port {
+            format!("{}:{}", target_parsed.host, port)
+        } else {
+            target_parsed.host.clone()
+        });
+    }
     state.call_actors.add_b_leg(call_id, b_leg.clone());
     spawn_b_leg_actor(call_id, &b_leg, state);
 
@@ -5116,17 +5137,10 @@ fn handle_b2bua_bye(
                 if let Some(from) = bye.headers.get("From").or_else(|| bye.headers.get("f")) {
                     bye.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
                 }
-                // Rewrite To URI host to B-leg's remote Contact host (topology hiding)
-                if let Some(ref uri_str) = b_leg.dialog.remote_contact {
-                    if let Ok(parsed) = parse_uri_standalone(uri_str) {
-                        let to_host = if let Some(port) = parsed.port {
-                            format!("{}:{}", parsed.host, port)
-                        } else {
-                            parsed.host.clone()
-                        };
-                        if let Some(to) = bye.headers.get("To").or_else(|| bye.headers.get("t")) {
-                            bye.headers.set("To", crate::b2bua::actor::rewrite_uri_host(&to, &to_host));
-                        }
+                // Rewrite To URI host to B-leg's original AoR (topology hiding)
+                if let Some(ref aor_host) = b_leg.dialog.remote_aor_host {
+                    if let Some(to) = bye.headers.get("To").or_else(|| bye.headers.get("t")) {
+                        bye.headers.set("To", crate::b2bua::actor::rewrite_uri_host(&to, aor_host));
                     }
                 }
                 // Regenerate CSeq for B-leg dialog
@@ -5176,17 +5190,10 @@ fn handle_b2bua_bye(
                 if let Some(from) = bye.headers.get("From").or_else(|| bye.headers.get("f")) {
                     bye.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
                 }
-                // Rewrite To URI host to A-leg's remote Contact host (topology hiding)
-                if let Some(ref uri_str) = call.a_leg.dialog.remote_contact {
-                    if let Ok(parsed) = parse_uri_standalone(uri_str) {
-                        let to_host = if let Some(port) = parsed.port {
-                            format!("{}:{}", parsed.host, port)
-                        } else {
-                            parsed.host.clone()
-                        };
-                        if let Some(to) = bye.headers.get("To").or_else(|| bye.headers.get("t")) {
-                            bye.headers.set("To", crate::b2bua::actor::rewrite_uri_host(&to, &to_host));
-                        }
+                // Rewrite To URI host to A-leg's original AoR (topology hiding)
+                if let Some(ref aor_host) = call.a_leg.dialog.remote_aor_host {
+                    if let Some(to) = bye.headers.get("To").or_else(|| bye.headers.get("t")) {
+                        bye.headers.set("To", crate::b2bua::actor::rewrite_uri_host(&to, aor_host));
                     }
                 }
             }
@@ -5553,13 +5560,13 @@ fn handle_b2bua_reinvite(
     };
 
     // Per-leg Contact URIs for RURI and Contact rewriting (RFC 3261 §12.2.1.1)
-    let (target_remote_contact, target_local_contact) = if from_a_leg {
+    let (target_remote_contact, target_local_contact, target_remote_aor_host) = if from_a_leg {
         // A→B: target is B-leg
-        winner_b_leg.as_ref().map(|b| (b.dialog.remote_contact.clone(), b.dialog.local_contact.clone()))
-            .unwrap_or((None, None))
+        winner_b_leg.as_ref().map(|b| (b.dialog.remote_contact.clone(), b.dialog.local_contact.clone(), b.dialog.remote_aor_host.clone()))
+            .unwrap_or((None, None, None))
     } else {
         // B→A: target is A-leg
-        (a_leg.dialog.remote_contact.clone(), a_leg.dialog.local_contact.clone())
+        (a_leg.dialog.remote_contact.clone(), a_leg.dialog.local_contact.clone(), a_leg.dialog.remote_aor_host.clone())
     };
 
     debug!(
@@ -5639,19 +5646,12 @@ fn handle_b2bua_reinvite(
             forwarded.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
         }
 
-        // Rewrite To URI host to the target leg's remote Contact host (topology hiding).
-        // The To header from the other leg contains that leg's view of the called party,
-        // which may include siphon's advertised address — must not leak across B2BUA boundary.
-        if let Some(ref uri_str) = target_remote_contact {
-            if let Ok(parsed) = parse_uri_standalone(uri_str) {
-                let to_host = if let Some(port) = parsed.port {
-                    format!("{}:{}", parsed.host, port)
-                } else {
-                    parsed.host.clone()
-                };
-                if let Some(to) = forwarded.headers.get("To").or_else(|| forwarded.headers.get("t")) {
-                    forwarded.headers.set("To", crate::b2bua::actor::rewrite_uri_host(&to, &to_host));
-                }
+        // Rewrite To URI host to the target leg's original AoR (topology hiding).
+        // In-dialog To headers use the AoR from dialog establishment — NOT the
+        // remote Contact (which is for RURI only, per RFC 3261 §12.2.1.1).
+        if let Some(ref aor_host) = target_remote_aor_host {
+            if let Some(to) = forwarded.headers.get("To").or_else(|| forwarded.headers.get("t")) {
+                forwarded.headers.set("To", crate::b2bua::actor::rewrite_uri_host(&to, aor_host));
             }
         }
 
