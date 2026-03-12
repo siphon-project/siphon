@@ -4109,6 +4109,13 @@ fn handle_b2bua_response(
             }
         }
 
+        // Capture responder's CSeq before we overwrite it with the originator's.
+        // The ACK sent to the responder must use the responder's CSeq (the one used
+        // in the forwarded re-INVITE), not the originator's.
+        let responder_cseq_num = message.headers.cseq()
+            .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
+            .unwrap_or_else(|| "1".to_string());
+
         // Replace Via(s) and CSeq — restore the originator's Via headers and CSeq
         // from the re-INVITE (stored_vias/stored_cseq), NOT from the initial INVITE.
         // Both A→B and B→A use stored values captured when the re-INVITE arrived.
@@ -4134,9 +4141,8 @@ fn handle_b2bua_response(
                     let outbound_port = state.listen_addrs.get(&responder_transport)
                         .map(|a| a.port())
                         .unwrap_or(state.local_addr.port());
-                    let cseq_num = message.headers.cseq()
-                        .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
-                        .unwrap_or_else(|| "1".to_string());
+                    // Use the responder's CSeq (captured before originator CSeq restoration).
+                    let cseq_num = responder_cseq_num.clone();
                     let from = message.headers.from().cloned().unwrap_or_default();
                     let to = message.headers.to().cloned().unwrap_or_default();
                     // RURI: extract Contact from the 200 OK message directly
