@@ -1548,7 +1548,7 @@ fn relay_fork_branch(
 
 /// Handle an inbound SIP response — route back to the original sender.
 fn handle_response(
-    _inbound: InboundMessage,
+    inbound: InboundMessage,
     mut message: SipMessage,
     status_code: u16,
     state: &DispatcherState,
@@ -1711,6 +1711,16 @@ fn handle_response(
                 Ok(actions) => {
                     for action in &actions {
                         match action {
+                            Action::SendMessage(ack_message) => {
+                                // RFC 3261 §17.1.1.3: send ACK for non-2xx back toward the UAS
+                                send_message(
+                                    ack_message.clone(),
+                                    inbound.transport,
+                                    inbound.remote_addr,
+                                    inbound.connection_id,
+                                    state,
+                                );
+                            }
                             Action::CancelTimer(name) => {
                                 let timer_id = format!("{}:{:?}", key, name);
                                 state.timer_wheel.remove(&timer_id);
@@ -5065,6 +5075,23 @@ fn handle_b2bua_response(
             a_leg.transport.connection_id,
             state,
         );
+
+        // Safety-net: if RTPEngine was offered but call failed, clean up the session.
+        // Only runs when the call is truly ending (script called reject, not retry).
+        let a_sip_call_id = a_leg.dialog.call_id.clone();
+        if let (Some(rtpengine_set), Some(media_sessions)) =
+            (&state.rtpengine_set, &state.rtpengine_sessions)
+        {
+            if let Some(session) = media_sessions.remove(&a_sip_call_id) {
+                let set = Arc::clone(rtpengine_set);
+                tokio::spawn(async move {
+                    if let Err(error) = set.delete(&session.call_id, &session.from_tag).await {
+                        warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
+                    }
+                });
+            }
+        }
+
         state.call_actors.remove_call(call_id);
         state.call_event_receivers.remove(call_id);
     }

@@ -5,7 +5,8 @@
 
 use std::time::Duration;
 
-use crate::sip::message::SipMessage;
+use crate::sip::message::{SipMessage, Method, StartLine};
+use crate::sip::builder::SipMessageBuilder;
 use crate::transaction::timer::TimerConfig;
 
 // ---------------------------------------------------------------------------
@@ -556,6 +557,8 @@ pub struct Ict {
     pub request: SipMessage,
     /// Current Timer A interval.
     pub timer_a_interval: Duration,
+    /// Cached ACK for non-2xx retransmission (RFC 3261 §17.1.1.3).
+    cached_ack: Option<SipMessage>,
 }
 
 impl Ict {
@@ -568,6 +571,7 @@ impl Ict {
             timers,
             request: request.clone(),
             timer_a_interval,
+            cached_ack: None,
         };
         let mut actions = vec![Action::SendMessage(request)];
         // Start Timer B (overall timeout)
@@ -577,6 +581,37 @@ impl Ict {
             actions.push(Action::StartTimer(TimerName::A, timer_a_interval));
         }
         (ict, actions)
+    }
+
+    /// Build an ACK for a non-2xx final response (RFC 3261 §17.1.1.3).
+    ///
+    /// The ACK reuses the original INVITE's From, Call-ID, Request-URI, and
+    /// top Via (same branch = hop-by-hop). The To header comes from the
+    /// response (includes the remote tag).
+    fn build_ack_for_non2xx(&self, response: &SipMessage) -> Option<SipMessage> {
+        let request_uri = match &self.request.start_line {
+            StartLine::Request(request_line) => request_line.request_uri.clone(),
+            _ => return None,
+        };
+        let via = self.request.headers.via()?.to_string();
+        let from = self.request.headers.from()?.to_string();
+        // To from response (has remote tag)
+        let to = response.headers.to()?.to_string();
+        let call_id = self.request.headers.call_id()?.to_string();
+        let cseq_num = self.request.headers.cseq()
+            .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
+            .unwrap_or_else(|| "1".to_string());
+
+        SipMessageBuilder::new()
+            .request(Method::Ack, request_uri)
+            .via(via)
+            .from(from)
+            .to(to)
+            .call_id(call_id)
+            .cseq(format!("{} ACK", cseq_num))
+            .content_length(0)
+            .build()
+            .ok()
     }
 
     pub fn process(&mut self, event: IctEvent) -> Vec<Action> {
@@ -614,11 +649,17 @@ impl Ict {
                     Transport::Udp => self.timers.timer_d_udp(),
                     Transport::Reliable => self.timers.timer_d_tcp(),
                 };
-                let mut actions = vec![
+                // RFC 3261 §17.1.1.3: ICT MUST generate ACK for non-2xx
+                let mut actions = Vec::new();
+                if let Some(ack) = self.build_ack_for_non2xx(&response) {
+                    self.cached_ack = Some(ack.clone());
+                    actions.push(Action::SendMessage(ack));
+                }
+                actions.extend([
                     Action::CancelTimer(TimerName::A),
                     Action::CancelTimer(TimerName::B),
                     Action::PassToTu(response),
-                ];
+                ]);
                 if timer_d.is_zero() {
                     self.state = IctState::Terminated;
                     actions.push(Action::Terminated);
@@ -656,12 +697,17 @@ impl Ict {
                     Transport::Udp => self.timers.timer_d_udp(),
                     Transport::Reliable => self.timers.timer_d_tcp(),
                 };
-                let mut actions = vec![
-                    // FIX: Cancel Timer A on non-2xx in Proceeding (RFC 3261 §17.1.1.2)
+                // RFC 3261 §17.1.1.3: ICT MUST generate ACK for non-2xx
+                let mut actions = Vec::new();
+                if let Some(ack) = self.build_ack_for_non2xx(&response) {
+                    self.cached_ack = Some(ack.clone());
+                    actions.push(Action::SendMessage(ack));
+                }
+                actions.extend([
                     Action::CancelTimer(TimerName::A),
                     Action::CancelTimer(TimerName::B),
                     Action::PassToTu(response),
-                ];
+                ]);
                 if timer_d.is_zero() {
                     self.state = IctState::Terminated;
                     actions.push(Action::Terminated);
@@ -673,8 +719,12 @@ impl Ict {
 
             // -- Completed --
             (IctState::Completed, IctEvent::ResponseNon2xx(_)) => {
-                // Absorb retransmits — ACK is sent by TU/transport layer
-                vec![]
+                // RFC 3261 §17.1.1.3: retransmitted non-2xx MUST cause ACK retransmission
+                if let Some(ref ack) = self.cached_ack {
+                    vec![Action::SendMessage(ack.clone())]
+                } else {
+                    vec![]
+                }
             }
             (IctState::Completed, IctEvent::TimerD) => {
                 self.state = IctState::Terminated;
@@ -1116,6 +1166,7 @@ mod tests {
         let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         assert_eq!(ict.state, IctState::Completed);
+        assert!(has_send(&actions), "ICT must generate ACK for non-2xx (RFC 3261 §17.1.1.3)");
         assert!(has_pass_to_tu(&actions));
         assert!(has_timer(&actions, TimerName::D));
     }
@@ -1125,6 +1176,7 @@ mod tests {
         let (mut ict, _) = Ict::new(dummy_invite(), Transport::Reliable, TimerConfig::default());
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         assert_eq!(ict.state, IctState::Terminated);
+        assert!(has_send(&actions), "ICT must generate ACK for non-2xx (RFC 3261 §17.1.1.3)");
         assert!(has_pass_to_tu(&actions));
         assert!(has_terminated(&actions));
     }
@@ -1139,11 +1191,13 @@ mod tests {
     }
 
     #[test]
-    fn ict_completed_absorbs_retransmit() {
+    fn ict_completed_retransmits_ack() {
+        // RFC 3261 §17.1.1.3: retransmitted non-2xx in Completed MUST cause ACK retransmission
         let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
         ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
-        assert!(actions.is_empty());
+        assert_eq!(actions.len(), 1);
+        assert!(has_send(&actions), "retransmitted non-2xx must trigger ACK retransmission");
     }
 
     #[test]
@@ -1162,6 +1216,7 @@ mod tests {
         ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(603, "Decline")));
         assert_eq!(ict.state, IctState::Completed);
+        assert!(has_send(&actions), "ICT must generate ACK for non-2xx from Proceeding");
         assert!(has_pass_to_tu(&actions));
     }
 

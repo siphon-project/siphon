@@ -29,6 +29,18 @@ async def on_answer(call, reply):
     log.info(f"RTPEngine answer done for call {call.call_id}")
 
 
+@b2bua.on_failure
+async def on_failure(call, code, reason):
+    log.warn(f"B-leg failed {code} {reason} for call {call.call_id}")
+
+    # Release RTPEngine session — offer was sent but call never connected.
+    # Without this, session lingers until RTPEngine's own inactivity timeout.
+    # Note: if retrying to another gateway, don't delete here — the same
+    # RTPEngine session can be reused for the next dial attempt.
+    await rtpengine.delete(call)
+    call.reject(code, reason)
+
+
 @b2bua.on_bye
 async def on_bye(call, initiator):
     log.info(f"B2BUA BYE: call {call.call_id}, initiator={initiator.side}")
