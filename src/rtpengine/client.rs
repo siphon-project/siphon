@@ -156,6 +156,41 @@ impl RtpEngineClient {
         self.extract_sdp_response(&response)
     }
 
+    /// Send a SIPREC-mode `subscribe request` — subscribes to both directions.
+    ///
+    /// Unlike the regular `subscribe_request`, this uses `flags: ["all", "siprec"]`
+    /// and omits from-tag/to-tag.  RTPEngine returns a combined SDP with 2 m=
+    /// lines (one per call direction) plus a `to-tag` for the subscription.
+    ///
+    /// Returns `(sdp, to_tag)` on success.
+    pub async fn subscribe_request_siprec(
+        &self,
+        call_id: &str,
+    ) -> Result<(Vec<u8>, String), RtpEngineError> {
+        let pairs: Vec<(&str, BencodeValue)> = vec![
+            ("command", BencodeValue::string("subscribe request")),
+            ("call-id", BencodeValue::string(call_id)),
+            ("flags", BencodeValue::string_list(&["all", "siprec"])),
+        ];
+
+        let response = self.send_command(BencodeValue::dict(pairs)).await?;
+        self.check_result(&response)?;
+
+        let sdp = response
+            .dict_get_bytes("sdp")
+            .map(|bytes| bytes.to_vec())
+            .ok_or_else(|| {
+                RtpEngineError::Protocol("response missing 'sdp' field".to_string())
+            })?;
+
+        let to_tag = response
+            .dict_get_str("to-tag")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        Ok((sdp, to_tag))
+    }
+
     /// Send a `subscribe answer` command to complete SIPREC media subscription.
     ///
     /// Returns the rewritten SDP if RTPEngine includes one, or an empty vec
@@ -524,6 +559,15 @@ impl RtpEngineSet {
     ) -> Result<Vec<u8>, RtpEngineError> {
         let client = self.select(call_id);
         client.subscribe_request(call_id, from_tag, to_tag, sdp, flags).await
+    }
+
+    /// Send a SIPREC-mode `subscribe request` to the affinity-bound instance.
+    pub async fn subscribe_request_siprec(
+        &self,
+        call_id: &str,
+    ) -> Result<(Vec<u8>, String), RtpEngineError> {
+        let client = self.select(call_id);
+        client.subscribe_request_siprec(call_id).await
     }
 
     /// Send a `subscribe answer` command to the affinity-bound instance.

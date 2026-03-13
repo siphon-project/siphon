@@ -1,8 +1,38 @@
 //! YAML configuration — `siphon.yaml` deserialization via serde_yml.
 
+use regex::Regex;
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::LazyLock;
 use crate::error::{Result, SiphonError};
+
+// ---------------------------------------------------------------------------
+// Environment variable expansion — `${VAR}` and `${VAR:-default}`
+// ---------------------------------------------------------------------------
+
+static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").expect("env var regex")
+});
+
+/// Expand `${VAR}` and `${VAR:-default}` patterns in a config string.
+///
+/// - `${VAR}` is replaced with the environment variable's value, or the empty
+///   string if unset/empty.
+/// - `${VAR:-fallback}` uses `fallback` when the variable is unset or empty.
+fn expand_env_vars(input: &str) -> String {
+    ENV_VAR_RE
+        .replace_all(input, |caps: &regex::Captures| {
+            let var_name = &caps[1];
+            match std::env::var(var_name) {
+                Ok(value) if !value.is_empty() => value,
+                _ => caps
+                    .get(2)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default(),
+            }
+        })
+        .into_owned()
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -877,7 +907,7 @@ pub struct NgFlagsConfig {
     pub ice: Option<String>,
     /// DTLS mode: "passive", "active", or "off".
     pub dtls: Option<String>,
-    /// SDP fields to replace: "origin", "session-connection".
+    /// SDP fields to replace: "origin".
     #[serde(default)]
     pub replace: Vec<String>,
     /// Additional flags: "trust-address", "symmetric", "asymmetric".
@@ -1567,11 +1597,18 @@ impl Config {
         let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
             SiphonError::Config(format!("cannot read siphon.yaml: {e}"))
         })?;
-        Self::from_str(&content)
+        let expanded = expand_env_vars(&content);
+        Self::from_str_raw(&expanded)
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(yaml: &str) -> Result<Self> {
+        let expanded = expand_env_vars(yaml);
+        Self::from_str_raw(&expanded)
+    }
+
+    /// Parse YAML without env-var expansion (used after expansion is already done).
+    fn from_str_raw(yaml: &str) -> Result<Self> {
         serde_yml::from_str(yaml)
             .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))
     }
@@ -2195,12 +2232,12 @@ media:
       offer:
         transport_protocol: "RTP/SAVP"
         ice: "remove"
-        replace: ["origin", "session-connection"]
+        replace: ["origin"]
         direction: ["external", "internal"]
       answer:
         transport_protocol: "RTP/SAVP"
         ice: "remove"
-        replace: ["origin", "session-connection"]
+        replace: ["origin"]
         direction: ["internal", "external"]
 "#;
         let config = Config::from_str(yaml).unwrap();
@@ -2808,5 +2845,83 @@ session_timer:
         let config = Config::from_str(minimal_yaml()).unwrap();
         assert!(config.isc.is_none());
         assert!(config.sbi.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Environment variable expansion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expand_env_var_set() {
+        std::env::set_var("SIPHON_TEST_HOST", "10.0.0.1");
+        let result = expand_env_vars("host: ${SIPHON_TEST_HOST}");
+        assert_eq!(result, "host: 10.0.0.1");
+        std::env::remove_var("SIPHON_TEST_HOST");
+    }
+
+    #[test]
+    fn expand_env_var_unset_no_default() {
+        std::env::remove_var("SIPHON_TEST_MISSING");
+        let result = expand_env_vars("host: ${SIPHON_TEST_MISSING}");
+        assert_eq!(result, "host: ");
+    }
+
+    #[test]
+    fn expand_env_var_unset_with_default() {
+        std::env::remove_var("SIPHON_TEST_MISSING2");
+        let result = expand_env_vars("host: ${SIPHON_TEST_MISSING2:-localhost}");
+        assert_eq!(result, "host: localhost");
+    }
+
+    #[test]
+    fn expand_env_var_empty_uses_default() {
+        std::env::set_var("SIPHON_TEST_EMPTY", "");
+        let result = expand_env_vars("host: ${SIPHON_TEST_EMPTY:-fallback}");
+        assert_eq!(result, "host: fallback");
+        std::env::remove_var("SIPHON_TEST_EMPTY");
+    }
+
+    #[test]
+    fn expand_env_var_set_ignores_default() {
+        std::env::set_var("SIPHON_TEST_PRIO", "actual");
+        let result = expand_env_vars("val: ${SIPHON_TEST_PRIO:-ignored}");
+        assert_eq!(result, "val: actual");
+        std::env::remove_var("SIPHON_TEST_PRIO");
+    }
+
+    #[test]
+    fn expand_env_var_multiple() {
+        std::env::set_var("SIPHON_TEST_A", "alpha");
+        std::env::set_var("SIPHON_TEST_B", "beta");
+        let result = expand_env_vars("${SIPHON_TEST_A}:${SIPHON_TEST_B}");
+        assert_eq!(result, "alpha:beta");
+        std::env::remove_var("SIPHON_TEST_A");
+        std::env::remove_var("SIPHON_TEST_B");
+    }
+
+    #[test]
+    fn expand_env_var_no_placeholders() {
+        let input = "listen:\n  udp: \"0.0.0.0:5060\"";
+        assert_eq!(expand_env_vars(input), input);
+    }
+
+    #[test]
+    fn expand_env_var_in_config_parse() {
+        std::env::set_var("SIPHON_TEST_DOMAIN", "test.example.com");
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "${SIPHON_TEST_DOMAIN}"
+script:
+  path: "scripts/proxy_default.py"
+registrar:
+  enabled: false
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.domain.local[0], "test.example.com");
+        std::env::remove_var("SIPHON_TEST_DOMAIN");
     }
 }

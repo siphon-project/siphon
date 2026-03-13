@@ -79,7 +79,7 @@ impl ProfileRegistry {
                 transport_protocol: Some("RTP/SAVP".into()),
                 ice: Some("remove".into()),
                 dtls: None,
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec![],
                 direction: vec!["external".into(), "internal".into()],
                 record_call: false,
@@ -89,7 +89,7 @@ impl ProfileRegistry {
                 transport_protocol: Some("RTP/AVP".into()),
                 ice: Some("remove".into()),
                 dtls: None,
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
                 record_call: false,
@@ -104,7 +104,7 @@ impl ProfileRegistry {
                 transport_protocol: Some("RTP/AVPF".into()),
                 ice: Some("force".into()),
                 dtls: None,
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec![],
                 direction: vec!["external".into(), "internal".into()],
                 record_call: false,
@@ -114,7 +114,7 @@ impl ProfileRegistry {
                 transport_protocol: Some("RTP/AVP".into()),
                 ice: Some("remove".into()),
                 dtls: None,
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
                 record_call: false,
@@ -129,7 +129,7 @@ impl ProfileRegistry {
                 transport_protocol: Some("RTP/SAVPF".into()),
                 ice: Some("force".into()),
                 dtls: Some("passive".into()),
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec![],
                 direction: vec!["external".into(), "internal".into()],
                 record_call: false,
@@ -139,7 +139,7 @@ impl ProfileRegistry {
                 transport_protocol: Some("RTP/AVP".into()),
                 ice: Some("remove".into()),
                 dtls: Some("off".into()),
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
                 record_call: false,
@@ -154,7 +154,7 @@ impl ProfileRegistry {
                 transport_protocol: None,
                 ice: Some("remove".into()),
                 dtls: None,
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec!["trust-address".into()],
                 direction: vec![],
                 record_call: true,
@@ -164,7 +164,7 @@ impl ProfileRegistry {
                 transport_protocol: None,
                 ice: Some("remove".into()),
                 dtls: None,
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec!["trust-address".into()],
                 direction: vec![],
                 record_call: false,
@@ -179,7 +179,7 @@ impl ProfileRegistry {
                 transport_protocol: None,
                 ice: None,
                 dtls: None,
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec!["trust-address".into()],
                 direction: vec![],
                 record_call: false,
@@ -189,7 +189,7 @@ impl ProfileRegistry {
                 transport_protocol: None,
                 ice: None,
                 dtls: None,
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec!["trust-address".into()],
                 direction: vec![],
                 record_call: false,
@@ -214,7 +214,7 @@ pub struct NgFlags {
     pub ice: Option<String>,
     /// DTLS mode: "passive", "active", or "off".
     pub dtls: Option<String>,
-    /// SDP fields to replace: "origin", "session-connection".
+    /// SDP fields to replace: "origin".
     pub replace: Vec<String>,
     /// Additional flags: "trust-address", "symmetric", "asymmetric".
     pub flags: Vec<String>,
@@ -401,7 +401,7 @@ mod tests {
         assert_eq!(entry.offer.transport_protocol.as_deref(), Some("RTP/SAVP"));
         assert_eq!(entry.offer.ice.as_deref(), Some("remove"));
         assert!(entry.offer.dtls.is_none());
-        assert_eq!(entry.offer.replace, vec!["origin", "session-connection"]);
+        assert_eq!(entry.offer.replace, vec!["origin"]);
         assert!(entry.offer.flags.is_empty());
         assert_eq!(entry.offer.direction, vec!["external", "internal"]);
     }

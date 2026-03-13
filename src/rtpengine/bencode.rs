@@ -508,7 +508,7 @@ mod tests {
             ),
             (
                 "replace",
-                BencodeValue::string_list(&["origin", "session-connection"]),
+                BencodeValue::string_list(&["origin"]),
             ),
             (
                 "flags",
@@ -616,7 +616,7 @@ mod tests {
             ("ICE", BencodeValue::string("remove")),
             (
                 "replace",
-                BencodeValue::string_list(&["origin", "session-connection"]),
+                BencodeValue::string_list(&["origin"]),
             ),
         ]);
         let encoded = encode(&request);

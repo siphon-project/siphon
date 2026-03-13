@@ -6,6 +6,15 @@
 #
 # Hot-reload: all sections except `listen` can be changed without restart.
 # (Transport listeners require a full restart to rebind.)
+#
+# Environment variable expansion:
+#   Any value can reference environment variables with ${VAR} syntax.
+#   Use ${VAR:-default} to provide a fallback when the variable is unset or empty.
+#
+#   Examples:
+#     url: "redis://${REDIS_HOST:-localhost}:6379"
+#     - "${LISTEN_IP:-0.0.0.0}:5060"
+#     cert: "${TLS_CERT_PATH:-/etc/siphon/tls/cert.pem}"
 
 # ---------------------------------------------------------------------------
 # Transport listeners
@@ -231,12 +240,12 @@ auth:
 #       offer:
 #         transport_protocol: "RTP/SAVP"
 #         ice: "remove"
-#         replace: ["origin", "session-connection"]
+#         replace: ["origin"]
 #         direction: ["external", "internal"]
 #       answer:
 #         transport_protocol: "RTP/SAVP"
 #         ice: "remove"
-#         replace: ["origin", "session-connection"]
+#         replace: ["origin"]
 #         direction: ["internal", "external"]
 #
 # Python usage:
