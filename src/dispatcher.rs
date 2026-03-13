@@ -1595,6 +1595,14 @@ fn handle_response(
                                     if let Some((original_call_id, original_from_tag, original_to_tag)) =
                                         state.recording_manager.original_call_info(&session_id)
                                     {
+                                        info!(
+                                            session_id = %session_id,
+                                            original_call_id = %original_call_id,
+                                            from_tag = %original_from_tag,
+                                            to_tag = %original_to_tag,
+                                            sdp_len = message.body.len(),
+                                            "SIPREC: sending subscribe_answer to RTPEngine"
+                                        );
                                         let flags = crate::rtpengine::NgFlags::default();
                                         match tokio::task::block_in_place(|| {
                                             tokio::runtime::Handle::current().block_on(
@@ -1605,7 +1613,7 @@ fn handle_response(
                                             )
                                         }) {
                                             Ok(_rewritten_sdp) => {
-                                                debug!(
+                                                info!(
                                                     session_id = %session_id,
                                                     "SIPREC: RTPEngine subscribe_answer completed, media fork active"
                                                 );
@@ -1613,10 +1621,16 @@ fn handle_response(
                                             Err(error) => {
                                                 warn!(
                                                     session_id = %session_id,
-                                                    "SIPREC: RTPEngine subscribe_answer failed: {error}"
+                                                    %error,
+                                                    "SIPREC: RTPEngine subscribe_answer failed"
                                                 );
                                             }
                                         }
+                                    } else {
+                                        warn!(
+                                            session_id = %session_id,
+                                            "SIPREC: no original call info for subscribe_answer"
+                                        );
                                     }
                                 }
                             }
