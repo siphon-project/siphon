@@ -31,11 +31,21 @@ impl SipHeaders {
         self.headers.entry(key).or_default().push(value);
     }
 
-    /// Set a header value (replaces existing)
+    /// Set a header value (replaces existing, preserves position in header order)
     pub fn set(&mut self, name: &str, value: String) {
         let key = name.to_lowercase();
         self.original_names.insert(key.clone(), name.to_string());
         self.headers.insert(key, vec![value]);
+    }
+
+    /// Set multiple values for a header (replaces existing, preserves position in header order).
+    ///
+    /// Use this when replacing a multi-value header like Via where you need to
+    /// keep insertion ordering but supply more than one value.
+    pub fn set_all(&mut self, name: &str, values: Vec<String>) {
+        let key = name.to_lowercase();
+        self.original_names.insert(key.clone(), name.to_string());
+        self.headers.insert(key, values);
     }
 
     /// Get first value of a header

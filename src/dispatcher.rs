@@ -2970,8 +2970,7 @@ fn cancel_other_fork_branches(
             if let StartLine::Request(ref mut rl) = cancel.start_line {
                 rl.method = crate::sip::message::Method::Cancel;
             }
-            cancel.headers.remove("Via");
-            cancel.headers.add("Via", via_value);
+            cancel.headers.set("Via", via_value);
 
             let data = Bytes::from(cancel.to_bytes());
             debug!(
@@ -3151,8 +3150,7 @@ fn handle_ack_via_session(
         if let Some(client_branch) = session.get_client_branch(client_key) {
             let mut ack_downstream = message.clone();
 
-            // Strip all existing Via headers, add our own
-            ack_downstream.headers.remove("Via");
+            // Replace Via with our own (set preserves header position)
             let transport_str = format!("{}", client_branch.transport);
             let via_value = format!(
                 "SIP/2.0/{} {}:{};branch={}",
@@ -3161,7 +3159,7 @@ fn handle_ack_via_session(
                 state.via_port(&client_branch.transport),
                 TransactionKey::generate_branch(),
             );
-            ack_downstream.headers.add("Via", via_value);
+            ack_downstream.headers.set("Via", via_value);
 
             let data = Bytes::from(ack_downstream.to_bytes());
             debug!(
@@ -3224,8 +3222,6 @@ fn handle_cancel_via_session(
     for client_key in &session.client_keys {
         if let Some(client_branch) = session.get_client_branch(client_key) {
             let mut cancel_downstream = message.clone();
-            cancel_downstream.headers.remove("Via");
-
             // CANCEL gets its own branch (different transaction) but we derive it
             // from the client branch so it's traceable.
             let cancel_branch = TransactionKey::generate_branch();
@@ -3237,7 +3233,7 @@ fn handle_cancel_via_session(
                 state.via_port(&client_branch.transport),
                 cancel_branch,
             );
-            cancel_downstream.headers.add("Via", via_value);
+            cancel_downstream.headers.set("Via", via_value);
 
             let data = Bytes::from(cancel_downstream.to_bytes());
             debug!(
@@ -3652,9 +3648,8 @@ fn b2bua_send_b_leg_invite(
     );
 
     let mut b_leg_invite = original_request.clone();
-    // Replace Via with our own
-    b_leg_invite.headers.remove("Via");
-    b_leg_invite.headers.add("Via", via_value);
+    // Replace Via with our own (set preserves header position)
+    b_leg_invite.headers.set("Via", via_value);
     // Update Request-URI: use dial target for routing (host/port/transport) but
     // preserve the called party's user part from the A-leg RURI.
     // The dial target is a routing destination, not the called party.
@@ -4143,10 +4138,7 @@ fn handle_b2bua_response(
         // Replace Via(s) and CSeq — restore the originator's Via headers and CSeq
         // from the re-INVITE (stored_vias/stored_cseq), NOT from the initial INVITE.
         // Both A→B and B→A use stored values captured when the re-INVITE arrived.
-        message.headers.remove("Via");
-        for via in &b_leg_stored_vias {
-            message.headers.add("Via", via.clone());
-        }
+        message.headers.set_all("Via", b_leg_stored_vias.clone());
         // Restore originator's CSeq (RFC 3261 §8.2.6.2 — response CSeq MUST
         // match the request being responded to, which is the originator's re-INVITE).
         if let Some(ref cseq) = b_leg_stored_cseq {
@@ -4601,13 +4593,10 @@ fn handle_b2bua_response(
         // Also restore the A-leg's original CSeq (RFC 3261 §8.2.6.2 — response
         // CSeq MUST equal the request CSeq). The B-leg response carries the B-leg
         // CSeq which is in an independent numbering space.
-        response.headers.remove("Via");
         if let Some(invite_arc) = &a_leg_invite {
             if let Ok(invite) = invite_arc.lock() {
                 if let Some(vias) = invite.headers.get_all("Via") {
-                    for via in vias {
-                        response.headers.add("Via", via.clone());
-                    }
+                    response.headers.set_all("Via", vias.clone());
                 }
                 if let Some(cseq) = invite.headers.cseq() {
                     response.headers.set("CSeq", cseq.clone());
@@ -4785,13 +4774,10 @@ fn handle_b2bua_response(
         }
         // Replace B-leg Via(s) and CSeq with A-leg originals from stored INVITE
         // (RFC 3261 §8.2.6.2 — response CSeq MUST equal request CSeq).
-        message.headers.remove("Via");
         if let Some(invite_arc) = &a_leg_invite {
             if let Ok(invite) = invite_arc.lock() {
                 if let Some(vias) = invite.headers.get_all("Via") {
-                    for via in vias {
-                        message.headers.add("Via", via.clone());
-                    }
+                    message.headers.set_all("Via", vias.clone());
                 }
                 if let Some(cseq) = invite.headers.cseq() {
                     message.headers.set("CSeq", cseq.clone());
@@ -4852,8 +4838,7 @@ fn handle_b2bua_response(
                                     state.via_port(&transport),
                                     new_branch,
                                 );
-                                retry.headers.remove("Via");
-                                retry.headers.add("Via", via_value);
+                                retry.headers.set("Via", via_value);
 
                                 // Update Request-URI
                                 if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
@@ -4967,8 +4952,7 @@ fn handle_b2bua_response(
                                     state.via_port(&transport),
                                     new_branch,
                                 );
-                                retry.headers.remove("Via");
-                                retry.headers.add("Via", via_value);
+                                retry.headers.set("Via", via_value);
 
                                 // Update Request-URI
                                 if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
@@ -5087,13 +5071,15 @@ fn handle_b2bua_response(
             );
         }
         // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
-        message.headers.remove("Via");
         if let Some(invite_arc) = &a_leg_invite {
             if let Ok(invite) = invite_arc.lock() {
                 if let Some(vias) = invite.headers.get_all("Via") {
-                    for via in vias {
-                        message.headers.add("Via", via.clone());
-                    }
+                    message.headers.set_all("Via", vias.clone());
+                }
+                // Restore A-leg CSeq (RFC 3261 §8.2.6.2 — response CSeq MUST
+                // equal the request CSeq). B-leg has independent CSeq numbering.
+                if let Some(cseq) = invite.headers.cseq() {
+                    message.headers.set("CSeq", cseq.clone());
                 }
             }
         }
@@ -5267,8 +5253,7 @@ fn handle_b2bua_bye(
                     branch,
                 );
                 let mut bye = message.clone();
-                bye.headers.remove("Via");
-                bye.headers.add("Via", via_value);
+                bye.headers.set("Via", via_value);
                 // Sanitize: strip headers that leak the other leg's identity
                 if let Some(ref ua) = state.user_agent_header {
                     bye.headers.set("User-Agent", ua.clone());
@@ -5356,8 +5341,7 @@ fn handle_b2bua_bye(
         // New Via for A-leg direction
         let transport_str = format!("{}", call.a_leg.transport.transport).to_uppercase();
         let branch = TransactionKey::generate_branch();
-        bye.headers.remove("Via");
-        bye.headers.add("Via", format!(
+        bye.headers.set("Via", format!(
             "SIP/2.0/{} {}:{};branch={}",
             transport_str,
             state.via_host(&call.a_leg.transport.transport),
@@ -5506,8 +5490,7 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
         state.via_port(&b_leg.transport.transport),
         branch,
     );
-    reinvite.headers.remove("Via");
-    reinvite.headers.add("Via", via_value);
+    reinvite.headers.set("Via", via_value);
 
     // Update Request-URI to B-leg's remote Contact (RFC 3261 §12.2.1.1),
     // falling back to the original dial target if Contact is not yet captured.
@@ -5755,8 +5738,6 @@ fn handle_b2bua_reinvite(
     let branch = TransactionKey::generate_branch();
 
     let mut forwarded = message.clone();
-    forwarded.headers.remove("Via");
-
     // Register this branch for response routing back to the re-INVITE sender
     let reinvite_target = if from_a_leg {
         // A→B: forward to winning B-leg, rewrite A-leg → B-leg dialog headers
@@ -5789,7 +5770,7 @@ fn handle_b2bua_reinvite(
             state.via_port(&transport),
             branch,
         );
-        forwarded.headers.add("Via", via_value);
+        forwarded.headers.set("Via", via_value);
 
         // Sanitize: strip headers that leak the other leg's identity/capabilities.
         // SIPhon is UAC on the forwarded re-INVITE, so set our own User-Agent.

@@ -22,16 +22,14 @@ pub fn add_via(
         Some(port) => format!("SIP/2.0/{transport} {host}:{port};branch={branch}"),
         None => format!("SIP/2.0/{transport} {host};branch={branch}"),
     };
-    // Prepend: remove all existing Via, add ours first, then re-add the rest
+    // Prepend our Via before existing ones, preserving header position
     let existing = headers
         .get_all("Via")
         .cloned()
         .unwrap_or_default();
-    headers.remove("Via");
-    headers.add("Via", via_value);
-    for via in existing {
-        headers.add("Via", via);
-    }
+    let mut all_vias = vec![via_value];
+    all_vias.extend(existing);
+    headers.set_all("Via", all_vias);
     branch
 }
 
@@ -61,8 +59,8 @@ pub fn strip_top_via(headers: &mut SipHeaders) -> Option<Via> {
 
     let removed = vias.remove(0);
 
-    // Reconstruct the Via headers
-    headers.remove("Via");
+    // Reconstruct the Via headers, preserving header position
+    let mut remaining_vias = Vec::new();
 
     // If the first raw value had multiple comma-separated Vias, put the rest back
     if !vias.is_empty() {
@@ -71,12 +69,18 @@ pub fn strip_top_via(headers: &mut SipHeaders) -> Option<Via> {
             .map(|v| v.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        headers.add("Via", remaining);
+        remaining_vias.push(remaining);
     }
 
     // Re-add the rest of the original raw Via headers
     for via in existing.iter().skip(1) {
-        headers.add("Via", via.clone());
+        remaining_vias.push(via.clone());
+    }
+
+    if remaining_vias.is_empty() {
+        headers.remove("Via");
+    } else {
+        headers.set_all("Via", remaining_vias);
     }
 
     Some(removed)
