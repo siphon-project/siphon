@@ -219,6 +219,34 @@ impl SrsManager {
         Some((session_id, to_tag))
     }
 
+    /// Update an existing session from a re-INVITE (SDP/metadata refresh).
+    ///
+    /// Returns the existing to-tag so the 200 OK uses the same dialog tag,
+    /// or `None` if the session doesn't exist.
+    pub fn update_session(
+        &self,
+        recording_call_id: &str,
+        metadata: RecordingMetadata,
+    ) -> Option<String> {
+        let session_id = self.call_id_to_session.get(recording_call_id)?
+            .clone();
+
+        if let Some(mut session) = self.sessions.get_mut(&session_id) {
+            let to_tag = session.to_tag.clone();
+            session.metadata = metadata;
+            info!(
+                session_id = %session_id,
+                recording_call_id = %recording_call_id,
+                participants = session.metadata.participants.len(),
+                streams = session.metadata.streams.len(),
+                "SRS: updated recording session (re-INVITE)"
+            );
+            Some(to_tag)
+        } else {
+            None
+        }
+    }
+
     /// Mark a session as actively recording (after RTPEngine setup succeeds).
     pub fn activate_session(&self, session_id: &str) {
         if let Some(mut session) = self.sessions.get_mut(session_id) {
@@ -489,5 +517,68 @@ mod tests {
         let (session_id, _) = manager.create_session("call-1", "tag-1", metadata).unwrap();
         let dir = manager.recording_dir(&session_id).unwrap();
         assert_eq!(dir, PathBuf::from("/tmp/siphon-test-recordings/test-session-001"));
+    }
+
+    #[test]
+    fn update_session_reinvite() {
+        let manager = SrsManager::new(test_config());
+        let metadata = test_metadata();
+
+        let (_, original_to_tag) = manager.create_session("call-1", "from-tag-1", metadata).unwrap();
+        manager.activate_session("test-session-001");
+
+        // Simulate re-INVITE with updated metadata (e.g. new stream).
+        let updated_metadata = RecordingMetadata {
+            session_id: "test-session-001".to_string(),
+            participants: vec![
+                Participant {
+                    participant_id: "p1".to_string(),
+                    aor: "sip:alice@example.com".to_string(),
+                    name: None,
+                },
+                Participant {
+                    participant_id: "p2".to_string(),
+                    aor: "sip:bob@example.com".to_string(),
+                    name: None,
+                },
+            ],
+            streams: vec![
+                StreamInfo {
+                    stream_id: "s1".to_string(),
+                    session_id: "test-session-001".to_string(),
+                    label: "caller-audio".to_string(),
+                },
+                StreamInfo {
+                    stream_id: "s2".to_string(),
+                    session_id: "test-session-001".to_string(),
+                    label: "callee-audio".to_string(),
+                },
+            ],
+        };
+
+        let to_tag = manager.update_session("call-1", updated_metadata);
+        assert!(to_tag.is_some());
+
+        // To-tag must be the same as the original (same dialog).
+        assert_eq!(to_tag.unwrap(), original_to_tag);
+
+        // Session count must not increase.
+        assert_eq!(manager.session_count(), 1);
+
+        // Metadata must be updated.
+        let session = manager.get_session("test-session-001").unwrap();
+        assert_eq!(session.metadata.streams.len(), 2);
+
+        // State must remain Recording (not reset to Pending).
+        assert_eq!(session.state, SrsSessionState::Recording);
+    }
+
+    #[test]
+    fn update_session_nonexistent_returns_none() {
+        let manager = SrsManager::new(test_config());
+        let metadata = test_metadata();
+
+        let result = manager.update_session("no-such-call", metadata);
+        assert!(result.is_none());
     }
 }

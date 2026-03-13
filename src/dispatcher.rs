@@ -6007,14 +6007,34 @@ fn handle_srs_invite(
             return;
         }
 
-        // Create the SRS session.
-        let (session_id, to_tag) = match srs_manager.create_session(&call_id, &from_tag, metadata) {
-            Some(result) => result,
-            None => {
-                warn!(call_id = %call_id, "SRS: session creation failed (max sessions?)");
-                let response = build_response(&message, 503, "Service Unavailable", state.server_header.as_deref());
-                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
-                return;
+        // Check if this is a re-INVITE for an existing session.
+        let is_reinvite = srs_manager.is_srs_session(&call_id);
+
+        let (session_id, to_tag) = if is_reinvite {
+            // Re-INVITE: update existing session metadata, reuse to-tag.
+            match srs_manager.update_session(&call_id, metadata) {
+                Some(to_tag) => {
+                    let session_id = srs_manager.session_for_call_id(&call_id)
+                        .unwrap_or_default();
+                    (session_id, to_tag)
+                }
+                None => {
+                    warn!(call_id = %call_id, "SRS: re-INVITE but session not found");
+                    let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref());
+                    send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                    return;
+                }
+            }
+        } else {
+            // Initial INVITE: create a new session.
+            match srs_manager.create_session(&call_id, &from_tag, metadata) {
+                Some(result) => result,
+                None => {
+                    warn!(call_id = %call_id, "SRS: session creation failed (max sessions?)");
+                    let response = build_response(&message, 503, "Service Unavailable", state.server_header.as_deref());
+                    send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                    return;
+                }
             }
         };
 
