@@ -2777,6 +2777,36 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
     }
 }
 
+/// Flip SDP direction attributes for an SRS answer.
+///
+/// The SRC offers `a=sendonly` (it sends forked media to the SRS).  The SRS
+/// answer must mirror this as `a=recvonly` (RFC 3264 §5: answerer reverses
+/// the direction).  RTPEngine's `offer` response preserves the offer direction,
+/// so we flip it before placing the SDP in the 200 OK.
+fn fix_srs_answer_sdp_direction(body: &mut Vec<u8>) {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return;
+    };
+    // Quick check: nothing to do if no direction attributes.
+    if !text.contains("a=sendonly") && !text.contains("a=recvonly") {
+        return;
+    }
+    let mut result = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(|c: char| c == '\r' || c == '\n');
+        if trimmed == "a=sendonly" {
+            result.push_str("a=recvonly");
+            result.push_str(&line[trimmed.len()..]);
+        } else if trimmed == "a=recvonly" {
+            result.push_str("a=sendonly");
+            result.push_str(&line[trimmed.len()..]);
+        } else {
+            result.push_str(line);
+        }
+    }
+    *body = result.into_bytes();
+}
+
 fn build_b2bua_ack_for_non2xx(
     response: &SipMessage,
     branch: &str,
@@ -6296,14 +6326,20 @@ fn handle_srs_invite(
 
         // Add SDP body (from RTPEngine or echo back original).
         // Sanitize o=/s= lines to hide the SRC's identity (e.g. "FreeSWITCH").
+        // Flip SDP direction for the answer: the SRC offered sendonly (it sends
+        // forked media), so the SRS answer must be recvonly (we receive it).
+        // RTPEngine's offer response preserves the offer direction — we must flip
+        // it since this SDP goes into the SIP 200 OK answer (RFC 3264 §5).
         let local_ip = state.local_addr.ip().to_string();
         if let Some(mut sdp) = answer_sdp {
+            fix_srs_answer_sdp_direction(&mut sdp);
             sanitize_sdp_identity(&mut sdp, "siphon", Some(&local_ip));
             response_builder = response_builder
                 .header("Content-Type", "application/sdp".to_string())
                 .body(sdp);
         } else if let Some(sdp_part) = sdp_part {
             let mut sdp = sdp_part.body.clone();
+            fix_srs_answer_sdp_direction(&mut sdp);
             sanitize_sdp_identity(&mut sdp, "siphon", Some(&local_ip));
             response_builder = response_builder
                 .header("Content-Type", "application/sdp".to_string())
@@ -6967,5 +7003,75 @@ mod tests {
         };
         assert!(ruri.contains("bob@192.168.1.50"),
             "fork branch R-URI should be updated to target contact: {ruri}");
+    }
+
+    #[test]
+    fn srs_answer_flips_sendonly_to_recvonly() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1234 5678 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 8 101\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=sendonly\r\n",
+            "m=audio 10002 RTP/AVP 8 101\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=sendonly\r\n",
+        );
+        let mut body = sdp.as_bytes().to_vec();
+        fix_srs_answer_sdp_direction(&mut body);
+        let result = String::from_utf8(body).unwrap();
+        assert!(!result.contains("a=sendonly"), "sendonly should be flipped");
+        assert_eq!(result.matches("a=recvonly").count(), 2);
+    }
+
+    #[test]
+    fn srs_answer_flips_recvonly_to_sendonly() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1234 5678 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 8\r\n",
+            "a=recvonly\r\n",
+        );
+        let mut body = sdp.as_bytes().to_vec();
+        fix_srs_answer_sdp_direction(&mut body);
+        let result = String::from_utf8(body).unwrap();
+        assert!(result.contains("a=sendonly"));
+        assert!(!result.contains("a=recvonly"));
+    }
+
+    #[test]
+    fn srs_answer_leaves_sendrecv_unchanged() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1234 5678 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 8\r\n",
+            "a=sendrecv\r\n",
+        );
+        let mut body = sdp.as_bytes().to_vec();
+        fix_srs_answer_sdp_direction(&mut body);
+        let result = String::from_utf8(body).unwrap();
+        assert!(result.contains("a=sendrecv"));
+    }
+
+    #[test]
+    fn srs_answer_no_direction_unchanged() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1234 5678 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 8\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+        );
+        let mut body = sdp.as_bytes().to_vec();
+        let original = body.clone();
+        fix_srs_answer_sdp_direction(&mut body);
+        assert_eq!(body, original);
     }
 }
