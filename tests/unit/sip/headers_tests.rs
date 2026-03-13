@@ -70,5 +70,69 @@ fn test_convenience_methods() {
     assert_eq!(headers.content_length(), Some(100));
 }
 
+#[test]
+fn set_preserves_header_position() {
+    let mut headers = SipHeaders::new();
+    headers.add("Via", "SIP/2.0/UDP original:5060".to_string());
+    headers.add("From", "<sip:alice@example.com>".to_string());
+    headers.add("To", "<sip:bob@example.com>".to_string());
+    headers.add("Call-ID", "abc@example.com".to_string());
 
+    // set() should replace Via in-place, keeping it first
+    headers.set("Via", "SIP/2.0/TCP new:5061".to_string());
+
+    let names: Vec<&str> = headers.names().iter().map(|s| s.as_str()).collect();
+    assert_eq!(names, vec!["Via", "From", "To", "Call-ID"]);
+    assert_eq!(headers.get("Via").unwrap(), "SIP/2.0/TCP new:5061");
+}
+
+#[test]
+fn set_all_preserves_header_position() {
+    let mut headers = SipHeaders::new();
+    headers.add("Via", "SIP/2.0/UDP first:5060".to_string());
+    headers.add("From", "<sip:alice@example.com>".to_string());
+    headers.add("To", "<sip:bob@example.com>".to_string());
+
+    // set_all() should replace Via values in-place, keeping position
+    headers.set_all("Via", vec![
+        "SIP/2.0/TCP new1:5061".to_string(),
+        "SIP/2.0/UDP new2:5060".to_string(),
+    ]);
+
+    let names: Vec<&str> = headers.names().iter().map(|s| s.as_str()).collect();
+    assert_eq!(names, vec!["Via", "From", "To"]);
+    let vias = headers.get_all("Via").unwrap();
+    assert_eq!(vias.len(), 2);
+    assert_eq!(vias[0], "SIP/2.0/TCP new1:5061");
+    assert_eq!(vias[1], "SIP/2.0/UDP new2:5060");
+}
+
+#[test]
+fn set_all_inserts_new_header_at_end() {
+    let mut headers = SipHeaders::new();
+    headers.add("From", "<sip:alice@example.com>".to_string());
+    headers.add("To", "<sip:bob@example.com>".to_string());
+
+    // set_all() on a header that doesn't exist yet appends at end
+    headers.set_all("Via", vec!["SIP/2.0/UDP host:5060".to_string()]);
+
+    let names: Vec<&str> = headers.names().iter().map(|s| s.as_str()).collect();
+    assert_eq!(names, vec!["From", "To", "Via"]);
+}
+
+#[test]
+fn remove_and_add_moves_header_to_end() {
+    // Demonstrates the bug that set/set_all fixes
+    let mut headers = SipHeaders::new();
+    headers.add("Via", "SIP/2.0/UDP original:5060".to_string());
+    headers.add("From", "<sip:alice@example.com>".to_string());
+    headers.add("To", "<sip:bob@example.com>".to_string());
+
+    // remove + add puts Via at the end (the old broken pattern)
+    headers.remove("Via");
+    headers.add("Via", "SIP/2.0/TCP new:5061".to_string());
+
+    let names: Vec<&str> = headers.names().iter().map(|s| s.as_str()).collect();
+    assert_eq!(names, vec!["From", "To", "Via"]); // Via moved to end!
+}
 
