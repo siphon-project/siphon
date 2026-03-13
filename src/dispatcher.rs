@@ -99,6 +99,8 @@ struct DispatcherState {
     rtpengine_set: Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
     /// RTPEngine media session store (None when media.rtpengine is not configured).
     rtpengine_sessions: Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
+    /// RTPEngine media profile registry (None when media.rtpengine is not configured).
+    rtpengine_profiles: Option<Arc<crate::rtpengine::ProfileRegistry>>,
     /// RFC 4028 session timer configuration (None when not configured).
     session_timer_config: Option<crate::config::SessionTimerConfig>,
     /// Outbound registration manager (None when registrant is not configured).
@@ -170,6 +172,7 @@ pub async fn run(
     pre_rtpengine: (
         Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
         Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
+        Option<Arc<crate::rtpengine::ProfileRegistry>>,
     ),
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
@@ -235,7 +238,7 @@ pub async fn run(
         }
     });
 
-    let (rtpengine_set, rtpengine_sessions) = pre_rtpengine;
+    let (rtpengine_set, rtpengine_sessions, rtpengine_profiles) = pre_rtpengine;
 
     // Merge per-transport advertised addresses with global advertised_address fallback.
     // Per-transport takes precedence; global fills in any transport that lacks one.
@@ -265,6 +268,7 @@ pub async fn run(
         uac_sender,
         rtpengine_set,
         rtpengine_sessions,
+        rtpengine_profiles,
         session_timer_config: config.session_timer.clone(),
         registrant_manager,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new()),
@@ -2348,10 +2352,11 @@ pub fn init_rtpengine(
 ) -> (
     Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
     Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
+    Option<Arc<crate::rtpengine::ProfileRegistry>>,
 ) {
     let media_config = match &config.media {
         Some(c) => c,
-        None => return (None, None),
+        None => return (None, None, None),
     };
 
     let instances_config = media_config.rtpengine.instances();
@@ -2373,7 +2378,7 @@ pub fn init_rtpengine(
     }
 
     if instance_tuples.is_empty() {
-        return (None, None);
+        return (None, None, None);
     }
 
     let handle = tokio::runtime::Handle::current();
@@ -2393,7 +2398,7 @@ pub fn init_rtpengine(
             let py_rtpengine = crate::script::api::rtpengine::PyRtpEngine::new(
                 Arc::clone(&rtpengine_set),
                 Arc::clone(&sessions),
-                registry,
+                Arc::clone(&registry),
             );
 
             Python::attach(|python| {
@@ -2411,11 +2416,11 @@ pub fn init_rtpengine(
                 }
             });
 
-            (Some(rtpengine_set), Some(sessions))
+            (Some(rtpengine_set), Some(sessions), Some(registry))
         }
         Err(rtpengine_error) => {
             error!(error = %rtpengine_error, "failed to initialize RTPEngine client");
-            (None, None)
+            (None, None, None)
         }
     }
 }
@@ -4150,6 +4155,44 @@ fn handle_b2bua_response(
 
         sanitize_b2bua_response(message, state, resp_transport);
 
+        // RTPEngine: rewrite re-INVITE 2xx response SDP through answer.
+        // Mirrors the offer processing done on the request side.
+        if (200..300).contains(&status_code) && !message.body.is_empty() {
+            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) =
+                (&state.rtpengine_set, &state.rtpengine_sessions, &state.rtpengine_profiles)
+            {
+                let a_sip_call_id = &a_leg.dialog.call_id;
+                if let Some(session) = media_sessions.get(a_sip_call_id) {
+                    if let Some(profile) = profiles.get(&session.profile) {
+                        // The answer comes from the opposite side of the offer.
+                        // In RTPEngine: from_tag = offerer, to_tag = answerer.
+                        let (answer_from, answer_to) = if is_a2b {
+                            // A→B re-INVITE: A offered (from_tag), B answers (to_tag)
+                            (session.from_tag.as_str(), session.to_tag.as_deref().unwrap_or(""))
+                        } else {
+                            // B→A re-INVITE: B offered (to_tag), A answers (from_tag)
+                            (session.to_tag.as_deref().unwrap_or(session.from_tag.as_str()), session.from_tag.as_str())
+                        };
+                        let answer_flags = profile.answer.clone();
+                        match tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(
+                                rtpengine_set.answer(&session.call_id, answer_from, answer_to, &message.body, &answer_flags)
+                            )
+                        }) {
+                            Ok(rewritten_sdp) => {
+                                message.body = rewritten_sdp;
+                                message.headers.set("Content-Length", message.body.len().to_string());
+                                debug!(call_id = %call_id, "RTPEngine: rewrote re-INVITE response SDP (answer)");
+                            }
+                            Err(error) => {
+                                warn!(call_id = %call_id, "RTPEngine answer for re-INVITE failed: {error}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Helper: build and send ACK to the responder of the re-INVITE.
         // For 2xx: ACK uses a NEW branch (end-to-end, RFC 3261 §13.2.2.4).
         // For non-2xx: ACK uses the SAME branch (hop-by-hop, RFC 3261 §17.1.1.3).
@@ -5794,7 +5837,42 @@ fn handle_b2bua_reinvite(
         let sdp_addr = state.via_host(&transport);
         sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
 
-        // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
+        // RTPEngine: rewrite re-INVITE SDP through offer to maintain media anchoring.
+        // Without this, re-INVITE SDP passes through unmodified — if the remote side
+        // includes stale or cross-wired RTP ports, media breaks (one-way audio).
+        if !forwarded.body.is_empty() {
+            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) =
+                (&state.rtpengine_set, &state.rtpengine_sessions, &state.rtpengine_profiles)
+            {
+                let a_sip_call_id = &a_leg.dialog.call_id;
+                if let Some(session) = media_sessions.get(a_sip_call_id) {
+                    if let Some(profile) = profiles.get(&session.profile) {
+                        // Use the tag of whichever side is sending the offer
+                        let offer_tag = if from_a_leg {
+                            session.from_tag.as_str()
+                        } else {
+                            session.to_tag.as_deref().unwrap_or(session.from_tag.as_str())
+                        };
+                        let offer_flags = profile.offer.clone();
+                        match tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(
+                                rtpengine_set.offer(&session.call_id, offer_tag, &forwarded.body, &offer_flags)
+                            )
+                        }) {
+                            Ok(rewritten_sdp) => {
+                                forwarded.body = rewritten_sdp;
+                                debug!(call_id = %call_id, "RTPEngine: rewrote re-INVITE SDP (offer)");
+                            }
+                            Err(error) => {
+                                warn!(call_id = %call_id, "RTPEngine offer for re-INVITE failed: {error}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update Content-Length after SDP rewrite (o=/s= and RTPEngine changes may alter body size)
         if !forwarded.body.is_empty() {
             forwarded.headers.set("Content-Length", forwarded.body.len().to_string());
         }
