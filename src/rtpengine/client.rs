@@ -157,6 +157,10 @@ impl RtpEngineClient {
     }
 
     /// Send a `subscribe answer` command to complete SIPREC media subscription.
+    ///
+    /// Returns the rewritten SDP if RTPEngine includes one, or an empty vec
+    /// if the command succeeded without returning SDP (which is valid for
+    /// subscribe answer — unlike offer/answer, the response may omit SDP).
     pub async fn subscribe_answer(
         &self,
         call_id: &str,
@@ -175,7 +179,13 @@ impl RtpEngineClient {
         pairs.extend(flags.to_bencode_pairs());
 
         let response = self.send_command(BencodeValue::dict(pairs)).await?;
-        self.extract_sdp_response(&response)
+        self.check_result(&response)?;
+
+        // subscribe answer may or may not return SDP — both are valid.
+        Ok(response
+            .dict_get_bytes("sdp")
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default())
     }
 
     /// Send an `unsubscribe` command to stop SIPREC media forking.

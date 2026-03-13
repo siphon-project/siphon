@@ -2,7 +2,7 @@
 //!
 //! Manages recording sessions that fork media to a Session Recording Server (SRS).
 //! When a B2BUA call is recorded, SIPhon sends an INVITE to the SRS with:
-//! - Part 1: SDP (a=recvonly, mirroring the main call's media)
+//! - Part 1: SDP (a=sendonly, SRC sends forked media to SRS)
 //! - Part 2: RFC 7866 recording metadata XML
 
 pub mod metadata;
@@ -190,9 +190,12 @@ impl RecordingManager {
             callee_uri,
         );
 
-        // Use override SDP (from RTPEngine subscribe) or build recvonly SDP
+        // Use override SDP (from RTPEngine subscribe) or build sendonly SDP.
+        // In both cases, ensure direction is sendonly — the SRC sends forked
+        // media to the SRS.  RTPEngine subscribe_request returns recvonly SDP
+        // (from its subscription port's perspective), which must be flipped.
         let recording_sdp = match recording_sdp_override {
-            Some(override_sdp) => override_sdp.to_vec(),
+            Some(override_sdp) => fix_recording_sdp_direction(override_sdp),
             None => build_recording_sdp(sdp, local_addr),
         };
 
@@ -571,17 +574,38 @@ impl RecordingManager {
     }
 }
 
-/// Build a recvonly SDP from the call's SDP.
+/// Rewrite SDP direction attributes to `a=sendonly` for SIPREC.
 ///
-/// Rewrites the SDP to be recvonly (the SRS receives but does not send).
+/// RTPEngine's subscribe_request returns SDP with `a=recvonly` (from its
+/// subscription endpoint's perspective — it receives a copy of the media).
+/// But in the SIPREC INVITE, the direction is from the SRC's perspective:
+/// "I (SRC) will send forked media to you (SRS)" → `a=sendonly`.
+fn fix_recording_sdp_direction(sdp: &[u8]) -> Vec<u8> {
+    let sdp_str = String::from_utf8_lossy(sdp);
+    let mut result = String::new();
+    for line in sdp_str.lines() {
+        if line.starts_with("a=recvonly") {
+            result.push_str("a=sendonly\r\n");
+        } else {
+            result.push_str(line);
+            result.push_str("\r\n");
+        }
+    }
+    result.into_bytes()
+}
+
+/// Build a sendonly SDP from the call's SDP for the SIPREC INVITE.
+///
+/// The SRC (us) sends forked media to the SRS, so the offer direction
+/// must be `a=sendonly` — "I will send, you receive" (RFC 3264 §5).
 fn build_recording_sdp(original_sdp: &[u8], local_addr: SocketAddr) -> Vec<u8> {
     let sdp_str = String::from_utf8_lossy(original_sdp);
 
-    // Simple SDP rewriting: replace sendrecv/sendonly with recvonly
+    // Rewrite direction to sendonly: the SRC sends forked RTP to the SRS.
     let mut result = String::new();
     for line in sdp_str.lines() {
-        if line.starts_with("a=sendrecv") || line.starts_with("a=sendonly") {
-            result.push_str("a=recvonly\r\n");
+        if line.starts_with("a=sendrecv") || line.starts_with("a=recvonly") {
+            result.push_str("a=sendonly\r\n");
         } else if line.starts_with("o=") {
             // Replace origin address with our address
             let parts: Vec<&str> = line.splitn(6, ' ').collect();
@@ -695,7 +719,7 @@ mod tests {
         assert!(raw.contains("multipart/mixed"));
         assert!(raw.contains("application/sdp"));
         assert!(raw.contains("application/rs-metadata+xml"));
-        assert!(raw.contains("a=recvonly"));
+        assert!(raw.contains("a=sendonly"));
 
         // Verify session is in pending state
         let session = manager.sessions.get(&session_id).unwrap();
@@ -919,7 +943,7 @@ mod tests {
         );
         let result = build_recording_sdp(sdp.as_bytes(), "10.0.0.2:5060".parse().unwrap());
         let result_str = String::from_utf8_lossy(&result);
-        assert!(result_str.contains("a=recvonly"));
+        assert!(result_str.contains("a=sendonly"));
         assert!(!result_str.contains("a=sendrecv"));
     }
 
@@ -938,6 +962,35 @@ mod tests {
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("c=IN IP4 10.0.0.2"));
         assert!(!result_str.contains("c=IN IP4 10.0.0.1"));
+    }
+
+    #[test]
+    fn fix_recording_sdp_direction_recvonly_to_sendonly() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=recvonly\r\n",
+        );
+        let result = fix_recording_sdp_direction(sdp.as_bytes());
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("a=sendonly"), "recvonly must be rewritten to sendonly");
+        assert!(!result_str.contains("a=recvonly"));
+    }
+
+    #[test]
+    fn fix_recording_sdp_direction_preserves_sendonly() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=sendonly\r\n",
+        );
+        let result = fix_recording_sdp_direction(sdp.as_bytes());
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("a=sendonly"));
     }
 
     #[test]
