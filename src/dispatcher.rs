@@ -4764,7 +4764,7 @@ fn handle_b2bua_response(
                 // knows which existing media session to subscribe to.
                 let a_sip_call_id = a_leg.dialog.call_id.clone();
                 let original_from_tag = a_leg.dialog.remote_tag.clone().unwrap_or_default();
-                let (recording_sdp, original_tags) = if let Some(ref rtpengine_set) = state.rtpengine_set {
+                let (mut recording_sdp, original_tags) = if let Some(ref rtpengine_set) = state.rtpengine_set {
                     // Look up the to_tag from the media session store
                     let original_to_tag = state.rtpengine_sessions.as_ref()
                         .and_then(|sessions| sessions.get(&a_sip_call_id))
@@ -4795,11 +4795,19 @@ fn handle_b2bua_response(
                     (None, None)
                 };
 
+                // Sanitize the subscribe SDP to hide the original call's identity
+                // (o=/s= lines may leak FreeSWITCH, Orace, etc.).
+                let local_ip = state.local_addr.ip().to_string();
+                if let Some(ref mut sdp_bytes) = recording_sdp {
+                    sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));
+                }
+
                 let tags_ref = original_tags.as_ref().map(|(ft, tt)| (ft.as_str(), tt.as_str()));
                 if let Some((_session_id, rec_invite, destination, transport)) =
                     state.recording_manager.start_recording(
                         call_id, srs_uri, &caller_uri, &callee_uri, sdp, state.local_addr,
                         recording_sdp.as_deref(), Some(&a_sip_call_id), tags_ref,
+                        state.server_header.as_deref(),
                     )
                 {
                     let data = Bytes::from(rec_invite.to_bytes());
@@ -6255,9 +6263,29 @@ fn handle_srs_invite(
                     offer_flags.record_path = Some(recording_dir.display().to_string());
 
                     match rtpengine_set.offer(&call_id, &from_tag, &sdp_part.body, &offer_flags).await {
-                        Ok(rewritten_sdp) => {
-                            srs_manager.activate_session(&session_id);
-                            Some(rewritten_sdp)
+                        Ok(offer_sdp) => {
+                            // Complete the RTPEngine call by sending `answer` with
+                            // our to-tag.  Without this, RTPEngine keeps the call
+                            // half-open and may not process incoming media on the
+                            // answer-side ports (where the SRC sends RTP).
+                            let answer_flags = profile.answer.clone();
+                            match rtpengine_set.answer(&call_id, &from_tag, &to_tag, &offer_sdp, &answer_flags).await {
+                                Ok(answer_sdp) => {
+                                    srs_manager.activate_session(&session_id);
+                                    Some(answer_sdp)
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        call_id = %call_id,
+                                        session_id = %session_id,
+                                        error = %error,
+                                        "SRS: RTPEngine answer failed, using offer SDP"
+                                    );
+                                    // Fall back to offer SDP if answer fails.
+                                    srs_manager.activate_session(&session_id);
+                                    Some(offer_sdp)
+                                }
+                            }
                         }
                         Err(error) => {
                             warn!(

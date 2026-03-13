@@ -124,6 +124,7 @@ impl RecordingManager {
         recording_sdp_override: Option<&[u8]>,
         original_sip_call_id: Option<&str>,
         original_tags: Option<(&str, &str)>,
+        user_agent: Option<&str>,
     ) -> Option<(String, SipMessage, SocketAddr, Transport)> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let sip_call_id = format!("siprec-{}", uuid::Uuid::new_v4());
@@ -226,7 +227,7 @@ impl RecordingManager {
             .header("Contact", format!("<sip:recorder@{local_addr}>"))
             .header("Content-Type", format!("multipart/mixed;boundary={boundary}"))
             .header("Require", "siprec".to_string())
-            .header("User-Agent", "SIPhon".to_string())
+            .header("User-Agent", user_agent.unwrap_or("SIPhon").to_string())
             .max_forwards(70)
             .body(multipart_body)
             .build();
@@ -702,6 +703,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(result.is_some());
@@ -746,6 +748,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -797,6 +800,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         let (ack, destination, transport) = manager.handle_success(
@@ -835,6 +839,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         manager.handle_failure(&session_id, 503);
@@ -863,6 +868,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -912,6 +918,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -1028,6 +1035,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         let (session_id_2, _, _, _) = manager.start_recording(
@@ -1037,6 +1045,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -1079,6 +1088,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         // Transport should be TCP, not UDP.
@@ -1118,6 +1128,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         // Default transport should be UDP.
@@ -1154,6 +1165,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         // Should default to port 5060.
@@ -1183,6 +1195,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         manager.handle_success(&session_id, Some("srs-tag-1".to_string()), "10.0.0.1:5060".parse().unwrap());
@@ -1197,5 +1210,37 @@ mod tests {
         let bytes = bye.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.contains("SIP/2.0/TCP"));
+    }
+
+    #[test]
+    fn start_recording_uses_configured_user_agent() {
+        let manager = RecordingManager::new();
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=sendrecv\r\n",
+        );
+
+        let (_, message, _, _) = manager.start_recording(
+            "call-1",
+            "sip:srs@10.0.0.5:5060",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            sdp.as_bytes(),
+            "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+            Some("SIPhon/0.1.3"),
+        ).unwrap();
+
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(raw.contains("User-Agent: SIPhon/0.1.3"));
+        assert!(!raw.contains("User-Agent: SIPhon\r\n"));
     }
 }
