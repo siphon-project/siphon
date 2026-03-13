@@ -8,6 +8,7 @@ use crate::error::{Result, SiphonError};
 pub struct Config {
     pub listen: ListenConfig,
     pub domain: DomainConfig,
+    #[serde(default)]
     pub script: ScriptConfig,
     #[serde(default)]
     pub registrar: RegistrarConfig,
@@ -162,9 +163,23 @@ pub struct DomainConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ScriptConfig {
+    #[serde(default = "default_script_path")]
     pub path: String,
     #[serde(default = "default_reload")]
     pub reload: ReloadMode,
+}
+
+fn default_script_path() -> String {
+    String::new()
+}
+
+impl Default for ScriptConfig {
+    fn default() -> Self {
+        Self {
+            path: default_script_path(),
+            reload: default_reload(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]

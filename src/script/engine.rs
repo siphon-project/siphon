@@ -175,6 +175,32 @@ impl ScriptEngine {
         })
     }
 
+    /// Create the engine from an embedded script source string.
+    ///
+    /// The script is compiled directly from the provided source — no file is
+    /// read from disk and hot-reload is disabled (reload mode forced to Sighup).
+    pub fn new_embedded(source: &str) -> Result<Self> {
+        let script_path = PathBuf::from("<embedded>");
+
+        // Initialise the free-threaded Python interpreter (no-op if already done).
+        Python::initialize();
+
+        let state = Self::compile_source_standalone(&script_path, source)?;
+
+        info!(
+            handlers = state.handlers.len(),
+            "embedded script loaded"
+        );
+
+        let state = Arc::new(ArcSwap::from_pointee(state));
+
+        Ok(Self {
+            state,
+            script_path,
+            reload_mode: ReloadMode::Sighup,
+        })
+    }
+
     /// Get a snapshot of the current script state.
     /// This is cheap — just an `Arc` clone.
     pub fn state(&self) -> arc_swap::Guard<Arc<ScriptState>> {
@@ -226,6 +252,13 @@ impl ScriptEngine {
 
         Python::attach(|python| {
             Self::compile_source(python, path, &source)
+        })
+    }
+
+    /// Compile an already-loaded source string. Used for embedded scripts.
+    fn compile_source_standalone(path: &Path, source: &str) -> Result<ScriptState> {
+        Python::attach(|python| {
+            Self::compile_source(python, path, source)
         })
     }
 
