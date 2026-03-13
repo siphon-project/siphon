@@ -72,6 +72,10 @@ pub struct StreamInfo {
 /// Build RFC 7866 recording metadata XML.
 ///
 /// The metadata describes the participants and streams being recorded.
+/// Per RFC 7866 §4.2, each participant's media direction gets its own
+/// `<stream>` element, correlated to an SDP `a=label:N` via `<label>`.
+/// The `<participantstreamassoc>` elements map which participant sends
+/// on which stream and receives on the other.
 pub fn build_recording_metadata(
     session_id: &str,
     caller_uri: &str,
@@ -79,7 +83,8 @@ pub fn build_recording_metadata(
 ) -> String {
     let caller_participant_id = format!("part-{}", &session_id[..8]);
     let callee_participant_id = format!("part-{}", &session_id[8..16.min(session_id.len())]);
-    let stream_id = format!("stream-{}", &session_id[..8]);
+    let stream_0_id = format!("stream-0-{}", &session_id[..8]);
+    let stream_1_id = format!("stream-1-{}", &session_id[..8]);
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -94,9 +99,20 @@ pub fn build_recording_metadata(
   <participant participant_id="{callee_participant_id}">
     <nameID aor="{callee_uri}"/>
   </participant>
-  <stream stream_id="{stream_id}" session_id="{session_id}">
-    <label>main-audio</label>
+  <stream stream_id="{stream_0_id}" session_id="{session_id}">
+    <label>0</label>
   </stream>
+  <stream stream_id="{stream_1_id}" session_id="{session_id}">
+    <label>1</label>
+  </stream>
+  <participantstreamassoc participant_id="{caller_participant_id}">
+    <send>{stream_0_id}</send>
+    <recv>{stream_1_id}</recv>
+  </participantstreamassoc>
+  <participantstreamassoc participant_id="{callee_participant_id}">
+    <send>{stream_1_id}</send>
+    <recv>{stream_0_id}</recv>
+  </participantstreamassoc>
 </recording>"#
     )
 }
@@ -273,14 +289,19 @@ mod tests {
     }
 
     #[test]
-    fn metadata_has_two_participants() {
+    fn metadata_has_two_participants_and_streams() {
         let xml = build_recording_metadata(
             "aaaabbbb-cccc-dddd-eeee-ffffffffffff",
             "sip:alice@example.com",
             "sip:bob@example.com",
         );
-        let count = xml.matches("<participant").count();
-        assert_eq!(count, 2);
+        assert_eq!(xml.matches("<participant ").count(), 2);
+        assert_eq!(xml.matches("<stream ").count(), 2);
+        assert_eq!(xml.matches("<participantstreamassoc ").count(), 2);
+        assert!(xml.contains("<label>0</label>"));
+        assert!(xml.contains("<label>1</label>"));
+        assert!(xml.contains("<send>stream-0-aaaabbbb</send>"));
+        assert!(xml.contains("<recv>stream-1-aaaabbbb</recv>"));
     }
 
     // --- Parsing tests (new) ---
@@ -298,8 +319,9 @@ mod tests {
         assert_eq!(metadata.participants.len(), 2);
         assert_eq!(metadata.participants[0].aor, "sip:alice@example.com");
         assert_eq!(metadata.participants[1].aor, "sip:bob@example.com");
-        assert_eq!(metadata.streams.len(), 1);
-        assert_eq!(metadata.streams[0].label, "main-audio");
+        assert_eq!(metadata.streams.len(), 2);
+        assert_eq!(metadata.streams[0].label, "0");
+        assert_eq!(metadata.streams[1].label, "1");
     }
 
     #[test]

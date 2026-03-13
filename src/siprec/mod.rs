@@ -112,6 +112,12 @@ impl RecordingManager {
 
     /// Start recording a call by sending INVITE to SRS.
     ///
+    /// `caller_sdp` and `callee_sdp` are optional per-direction SDPs from
+    /// RTPEngine subscribe_request (caller's audio = label 0, callee's = label 1).
+    /// If both are provided, the INVITE carries 2 m= lines (RFC 7866 §4).
+    /// If only one or neither is available, falls back to a single m= line
+    /// built from the call's original SDP.
+    ///
     /// Returns the recording session ID and the SIP message to send.
     pub fn start_recording(
         &self,
@@ -121,7 +127,8 @@ impl RecordingManager {
         callee_uri: &str,
         sdp: &[u8],
         local_addr: SocketAddr,
-        recording_sdp_override: Option<&[u8]>,
+        caller_sdp: Option<&[u8]>,
+        callee_sdp: Option<&[u8]>,
         original_sip_call_id: Option<&str>,
         original_tags: Option<(&str, &str)>,
         user_agent: Option<&str>,
@@ -191,13 +198,22 @@ impl RecordingManager {
             callee_uri,
         );
 
-        // Use override SDP (from RTPEngine subscribe) or build sendonly SDP.
-        // In both cases, ensure direction is sendonly — the SRC sends forked
-        // media to the SRS.  RTPEngine subscribe_request returns recvonly SDP
-        // (from its subscription port's perspective), which must be flipped.
-        let recording_sdp = match recording_sdp_override {
-            Some(override_sdp) => fix_recording_sdp_direction(override_sdp),
-            None => build_recording_sdp(sdp, local_addr),
+        // Build recording SDP with per-direction streams.
+        // RTPEngine subscribe_request returns recvonly SDP (from its subscription
+        // port perspective), which must be flipped to sendonly (SRC→SRS direction).
+        let recording_sdp = match (caller_sdp, callee_sdp) {
+            (Some(caller), Some(callee)) => {
+                // Both directions available — combine into 2 m= lines with labels.
+                combine_recording_sdps(caller, callee)
+            }
+            (Some(single), None) | (None, Some(single)) => {
+                // Only one direction — single m= line fallback.
+                fix_recording_sdp_direction(single)
+            }
+            (None, None) => {
+                // No RTPEngine SDPs — build from original call SDP.
+                build_recording_sdp(sdp, local_addr)
+            }
         };
 
         // Build multipart/mixed body
@@ -227,7 +243,7 @@ impl RecordingManager {
             .header("Contact", format!("<sip:recorder@{local_addr}>"))
             .header("Content-Type", format!("multipart/mixed;boundary={boundary}"))
             .header("Require", "siprec".to_string())
-            .header("User-Agent", user_agent.unwrap_or("SIPhon").to_string())
+            .header("User-Agent", user_agent.unwrap_or(concat!("SIPhon/", env!("CARGO_PKG_VERSION"))).to_string())
             .max_forwards(70)
             .body(multipart_body)
             .build();
@@ -595,6 +611,70 @@ fn fix_recording_sdp_direction(sdp: &[u8]) -> Vec<u8> {
     result.into_bytes()
 }
 
+/// Combine two per-direction subscribe SDPs into a single SDP with 2 m= lines.
+///
+/// Takes the caller's subscribe SDP (label 0) and callee's subscribe SDP
+/// (label 1), extracts the session-level headers from the first, then
+/// appends both media sections with `a=label:N` and `a=sendonly`.
+fn combine_recording_sdps(caller_sdp: &[u8], callee_sdp: &[u8]) -> Vec<u8> {
+    let caller_str = String::from_utf8_lossy(caller_sdp);
+    let callee_str = String::from_utf8_lossy(callee_sdp);
+
+    let mut result = String::new();
+
+    // Extract session-level lines from caller SDP (v=, o=, s=, t=, c=).
+    // Stop at the first m= line.
+    for line in caller_str.lines() {
+        if line.starts_with("m=") {
+            break;
+        }
+        result.push_str(line);
+        result.push_str("\r\n");
+    }
+
+    // Append caller's media section (label 0) with direction fix.
+    append_media_section(&mut result, &caller_str, "0");
+
+    // Append callee's media section (label 1) with direction fix.
+    append_media_section(&mut result, &callee_str, "1");
+
+    result.into_bytes()
+}
+
+/// Extract the first m= section from an SDP and append it with a label.
+fn append_media_section(result: &mut String, sdp: &str, label: &str) {
+    let mut in_media = false;
+    let mut has_label = false;
+
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            in_media = true;
+            result.push_str(line);
+            result.push_str("\r\n");
+            continue;
+        }
+        if !in_media {
+            continue;
+        }
+        // Direction fix: recvonly → sendonly (subscribe returns recvonly).
+        if line.starts_with("a=recvonly") {
+            result.push_str("a=sendonly\r\n");
+        } else if line.starts_with("a=label:") {
+            // Replace existing label.
+            has_label = true;
+            result.push_str(&format!("a=label:{label}\r\n"));
+        } else {
+            result.push_str(line);
+            result.push_str("\r\n");
+        }
+    }
+
+    // Add label if the subscribe SDP didn't have one.
+    if in_media && !has_label {
+        result.push_str(&format!("a=label:{label}\r\n"));
+    }
+}
+
 /// Build a sendonly SDP from the call's SDP for the SIPREC INVITE.
 ///
 /// The SRC (us) sends forked media to the SRS, so the offer direction
@@ -704,6 +784,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(result.is_some());
@@ -748,6 +829,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -801,6 +883,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         let (ack, destination, transport) = manager.handle_success(
@@ -840,6 +923,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         manager.handle_failure(&session_id, 503);
@@ -868,6 +952,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -918,6 +1003,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -1001,6 +1087,83 @@ mod tests {
     }
 
     #[test]
+    fn combine_two_subscribe_sdps_into_labeled_streams() {
+        let caller_sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=session\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8 101\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=recvonly\r\n",
+            "a=ptime:20\r\n",
+        );
+        let callee_sdp = concat!(
+            "v=0\r\n",
+            "o=- 2 2 IN IP4 10.0.0.2\r\n",
+            "s=session\r\n",
+            "t=0 0\r\n",
+            "m=audio 30100 RTP/AVP 8 101\r\n",
+            "c=IN IP4 10.0.0.2\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=recvonly\r\n",
+            "a=ptime:20\r\n",
+        );
+
+        let combined = combine_recording_sdps(caller_sdp.as_bytes(), callee_sdp.as_bytes());
+        let result = String::from_utf8_lossy(&combined);
+
+        // Session-level headers from first SDP only.
+        assert_eq!(result.matches("v=0").count(), 1);
+        assert_eq!(result.matches("o=").count(), 1);
+
+        // Two m= lines with different ports.
+        assert_eq!(result.matches("m=audio").count(), 2);
+        assert!(result.contains("m=audio 30000"));
+        assert!(result.contains("m=audio 30100"));
+
+        // Labels assigned: 0 for caller, 1 for callee.
+        assert!(result.contains("a=label:0"));
+        assert!(result.contains("a=label:1"));
+
+        // Direction flipped from recvonly to sendonly.
+        assert!(!result.contains("a=recvonly"));
+        assert_eq!(result.matches("a=sendonly").count(), 2);
+    }
+
+    #[test]
+    fn combine_sdps_preserves_existing_labels() {
+        let caller_sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8\r\n",
+            "a=label:existing\r\n",
+            "a=recvonly\r\n",
+        );
+        let callee_sdp = concat!(
+            "v=0\r\n",
+            "o=- 2 2 IN IP4 10.0.0.2\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30100 RTP/AVP 8\r\n",
+            "a=recvonly\r\n",
+        );
+
+        let combined = combine_recording_sdps(caller_sdp.as_bytes(), callee_sdp.as_bytes());
+        let result = String::from_utf8_lossy(&combined);
+
+        // Existing label replaced with 0.
+        assert!(result.contains("a=label:0"));
+        assert!(result.contains("a=label:1"));
+        assert!(!result.contains("a=label:existing"));
+    }
+
+    #[test]
     fn build_multipart_body_structure() {
         let sdp = b"v=0\r\nm=audio 10000 RTP/AVP 0\r\n";
         let xml = "<recording xmlns='urn:ietf:params:xml:ns:recording:1'/>";
@@ -1036,6 +1199,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         let (session_id_2, _, _, _) = manager.start_recording(
@@ -1045,6 +1209,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -1089,6 +1254,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         // Transport should be TCP, not UDP.
@@ -1125,6 +1291,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -1166,6 +1333,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         // Should default to port 5060.
@@ -1192,6 +1360,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -1232,6 +1401,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
             None,

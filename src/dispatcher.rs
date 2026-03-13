@@ -4762,43 +4762,67 @@ fn handle_b2bua_response(
                 // RTPEngine subscribe: fork media to the recording leg.
                 // Use the original call's SIP Call-ID and tags so RTPEngine
                 // knows which existing media session to subscribe to.
+                // Two subscribe_request calls — one per direction — so the
+                // SIPREC INVITE carries 2 m= lines (RFC 7866 §4).
                 let a_sip_call_id = a_leg.dialog.call_id.clone();
                 let original_from_tag = a_leg.dialog.remote_tag.clone().unwrap_or_default();
-                let (mut recording_sdp, original_tags) = if let Some(ref rtpengine_set) = state.rtpengine_set {
-                    // Look up the to_tag from the media session store
+                let (mut caller_sdp, mut callee_sdp, original_tags) = if let Some(ref rtpengine_set) = state.rtpengine_set {
                     let original_to_tag = state.rtpengine_sessions.as_ref()
                         .and_then(|sessions| sessions.get(&a_sip_call_id))
                         .and_then(|session| session.to_tag.clone())
                         .unwrap_or_default();
                     let flags = crate::rtpengine::NgFlags::default();
-                    match tokio::task::block_in_place(|| {
+
+                    // Subscribe to caller's direction (from-tag → to-tag).
+                    let caller_result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(
                             rtpengine_set.subscribe_request(
                                 &a_sip_call_id, &original_from_tag, &original_to_tag, None, &flags,
                             )
                         )
-                    }) {
-                        Ok(subscribe_sdp) => {
-                            debug!(
-                                call_id = %call_id,
-                                sdp_len = subscribe_sdp.len(),
-                                "SIPREC: RTPEngine subscribe_request returned SDP for SRS"
-                            );
-                            (Some(subscribe_sdp), Some((original_from_tag.clone(), original_to_tag)))
+                    });
+                    let caller_sub = match caller_result {
+                        Ok(sdp) => {
+                            debug!(call_id = %call_id, sdp_len = sdp.len(), "SIPREC: subscribe caller direction OK");
+                            Some(sdp)
                         }
                         Err(error) => {
-                            warn!(call_id = %call_id, "SIPREC: RTPEngine subscribe_request failed: {error}");
-                            (None, Some((original_from_tag.clone(), String::new())))
+                            warn!(call_id = %call_id, %error, "SIPREC: subscribe caller direction failed");
+                            None
                         }
-                    }
+                    };
+
+                    // Subscribe to callee's direction (to-tag → from-tag).
+                    let callee_result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            rtpengine_set.subscribe_request(
+                                &a_sip_call_id, &original_to_tag, &original_from_tag, None, &flags,
+                            )
+                        )
+                    });
+                    let callee_sub = match callee_result {
+                        Ok(sdp) => {
+                            debug!(call_id = %call_id, sdp_len = sdp.len(), "SIPREC: subscribe callee direction OK");
+                            Some(sdp)
+                        }
+                        Err(error) => {
+                            warn!(call_id = %call_id, %error, "SIPREC: subscribe callee direction failed");
+                            None
+                        }
+                    };
+
+                    (caller_sub, callee_sub, Some((original_from_tag.clone(), original_to_tag)))
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
 
-                // Sanitize the subscribe SDP to hide the original call's identity
-                // (o=/s= lines may leak FreeSWITCH, Orace, etc.).
+                // Sanitize the subscribe SDPs to hide the original call's identity
+                // (o=/s= lines may leak FreeSWITCH, Oracle, etc.).
                 let local_ip = state.local_addr.ip().to_string();
-                if let Some(ref mut sdp_bytes) = recording_sdp {
+                if let Some(ref mut sdp_bytes) = caller_sdp {
+                    sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));
+                }
+                if let Some(ref mut sdp_bytes) = callee_sdp {
                     sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));
                 }
 
@@ -4806,8 +4830,9 @@ fn handle_b2bua_response(
                 if let Some((_session_id, rec_invite, destination, transport)) =
                     state.recording_manager.start_recording(
                         call_id, srs_uri, &caller_uri, &callee_uri, sdp, state.local_addr,
-                        recording_sdp.as_deref(), Some(&a_sip_call_id), tags_ref,
-                        state.server_header.as_deref(),
+                        caller_sdp.as_deref(), callee_sdp.as_deref(),
+                        Some(&a_sip_call_id), tags_ref,
+                        state.user_agent_header.as_deref(),
                     )
                 {
                     let data = Bytes::from(rec_invite.to_bytes());

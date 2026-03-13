@@ -93,8 +93,9 @@ fn siprec_body_round_trip() {
     assert_eq!(metadata.participants.len(), 2);
     assert_eq!(metadata.participants[0].aor, "sip:alice@example.com");
     assert_eq!(metadata.participants[1].aor, "sip:bob@example.com");
-    assert_eq!(metadata.streams.len(), 1);
-    assert_eq!(metadata.streams[0].label, "main-audio");
+    assert_eq!(metadata.streams.len(), 2);
+    assert_eq!(metadata.streams[0].label, "0");
+    assert_eq!(metadata.streams[1].label, "1");
 }
 
 // ---------------------------------------------------------------------------
