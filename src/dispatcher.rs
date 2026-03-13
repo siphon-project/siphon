@@ -4760,30 +4760,39 @@ fn handle_b2bua_response(
                 drop(invite);
 
                 // RTPEngine subscribe: fork media to the recording leg.
-                // Use the original call's SIP Call-ID and tags so RTPEngine
-                // knows which existing media session to subscribe to.
-                // Two subscribe_request calls — one per direction — so the
+                // Two subscribe_request calls — one per call direction — so the
                 // SIPREC INVITE carries 2 m= lines (RFC 7866 §4).
+                //
+                // RTPEngine subscribe protocol:
+                //   from-tag = NEW subscriber tag (unique per subscription)
+                //   to-tag   = existing party's tag (identifies which direction)
+                // This is different from offer/answer where from-tag identifies
+                // the originator.  Using the existing call's tags as from-tag
+                // would corrupt the dialogue state.
                 let a_sip_call_id = a_leg.dialog.call_id.clone();
                 let original_from_tag = a_leg.dialog.remote_tag.clone().unwrap_or_default();
-                let (mut caller_sdp, mut callee_sdp, original_tags) = if let Some(ref rtpengine_set) = state.rtpengine_set {
+                // subscriber_tags: Vec<(from_tag, to_tag)> for unsubscribe on BYE.
+                let (mut caller_sdp, mut callee_sdp, original_tags, subscriber_tags) = if let Some(ref rtpengine_set) = state.rtpengine_set {
                     let original_to_tag = state.rtpengine_sessions.as_ref()
                         .and_then(|sessions| sessions.get(&a_sip_call_id))
                         .and_then(|session| session.to_tag.clone())
                         .unwrap_or_default();
                     let flags = crate::rtpengine::NgFlags::default();
+                    let mut sub_tags = Vec::new();
 
-                    // Subscribe to caller's direction (from-tag → to-tag).
+                    // Subscribe to caller's media (from-tag side of the call).
+                    let caller_sub_tag = format!("srec-{}", uuid::Uuid::new_v4());
                     let caller_result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(
                             rtpengine_set.subscribe_request(
-                                &a_sip_call_id, &original_from_tag, &original_to_tag, None, &flags,
+                                &a_sip_call_id, &caller_sub_tag, &original_from_tag, None, &flags,
                             )
                         )
                     });
                     let caller_sub = match caller_result {
                         Ok(sdp) => {
                             debug!(call_id = %call_id, sdp_len = sdp.len(), "SIPREC: subscribe caller direction OK");
+                            sub_tags.push((caller_sub_tag, original_from_tag.clone()));
                             Some(sdp)
                         }
                         Err(error) => {
@@ -4792,17 +4801,19 @@ fn handle_b2bua_response(
                         }
                     };
 
-                    // Subscribe to callee's direction (to-tag → from-tag).
+                    // Subscribe to callee's media (to-tag side of the call).
+                    let callee_sub_tag = format!("srec-{}", uuid::Uuid::new_v4());
                     let callee_result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(
                             rtpengine_set.subscribe_request(
-                                &a_sip_call_id, &original_to_tag, &original_from_tag, None, &flags,
+                                &a_sip_call_id, &callee_sub_tag, &original_to_tag, None, &flags,
                             )
                         )
                     });
                     let callee_sub = match callee_result {
                         Ok(sdp) => {
                             debug!(call_id = %call_id, sdp_len = sdp.len(), "SIPREC: subscribe callee direction OK");
+                            sub_tags.push((callee_sub_tag, original_to_tag.clone()));
                             Some(sdp)
                         }
                         Err(error) => {
@@ -4811,9 +4822,9 @@ fn handle_b2bua_response(
                         }
                     };
 
-                    (caller_sub, callee_sub, Some((original_from_tag.clone(), original_to_tag)))
+                    (caller_sub, callee_sub, Some((original_from_tag.clone(), original_to_tag)), sub_tags)
                 } else {
-                    (None, None, None)
+                    (None, None, None, Vec::new())
                 };
 
                 // Sanitize the subscribe SDPs to hide the original call's identity
@@ -4827,7 +4838,7 @@ fn handle_b2bua_response(
                 }
 
                 let tags_ref = original_tags.as_ref().map(|(ft, tt)| (ft.as_str(), tt.as_str()));
-                if let Some((_session_id, rec_invite, destination, transport)) =
+                if let Some((session_id, rec_invite, destination, transport)) =
                     state.recording_manager.start_recording(
                         call_id, srs_uri, &caller_uri, &callee_uri, sdp, state.local_addr,
                         caller_sdp.as_deref(), callee_sdp.as_deref(),
@@ -4835,6 +4846,13 @@ fn handle_b2bua_response(
                         state.user_agent_header.as_deref(),
                     )
                 {
+                    // Store subscriber tags so unsubscribe on BYE uses the correct tags.
+                    for (sub_from, sub_to) in &subscriber_tags {
+                        state.recording_manager.add_subscriber_tags(
+                            &session_id, sub_from.clone(), sub_to.clone(),
+                        );
+                    }
+
                     let data = Bytes::from(rec_invite.to_bytes());
                     let target = RelayTarget {
                         address: destination,

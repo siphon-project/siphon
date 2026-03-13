@@ -79,6 +79,8 @@ pub struct RecordingSession {
     pub original_from_tag: Option<String>,
     /// Original call's To-tag (for RTPEngine subscribe correlation).
     pub original_to_tag: Option<String>,
+    /// RTPEngine subscriber tags (generated per subscribe_request, needed for unsubscribe).
+    pub subscriber_tags: Vec<(String, String)>,
 }
 
 /// Manages all active recording sessions.
@@ -270,6 +272,7 @@ impl RecordingManager {
             original_sip_call_id: original_sip_call_id.map(|s| s.to_string()),
             original_from_tag: original_tags.map(|(ft, _)| ft.to_string()),
             original_to_tag: original_tags.map(|(_, tt)| tt.to_string()),
+            subscriber_tags: Vec::new(),
         };
 
         self.sessions.insert(session_id.clone(), session);
@@ -436,15 +439,35 @@ impl RecordingManager {
         })
     }
 
-    /// Get original call info for all active sessions of a call (for RTPEngine unsubscribe on BYE).
+    /// Get RTPEngine unsubscribe info for all active sessions of a call.
+    ///
+    /// Returns `(original_call_id, subscriber_from_tag, subscriber_to_tag)` pairs
+    /// for each subscribe_request that was made.  These use the subscriber tags
+    /// (not the original call's tags) because RTPEngine identifies subscriptions
+    /// by the subscriber's from-tag.
     pub fn active_session_infos(&self, call_id: &str) -> Vec<(String, String, String)> {
         let session_ids = match self.call_sessions.get(call_id) {
             Some(ids) => ids.clone(),
             None => return Vec::new(),
         };
-        session_ids.iter()
-            .filter_map(|session_id| self.original_call_info(session_id))
-            .collect()
+        let mut infos = Vec::new();
+        for session_id in &session_ids {
+            if let Some(session) = self.sessions.get(session_id) {
+                if let Some(ref original_call_id) = session.original_sip_call_id {
+                    for (sub_from, sub_to) in &session.subscriber_tags {
+                        infos.push((original_call_id.clone(), sub_from.clone(), sub_to.clone()));
+                    }
+                }
+            }
+        }
+        infos
+    }
+
+    /// Store RTPEngine subscriber tags for a recording session.
+    pub fn add_subscriber_tags(&self, session_id: &str, from_tag: String, to_tag: String) {
+        if let Some(mut session) = self.sessions.get_mut(session_id) {
+            session.subscriber_tags.push((from_tag, to_tag));
+        }
     }
 
     /// Stop recording a call by sending BYE to SRS.
