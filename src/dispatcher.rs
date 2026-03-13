@@ -5038,6 +5038,7 @@ fn handle_b2bua_response(
 
         // Send ACK to B-leg for non-2xx final response (RFC 3261 §17.1.1.3).
         // The B2BUA must acknowledge non-2xx responses hop-by-hop.
+        // Use send_b2bua_to_bleg (not send_message) so TCP goes through the pool.
         if let Some((b_dest, b_transport)) = b_leg_dest {
             let ack = build_b2bua_ack_for_non2xx(
                 message,
@@ -5046,7 +5047,7 @@ fn handle_b2bua_response(
                 b_transport,
                 state.local_addr,
             );
-            send_message(ack, b_transport, b_dest, ConnectionId::default(), state);
+            send_b2bua_to_bleg(ack, b_transport, b_dest, state);
         }
 
         // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg
