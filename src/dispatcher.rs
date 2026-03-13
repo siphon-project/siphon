@@ -3372,16 +3372,7 @@ fn handle_b2bua_cancel(
         };
 
         if let Ok(cancel_built) = cancel_msg.build() {
-            let data = Bytes::from(cancel_built.to_bytes());
-            let outbound_message = OutboundMessage {
-                connection_id: ConnectionId::default(),
-                transport: b_leg.transport.transport,
-                destination: b_leg.transport.remote_addr,
-                data,
-            };
-            if let Err(error) = state.outbound.send(outbound_message) {
-                error!(call_id = %call_id, "B2BUA: failed to send CANCEL to B-leg: {error}");
-            }
+            send_b2bua_to_bleg(cancel_built, b_leg.transport.transport, b_leg.transport.remote_addr, state);
         }
     }
 
@@ -4667,15 +4658,11 @@ fn handle_b2bua_response(
                     )
                 {
                     let data = Bytes::from(rec_invite.to_bytes());
-                    let outbound_message = OutboundMessage {
-                        connection_id: ConnectionId::default(),
-                        transport,
-                        destination,
-                        data,
+                    let target = RelayTarget {
+                        address: destination,
+                        transport: Some(transport),
                     };
-                    if let Err(error) = state.outbound.send(outbound_message) {
-                        error!(call_id = %call_id, "SIPREC: failed to send recording INVITE: {error}");
-                    }
+                    send_to_target(data, &target, transport, ConnectionId::default(), state);
                 }
             }
         }
@@ -5380,15 +5367,11 @@ fn handle_b2bua_bye(
     let bye_messages = state.recording_manager.stop_recording(&call_id, state.local_addr);
     for (bye_msg, destination, transport) in bye_messages {
         let data = Bytes::from(bye_msg.to_bytes());
-        let outbound_message = OutboundMessage {
-            connection_id: ConnectionId::default(),
-            transport,
-            destination,
-            data,
+        let target = RelayTarget {
+            address: destination,
+            transport: Some(transport),
         };
-        if let Err(error) = state.outbound.send(outbound_message) {
-            error!(call_id = %call_id, "SIPREC: failed to send BYE to SRS: {error}");
-        }
+        send_to_target(data, &target, transport, ConnectionId::default(), state);
     }
 
     state.call_actors.set_state(&call_id, CallState::Terminated);
