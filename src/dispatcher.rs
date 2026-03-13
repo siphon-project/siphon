@@ -1587,7 +1587,53 @@ fn handle_response(
                             let to_tag = message.headers.get("To")
                                 .and_then(|to| to.split("tag=").nth(1))
                                 .map(|tag| tag.split(';').next().unwrap_or(tag).trim().to_string());
-                            state.recording_manager.handle_success(&session_id, to_tag);
+
+                            // RTPEngine subscribe_answer: complete the media fork
+                            // by sending the SRS's answer SDP back to RTPEngine.
+                            if !message.body.is_empty() {
+                                if let Some(ref rtpengine_set) = state.rtpengine_set {
+                                    if let Some((original_call_id, original_from_tag, original_to_tag)) =
+                                        state.recording_manager.original_call_info(&session_id)
+                                    {
+                                        let flags = crate::rtpengine::NgFlags::default();
+                                        match tokio::task::block_in_place(|| {
+                                            tokio::runtime::Handle::current().block_on(
+                                                rtpengine_set.subscribe_answer(
+                                                    &original_call_id, &original_from_tag, &original_to_tag,
+                                                    &message.body, &flags,
+                                                )
+                                            )
+                                        }) {
+                                            Ok(_rewritten_sdp) => {
+                                                debug!(
+                                                    session_id = %session_id,
+                                                    "SIPREC: RTPEngine subscribe_answer completed, media fork active"
+                                                );
+                                            }
+                                            Err(error) => {
+                                                warn!(
+                                                    session_id = %session_id,
+                                                    "SIPREC: RTPEngine subscribe_answer failed: {error}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Build and send ACK for 2xx (RFC 3261 §13.2.2.4).
+                            if let Some((ack, destination, transport)) =
+                                state.recording_manager.handle_success(
+                                    &session_id, to_tag, state.local_addr,
+                                )
+                            {
+                                let data = Bytes::from(ack.to_bytes());
+                                let target = RelayTarget {
+                                    address: destination,
+                                    transport: Some(transport),
+                                };
+                                send_to_target(data, &target, transport, ConnectionId::default(), state);
+                            }
                         } else if status_code >= 300 {
                             state.recording_manager.handle_failure(&session_id, status_code);
                         }
@@ -4683,10 +4729,47 @@ fn handle_b2bua_response(
                     .unwrap_or_default();
                 drop(invite);
 
+                // RTPEngine subscribe: fork media to the recording leg.
+                // Use the original call's SIP Call-ID and tags so RTPEngine
+                // knows which existing media session to subscribe to.
+                let a_sip_call_id = a_leg.dialog.call_id.clone();
+                let original_from_tag = a_leg.dialog.remote_tag.clone().unwrap_or_default();
+                let (recording_sdp, original_tags) = if let Some(ref rtpengine_set) = state.rtpengine_set {
+                    // Look up the to_tag from the media session store
+                    let original_to_tag = state.rtpengine_sessions.as_ref()
+                        .and_then(|sessions| sessions.get(&a_sip_call_id))
+                        .and_then(|session| session.to_tag.clone())
+                        .unwrap_or_default();
+                    let flags = crate::rtpengine::NgFlags::default();
+                    match tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            rtpengine_set.subscribe_request(
+                                &a_sip_call_id, &original_from_tag, &original_to_tag, None, &flags,
+                            )
+                        )
+                    }) {
+                        Ok(subscribe_sdp) => {
+                            debug!(
+                                call_id = %call_id,
+                                sdp_len = subscribe_sdp.len(),
+                                "SIPREC: RTPEngine subscribe_request returned SDP for SRS"
+                            );
+                            (Some(subscribe_sdp), Some((original_from_tag.clone(), original_to_tag)))
+                        }
+                        Err(error) => {
+                            warn!(call_id = %call_id, "SIPREC: RTPEngine subscribe_request failed: {error}");
+                            (None, Some((original_from_tag.clone(), String::new())))
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+
+                let tags_ref = original_tags.as_ref().map(|(ft, tt)| (ft.as_str(), tt.as_str()));
                 if let Some((_session_id, rec_invite, destination, transport)) =
                     state.recording_manager.start_recording(
                         call_id, srs_uri, &caller_uri, &callee_uri, sdp, state.local_addr,
-                        None, None,
+                        recording_sdp.as_deref(), Some(&a_sip_call_id), tags_ref,
                     )
                 {
                     let data = Bytes::from(rec_invite.to_bytes());
@@ -5390,7 +5473,9 @@ fn handle_b2bua_bye(
         }
     }
 
-    // SIPREC: stop any active recording sessions for this call
+    // SIPREC: stop any active recording sessions for this call.
+    // First, collect RTPEngine subscribe info before stop_recording cleans up sessions.
+    let siprec_infos = state.recording_manager.active_session_infos(&call_id);
     let bye_messages = state.recording_manager.stop_recording(&call_id, state.local_addr);
     for (bye_msg, destination, transport) in bye_messages {
         let data = Bytes::from(bye_msg.to_bytes());
@@ -5399,6 +5484,20 @@ fn handle_b2bua_bye(
             transport: Some(transport),
         };
         send_to_target(data, &target, transport, ConnectionId::default(), state);
+    }
+    // RTPEngine unsubscribe: stop media forking for each recording session.
+    if let Some(ref rtpengine_set) = state.rtpengine_set {
+        for (original_call_id, original_from_tag, original_to_tag) in siprec_infos {
+            let set = Arc::clone(rtpengine_set);
+            tokio::spawn(async move {
+                if let Err(error) = set.unsubscribe(&original_call_id, &original_from_tag, &original_to_tag).await {
+                    warn!(
+                        call_id = %original_call_id,
+                        "SIPREC: RTPEngine unsubscribe failed: {error}"
+                    );
+                }
+            });
+        }
     }
 
     state.call_actors.set_state(&call_id, CallState::Terminated);

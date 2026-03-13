@@ -65,12 +65,16 @@ pub struct RecordingSession {
     pub sip_call_id: String,
     /// Branch used for the recording INVITE.
     pub branch: String,
+    /// CSeq number used in the original INVITE (needed for ACK).
+    pub invite_cseq: u32,
     /// CSeq counter for this recording dialog.
     pub cseq: AtomicU32,
     /// From-tag for this recording dialog.
     pub from_tag: String,
     /// To-tag from the SRS 200 OK (set after answer).
     pub to_tag: Option<String>,
+    /// Original call's SIP Call-ID (for RTPEngine subscribe correlation).
+    pub original_sip_call_id: Option<String>,
     /// Original call's From-tag (for RTPEngine subscribe correlation).
     pub original_from_tag: Option<String>,
     /// Original call's To-tag (for RTPEngine subscribe correlation).
@@ -118,6 +122,7 @@ impl RecordingManager {
         sdp: &[u8],
         local_addr: SocketAddr,
         recording_sdp_override: Option<&[u8]>,
+        original_sip_call_id: Option<&str>,
         original_tags: Option<(&str, &str)>,
     ) -> Option<(String, SipMessage, SocketAddr, Transport)> {
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -238,9 +243,11 @@ impl RecordingManager {
             state: RecordingState::Pending,
             sip_call_id,
             branch: branch.clone(),
+            invite_cseq: cseq,
             cseq: AtomicU32::new(cseq + 1),
             from_tag,
             to_tag: None,
+            original_sip_call_id: original_sip_call_id.map(|s| s.to_string()),
             original_from_tag: original_tags.map(|(ft, _)| ft.to_string()),
             original_to_tag: original_tags.map(|(_, tt)| tt.to_string()),
         };
@@ -263,15 +270,114 @@ impl RecordingManager {
     }
 
     /// Handle a 200 OK from the SRS — recording is now active.
-    pub fn handle_success(&self, session_id: &str, to_tag: Option<String>) {
-        if let Some(mut session) = self.sessions.get_mut(session_id) {
-            session.state = RecordingState::Active;
-            session.to_tag = to_tag;
-            info!(
-                session_id = %session_id,
-                call_id = %session.call_id,
-                "SIPREC: recording active"
+    ///
+    /// Returns the ACK message to send back to the SRS (RFC 3261 §13.2.2.4).
+    pub fn handle_success(
+        &self,
+        session_id: &str,
+        to_tag: Option<String>,
+        local_addr: SocketAddr,
+    ) -> Option<(SipMessage, SocketAddr, Transport)> {
+        let mut session = self.sessions.get_mut(session_id)?;
+        session.state = RecordingState::Active;
+        session.to_tag = to_tag;
+        info!(
+            session_id = %session_id,
+            call_id = %session.call_id,
+            "SIPREC: recording active"
+        );
+
+        // Build ACK for the 200 OK (same SRS URI parsing as BYE).
+        let srs_host_part = session.srs_uri
+            .strip_prefix("sip:")
+            .or_else(|| session.srs_uri.strip_prefix("sips:"))
+            .unwrap_or(&session.srs_uri);
+        let srs_host_with_params = if let Some(at_pos) = srs_host_part.find('@') {
+            &srs_host_part[at_pos + 1..]
+        } else {
+            srs_host_part
+        };
+
+        let (srs_hostport, uri_params) = match srs_host_with_params.find(';') {
+            Some(pos) => (&srs_host_with_params[..pos], &srs_host_with_params[pos..]),
+            None => (srs_host_with_params, ""),
+        };
+
+        let ack_transport = if uri_params.to_ascii_lowercase().contains("transport=tcp") {
+            Transport::Tcp
+        } else if uri_params.to_ascii_lowercase().contains("transport=tls") {
+            Transport::Tls
+        } else {
+            Transport::Udp
+        };
+
+        let transport_name = match ack_transport {
+            Transport::Tcp => "TCP",
+            Transport::Tls => "TLS",
+            _ => "UDP",
+        };
+
+        let (host_str, port_opt) = if let Some(colon_pos) = srs_hostport.rfind(':') {
+            let potential_port = &srs_hostport[colon_pos + 1..];
+            if let Ok(port) = potential_port.parse::<u16>() {
+                (&srs_hostport[..colon_pos], Some(port))
+            } else {
+                (srs_hostport, None)
+            }
+        } else {
+            (srs_hostport, None)
+        };
+
+        let destination_port = port_opt.unwrap_or(5060);
+        let destination: SocketAddr = format!("{host_str}:{destination_port}")
+            .parse()
+            .unwrap_or(FALLBACK_DESTINATION);
+
+        let mut request_uri = SipUri::new(host_str.to_string());
+        if let Some(port) = port_opt {
+            request_uri = request_uri.with_port(port);
+        }
+        if ack_transport != Transport::Udp {
+            request_uri = request_uri.with_param(
+                "transport".to_string(),
+                Some(transport_name.to_string()),
             );
+        }
+
+        // ACK for 2xx is a new transaction — new branch (RFC 3261 §13.2.2.4).
+        let branch = format!("z9hG4bK-rec-ack-{}", uuid::Uuid::new_v4());
+        let via = format!("SIP/2.0/{} {};branch={}", transport_name, local_addr, branch);
+
+        let mut to_value = format!("<{}>", session.srs_uri);
+        if let Some(ref to_tag) = session.to_tag {
+            to_value.push_str(&format!(";tag={to_tag}"));
+        }
+
+        // ACK CSeq must match the original INVITE CSeq number.
+        let invite_cseq = session.invite_cseq;
+
+        match SipMessageBuilder::new()
+            .request(Method::Ack, request_uri)
+            .via(via)
+            .from(format!("<sip:recorder@{}>;tag={}", local_addr.ip(), session.from_tag))
+            .to(to_value)
+            .call_id(session.sip_call_id.clone())
+            .cseq(format!("{invite_cseq} ACK"))
+            .max_forwards(70)
+            .content_length(0)
+            .build()
+        {
+            Ok(ack) => {
+                debug!(
+                    session_id = %session_id,
+                    "SIPREC: sending ACK to SRS"
+                );
+                Some((ack, destination, ack_transport))
+            }
+            Err(error) => {
+                warn!(session_id = %session_id, %error, "SIPREC: failed to build ACK for SRS");
+                None
+            }
         }
     }
 
@@ -296,6 +402,29 @@ impl RecordingManager {
                 _ => None,
             }
         })
+    }
+
+    /// Get the original call's SIP Call-ID and tags (for RTPEngine subscribe/unsubscribe).
+    pub fn original_call_info(&self, session_id: &str) -> Option<(String, String, String)> {
+        self.sessions.get(session_id).and_then(|session| {
+            match (&session.original_sip_call_id, &session.original_from_tag, &session.original_to_tag) {
+                (Some(call_id), Some(from_tag), Some(to_tag)) => {
+                    Some((call_id.clone(), from_tag.clone(), to_tag.clone()))
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// Get original call info for all active sessions of a call (for RTPEngine unsubscribe on BYE).
+    pub fn active_session_infos(&self, call_id: &str) -> Vec<(String, String, String)> {
+        let session_ids = match self.call_sessions.get(call_id) {
+            Some(ids) => ids.clone(),
+            None => return Vec::new(),
+        };
+        session_ids.iter()
+            .filter_map(|session_id| self.original_call_info(session_id))
+            .collect()
     }
 
     /// Stop recording a call by sending BYE to SRS.
@@ -548,6 +677,7 @@ mod tests {
             "10.0.0.1:5060".parse().unwrap(),
             None,
             None,
+            None,
         );
 
         assert!(result.is_some());
@@ -594,14 +724,68 @@ mod tests {
             "10.0.0.1:5060".parse().unwrap(),
             None,
             None,
+            None,
         ).unwrap();
 
-        manager.handle_success(&session_id, Some("srs-tag-1".to_string()));
+        let ack_result = manager.handle_success(&session_id, Some("srs-tag-1".to_string()), "10.0.0.1:5060".parse().unwrap());
 
         let session = manager.sessions.get(&session_id).unwrap();
         assert_eq!(session.state, RecordingState::Active);
         assert_eq!(session.to_tag.as_deref(), Some("srs-tag-1"));
         assert_eq!(manager.active_count(), 1);
+
+        // handle_success must return an ACK message.
+        let (ack, destination, transport) = ack_result.unwrap();
+        assert_eq!(destination, "10.0.0.5:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(transport, Transport::Udp);
+
+        let bytes = ack.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(raw.starts_with("ACK sip:10.0.0.5:5060 SIP/2.0\r\n"));
+        assert!(raw.contains(";tag=srs-tag-1"), "ACK must include SRS To-tag");
+        assert!(raw.contains("CSeq: "), "ACK must have CSeq header");
+        assert!(raw.contains(" ACK"), "CSeq method must be ACK");
+        // ACK CSeq number must match the original INVITE CSeq.
+        let invite_cseq = session.invite_cseq;
+        assert!(raw.contains(&format!("CSeq: {invite_cseq} ACK")));
+    }
+
+    #[test]
+    fn handle_success_ack_uses_tcp_when_srs_uri_requires_it() {
+        let manager = RecordingManager::new();
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=sendrecv\r\n",
+        );
+
+        let (session_id, _, _, _) = manager.start_recording(
+            "call-1",
+            "sip:srs@10.0.0.5:5080;transport=TCP",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            sdp.as_bytes(),
+            "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+        ).unwrap();
+
+        let (ack, destination, transport) = manager.handle_success(
+            &session_id, Some("srs-tag-tcp".to_string()), "10.0.0.1:5060".parse().unwrap(),
+        ).unwrap();
+
+        assert_eq!(transport, Transport::Tcp);
+        assert_eq!(destination, "10.0.0.5:5080".parse::<SocketAddr>().unwrap());
+
+        let ack_bytes = ack.to_bytes();
+        let raw = String::from_utf8_lossy(&ack_bytes);
+        assert!(raw.contains("SIP/2.0/TCP"), "ACK Via must use TCP");
+        assert!(raw.contains(";tag=srs-tag-tcp"));
     }
 
     #[test]
@@ -624,6 +808,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
         ).unwrap();
@@ -656,9 +841,10 @@ mod tests {
             "10.0.0.1:5060".parse().unwrap(),
             None,
             None,
+            None,
         ).unwrap();
 
-        manager.handle_success(&session_id, Some("srs-tag-1".to_string()));
+        manager.handle_success(&session_id, Some("srs-tag-1".to_string()), "10.0.0.1:5060".parse().unwrap());
         assert_eq!(manager.active_count(), 1);
 
         let bye_messages = manager.stop_recording("call-1", "10.0.0.1:5060".parse().unwrap());
@@ -702,6 +888,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
         ).unwrap();
@@ -787,6 +974,7 @@ mod tests {
             "10.0.0.1:5060".parse().unwrap(),
             None,
             None,
+            None,
         ).unwrap();
 
         let (session_id_2, _, _, _) = manager.start_recording(
@@ -798,14 +986,15 @@ mod tests {
             "10.0.0.1:5060".parse().unwrap(),
             None,
             None,
+            None,
         ).unwrap();
 
         assert_ne!(session_id_1, session_id_2);
         assert!(manager.is_recording("call-1"));
 
         // Activate both
-        manager.handle_success(&session_id_1, Some("tag-1".to_string()));
-        manager.handle_success(&session_id_2, Some("tag-2".to_string()));
+        manager.handle_success(&session_id_1, Some("tag-1".to_string()), "10.0.0.1:5060".parse().unwrap());
+        manager.handle_success(&session_id_2, Some("tag-2".to_string()), "10.0.0.1:5060".parse().unwrap());
         assert_eq!(manager.active_count(), 2);
 
         // Stop all recordings for the call
@@ -834,6 +1023,7 @@ mod tests {
             "sip:bob@example.com",
             sdp.as_bytes(),
             "10.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
         ).unwrap();
@@ -874,6 +1064,7 @@ mod tests {
             "10.0.0.1:5060".parse().unwrap(),
             None,
             None,
+            None,
         ).unwrap();
 
         // Default transport should be UDP.
@@ -909,6 +1100,7 @@ mod tests {
             "10.0.0.1:5060".parse().unwrap(),
             None,
             None,
+            None,
         ).unwrap();
 
         // Should default to port 5060.
@@ -937,9 +1129,10 @@ mod tests {
             "10.0.0.1:5060".parse().unwrap(),
             None,
             None,
+            None,
         ).unwrap();
 
-        manager.handle_success(&session_id, Some("srs-tag-1".to_string()));
+        manager.handle_success(&session_id, Some("srs-tag-1".to_string()), "10.0.0.1:5060".parse().unwrap());
 
         let bye_messages = manager.stop_recording("call-1", "10.0.0.1:5060".parse().unwrap());
         assert_eq!(bye_messages.len(), 1);
