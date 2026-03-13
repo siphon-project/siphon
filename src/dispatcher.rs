@@ -4760,41 +4760,28 @@ fn handle_b2bua_response(
                 drop(invite);
 
                 // RTPEngine subscribe: fork media to the recording leg.
-                // Uses the original call's from-tag/to-tag to identify the
-                // existing RTPEngine session.  A single subscribe_request
-                // returns one m= line (one direction).
-                //
-                // NOTE: subscribing to the second direction (swapping tags)
-                // corrupts RTPEngine's dialogue state and breaks re-INVITE
-                // offers.  For now we record one direction only.  Dual-stream
-                // SIPREC (2 m= lines like Invenio SBC) needs further
-                // investigation of RTPEngine's subscribe semantics.
+                // Uses SIPREC-mode subscribe (flags: ["all", "siprec"]) which
+                // returns a combined SDP with 2 m= lines (one per direction)
+                // without requiring from-tag/to-tag — avoids dialogue corruption.
                 let a_sip_call_id = a_leg.dialog.call_id.clone();
-                let original_from_tag = a_leg.dialog.remote_tag.clone().unwrap_or_default();
-                let (mut caller_sdp, original_tags) = if let Some(ref rtpengine_set) = state.rtpengine_set {
-                    let original_to_tag = state.rtpengine_sessions.as_ref()
-                        .and_then(|sessions| sessions.get(&a_sip_call_id))
-                        .and_then(|session| session.to_tag.clone())
-                        .unwrap_or_default();
-                    let flags = crate::rtpengine::NgFlags::default();
+                let (mut caller_sdp, subscriber_to_tag) = if let Some(ref rtpengine_set) = state.rtpengine_set {
                     let result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(
-                            rtpengine_set.subscribe_request(
-                                &a_sip_call_id, &original_from_tag, &original_to_tag, None, &flags,
-                            )
+                            rtpengine_set.subscribe_request_siprec(&a_sip_call_id)
                         )
                     });
-                    let subscribe_sdp = match result {
-                        Ok(sdp) => {
-                            debug!(call_id = %call_id, sdp_len = sdp.len(), "SIPREC: subscribe_request OK");
-                            Some(sdp)
+                    match result {
+                        Ok((sdp, to_tag)) => {
+                            debug!(call_id = %call_id, sdp_len = sdp.len(), subscriber_to_tag = %to_tag, "SIPREC: subscribe_request_siprec OK");
+                            // Fix direction (recvonly→sendonly) and add a=label per m= section.
+                            let processed = crate::siprec::fix_siprec_subscribe_sdp(&sdp);
+                            (Some(processed), Some(to_tag))
                         }
                         Err(error) => {
-                            warn!(call_id = %call_id, %error, "SIPREC: subscribe_request failed");
-                            None
+                            warn!(call_id = %call_id, %error, "SIPREC: subscribe_request_siprec failed");
+                            (None, None)
                         }
-                    };
-                    (subscribe_sdp, Some((original_from_tag.clone(), original_to_tag)))
+                    }
                 } else {
                     (None, None)
                 };
@@ -4806,7 +4793,10 @@ fn handle_b2bua_response(
                     sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));
                 }
 
-                let tags_ref = original_tags.as_ref().map(|(ft, tt)| (ft.as_str(), tt.as_str()));
+                // For unsubscribe on BYE: SIPREC-mode uses empty from-tag and
+                // the subscriber to-tag returned by RTPEngine.
+                let tags_for_unsubscribe = subscriber_to_tag.as_ref().map(|tt| (String::new(), tt.clone()));
+                let tags_ref = tags_for_unsubscribe.as_ref().map(|(ft, tt)| (ft.as_str(), tt.as_str()));
                 if let Some((_session_id, rec_invite, destination, transport)) =
                     state.recording_manager.start_recording(
                         call_id, srs_uri, &caller_uri, &callee_uri, sdp, state.local_addr,

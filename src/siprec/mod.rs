@@ -597,6 +597,48 @@ impl RecordingManager {
 /// subscription endpoint's perspective — it receives a copy of the media).
 /// But in the SIPREC INVITE, the direction is from the SRC's perspective:
 /// "I (SRC) will send forked media to you (SRS)" → `a=sendonly`.
+/// Process a SIPREC-mode subscribe SDP (combined multi-m= from RTPEngine).
+///
+/// RTPEngine's `subscribe request` with `flags: ["all", "siprec"]` returns a
+/// single SDP with one m= line per call direction.  This function:
+/// 1. Flips `a=recvonly` → `a=sendonly` (SRC sends to SRS)
+/// 2. Adds `a=label:N` to each m= section (0-based) if not already present
+pub fn fix_siprec_subscribe_sdp(sdp: &[u8]) -> Vec<u8> {
+    let sdp_str = String::from_utf8_lossy(sdp);
+    let mut result = String::new();
+    let mut media_index: i32 = -1; // -1 = session-level, 0+ = media section index
+    let mut section_has_label = false;
+
+    for line in sdp_str.lines() {
+        if line.starts_with("m=") {
+            // Before starting a new m= section, add label to previous section if missing.
+            if media_index >= 0 && !section_has_label {
+                result.push_str(&format!("a=label:{media_index}\r\n"));
+            }
+            media_index += 1;
+            section_has_label = false;
+            result.push_str(line);
+            result.push_str("\r\n");
+        } else if line.starts_with("a=recvonly") {
+            result.push_str("a=sendonly\r\n");
+        } else if line.starts_with("a=label:") {
+            // Replace existing label with our index.
+            section_has_label = true;
+            result.push_str(&format!("a=label:{media_index}\r\n"));
+        } else {
+            result.push_str(line);
+            result.push_str("\r\n");
+        }
+    }
+
+    // Add label to the last m= section if missing.
+    if media_index >= 0 && !section_has_label {
+        result.push_str(&format!("a=label:{media_index}\r\n"));
+    }
+
+    result.into_bytes()
+}
+
 fn fix_recording_sdp_direction(sdp: &[u8]) -> Vec<u8> {
     let sdp_str = String::from_utf8_lossy(sdp);
     let mut result = String::new();
@@ -1084,6 +1126,81 @@ mod tests {
         let result = fix_recording_sdp_direction(sdp.as_bytes());
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("a=sendonly"));
+    }
+
+    #[test]
+    fn fix_siprec_subscribe_sdp_dual_stream() {
+        // Simulates RTPEngine's SIPREC-mode subscribe response with 2 m= lines.
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8 101\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=recvonly\r\n",
+            "m=audio 30100 RTP/AVP 8 101\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=recvonly\r\n",
+        );
+        let result = fix_siprec_subscribe_sdp(sdp.as_bytes());
+        let result_str = String::from_utf8_lossy(&result);
+
+        // Direction flipped.
+        assert!(!result_str.contains("a=recvonly"));
+        assert_eq!(result_str.matches("a=sendonly").count(), 2);
+
+        // Labels added: 0 for first m=, 1 for second m=.
+        assert!(result_str.contains("a=label:0"));
+        assert!(result_str.contains("a=label:1"));
+
+        // Two m= lines preserved.
+        assert_eq!(result_str.matches("m=audio").count(), 2);
+    }
+
+    #[test]
+    fn fix_siprec_subscribe_sdp_single_stream() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8\r\n",
+            "a=recvonly\r\n",
+        );
+        let result = fix_siprec_subscribe_sdp(sdp.as_bytes());
+        let result_str = String::from_utf8_lossy(&result);
+
+        assert!(result_str.contains("a=sendonly"));
+        assert!(result_str.contains("a=label:0"));
+        assert!(!result_str.contains("a=label:1"));
+    }
+
+    #[test]
+    fn fix_siprec_subscribe_sdp_replaces_existing_labels() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8\r\n",
+            "a=label:foo\r\n",
+            "a=recvonly\r\n",
+            "m=audio 30100 RTP/AVP 8\r\n",
+            "a=label:bar\r\n",
+            "a=recvonly\r\n",
+        );
+        let result = fix_siprec_subscribe_sdp(sdp.as_bytes());
+        let result_str = String::from_utf8_lossy(&result);
+
+        assert!(result_str.contains("a=label:0"));
+        assert!(result_str.contains("a=label:1"));
+        assert!(!result_str.contains("a=label:foo"));
+        assert!(!result_str.contains("a=label:bar"));
     }
 
     #[test]
