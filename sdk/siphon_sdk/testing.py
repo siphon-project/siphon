@@ -365,6 +365,18 @@ class SipTestHarness:
             headers=headers,
         )
 
+        # --- Test harness only: simulate Rust dispatcher pre-checks ---
+        # In production these never reach Python — the Rust transaction
+        # layer handles them before script dispatch.  We replicate the
+        # behaviour here so SDK tests can assert on the expected outcome.
+        if request.max_forwards == 0:
+            request.reply(483, "Too Many Hops")
+            return RequestResult(request=request, actions=list(request.actions))
+
+        if method == "CANCEL":
+            request.relay()
+            return RequestResult(request=request, actions=list(request.actions))
+
         registry = mock_module.get_registry()
         handlers = registry.get("proxy.on_request", method)
 
