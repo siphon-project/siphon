@@ -211,6 +211,7 @@ mod tests {
             srs_uri: "sip:srs@recorder.example.com".to_string(),
             session_copies: 1,
             transport: "tcp".to_string(),
+            rtpengine_profile: "siprec_src".to_string(),
         }
     }
 

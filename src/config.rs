@@ -1558,6 +1558,9 @@ pub struct LiSiprecConfig {
     /// Transport for SRS INVITE: "udp", "tcp", or "tls". Default: "tcp".
     #[serde(default = "default_siprec_transport")]
     pub transport: String,
+    /// RTPEngine media profile for subscribe (media fork) commands. Default: "siprec_src".
+    #[serde(default = "default_siprec_src_profile")]
+    pub rtpengine_profile: String,
 }
 
 /// TLS configuration for LI interfaces (X1 admin, X2/X3 delivery).
@@ -1584,6 +1587,7 @@ fn default_li_x3_transport() -> String { "udp".to_string() }
 fn default_li_x3_encapsulation() -> String { "etsi".to_string() }
 fn default_siprec_session_copies() -> u32 { 1 }
 fn default_siprec_transport() -> String { "tcp".to_string() }
+fn default_siprec_src_profile() -> String { "siprec_src".to_string() }
 
 // ---------------------------------------------------------------------------
 // SRS — Session Recording Server

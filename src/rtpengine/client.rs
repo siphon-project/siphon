@@ -166,12 +166,35 @@ impl RtpEngineClient {
     pub async fn subscribe_request_siprec(
         &self,
         call_id: &str,
+        profile_flags: Option<&super::NgFlags>,
     ) -> Result<(Vec<u8>, String), RtpEngineError> {
-        let pairs: Vec<(&str, BencodeValue)> = vec![
+        // Mandatory SIPREC flags — always present.
+        let mut siprec_flags = vec!["all", "siprec"];
+
+        // Merge profile flags if provided.
+        let mut pairs: Vec<(&str, BencodeValue)> = vec![
             ("command", BencodeValue::string("subscribe request")),
             ("call-id", BencodeValue::string(call_id)),
-            ("flags", BencodeValue::string_list(&["all", "siprec"])),
         ];
+
+        if let Some(flags) = profile_flags {
+            // Merge any profile-level flags into the siprec flags list.
+            let extra: Vec<&str> = flags.flags.iter().map(|s| s.as_str()).collect();
+            for flag in &extra {
+                if !siprec_flags.contains(flag) {
+                    siprec_flags.push(flag);
+                }
+            }
+            // Add non-flag profile pairs (transport-protocol, ICE, DTLS, etc.)
+            // but skip "flags" since we handle it separately above.
+            for (key, value) in flags.to_bencode_pairs() {
+                if key != "flags" {
+                    pairs.push((key, value));
+                }
+            }
+        }
+
+        pairs.push(("flags", BencodeValue::string_list(&siprec_flags)));
 
         let response = self.send_command(BencodeValue::dict(pairs)).await?;
         self.check_result(&response)?;
@@ -565,9 +588,10 @@ impl RtpEngineSet {
     pub async fn subscribe_request_siprec(
         &self,
         call_id: &str,
+        profile_flags: Option<&NgFlags>,
     ) -> Result<(Vec<u8>, String), RtpEngineError> {
         let client = self.select(call_id);
-        client.subscribe_request_siprec(call_id).await
+        client.subscribe_request_siprec(call_id, profile_flags).await
     }
 
     /// Send a `subscribe answer` command to the affinity-bound instance.

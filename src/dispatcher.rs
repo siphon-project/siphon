@@ -109,6 +109,8 @@ struct DispatcherState {
     recording_manager: Arc<crate::siprec::RecordingManager>,
     /// SRS URI from lawful_intercept.siprec config (used when li.record() is called).
     li_siprec_srs_uri: Option<String>,
+    /// RTPEngine profile name for SIPREC SRC subscribe commands.
+    li_siprec_rtpengine_profile: Option<String>,
     /// SRS — Session Recording Server manager (receives SIPREC INVITEs from external SRCs).
     srs_manager: Option<Arc<crate::srs::SrsManager>>,
     /// IPsec SA manager (None when ipsec is not configured).
@@ -275,6 +277,9 @@ pub async fn run(
         li_siprec_srs_uri: config.lawful_intercept.as_ref()
             .and_then(|li| li.siprec.as_ref())
             .map(|siprec| siprec.srs_uri.clone()),
+        li_siprec_rtpengine_profile: config.lawful_intercept.as_ref()
+            .and_then(|li| li.siprec.as_ref())
+            .map(|siprec| siprec.rtpengine_profile.clone()),
         srs_manager: config.srs.as_ref()
             .filter(|srs_config| srs_config.enabled)
             .map(|srs_config| Arc::new(crate::srs::SrsManager::new(srs_config.clone()))),
@@ -4766,10 +4771,19 @@ fn handle_b2bua_response(
                 // returns a combined SDP with 2 m= lines (one per direction)
                 // without requiring from-tag/to-tag — avoids dialogue corruption.
                 let a_sip_call_id = a_leg.dialog.call_id.clone();
+
+                // Look up the SIPREC SRC RTPEngine profile for additional subscribe flags.
+                let siprec_src_profile = state.li_siprec_rtpengine_profile.as_deref()
+                    .and_then(|name| {
+                        state.rtpengine_profiles.as_ref()
+                            .and_then(|registry| registry.get(name).cloned())
+                    });
+                let siprec_src_flags = siprec_src_profile.as_ref().map(|profile| &profile.offer);
+
                 let (mut caller_sdp, subscriber_to_tag) = if let Some(ref rtpengine_set) = state.rtpengine_set {
                     let result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(
-                            rtpengine_set.subscribe_request_siprec(&a_sip_call_id)
+                            rtpengine_set.subscribe_request_siprec(&a_sip_call_id, siprec_src_flags)
                         )
                     });
                     match result {

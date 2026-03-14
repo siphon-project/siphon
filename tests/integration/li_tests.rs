@@ -56,6 +56,7 @@ fn full_li_config() -> LawfulInterceptConfig {
             srs_uri: "sip:srs@recorder.example.com".to_string(),
             session_copies: 1,
             transport: "tcp".to_string(),
+            rtpengine_profile: "siprec_src".to_string(),
         }),
     }
 }
@@ -389,6 +390,7 @@ async fn siprec_recording_lifecycle() {
         srs_uri: "sip:srs@recorder.example.com".to_string(),
         session_copies: 1,
         transport: "tcp".to_string(),
+        rtpengine_profile: "siprec_src".to_string(),
     };
 
     let manager = SiprecManager::new(&siprec_config);

@@ -444,6 +444,7 @@ auth:
 #     srs_uri: "sip:srs@recorder.example.com"
 #     session_copies: 1                   # parallel recording sessions per call
 #     transport: tcp                       # transport for SRS INVITE
+#     rtpengine_profile: siprec_src       # RTPEngine profile for subscribe (media fork)
 
 # ---------------------------------------------------------------------------
 # Diameter peer connections and application routing
