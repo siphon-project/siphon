@@ -31,8 +31,9 @@ class _HandlerRegistry:
         self.handlers: dict[str, list[tuple[Optional[str], Callable, bool]]] = {}
 
     def register(self, event: str, method_filter: Optional[str],
-                 fn: Callable, is_async: bool) -> None:
-        self.handlers.setdefault(event, []).append((method_filter, fn, is_async))
+                 fn: Callable, is_async: bool,
+                 metadata: Optional[dict[str, Any]] = None) -> None:
+        self.handlers.setdefault(event, []).append((method_filter, fn, is_async, metadata))
 
     def clear(self) -> None:
         self.handlers.clear()
@@ -41,7 +42,7 @@ class _HandlerRegistry:
             ) -> list[tuple[Callable, bool]]:
         """Return matching handlers for an event, filtered by SIP method."""
         result = []
-        for method_filter, fn, is_async in self.handlers.get(event, []):
+        for method_filter, fn, is_async, _metadata in self.handlers.get(event, []):
             if method_filter is None:
                 result.append((fn, is_async))
             elif method and method in method_filter.split("|"):
@@ -542,7 +543,7 @@ class MockRegistrar:
     def _fire_on_change(self, aor: str, event_type: str) -> None:
         """Invoke all on_change handlers registered via decorator."""
         contacts = self._store.get(aor, [])
-        for _, fn, _ in _registry.handlers.get("registrar.on_change", []):
+        for _, fn, _, _meta in _registry.handlers.get("registrar.on_change", []):
             fn(aor, event_type, contacts)
 
 
@@ -1933,6 +1934,59 @@ class MockSrs:
 
 
 # ---------------------------------------------------------------------------
+# Timer namespace — periodic callbacks (like OpenSIPS timer_route)
+# ---------------------------------------------------------------------------
+
+class MockTimer:
+    """Mock ``timer`` namespace for periodic timer callbacks.
+
+    Timer handlers run on a Tokio interval in the Rust runtime.
+    They receive no SIP request/call context but can use all other
+    namespaces (registrar, cache, gateway, log, etc.).
+
+    Example::
+
+        from siphon import timer
+
+        @timer.every(seconds=30)
+        async def health_check():
+            for dest in gateway.list("carriers"):
+                if not dest.healthy:
+                    log.warn(f"Gateway {dest.uri} is down")
+
+        @timer.every(seconds=300, name="stats_push", jitter=10)
+        def push_stats():
+            log.info("pushing stats")
+    """
+
+    def every(self, seconds: int, name: str | None = None,
+              jitter: int = 0) -> Callable:
+        """Register a periodic timer callback.
+
+        Args:
+            seconds: Interval between invocations.
+            name: Optional name for logging (defaults to function name).
+            jitter: Random jitter in seconds added to each interval (default 0).
+
+        Returns:
+            Decorator that registers the function as a timer handler.
+
+        Example::
+
+            @timer.every(seconds=60)
+            def cleanup():
+                presence.expire_stale()
+        """
+        def decorator(fn: Callable) -> Callable:
+            timer_name = name if name is not None else fn.__name__
+            is_async = asyncio.iscoroutinefunction(fn)
+            metadata = {"seconds": seconds, "name": timer_name, "jitter": jitter}
+            _registry.register("timer.every", None, fn, is_async, metadata)
+            return fn
+        return decorator
+
+
+# ---------------------------------------------------------------------------
 # Module installation
 # ---------------------------------------------------------------------------
 
@@ -1951,6 +2005,7 @@ _registration = MockRegistration()
 _diameter = MockDiameter()
 _presence = MockPresence()
 _srs = MockSrs()
+_timer = MockTimer()
 
 
 def install() -> ModuleType:
@@ -1981,6 +2036,7 @@ def install() -> ModuleType:
     mod.diameter = _diameter  # type: ignore[attr-defined]
     mod.presence = _presence  # type: ignore[attr-defined]
     mod.srs = _srs  # type: ignore[attr-defined]
+    mod.timer = _timer  # type: ignore[attr-defined]
 
     # Also install the _siphon_registry mock
     registry_mod = ModuleType("_siphon_registry")
@@ -2084,3 +2140,8 @@ def get_presence() -> MockPresence:
 def get_srs() -> MockSrs:
     """Access the mock SRS singleton."""
     return _srs
+
+
+def get_timer() -> MockTimer:
+    """Access the mock timer singleton."""
+    return _timer

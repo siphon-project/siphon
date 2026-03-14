@@ -58,6 +58,12 @@ pub enum HandlerKind {
     SrsOnInvite,
     /// `@srs.on_session_end` — recording session completed.
     SrsOnSessionEnd,
+    /// `@timer.every(seconds=N)` — periodic timer callback.
+    TimerEvery {
+        interval_secs: u64,
+        name: String,
+        jitter_secs: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +126,21 @@ impl ScriptState {
                 | HandlerKind::B2buaRefer
         ))
     }
+
+    /// Return all timer handlers.
+    pub fn timer_handlers(&self) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| matches!(h.kind, HandlerKind::TimerEvery { .. }))
+            .collect()
+    }
+
+    /// Whether the script registered any timer handlers.
+    pub fn has_timer_handlers(&self) -> bool {
+        self.handlers
+            .iter()
+            .any(|h| matches!(h.kind, HandlerKind::TimerEvery { .. }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +156,8 @@ pub struct ScriptEngine {
     script_path: PathBuf,
     /// Reload mode (auto = inotify, sighup = manual).
     reload_mode: ReloadMode,
+    /// Active timer task handles — aborted and re-spawned on reload.
+    timer_handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl ScriptEngine {
@@ -172,6 +195,7 @@ impl ScriptEngine {
             state,
             script_path,
             reload_mode: config.reload.clone(),
+            timer_handles: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -198,6 +222,7 @@ impl ScriptEngine {
             state,
             script_path,
             reload_mode: ReloadMode::Sighup,
+            timer_handles: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -219,6 +244,7 @@ impl ScriptEngine {
                     "script reloaded successfully"
                 );
                 self.state.store(Arc::new(new_state));
+                self.restart_timers();
                 Ok(())
             }
             Err(error) => {
@@ -237,6 +263,46 @@ impl ScriptEngine {
     /// The path being watched.
     pub fn script_path(&self) -> &Path {
         &self.script_path
+    }
+
+    /// Cancel all running timer tasks and spawn new ones from the current state.
+    ///
+    /// Called after every script load/reload and once at server startup.
+    pub fn restart_timers(&self) {
+        let mut handles = self.timer_handles.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Abort all existing timer tasks.
+        for handle in handles.drain(..) {
+            handle.abort();
+        }
+
+        let state = self.state.load();
+        for handler in state.timer_handlers() {
+            if let HandlerKind::TimerEvery {
+                interval_secs,
+                ref name,
+                jitter_secs,
+            } = handler.kind
+            {
+                let callable = handler.callable.clone();
+                let is_async = handler.is_async;
+                let timer_name = name.clone();
+                let interval = interval_secs;
+                let jitter = jitter_secs;
+
+                info!(
+                    name = %timer_name,
+                    interval_secs = interval,
+                    jitter_secs = jitter,
+                    "starting timer"
+                );
+
+                let handle = tokio::spawn(async move {
+                    timer_loop(callable, is_async, interval, jitter, timer_name).await;
+                });
+                handles.push(handle);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -455,6 +521,12 @@ fn extract_handlers(
             .extract()
             .map_err(|error| SiphonError::Script(format!("entry[3] bool: {error}")))?;
 
+        // Optional 5th element: metadata dict (used by timer.every, etc.).
+        let metadata: Option<Bound<'_, PyAny>> = item
+            .get_item(4)
+            .ok()
+            .and_then(|v: Bound<'_, PyAny>| if v.is_none() { None } else { Some(v) });
+
         let kind = match kind_str.as_str() {
             "proxy.on_request" => HandlerKind::ProxyRequest(filter),
             "proxy.on_reply" => HandlerKind::ProxyReply,
@@ -469,6 +541,26 @@ fn extract_handlers(
             "registrar.on_change" => HandlerKind::RegistrarOnChange,
             "srs.on_invite" => HandlerKind::SrsOnInvite,
             "srs.on_session_end" => HandlerKind::SrsOnSessionEnd,
+            "timer.every" => {
+                let meta = metadata.ok_or_else(|| {
+                    SiphonError::Script("timer.every handler missing metadata".into())
+                })?;
+                let interval_secs: u64 = meta
+                    .get_item("seconds")
+                    .map_err(|error| SiphonError::Script(format!("timer metadata 'seconds': {error}")))?
+                    .extract()
+                    .map_err(|error| SiphonError::Script(format!("timer 'seconds' u64: {error}")))?;
+                let name: String = meta
+                    .get_item("name")
+                    .map_err(|error| SiphonError::Script(format!("timer metadata 'name': {error}")))?
+                    .extract()
+                    .map_err(|error| SiphonError::Script(format!("timer 'name' str: {error}")))?;
+                let jitter_secs: u64 = meta
+                    .get_item("jitter")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(0);
+                HandlerKind::TimerEvery { interval_secs, name, jitter_secs }
+            }
             other => {
                 warn!(kind = other, "unknown handler kind, skipping");
                 continue;
@@ -483,6 +575,90 @@ fn extract_handlers(
     }
 
     Ok(handlers)
+}
+
+// ---------------------------------------------------------------------------
+// Timer loop — runs as a spawned Tokio task
+// ---------------------------------------------------------------------------
+
+/// Periodic loop for a single timer handler.
+///
+/// Sleeps for `interval_secs` (plus optional random jitter), then calls the
+/// Python callback.  Errors are logged and do not stop the loop.
+async fn timer_loop(
+    callable: Py<PyAny>,
+    is_async: bool,
+    interval_secs: u64,
+    jitter_secs: u64,
+    name: String,
+) {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    loop {
+        let mut wait = Duration::from_secs(interval_secs);
+        if jitter_secs > 0 {
+            // Lightweight pseudo-random jitter without adding the `rand` crate.
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64;
+            let jitter = nanos % (jitter_secs + 1);
+            wait += Duration::from_secs(jitter);
+        }
+        tokio::time::sleep(wait).await;
+
+        let timer_name = name.clone();
+        let callback = callable.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            Python::attach(|python| {
+                let bound = callback.bind(python);
+                match bound.call0() {
+                    Ok(ret) => {
+                        if is_async {
+                            if let Err(error) = run_coroutine(python, &ret) {
+                                warn!(
+                                    timer = %timer_name,
+                                    %error,
+                                    "async timer callback error"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(timer = %timer_name, %error, "timer callback error");
+                    }
+                }
+            });
+        })
+        .await;
+
+        if let Err(error) = result {
+            if error.is_cancelled() {
+                debug!(name = %name, "timer cancelled");
+                break;
+            }
+            warn!(name = %name, %error, "timer task panicked");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async Python coroutine runner (shared by dispatcher and timer scheduler)
+// ---------------------------------------------------------------------------
+
+/// Run a Python coroutine to completion using `asyncio.run()`.
+///
+/// `block_in_place` allows blocking in a Tokio multi-threaded runtime while
+/// `asyncio.run()` drives the Python event loop. The Tokio runtime continues
+/// on other worker threads so Tokio-backed futures (e.g. RTPEngine UDP I/O)
+/// can still make progress.
+pub(crate) fn run_coroutine(
+    python: Python<'_>,
+    coroutine: &Bound<'_, pyo3::PyAny>,
+) -> PyResult<()> {
+    let asyncio = python.import("asyncio")?;
+    tokio::task::block_in_place(|| asyncio.call_method1("run", (coroutine,)))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -908,5 +1084,104 @@ def failed(call, code, reason):
 "#;
         let state = compile_temp_script(source).unwrap();
         assert_eq!(state.handlers.len(), 6);
+    }
+
+    #[test]
+    fn timer_every_decorator_registers_handler() {
+        let source = r#"
+from siphon import timer
+
+@timer.every(seconds=30)
+def health_check():
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert_eq!(
+            state.handlers[0].kind,
+            HandlerKind::TimerEvery {
+                interval_secs: 30,
+                name: "health_check".to_owned(),
+                jitter_secs: 0,
+            }
+        );
+        assert!(!state.handlers[0].is_async);
+    }
+
+    #[test]
+    fn timer_every_with_custom_name_and_jitter() {
+        let source = r#"
+from siphon import timer
+
+@timer.every(seconds=300, name="stats_push", jitter=10)
+def push_stats():
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert_eq!(
+            state.handlers[0].kind,
+            HandlerKind::TimerEvery {
+                interval_secs: 300,
+                name: "stats_push".to_owned(),
+                jitter_secs: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn timer_every_async_handler_detected() {
+        let source = r#"
+from siphon import timer
+
+@timer.every(seconds=60)
+async def check_gateways():
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert!(state.handlers[0].is_async);
+        assert!(matches!(
+            state.handlers[0].kind,
+            HandlerKind::TimerEvery { interval_secs: 60, .. }
+        ));
+    }
+
+    #[test]
+    fn multiple_timers_coexist_with_other_handlers() {
+        let source = r#"
+from siphon import proxy, timer
+
+@proxy.on_request
+def route(request):
+    pass
+
+@timer.every(seconds=10)
+def fast_check():
+    pass
+
+@timer.every(seconds=600, name="slow_task")
+async def slow_task():
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 3);
+        assert_eq!(state.timer_handlers().len(), 2);
+        assert!(state.has_timer_handlers());
+        assert_eq!(state.proxy_request_handlers("INVITE").len(), 1);
+    }
+
+    #[test]
+    fn timer_handlers_empty_without_timers() {
+        let source = r#"
+from siphon import proxy
+
+@proxy.on_request
+def route(request):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert!(state.timer_handlers().is_empty());
+        assert!(!state.has_timer_handlers());
     }
 }

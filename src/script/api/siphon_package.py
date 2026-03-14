@@ -439,3 +439,44 @@ class _SrsNamespace:
 
 
 srs = _SrsNamespace()
+
+
+# ---------------------------------------------------------------------------
+# Timer namespace — periodic callbacks (like OpenSIPS timer_route)
+# ---------------------------------------------------------------------------
+
+class _TimerNamespace:
+    """Namespace for periodic timer callbacks.
+
+    Timer handlers run on a Tokio interval in the Rust runtime.
+    They receive no SIP request/call context but can use all other
+    namespaces (registrar, cache, gateway, log, etc.).
+    """
+
+    def every(self, seconds, name=None, jitter=0):
+        """Register a periodic timer callback.
+
+        Usage:
+            @timer.every(seconds=30)
+            async def health_check():
+                ...
+
+            @timer.every(seconds=300, name="stats", jitter=10)
+            def push_stats():
+                ...
+
+        Args:
+            seconds: Interval between invocations.
+            name: Optional name for logging (defaults to function name).
+            jitter: Random jitter in seconds added to each interval (default 0).
+        """
+        def decorator(fn):
+            timer_name = name if name is not None else fn.__name__
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"seconds": seconds, "name": timer_name, "jitter": jitter}
+            _registry.register("timer.every", None, fn, is_async, metadata)
+            return fn
+        return decorator
+
+
+timer = _TimerNamespace()

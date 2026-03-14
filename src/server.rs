@@ -181,6 +181,9 @@ impl SiphonServer {
         // Start file watcher for hot-reload (no-op for embedded scripts)
         spawn_file_watcher(Arc::clone(&engine));
 
+        // Start any @timer.every() handlers registered in the script.
+        engine.restart_timers();
+
         // --- Initialize metrics ---
         if let Err(error) = crate::metrics::init() {
             error!("Failed to initialize metrics: {error}");

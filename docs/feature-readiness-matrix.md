@@ -186,6 +186,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Lawful intercept API | Implemented | `li.*` | |
 | Logging API | **Production** | `log.*` | |
 | Async handler support | Implemented | | Auto-detected by runtime |
+| Timer routes | Implemented | `@timer.every()` | Periodic callbacks via Tokio scheduler |
 | Mock SDK for testing | Implemented | `siphon-sdk` | Test scripts without Rust binary |
 
 ## Dialog Management

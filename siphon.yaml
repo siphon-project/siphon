@@ -80,6 +80,9 @@ domain:
 script:
   path: "scripts/proxy_default.py"
   reload: auto    # auto = inotify (change without restart) | sighup = signal only
+  # Timer routes: use @timer.every(seconds=N) in scripts for periodic callbacks.
+  # No YAML config needed — all parameters are per-decorator in the script.
+  # See examples/timer_example.py for usage patterns.
 
 # ---------------------------------------------------------------------------
 # Registrar
