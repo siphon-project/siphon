@@ -296,9 +296,12 @@ fn srs_recording_profile_has_record_call() {
     let profile = registry.get("srs_recording").unwrap();
 
     assert!(profile.offer.record_call, "srs_recording offer should have record_call=true");
-    assert!(!profile.answer.record_call, "srs_recording answer should NOT have record_call");
+    assert!(profile.answer.record_call, "srs_recording answer should have record_call=true");
     assert_eq!(profile.offer.ice.as_deref(), Some("remove"));
-    assert!(profile.offer.flags.contains(&"trust-address".to_string()));
+    assert_eq!(profile.offer.dtls.as_deref(), Some("off"));
+    assert!(profile.offer.flags.contains(&"media handover".to_string()));
+    assert!(profile.offer.flags.contains(&"port latching".to_string()));
+    assert!(profile.offer.replace.contains(&"session-connection".to_string()));
 }
 
 #[test]

@@ -717,6 +717,137 @@ fn append_media_section(result: &mut String, sdp: &str, label: &str) {
     }
 }
 
+/// Split a dual-m= SDP (from a SIPREC INVITE) into two single-m= SDPs.
+///
+/// Each returned SDP retains the session-level headers (v=, o=, s=, t=, c=)
+/// and contains exactly one m= section. Used by the SRS to feed each stream
+/// to RTPEngine as a separate offer/answer pair.
+///
+/// Also replaces `a=inactive` with `a=sendonly` so RTPEngine activates recording
+/// (inactive media causes RTPEngine to skip recording for that stream).
+pub fn split_dual_sdp(sdp: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let sdp_str = String::from_utf8_lossy(sdp);
+    let mut session_header = String::new();
+    let mut media_sections: Vec<String> = Vec::new();
+    let mut current_media = String::new();
+
+    for line in sdp_str.lines() {
+        if line.starts_with("m=") {
+            if !current_media.is_empty() {
+                media_sections.push(current_media.clone());
+                current_media.clear();
+            }
+            current_media.push_str(line);
+            current_media.push_str("\r\n");
+        } else if media_sections.is_empty() && current_media.is_empty() {
+            // Session-level header (before any m= line).
+            session_header.push_str(line);
+            session_header.push_str("\r\n");
+        } else {
+            // Media-level attribute.
+            if line.starts_with("a=inactive") {
+                current_media.push_str("a=sendonly\r\n");
+            } else {
+                current_media.push_str(line);
+                current_media.push_str("\r\n");
+            }
+        }
+    }
+    if !current_media.is_empty() {
+        media_sections.push(current_media);
+    }
+
+    let sdp1 = if !media_sections.is_empty() {
+        format!("{}{}", session_header, media_sections[0])
+    } else {
+        session_header.clone()
+    };
+
+    let sdp2 = if media_sections.len() > 1 {
+        format!("{}{}", session_header, media_sections[1])
+    } else {
+        // Single m= line — duplicate it for both sides.
+        sdp1.clone()
+    };
+
+    (sdp1.into_bytes(), sdp2.into_bytes())
+}
+
+/// Combine two RTPEngine response SDPs into a single SDP with 2 m= lines.
+///
+/// Takes the offer response (caller ports) and answer response (callee ports),
+/// merges them into a single SDP body with `a=recvonly` direction (the SRS
+/// receives media from the SRC) and `a=label:N` on each m= section.
+pub fn combine_srs_answer_sdps(offer_sdp: &[u8], answer_sdp: &[u8]) -> Vec<u8> {
+    let offer_str = String::from_utf8_lossy(offer_sdp);
+    let answer_str = String::from_utf8_lossy(answer_sdp);
+
+    let mut result = String::new();
+
+    // Take session-level headers from the offer response.
+    for line in offer_str.lines() {
+        if line.starts_with("m=") {
+            break;
+        }
+        result.push_str(line);
+        result.push_str("\r\n");
+    }
+
+    // Append offer media section (label 0, recvonly).
+    append_srs_media_section(&mut result, &offer_str, "0");
+
+    // Append answer media section (label 1, recvonly).
+    append_srs_media_section(&mut result, &answer_str, "1");
+
+    result.into_bytes()
+}
+
+/// Extract the first m= section from an RTPEngine response SDP and append it
+/// with `a=recvonly` direction and the given label.
+fn append_srs_media_section(result: &mut String, sdp: &str, label: &str) {
+    let mut in_media = false;
+    let mut has_label = false;
+    let mut has_direction = false;
+
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            if in_media {
+                break; // Only take the first m= section.
+            }
+            in_media = true;
+            result.push_str(line);
+            result.push_str("\r\n");
+            continue;
+        }
+        if !in_media {
+            continue;
+        }
+        if line.starts_with("a=sendonly")
+            || line.starts_with("a=recvonly")
+            || line.starts_with("a=sendrecv")
+            || line.starts_with("a=inactive")
+        {
+            if !has_direction {
+                result.push_str("a=recvonly\r\n");
+                has_direction = true;
+            }
+        } else if line.starts_with("a=label:") {
+            has_label = true;
+            result.push_str(&format!("a=label:{label}\r\n"));
+        } else {
+            result.push_str(line);
+            result.push_str("\r\n");
+        }
+    }
+
+    if in_media && !has_label {
+        result.push_str(&format!("a=label:{label}\r\n"));
+    }
+    if in_media && !has_direction {
+        result.push_str("a=recvonly\r\n");
+    }
+}
+
 /// Build a sendonly SDP from the call's SDP for the SIPREC INVITE.
 ///
 /// The SRC (us) sends forked media to the SRS, so the offer direction
@@ -1529,5 +1660,120 @@ mod tests {
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.contains("User-Agent: SIPhon/0.1.3"));
         assert!(!raw.contains("User-Agent: SIPhon\r\n"));
+    }
+
+    #[test]
+    fn split_dual_sdp_produces_two_single_m_sdps() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=siphon 1 1 IN IP4 10.0.0.1\r\n",
+            "s=siphon\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=label:0\r\n",
+            "a=sendonly\r\n",
+            "m=audio 30100 RTP/AVP 8\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=label:1\r\n",
+            "a=sendonly\r\n",
+        );
+
+        let (sdp1, sdp2) = split_dual_sdp(sdp.as_bytes());
+        let s1 = String::from_utf8_lossy(&sdp1);
+        let s2 = String::from_utf8_lossy(&sdp2);
+
+        // Each SDP has exactly one m= line.
+        assert_eq!(s1.matches("m=audio").count(), 1);
+        assert_eq!(s2.matches("m=audio").count(), 1);
+
+        // Both have session headers.
+        assert!(s1.contains("v=0"));
+        assert!(s2.contains("v=0"));
+        assert!(s1.contains("o=siphon"));
+        assert!(s2.contains("o=siphon"));
+
+        // First gets port 30000, second gets port 30100.
+        assert!(s1.contains("m=audio 30000"));
+        assert!(s2.contains("m=audio 30100"));
+    }
+
+    #[test]
+    fn split_dual_sdp_replaces_inactive_with_sendonly() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8\r\n",
+            "a=inactive\r\n",
+            "m=audio 30100 RTP/AVP 8\r\n",
+            "a=inactive\r\n",
+        );
+
+        let (sdp1, sdp2) = split_dual_sdp(sdp.as_bytes());
+        let s1 = String::from_utf8_lossy(&sdp1);
+        let s2 = String::from_utf8_lossy(&sdp2);
+
+        assert!(s1.contains("a=sendonly"));
+        assert!(s2.contains("a=sendonly"));
+        assert!(!s1.contains("a=inactive"));
+        assert!(!s2.contains("a=inactive"));
+    }
+
+    #[test]
+    fn split_single_m_sdp_duplicates() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8\r\n",
+            "a=sendonly\r\n",
+        );
+
+        let (sdp1, sdp2) = split_dual_sdp(sdp.as_bytes());
+        assert_eq!(sdp1, sdp2, "single m= SDP should be duplicated");
+    }
+
+    #[test]
+    fn combine_srs_answer_sdps_produces_recvonly_labeled() {
+        let offer_sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 20000 RTP/AVP 8\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=sendrecv\r\n",
+        );
+        let answer_sdp = concat!(
+            "v=0\r\n",
+            "o=- 2 2 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 20100 RTP/AVP 8\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=sendrecv\r\n",
+        );
+
+        let combined = combine_srs_answer_sdps(offer_sdp.as_bytes(), answer_sdp.as_bytes());
+        let result = String::from_utf8_lossy(&combined);
+
+        // Two m= lines.
+        assert_eq!(result.matches("m=audio").count(), 2);
+        assert!(result.contains("m=audio 20000"));
+        assert!(result.contains("m=audio 20100"));
+
+        // Both recvonly (SRS receives from SRC).
+        assert_eq!(result.matches("a=recvonly").count(), 2);
+        assert!(!result.contains("a=sendrecv"));
+
+        // Labeled 0 and 1.
+        assert!(result.contains("a=label:0"));
+        assert!(result.contains("a=label:1"));
+
+        // Session headers from offer only (no duplicates).
+        assert_eq!(result.matches("v=0").count(), 1);
     }
 }

@@ -6265,21 +6265,56 @@ fn handle_srs_invite(
                 if let Some(recording_dir) = srs_manager.recording_dir(&session_id) {
                     let _ = tokio::fs::create_dir_all(&recording_dir).await;
 
-                    // Build flags with record-call enabled and record-path pointing
-                    // to the session directory so RTPEngine writes the media files.
+                    let recording_dir_str = recording_dir.display().to_string();
+
+                    // Split the dual-m= SDP into two single-m= SDPs (one per
+                    // call direction).  RTPEngine needs a separate offer/answer
+                    // pair to fully activate both media legs for recording.
+                    let (sdp1, sdp2) = crate::siprec::split_dual_sdp(&sdp_part.body);
+
                     let mut offer_flags = profile.offer.clone();
                     offer_flags.record_call = true;
-                    offer_flags.record_path = Some(recording_dir.display().to_string());
+                    offer_flags.record_path = Some(recording_dir_str.clone());
 
-                    match rtpengine_set.offer(&call_id, &from_tag, &sdp_part.body, &offer_flags).await {
-                        Ok(offer_sdp) => {
-                            // offer-only: RTPEngine allocates receive ports and
-                            // records incoming RTP to disk via record_call/record_path.
-                            // No answer() needed — the SRS is a pure media sink.
-                            // Calling answer() with the offer response SDP would create
-                            // a bogus second leg where RTPEngine talks to itself.
-                            srs_manager.activate_session(&session_id);
-                            Some(offer_sdp)
+                    let mut answer_flags = profile.answer.clone();
+                    answer_flags.record_call = true;
+                    answer_flags.record_path = Some(recording_dir_str);
+
+                    // Step 1: offer() with first m= line (caller stream).
+                    let offer_result = rtpengine_set.offer(
+                        &call_id, &from_tag, &sdp1, &offer_flags,
+                    ).await;
+
+                    match offer_result {
+                        Ok(offer_response_sdp) => {
+                            // Step 2: answer() with second m= line (callee stream).
+                            let srs_to_tag = format!("srs-{}", uuid::Uuid::new_v4().as_simple());
+                            let answer_result = rtpengine_set.answer(
+                                &call_id, &from_tag, &srs_to_tag, &sdp2, &answer_flags,
+                            ).await;
+
+                            match answer_result {
+                                Ok(answer_response_sdp) => {
+                                    // Combine both response SDPs into a single
+                                    // recvonly SDP with 2 labeled m= lines.
+                                    let combined = crate::siprec::combine_srs_answer_sdps(
+                                        &offer_response_sdp,
+                                        &answer_response_sdp,
+                                    );
+                                    srs_manager.activate_session(&session_id);
+                                    Some(combined)
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        call_id = %call_id,
+                                        session_id = %session_id,
+                                        error = %error,
+                                        "SRS: RTPEngine answer failed"
+                                    );
+                                    srs_manager.fail_session(&session_id, &error.to_string());
+                                    None
+                                }
+                            }
                         }
                         Err(error) => {
                             warn!(

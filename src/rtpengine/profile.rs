@@ -149,25 +149,37 @@ impl ProfileRegistry {
     }
 
     fn builtin_srs_recording() -> ProfileEntry {
+        // SIPREC SRS recording profile:
+        // - replace origin + session-connection so RTPEngine rewrites o=/c=
+        // - media handover + port latching for NAT/SIPREC source port flexibility
+        // - trust-address to accept RTP from any source
+        // - ICE remove, DTLS off (recording sink, no oer security needed)
+        // - direction public/public (both sides are external-facing)
         ProfileEntry {
             offer: NgFlags {
-                transport_protocol: None,
+                transport_protocol: Some("RTP/AVP".into()),
                 ice: Some("remove".into()),
-                dtls: None,
-                replace: vec!["origin".into()],
-                flags: vec!["trust-address".into()],
-                direction: vec![],
+                dtls: Some("off".into()),
+                replace: vec!["origin".into(), "session-connection".into()],
+                flags: vec![
+                    "media handover".into(),
+                    "port latching".into(),
+                ],
+                direction: vec!["public".into(), "public".into()],
                 record_call: true,
                 record_path: None,
             },
             answer: NgFlags {
-                transport_protocol: None,
+                transport_protocol: Some("RTP/AVP".into()),
                 ice: Some("remove".into()),
-                dtls: None,
-                replace: vec!["origin".into()],
-                flags: vec!["trust-address".into()],
-                direction: vec![],
-                record_call: false,
+                dtls: Some("off".into()),
+                replace: vec!["origin".into(), "session-connection".into()],
+                flags: vec![
+                    "media handover".into(),
+                    "port latching".into(),
+                ],
+                direction: vec!["public".into(), "public".into()],
+                record_call: true,
                 record_path: None,
             },
         }
@@ -275,9 +287,7 @@ impl NgFlags {
             pairs.push(("record call", BencodeValue::string("yes")));
         }
         if let Some(record_path) = &self.record_path {
-            pairs.push(("metadata", BencodeValue::dict(vec![
-                ("record-path", BencodeValue::string(record_path)),
-            ])));
+            pairs.push(("recording-dir", BencodeValue::string(record_path)));
         }
 
         pairs
