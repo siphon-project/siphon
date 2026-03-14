@@ -4767,10 +4767,20 @@ fn handle_b2bua_response(
                 drop(invite);
 
                 // RTPEngine subscribe: fork media to the recording leg.
-                // Uses SIPREC-mode subscribe (flags: ["all", "siprec"]) which
-                // returns a combined SDP with 2 m= lines (one per direction)
-                // without requiring from-tag/to-tag — avoids dialogue corruption.
+                // Uses SIPREC-mode subscribe with from-tags containing both
+                // monologue tags so RTPEngine returns a combined SDP with
+                // 2 m= lines (one per call direction).
                 let a_sip_call_id = a_leg.dialog.call_id.clone();
+
+                // Look up the MediaSession to get both monologue tags that
+                // RTPEngine knows about (from_tag = A-leg, to_tag = B-leg).
+                let media_tags: Option<(String, String)> = state.rtpengine_sessions.as_ref()
+                    .and_then(|sessions| sessions.get(&a_sip_call_id))
+                    .and_then(|session| {
+                        session.to_tag.as_ref().map(|to_tag| {
+                            (session.from_tag.clone(), to_tag.clone())
+                        })
+                    });
 
                 // Look up the SIPREC SRC RTPEngine profile for additional subscribe flags.
                 let siprec_src_profile = state.li_siprec_rtpengine_profile.as_deref()
@@ -4780,10 +4790,19 @@ fn handle_b2bua_response(
                     });
                 let siprec_src_flags = siprec_src_profile.as_ref().map(|profile| &profile.offer);
 
-                let (mut caller_sdp, subscriber_to_tag) = if let Some(ref rtpengine_set) = state.rtpengine_set {
+                let (mut caller_sdp, mut callee_sdp, subscriber_to_tag) = if let Some(ref rtpengine_set) = state.rtpengine_set {
+                    // Build from-tags list with both monologue tags.
+                    let from_tags: Vec<&str> = match &media_tags {
+                        Some((from_tag, to_tag)) => vec![from_tag.as_str(), to_tag.as_str()],
+                        None => {
+                            warn!(call_id = %call_id, "SIPREC: no MediaSession tags found, subscribe may return only 1 stream");
+                            vec![]
+                        }
+                    };
+
                     let result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(
-                            rtpengine_set.subscribe_request_siprec(&a_sip_call_id, siprec_src_flags)
+                            rtpengine_set.subscribe_request_siprec(&a_sip_call_id, &from_tags, siprec_src_flags)
                         )
                     });
                     match result {
@@ -4791,21 +4810,33 @@ fn handle_b2bua_response(
                             debug!(call_id = %call_id, sdp_len = sdp.len(), subscriber_to_tag = %to_tag, "SIPREC: subscribe_request_siprec OK");
                             // Fix direction (recvonly→sendonly) and add a=label per m= section.
                             let processed = crate::siprec::fix_siprec_subscribe_sdp(&sdp);
-                            (Some(processed), Some(to_tag))
+                            // Split the dual-m= SDP into per-direction parts so
+                            // start_recording builds a proper 2-stream INVITE.
+                            let (sdp1, sdp2) = crate::siprec::split_dual_sdp(&processed);
+                            let has_two = sdp1 != sdp2;
+                            if has_two {
+                                (Some(sdp1), Some(sdp2), Some(to_tag))
+                            } else {
+                                // Single m= line — split returned two identical copies.
+                                (Some(sdp1), None, Some(to_tag))
+                            }
                         }
                         Err(error) => {
                             warn!(call_id = %call_id, %error, "SIPREC: subscribe_request_siprec failed");
-                            (None, None)
+                            (None, None, None)
                         }
                     }
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
 
-                // Sanitize the subscribe SDP to hide the original call's identity
+                // Sanitize the subscribe SDPs to hide the original call's identity
                 // (o=/s= lines may leak FreeSWITCH, Oracle, etc.).
                 let local_ip = state.local_addr.ip().to_string();
                 if let Some(ref mut sdp_bytes) = caller_sdp {
+                    sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));
+                }
+                if let Some(ref mut sdp_bytes) = callee_sdp {
                     sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));
                 }
 
@@ -4816,7 +4847,7 @@ fn handle_b2bua_response(
                 if let Some((_session_id, rec_invite, destination, transport)) =
                     state.recording_manager.start_recording(
                         call_id, srs_uri, &caller_uri, &callee_uri, sdp, state.local_addr,
-                        caller_sdp.as_deref(), None,
+                        caller_sdp.as_deref(), callee_sdp.as_deref(),
                         Some(&a_sip_call_id), tags_ref,
                         state.user_agent_header.as_deref(),
                     )

@@ -158,14 +158,16 @@ impl RtpEngineClient {
 
     /// Send a SIPREC-mode `subscribe request` — subscribes to both directions.
     ///
-    /// Unlike the regular `subscribe_request`, this uses `flags: ["all", "siprec"]`
-    /// and omits from-tag/to-tag.  RTPEngine returns a combined SDP with 2 m=
-    /// lines (one per call direction) plus a `to-tag` for the subscription.
+    /// Uses `flags: ["all", "siprec"]` and `from-tags` to select both call
+    /// participants (A-leg from_tag + B-leg to_tag).  RTPEngine returns a
+    /// combined SDP with 2 m= lines (one per call direction) plus a `to-tag`
+    /// for the subscription.
     ///
     /// Returns `(sdp, to_tag)` on success.
     pub async fn subscribe_request_siprec(
         &self,
         call_id: &str,
+        from_tags: &[&str],
         profile_flags: Option<&super::NgFlags>,
     ) -> Result<(Vec<u8>, String), RtpEngineError> {
         // Mandatory SIPREC flags — always present.
@@ -176,6 +178,12 @@ impl RtpEngineClient {
             ("command", BencodeValue::string("subscribe request")),
             ("call-id", BencodeValue::string(call_id)),
         ];
+
+        // from-tags selects which call participants to subscribe to.
+        // Both monologue tags are needed to get 2 m= lines in the response.
+        if !from_tags.is_empty() {
+            pairs.push(("from-tags", BencodeValue::string_list(from_tags)));
+        }
 
         if let Some(flags) = profile_flags {
             // Merge any profile-level flags into the siprec flags list.
@@ -588,10 +596,11 @@ impl RtpEngineSet {
     pub async fn subscribe_request_siprec(
         &self,
         call_id: &str,
+        from_tags: &[&str],
         profile_flags: Option<&NgFlags>,
     ) -> Result<(Vec<u8>, String), RtpEngineError> {
         let client = self.select(call_id);
-        client.subscribe_request_siprec(call_id, profile_flags).await
+        client.subscribe_request_siprec(call_id, from_tags, profile_flags).await
     }
 
     /// Send a `subscribe answer` command to the affinity-bound instance.

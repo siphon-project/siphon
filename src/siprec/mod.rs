@@ -1777,4 +1777,131 @@ mod tests {
         // Session headers from offer only (no duplicates).
         assert_eq!(result.matches("v=0").count(), 1);
     }
+
+    #[test]
+    fn start_recording_dual_sdp_produces_two_m_lines() {
+        let manager = RecordingManager::new();
+        let fallback_sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=sendrecv\r\n",
+        );
+
+        // Simulate two per-direction SDPs from split_dual_sdp after
+        // subscribe_request_siprec + fix_siprec_subscribe_sdp.
+        let caller_sdp = concat!(
+            "v=0\r\n",
+            "o=siphon 1 1 IN IP4 10.0.0.1\r\n",
+            "s=siphon\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8 101\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=sendonly\r\n",
+            "a=label:0\r\n",
+        );
+        let callee_sdp = concat!(
+            "v=0\r\n",
+            "o=siphon 1 1 IN IP4 10.0.0.1\r\n",
+            "s=siphon\r\n",
+            "t=0 0\r\n",
+            "m=audio 30100 RTP/AVP 8 101\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=sendonly\r\n",
+            "a=label:1\r\n",
+        );
+
+        let (_session_id, message, _destination, _transport) = manager.start_recording(
+            "call-dual",
+            "sip:srs@10.0.0.5:5060",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            fallback_sdp.as_bytes(),
+            "10.0.0.1:5060".parse().unwrap(),
+            Some(caller_sdp.as_bytes()),
+            Some(callee_sdp.as_bytes()),
+            Some("original-call-id"),
+            Some(("", "subscriber-to-tag")),
+            None,
+        ).unwrap();
+
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+
+        // The INVITE body must contain 2 m= lines (both monologues).
+        assert_eq!(
+            raw.matches("m=audio").count(), 2,
+            "SIPREC INVITE must have 2 m=audio lines for both monologues"
+        );
+        // Both should be sendonly (SRC → SRS direction).
+        assert_eq!(raw.matches("a=sendonly").count(), 2);
+        // Labels must be present and distinct.
+        assert!(raw.contains("a=label:0"));
+        assert!(raw.contains("a=label:1"));
+        // Both ports present.
+        assert!(raw.contains("m=audio 30000"));
+        assert!(raw.contains("m=audio 30100"));
+        // Multipart body with SDP + metadata.
+        assert!(raw.contains("Content-Type: multipart/mixed"));
+        assert!(raw.contains("application/sdp"));
+        assert!(raw.contains("application/rs-metadata+xml"));
+    }
+
+    #[test]
+    fn start_recording_single_sdp_fallback() {
+        let manager = RecordingManager::new();
+        let fallback_sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=sendrecv\r\n",
+        );
+
+        // Only caller SDP — callee is None (single-monologue fallback).
+        let caller_sdp = concat!(
+            "v=0\r\n",
+            "o=siphon 1 1 IN IP4 10.0.0.1\r\n",
+            "s=siphon\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "a=recvonly\r\n",
+        );
+
+        let (_session_id, message, _destination, _transport) = manager.start_recording(
+            "call-single",
+            "sip:srs@10.0.0.5:5060",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            fallback_sdp.as_bytes(),
+            "10.0.0.1:5060".parse().unwrap(),
+            Some(caller_sdp.as_bytes()),
+            None,
+            None,
+            None,
+            None,
+        ).unwrap();
+
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+
+        // Single m= line fallback.
+        assert_eq!(
+            raw.matches("m=audio").count(), 1,
+            "single-direction fallback should have 1 m=audio line"
+        );
+        // Direction flipped to sendonly.
+        assert!(raw.contains("a=sendonly"));
+        assert!(!raw.contains("a=recvonly"));
+    }
 }
