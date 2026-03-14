@@ -21,6 +21,7 @@ use pyo3::prelude::*;
 #[derive(Clone)]
 pub struct PyRecordingMetadata {
     session_id: String,
+    sip_session_ids: Vec<String>,
     participants: Vec<PyParticipant>,
     streams: Vec<PyStreamInfo>,
 }
@@ -31,6 +32,18 @@ impl PyRecordingMetadata {
     #[getter]
     fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// SIP Session-IDs from the original call dialog(s) being recorded (RFC 7865).
+    #[getter]
+    fn sip_session_ids(&self) -> Vec<String> {
+        self.sip_session_ids.clone()
+    }
+
+    /// Original call-id of the recorded dialog (first sipSessionID, if any).
+    #[getter]
+    fn original_call_id(&self) -> Option<String> {
+        self.sip_session_ids.first().cloned()
     }
 
     /// List of participants in the recorded call.
@@ -60,6 +73,7 @@ impl PyRecordingMetadata {
     pub fn from_metadata(metadata: &crate::siprec::metadata::RecordingMetadata) -> Self {
         Self {
             session_id: metadata.session_id.clone(),
+            sip_session_ids: metadata.sip_session_ids.clone(),
             participants: metadata.participants.iter().map(|participant| {
                 PyParticipant {
                     participant_id: participant.participant_id.clone(),

@@ -196,6 +196,7 @@ impl RecordingManager {
             &session_id,
             caller_uri,
             callee_uri,
+            original_sip_call_id,
         );
 
         // Build recording SDP with per-direction streams.

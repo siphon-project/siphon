@@ -37,6 +37,10 @@ impl From<quick_xml::Error> for MetadataError {
 pub struct RecordingMetadata {
     /// Recording session ID (from `<session session_id="...">`).
     pub session_id: String,
+    /// SIP Session-IDs from `<sipSessionID>` elements (RFC 7865 §8.1.1).
+    /// These reference the original SIP dialog(s) being recorded.
+    /// A session may have zero or more sipSessionID values.
+    pub sip_session_ids: Vec<String>,
     /// Participants in the recorded call.
     pub participants: Vec<Participant>,
     /// Media streams being recorded.
@@ -80,18 +84,25 @@ pub fn build_recording_metadata(
     session_id: &str,
     caller_uri: &str,
     callee_uri: &str,
+    original_call_id: Option<&str>,
 ) -> String {
     let caller_participant_id = format!("part-{}", &session_id[..8]);
     let callee_participant_id = format!("part-{}", &session_id[8..16.min(session_id.len())]);
     let stream_0_id = format!("stream-0-{}", &session_id[..8]);
     let stream_1_id = format!("stream-1-{}", &session_id[..8]);
 
+    // RFC 7865 §8.1.1: <sipSessionID> references the original SIP dialog
+    // being recorded, not the recording session itself. Omit if unknown.
+    let sip_session_id_element = match original_call_id {
+        Some(call_id) => format!("\n    <sipSessionID>{call_id}</sipSessionID>"),
+        None => String::new(),
+    };
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <recording xmlns="urn:ietf:params:xml:ns:recording:1">
   <datamode>complete</datamode>
-  <session session_id="{session_id}">
-    <sipSessionID>{session_id}</sipSessionID>
+  <session session_id="{session_id}">{sip_session_id_element}
   </session>
   <participant participant_id="{caller_participant_id}">
     <nameID aor="{caller_uri}"/>
@@ -129,6 +140,7 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
     let mut reader = Reader::from_str(xml);
 
     let mut session_id: Option<String> = None;
+    let mut sip_session_ids = Vec::new();
     let mut participants = Vec::new();
     let mut streams = Vec::new();
 
@@ -141,6 +153,7 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
     let mut current_label: Option<String> = None;
     let mut inside_label = false;
     let mut inside_name = false;
+    let mut inside_sip_session_id = false;
 
     let mut buffer = Vec::new();
 
@@ -169,6 +182,9 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
                     "name" => {
                         inside_name = true;
                     }
+                    "sipSessionID" => {
+                        inside_sip_session_id = true;
+                    }
                     "stream" => {
                         current_stream_id = get_attribute(element, "stream_id");
                         current_stream_session_id = get_attribute(element, "session_id");
@@ -189,6 +205,14 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
                 if inside_name {
                     if let Ok(value) = text.unescape() {
                         current_participant_name = Some(value.trim().to_string());
+                    }
+                }
+                if inside_sip_session_id {
+                    if let Ok(value) = text.unescape() {
+                        let trimmed = value.trim().to_string();
+                        if !trimmed.is_empty() {
+                            sip_session_ids.push(trimmed);
+                        }
                     }
                 }
             }
@@ -219,6 +243,7 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
                             });
                         }
                     }
+                    "sipSessionID" => inside_sip_session_id = false,
                     "label" => inside_label = false,
                     "name" => inside_name = false,
                     _ => {}
@@ -235,6 +260,7 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
 
     Ok(RecordingMetadata {
         session_id,
+        sip_session_ids,
         participants,
         streams,
     })
@@ -267,10 +293,26 @@ mod tests {
             "abc12345-6789-0000-0000-000000000000",
             "sip:alice@example.com",
             "sip:bob@example.com",
+            None,
         );
         assert!(xml.contains("abc12345-6789-0000-0000-000000000000"));
         assert!(xml.contains("sip:alice@example.com"));
         assert!(xml.contains("sip:bob@example.com"));
+        // No sipSessionID when original_call_id is None.
+        assert!(!xml.contains("<sipSessionID>"));
+    }
+
+    #[test]
+    fn metadata_with_original_call_id() {
+        let xml = build_recording_metadata(
+            "abc12345-6789-0000-0000-000000000000",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            Some("original-call-id-from-invite@192.168.1.1"),
+        );
+        assert!(xml.contains("<sipSessionID>original-call-id-from-invite@192.168.1.1</sipSessionID>"));
+        // session_id attribute should still be the recording session ID.
+        assert!(xml.contains("session_id=\"abc12345-6789-0000-0000-000000000000\""));
     }
 
     #[test]
@@ -279,6 +321,7 @@ mod tests {
             "test-session-id-0000-0000-000000000000",
             "sip:caller@host.com",
             "sip:callee@host.com",
+            None,
         );
         assert!(xml.starts_with("<?xml"));
         assert!(xml.contains("<recording xmlns="));
@@ -294,6 +337,7 @@ mod tests {
             "aaaabbbb-cccc-dddd-eeee-ffffffffffff",
             "sip:alice@example.com",
             "sip:bob@example.com",
+            None,
         );
         assert_eq!(xml.matches("<participant ").count(), 2);
         assert_eq!(xml.matches("<stream ").count(), 2);
@@ -304,18 +348,20 @@ mod tests {
         assert!(xml.contains("<recv>stream-1-aaaabbbb</recv>"));
     }
 
-    // --- Parsing tests (new) ---
+    // --- Parsing tests ---
 
     #[test]
-    fn parse_roundtrip() {
+    fn parse_roundtrip_no_original_call_id() {
         let xml = build_recording_metadata(
             "abc12345-6789-0000-0000-000000000000",
             "sip:alice@example.com",
             "sip:bob@example.com",
+            None,
         );
         let metadata = parse_recording_metadata(&xml).unwrap();
 
         assert_eq!(metadata.session_id, "abc12345-6789-0000-0000-000000000000");
+        assert!(metadata.sip_session_ids.is_empty());
         assert_eq!(metadata.participants.len(), 2);
         assert_eq!(metadata.participants[0].aor, "sip:alice@example.com");
         assert_eq!(metadata.participants[1].aor, "sip:bob@example.com");
@@ -325,11 +371,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_roundtrip_with_original_call_id() {
+        let xml = build_recording_metadata(
+            "abc12345-6789-0000-0000-000000000000",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            Some("orig-call-id@10.0.0.1"),
+        );
+        let metadata = parse_recording_metadata(&xml).unwrap();
+
+        assert_eq!(metadata.session_id, "abc12345-6789-0000-0000-000000000000");
+        assert_eq!(metadata.sip_session_ids, vec!["orig-call-id@10.0.0.1"]);
+    }
+
+    #[test]
     fn parse_participant_ids() {
         let xml = build_recording_metadata(
             "aaaabbbb-cccc-dddd-eeee-ffffffffffff",
             "sip:caller@host.com",
             "sip:callee@host.com",
+            None,
         );
         let metadata = parse_recording_metadata(&xml).unwrap();
 
@@ -343,6 +404,7 @@ mod tests {
             "aaaabbbb-cccc-dddd-eeee-ffffffffffff",
             "sip:a@x.com",
             "sip:b@x.com",
+            None,
         );
         let metadata = parse_recording_metadata(&xml).unwrap();
         assert_eq!(metadata.streams[0].session_id, "aaaabbbb-cccc-dddd-eeee-ffffffffffff");
@@ -362,14 +424,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_external_metadata() {
-        // Metadata from a different SRC implementation (not ours).
+    fn parse_external_metadata_with_sip_session_id() {
+        // Metadata from a different SRC implementation with sipSessionID.
         let xml = concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
             "<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">\n",
             "  <datamode>complete</datamode>\n",
             "  <session session_id=\"ext-sess-001\">\n",
-            "    <sipSessionID>ext-sess-001</sipSessionID>\n",
+            "    <sipSessionID>original-dialog-call-id@10.0.0.5</sipSessionID>\n",
             "  </session>\n",
             "  <participant participant_id=\"p1\">\n",
             "    <nameID aor=\"sip:external@vendor.com\"/>\n",
@@ -388,12 +450,28 @@ mod tests {
 
         let metadata = parse_recording_metadata(xml).unwrap();
         assert_eq!(metadata.session_id, "ext-sess-001");
+        assert_eq!(metadata.sip_session_ids, vec!["original-dialog-call-id@10.0.0.5"]);
         assert_eq!(metadata.participants.len(), 2);
         assert_eq!(metadata.participants[0].aor, "sip:external@vendor.com");
         assert_eq!(metadata.participants[1].aor, "sip:customer@our.com");
         assert_eq!(metadata.streams.len(), 2);
         assert_eq!(metadata.streams[0].label, "caller-audio");
         assert_eq!(metadata.streams[1].label, "callee-audio");
+    }
+
+    #[test]
+    fn parse_multiple_sip_session_ids() {
+        // RFC 7865 allows multiple sipSessionID elements per session.
+        let xml = concat!(
+            "<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">\n",
+            "  <session session_id=\"multi-sess\">\n",
+            "    <sipSessionID>call-id-1@host1</sipSessionID>\n",
+            "    <sipSessionID>call-id-2@host2</sipSessionID>\n",
+            "  </session>\n",
+            "</recording>",
+        );
+        let metadata = parse_recording_metadata(xml).unwrap();
+        assert_eq!(metadata.sip_session_ids, vec!["call-id-1@host1", "call-id-2@host2"]);
     }
 
     #[test]
@@ -412,6 +490,7 @@ mod tests {
         );
         let metadata = parse_recording_metadata(xml).unwrap();
         assert_eq!(metadata.session_id, "sess-1");
+        assert!(metadata.sip_session_ids.is_empty());
         assert!(metadata.participants.is_empty());
     }
 }

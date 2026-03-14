@@ -195,7 +195,7 @@ impl SrsManager {
         let session = SrsSession {
             session_id: session_id.clone(),
             recording_call_id: recording_call_id.to_string(),
-            original_call_id: None, // Set from metadata sipSessionID if needed
+            original_call_id: metadata.sip_session_ids.first().cloned(),
             from_tag: from_tag.to_string(),
             to_tag: to_tag.clone(),
             metadata,
@@ -353,6 +353,7 @@ mod tests {
     fn test_metadata() -> RecordingMetadata {
         RecordingMetadata {
             session_id: "test-session-001".to_string(),
+            sip_session_ids: vec![],
             participants: vec![
                 Participant {
                     participant_id: "p1".to_string(),
@@ -452,6 +453,7 @@ mod tests {
         // Create session 1.
         let metadata1 = RecordingMetadata {
             session_id: "sess-1".to_string(),
+            sip_session_ids: vec![],
             participants: vec![],
             streams: vec![],
         };
@@ -460,6 +462,7 @@ mod tests {
         // Create session 2.
         let metadata2 = RecordingMetadata {
             session_id: "sess-2".to_string(),
+            sip_session_ids: vec![],
             participants: vec![],
             streams: vec![],
         };
@@ -468,6 +471,7 @@ mod tests {
         // Session 3 should be rejected.
         let metadata3 = RecordingMetadata {
             session_id: "sess-3".to_string(),
+            sip_session_ids: vec![],
             participants: vec![],
             streams: vec![],
         };
@@ -530,6 +534,7 @@ mod tests {
         // Simulate re-INVITE with updated metadata (e.g. new stream).
         let updated_metadata = RecordingMetadata {
             session_id: "test-session-001".to_string(),
+            sip_session_ids: vec![],
             participants: vec![
                 Participant {
                     participant_id: "p1".to_string(),

@@ -39,7 +39,7 @@ fn sample_siprec_body(session_id: &str, caller: &str, callee: &str) -> (String, 
         "a=label:main-audio\r\n",
     );
 
-    let metadata_xml = build_recording_metadata(session_id, caller, callee);
+    let metadata_xml = build_recording_metadata(session_id, caller, callee, None);
 
     let boundary = "siprec-boundary-12345";
     let body = format!(
@@ -113,6 +113,7 @@ fn srs_manager_session_lifecycle() {
             session_id,
             "sip:caller@host.com",
             "sip:callee@host.com",
+            None,
         ),
     ).unwrap();
 
@@ -155,6 +156,7 @@ fn srs_manager_multiple_sessions() {
             "session-aaaa-0000-0000-000000000001",
             "sip:a@x.com",
             "sip:b@x.com",
+            None,
         ),
     ).unwrap();
 
@@ -163,6 +165,7 @@ fn srs_manager_multiple_sessions() {
             "session-bbbb-0000-0000-000000000002",
             "sip:c@x.com",
             "sip:d@x.com",
+            None,
         ),
     ).unwrap();
 
@@ -193,6 +196,7 @@ fn srs_manager_fail_session() {
             "session-fail-0000-0000-000000000000",
             "sip:x@y.com",
             "sip:z@y.com",
+            None,
         ),
     ).unwrap();
 
@@ -217,7 +221,7 @@ fn srs_manager_max_sessions_enforced() {
 
     let make_metadata = |id: &str| {
         parse_recording_metadata(
-            &build_recording_metadata(id, "sip:a@x.com", "sip:b@x.com"),
+            &build_recording_metadata(id, "sip:a@x.com", "sip:b@x.com", None),
         ).unwrap()
     };
 
@@ -257,6 +261,7 @@ async fn srs_file_storage_writes_metadata() {
             "storage-test-0000-0000-000000000000",
             "sip:alice@storage.test",
             "sip:bob@storage.test",
+            None,
         ),
     ).unwrap();
 
@@ -325,6 +330,7 @@ fn siprec_multipart_with_extra_parts() {
         "extra-sess-0000-0000-000000000000",
         "sip:a@x.com",
         "sip:b@x.com",
+        None,
     );
     let body = format!(
         "--{boundary}\r\n\
@@ -355,6 +361,40 @@ fn siprec_multipart_with_extra_parts() {
     assert!(find_part(&parts, "application/sdp").is_some());
     assert!(find_part(&parts, "application/rs-metadata").is_some());
     assert!(find_part(&parts, "application/pidf").is_some());
+}
+
+#[test]
+fn srs_session_captures_original_call_id() {
+    let config = sample_srs_config();
+    let manager = SrsManager::new(config);
+
+    // Metadata with sipSessionID referencing the original call.
+    let xml = concat!(
+        "<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">\n",
+        "  <session session_id=\"rec-session-001\">\n",
+        "    <sipSessionID>original-dialog-call-id@10.0.0.1</sipSessionID>\n",
+        "  </session>\n",
+        "  <participant participant_id=\"p1\">\n",
+        "    <nameID aor=\"sip:alice@example.com\"/>\n",
+        "  </participant>\n",
+        "  <participant participant_id=\"p2\">\n",
+        "    <nameID aor=\"sip:bob@example.com\"/>\n",
+        "  </participant>\n",
+        "  <stream stream_id=\"s1\" session_id=\"rec-session-001\">\n",
+        "    <label>0</label>\n",
+        "  </stream>\n",
+        "</recording>",
+    );
+    let metadata = parse_recording_metadata(xml).unwrap();
+    assert_eq!(metadata.sip_session_ids, vec!["original-dialog-call-id@10.0.0.1"]);
+
+    let (session_id, _) = manager.create_session("siprec-call-1", "from-tag", metadata).unwrap();
+    let session = manager.get_session(&session_id).unwrap();
+    assert_eq!(session.original_call_id.as_deref(), Some("original-dialog-call-id@10.0.0.1"));
+
+    drop(session);
+    let record = manager.stop_session("siprec-call-1").unwrap();
+    assert_eq!(record.original_call_id.as_deref(), Some("original-dialog-call-id@10.0.0.1"));
 }
 
 #[test]
