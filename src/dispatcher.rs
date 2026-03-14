@@ -6273,28 +6273,13 @@ fn handle_srs_invite(
 
                     match rtpengine_set.offer(&call_id, &from_tag, &sdp_part.body, &offer_flags).await {
                         Ok(offer_sdp) => {
-                            // Complete the RTPEngine call by sending `answer` with
-                            // our to-tag.  Without this, RTPEngine keeps the call
-                            // half-open and may not process incoming media on the
-                            // answer-side ports (where the SRC sends RTP).
-                            let answer_flags = profile.answer.clone();
-                            match rtpengine_set.answer(&call_id, &from_tag, &to_tag, &offer_sdp, &answer_flags).await {
-                                Ok(answer_sdp) => {
-                                    srs_manager.activate_session(&session_id);
-                                    Some(answer_sdp)
-                                }
-                                Err(error) => {
-                                    warn!(
-                                        call_id = %call_id,
-                                        session_id = %session_id,
-                                        error = %error,
-                                        "SRS: RTPEngine answer failed, using offer SDP"
-                                    );
-                                    // Fall back to offer SDP if answer fails.
-                                    srs_manager.activate_session(&session_id);
-                                    Some(offer_sdp)
-                                }
-                            }
+                            // offer-only: RTPEngine allocates receive ports and
+                            // records incoming RTP to disk via record_call/record_path.
+                            // No answer() needed — the SRS is a pure media sink.
+                            // Calling answer() with the offer response SDP would create
+                            // a bogus second leg where RTPEngine talks to itself.
+                            srs_manager.activate_session(&session_id);
+                            Some(offer_sdp)
                         }
                         Err(error) => {
                             warn!(
