@@ -12,7 +12,6 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
@@ -95,6 +94,7 @@ pub async fn listen(
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
     addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
+    tos: Option<u32>,
 ) {
     let acceptor = build_tls_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
@@ -116,12 +116,37 @@ pub async fn listen(
     });
 
     tokio::spawn(async move {
-        let listener = match TcpListener::bind(local_addr).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                error!("failed to bind TLS listener on {local_addr}: {error}");
-                return;
+        // Use TcpSocket so we can set TOS/DSCP before binding.
+        let socket = if local_addr.is_ipv6() {
+            match tokio::net::TcpSocket::new_v6() {
+                Ok(socket) => socket,
+                Err(error) => { error!("failed to create TLS socket: {error}"); return; }
             }
+        } else {
+            match tokio::net::TcpSocket::new_v4() {
+                Ok(socket) => socket,
+                Err(error) => { error!("failed to create TLS socket: {error}"); return; }
+            }
+        };
+        if let Err(error) = socket.set_reuseaddr(true) {
+            error!("failed to set SO_REUSEADDR on TLS socket: {error}"); return;
+        }
+        #[cfg(unix)]
+        if let Err(error) = socket.set_reuseport(true) {
+            error!("failed to set SO_REUSEPORT on TLS socket: {error}"); return;
+        }
+        if let Some(tos) = tos {
+            let sock_ref = socket2::SockRef::from(&socket);
+            if let Err(error) = sock_ref.set_tos_v4(tos) {
+                error!("failed to set IP_TOS on TLS socket: {error}"); return;
+            }
+        }
+        if let Err(error) = socket.bind(local_addr) {
+            error!("failed to bind TLS listener on {local_addr}: {error}"); return;
+        }
+        let listener = match socket.listen(1024) {
+            Ok(listener) => listener,
+            Err(error) => { error!("failed to listen on TLS socket: {error}"); return; }
         };
         info!("TLS listener on {}", local_addr);
 
@@ -137,7 +162,7 @@ pub async fn listen(
                     let connection_map = connection_map.clone();
                     let addr_map = addr_map.clone();
 
-                    configure_tcp_socket(&tcp_stream);
+                    configure_tcp_socket(&tcp_stream, tos);
 
                     tokio::spawn(async move {
                         // Perform TLS handshake — timeout is inherited from tokio runtime.
@@ -338,6 +363,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             Arc::new(DashMap::new()),
+            None,
         )
         .await;
 
@@ -385,6 +411,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             Arc::new(DashMap::new()),
+            None,
         )
         .await;
 
@@ -456,6 +483,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             Arc::clone(&addr_map),
+            None,
         )
         .await;
 

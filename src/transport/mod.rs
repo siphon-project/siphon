@@ -33,9 +33,25 @@ pub fn next_connection_id() -> ConnectionId {
 /// zombie connections from accumulating (especially behind NAT).
 pub const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Apply TCP_NODELAY and SO_KEEPALIVE to an accepted TCP socket.
+/// Apply IP_TOS / IPV6_TCLASS on a socket2 reference.
+///
+/// `tos` is the full 8-bit TOS byte (DSCP << 2).  Use [`crate::config::dscp_to_tos`]
+/// to convert from a 6-bit DSCP value.
+///
+/// socket2 0.6 only exposes `set_tos_v4` (IP_TOS).  For IPv6 sockets we
+/// fall back to a raw `setsockopt(IPV6_TCLASS)` via `set_tos_v4` which on
+/// Linux works on dual-stack sockets.  If the v4 call fails we log and
+/// continue — TOS is best-effort (the kernel may ignore it without
+/// `CAP_NET_ADMIN` depending on DSCP value).
+pub fn apply_tos(sock_ref: &SockRef<'_>, tos: u32) {
+    if let Err(error) = sock_ref.set_tos_v4(tos) {
+        warn!(tos, "failed to set IP_TOS/IPV6_TCLASS: {error}");
+    }
+}
+
+/// Apply TCP_NODELAY, SO_KEEPALIVE, and optional TOS to an accepted TCP socket.
 /// Called after `TcpListener::accept()` for TCP, TLS, WS, and WSS connections.
-pub fn configure_tcp_socket(socket: &tokio::net::TcpStream) {
+pub fn configure_tcp_socket(socket: &tokio::net::TcpStream, tos: Option<u32>) {
     let sock_ref = SockRef::from(socket);
 
     // Disable Nagle — SIP is request-response, every message should go immediately.
@@ -60,6 +76,12 @@ pub fn configure_tcp_socket(socket: &tokio::net::TcpStream) {
         ) {
             warn!("failed to set TCP keepalive params: {}", error);
         }
+    }
+
+    // DSCP / DiffServ marking (RFC 4594) on accepted connections (belt-and-suspenders:
+    // Linux inherits TOS from the listener, but we set it explicitly for safety).
+    if let Some(tos) = tos {
+        apply_tos(&sock_ref, tos);
     }
 }
 
@@ -152,8 +174,8 @@ mod tests {
         let client_socket = connect_task.await.unwrap();
 
         // Apply our configuration
-        configure_tcp_socket(&server_socket);
-        configure_tcp_socket(&client_socket);
+        configure_tcp_socket(&server_socket, None);
+        configure_tcp_socket(&client_socket, None);
 
         // Verify TCP_NODELAY is set
         assert!(server_socket.nodelay().unwrap(), "server TCP_NODELAY should be true");
@@ -162,6 +184,51 @@ mod tests {
         // Verify SO_KEEPALIVE is set via socket2
         let server_ref = SockRef::from(&server_socket);
         assert!(server_ref.keepalive().unwrap(), "server SO_KEEPALIVE should be true");
+    }
+
+    #[test]
+    fn apply_tos_sets_value_on_udp_socket() {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        let sock_ref = SockRef::from(&socket);
+        apply_tos(&sock_ref, 96); // CS3
+        let tos = sock_ref.tos_v4().unwrap();
+        assert_eq!(tos, 96, "TOS should be 96 (CS3 = DSCP 24 << 2)");
+    }
+
+    #[test]
+    fn apply_tos_sets_value_on_tcp_socket() {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        let sock_ref = SockRef::from(&socket);
+        apply_tos(&sock_ref, 184); // EF
+        let tos = sock_ref.tos_v4().unwrap();
+        assert_eq!(tos, 184, "TOS should be 184 (EF = DSCP 46 << 2)");
+    }
+
+    #[tokio::test]
+    async fn configure_tcp_socket_applies_tos() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_task = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(addr).await.unwrap()
+        });
+
+        let (server_socket, _) = listener.accept().await.unwrap();
+        let _client_socket = connect_task.await.unwrap();
+
+        configure_tcp_socket(&server_socket, Some(96));
+        let sock_ref = SockRef::from(&server_socket);
+        assert_eq!(sock_ref.tos_v4().unwrap(), 96, "TOS should be set by configure_tcp_socket");
     }
 
     #[test]

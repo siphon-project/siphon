@@ -32,6 +32,7 @@ pub async fn listen(
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
+    tos: Option<u32>,
 ) {
     // Spawn a task that distributes outbound messages to per-connection senders.
     let connection_map_clone = connection_map.clone();
@@ -69,6 +70,13 @@ pub async fn listen(
         if let Err(error) = socket.set_reuseport(true) {
             error!("failed to set SO_REUSEPORT: {error}"); return;
         }
+        // DSCP / DiffServ marking (RFC 4594).
+        if let Some(tos) = tos {
+            let sock_ref = socket2::SockRef::from(&socket);
+            if let Err(error) = sock_ref.set_tos_v4(tos) {
+                error!("failed to set IP_TOS on TCP listener: {error}"); return;
+            }
+        }
         if let Err(error) = socket.bind(local_addr) {
             error!("failed to bind TCP listener to {local_addr}: {error}"); return;
         }
@@ -89,7 +97,7 @@ pub async fn listen(
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
 
-                    configure_tcp_socket(&socket);
+                    configure_tcp_socket(&socket, tos);
                     debug!("TCP accepted {} as {:?}", remote_addr, connection_id);
 
                     tokio::spawn(async move {

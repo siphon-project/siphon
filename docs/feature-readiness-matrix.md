@@ -42,6 +42,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | SCTP | Implemented | `listen.sctp` | RFC 4168, IMS inter-node |
 | Per-socket advertised address | **Production** | `listen.tls[].advertise` | |
 | Global advertised address | Implemented | `advertised_address:` | Fallback for 0.0.0.0 binds |
+| DSCP/ToS marking | Implemented | `listen.dscp` | RFC 4594 signaling QoS; default CS3 (24); per-listener override |
 
 ## Registrar
 

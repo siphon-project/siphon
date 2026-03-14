@@ -1,7 +1,7 @@
 //! YAML configuration — `siphon.yaml` deserialization via serde_yml.
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::Path;
 use std::sync::LazyLock;
 use crate::error::{Result, SiphonError};
@@ -115,6 +115,85 @@ pub struct Config {
 }
 
 // ---------------------------------------------------------------------------
+// DSCP / DiffServ — RFC 4594 signaling QoS
+// ---------------------------------------------------------------------------
+
+/// Parse a DSCP name (CS0–CS7, AF11–AF43, EF, BE) or a raw integer 0–63.
+pub fn parse_dscp(value: &str) -> std::result::Result<u8, String> {
+    match value.to_uppercase().as_str() {
+        "CS0" | "BE" => Ok(0),
+        "CS1" => Ok(8),
+        "AF11" => Ok(10),
+        "AF12" => Ok(12),
+        "AF13" => Ok(14),
+        "CS2" => Ok(16),
+        "AF21" => Ok(18),
+        "AF22" => Ok(20),
+        "AF23" => Ok(22),
+        "CS3" => Ok(24),
+        "AF31" => Ok(26),
+        "AF32" => Ok(28),
+        "AF33" => Ok(30),
+        "CS4" => Ok(32),
+        "AF41" => Ok(34),
+        "AF42" => Ok(36),
+        "AF43" => Ok(38),
+        "CS5" => Ok(40),
+        "EF" => Ok(46),
+        "CS6" => Ok(48),
+        "CS7" => Ok(56),
+        _ => value
+            .parse::<u8>()
+            .map_err(|_| format!("invalid DSCP value: {value}"))
+            .and_then(|v| {
+                if v <= 63 {
+                    Ok(v)
+                } else {
+                    Err(format!("DSCP must be 0-63, got {v}"))
+                }
+            }),
+    }
+}
+
+/// Convert a 6-bit DSCP value to the 8-bit TOS byte (RFC 2474 §3).
+pub fn dscp_to_tos(dscp: u8) -> u32 {
+    (dscp as u32) << 2
+}
+
+/// Default DSCP: CS3 (24) — RFC 4594 Signaling class for SIP.
+fn default_dscp() -> Option<u8> {
+    Some(24)
+}
+
+/// Serde deserializer accepting either a DSCP name string or a raw integer.
+fn deserialize_dscp<'de, D>(deserializer: D) -> std::result::Result<Option<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DscpValue {
+        Int(u64),
+        Str(String),
+    }
+
+    let value: Option<DscpValue> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(DscpValue::Int(n)) => {
+            if n > 63 {
+                Err(de::Error::custom(format!("DSCP must be 0-63, got {n}")))
+            } else {
+                Ok(Some(n as u8))
+            }
+        }
+        Some(DscpValue::Str(s)) => parse_dscp(&s).map(Some).map_err(de::Error::custom),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Transport listeners
 // ---------------------------------------------------------------------------
 
@@ -133,11 +212,14 @@ pub struct Config {
 pub enum ListenEntry {
     /// Plain address string (e.g. `"10.0.0.1:5060"`).
     Plain(String),
-    /// Address with optional advertised host.
+    /// Address with optional advertised host and per-listener DSCP override.
     Extended {
         address: String,
         #[serde(default)]
         advertise: Option<String>,
+        /// Per-listener DSCP override (0–63 or name like "CS3", "EF").
+        #[serde(default, deserialize_with = "deserialize_dscp")]
+        dscp: Option<u8>,
     },
 }
 
@@ -157,10 +239,23 @@ impl ListenEntry {
             ListenEntry::Extended { advertise, .. } => advertise.as_deref(),
         }
     }
+
+    /// Per-listener DSCP override (if configured).
+    pub fn dscp(&self) -> Option<u8> {
+        match self {
+            ListenEntry::Plain(_) => None,
+            ListenEntry::Extended { dscp, .. } => *dscp,
+        }
+    }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ListenConfig {
+    /// Global DSCP value applied to all listeners (default: CS3 = 24).
+    /// Per-listener `dscp` in the extended form overrides this.
+    /// Set to `0` or `"BE"` to disable marking.
+    #[serde(default = "default_dscp", deserialize_with = "deserialize_dscp")]
+    pub dscp: Option<u8>,
     #[serde(default)]
     pub udp: Vec<ListenEntry>,
     #[serde(default)]
@@ -176,6 +271,20 @@ pub struct ListenConfig {
     /// SCTP (RFC 4168) — used between IMS core nodes.
     #[serde(default)]
     pub sctp: Vec<ListenEntry>,
+}
+
+impl Default for ListenConfig {
+    fn default() -> Self {
+        Self {
+            dscp: default_dscp(),
+            udp: Vec::new(),
+            tcp: Vec::new(),
+            tls: Vec::new(),
+            ws: Vec::new(),
+            wss: Vec::new(),
+            sctp: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2923,5 +3032,136 @@ registrar:
         let config = Config::from_str(yaml).unwrap();
         assert_eq!(config.domain.local[0], "test.example.com");
         std::env::remove_var("SIPHON_TEST_DOMAIN");
+    }
+
+    // --- DSCP / DiffServ tests ---
+
+    #[test]
+    fn parse_dscp_named_values() {
+        assert_eq!(parse_dscp("CS0").unwrap(), 0);
+        assert_eq!(parse_dscp("BE").unwrap(), 0);
+        assert_eq!(parse_dscp("CS1").unwrap(), 8);
+        assert_eq!(parse_dscp("AF11").unwrap(), 10);
+        assert_eq!(parse_dscp("AF12").unwrap(), 12);
+        assert_eq!(parse_dscp("AF13").unwrap(), 14);
+        assert_eq!(parse_dscp("CS2").unwrap(), 16);
+        assert_eq!(parse_dscp("AF21").unwrap(), 18);
+        assert_eq!(parse_dscp("AF22").unwrap(), 20);
+        assert_eq!(parse_dscp("AF23").unwrap(), 22);
+        assert_eq!(parse_dscp("CS3").unwrap(), 24);
+        assert_eq!(parse_dscp("AF31").unwrap(), 26);
+        assert_eq!(parse_dscp("AF32").unwrap(), 28);
+        assert_eq!(parse_dscp("AF33").unwrap(), 30);
+        assert_eq!(parse_dscp("CS4").unwrap(), 32);
+        assert_eq!(parse_dscp("AF41").unwrap(), 34);
+        assert_eq!(parse_dscp("AF42").unwrap(), 36);
+        assert_eq!(parse_dscp("AF43").unwrap(), 38);
+        assert_eq!(parse_dscp("CS5").unwrap(), 40);
+        assert_eq!(parse_dscp("EF").unwrap(), 46);
+        assert_eq!(parse_dscp("CS6").unwrap(), 48);
+        assert_eq!(parse_dscp("CS7").unwrap(), 56);
+    }
+
+    #[test]
+    fn parse_dscp_case_insensitive() {
+        assert_eq!(parse_dscp("cs3").unwrap(), 24);
+        assert_eq!(parse_dscp("ef").unwrap(), 46);
+        assert_eq!(parse_dscp("af41").unwrap(), 34);
+        assert_eq!(parse_dscp("Cs3").unwrap(), 24);
+    }
+
+    #[test]
+    fn parse_dscp_raw_integers() {
+        assert_eq!(parse_dscp("0").unwrap(), 0);
+        assert_eq!(parse_dscp("24").unwrap(), 24);
+        assert_eq!(parse_dscp("46").unwrap(), 46);
+        assert_eq!(parse_dscp("63").unwrap(), 63);
+    }
+
+    #[test]
+    fn parse_dscp_rejects_out_of_range() {
+        assert!(parse_dscp("64").is_err());
+        assert!(parse_dscp("255").is_err());
+    }
+
+    #[test]
+    fn parse_dscp_rejects_invalid() {
+        assert!(parse_dscp("INVALID").is_err());
+        assert!(parse_dscp("CS8").is_err());
+        assert!(parse_dscp("").is_err());
+    }
+
+    #[test]
+    fn dscp_to_tos_conversion() {
+        assert_eq!(dscp_to_tos(0), 0);      // BE
+        assert_eq!(dscp_to_tos(24), 96);     // CS3 → signaling
+        assert_eq!(dscp_to_tos(46), 184);    // EF  → voice media
+        assert_eq!(dscp_to_tos(34), 136);    // AF41 → video
+        assert_eq!(dscp_to_tos(63), 252);    // max DSCP
+    }
+
+    #[test]
+    fn listen_config_defaults_to_cs3() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert_eq!(config.listen.dscp, Some(24), "default DSCP should be CS3 (24)");
+    }
+
+    #[test]
+    fn listen_config_dscp_from_yaml_string() {
+        let yaml = r#"
+listen:
+  dscp: EF
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.dscp, Some(46));
+    }
+
+    #[test]
+    fn listen_config_dscp_from_yaml_integer() {
+        let yaml = r#"
+listen:
+  dscp: 24
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.dscp, Some(24));
+    }
+
+    #[test]
+    fn listen_entry_per_listener_dscp_override() {
+        let yaml = r#"
+listen:
+  dscp: CS3
+  udp:
+    - address: "0.0.0.0:5060"
+      dscp: EF
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.dscp, Some(24));
+        assert_eq!(config.listen.udp[0].dscp(), Some(46));
+    }
+
+    #[test]
+    fn listen_entry_plain_has_no_dscp() {
+        let entry = ListenEntry::Plain("0.0.0.0:5060".to_string());
+        assert_eq!(entry.dscp(), None);
     }
 }

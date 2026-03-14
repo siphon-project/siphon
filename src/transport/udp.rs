@@ -29,6 +29,7 @@ pub async fn listen(
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
     acl: Arc<TransportAcl>,
+    tos: Option<u32>,
 ) {
     let worker_count = num_cpus::get();
     info!("Starting {} UDP workers on {}", worker_count, local_addr);
@@ -39,7 +40,7 @@ pub async fn listen(
         let acl = Arc::clone(&acl);
 
         tokio::spawn(async move {
-            let socket = match create_reusable_udp_socket(local_addr) {
+            let socket = match create_reusable_udp_socket(local_addr, tos) {
                 Ok(socket) => Arc::new(socket),
                 Err(error) => {
                     error!("[udp-worker-{}] failed to create socket: {}", worker_index, error);
@@ -114,7 +115,7 @@ fn udp_connection_id(local: SocketAddr, remote: SocketAddr) -> ConnectionId {
     ConnectionId(hasher.finish())
 }
 
-fn create_reusable_udp_socket(local_addr: SocketAddr) -> std::io::Result<UdpSocket> {
+fn create_reusable_udp_socket(local_addr: SocketAddr, tos: Option<u32>) -> std::io::Result<UdpSocket> {
     let socket = match local_addr {
         SocketAddr::V4(_) => socket2::Socket::new(
             socket2::Domain::IPV4,
@@ -132,6 +133,12 @@ fn create_reusable_udp_socket(local_addr: SocketAddr) -> std::io::Result<UdpSock
     #[cfg(not(target_os = "windows"))]
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
+
+    // DSCP / DiffServ marking (RFC 4594).
+    if let Some(tos) = tos {
+        socket.set_tos_v4(tos)?;
+    }
+
     socket.bind(&SockAddr::from(local_addr))?;
 
     UdpSocket::from_std(socket.into())

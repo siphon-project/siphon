@@ -20,6 +20,12 @@
 # Transport listeners
 # ---------------------------------------------------------------------------
 listen:
+  # DSCP / DiffServ marking for SIP signaling packets (RFC 4594 §4.1).
+  # Accepts a DSCP name (CS3, EF, AF41, …) or a raw integer 0–63.
+  # Default: CS3 (24) → TOS byte 96 — RFC 4594 "Signaling" service class.
+  # Set to 0 or "BE" (Best Effort) to disable marking.
+  # Per-listener overrides are possible in the extended form (see below).
+  dscp: CS3
   udp:
     - "0.0.0.0:5060"    # Standard SIP (PSTN gateways, legacy UEs)
     # - "[::]:5060"      # Dual-stack IPv6 (accepts both IPv4 and IPv6)
@@ -42,12 +48,13 @@ listen:
   # Use when the bind IP differs from what external peers should see
   # in Record-Route / Via (e.g. cloud instances, NAT, split-horizon DNS).
   #
-  # Example — internal TCP, public-facing TLS:
+  # Example — internal TCP, public-facing TLS with per-listener DSCP override:
   #   tcp:
   #     - "10.0.0.1:5060"                            # plain string = no advertise
   #   tls:
   #     - address: "10.0.0.1:5061"                    # extended form
   #       advertise: "sip.example.com"                # hostname or IP for Record-Route
+  #       dscp: EF                                    # per-listener override (default is global dscp)
   #
   # The global `advertised_address` (below) serves as fallback for transports
   # that don't have a per-socket advertise.

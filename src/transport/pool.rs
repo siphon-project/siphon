@@ -48,6 +48,8 @@ pub struct ConnectionPool {
     inbound_tx: flume::Sender<InboundMessage>,
     /// Local address to use as source in InboundMessage.
     local_addr: SocketAddr,
+    /// Pre-computed TOS byte (DSCP << 2) for DSCP/DiffServ marking.
+    tos: Option<u32>,
 }
 
 impl ConnectionPool {
@@ -55,12 +57,14 @@ impl ConnectionPool {
         connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
         inbound_tx: flume::Sender<InboundMessage>,
         local_addr: SocketAddr,
+        tos: Option<u32>,
     ) -> Self {
         Self {
             connections: Arc::new(DashMap::new()),
             connection_map,
             inbound_tx,
             local_addr,
+            tos,
         }
     }
 
@@ -102,9 +106,13 @@ impl ConnectionPool {
         socket.set_reuseaddr(true)?;
         #[cfg(unix)]
         socket.set_reuseport(true)?;
+        if let Some(tos) = self.tos {
+            let sock_ref = socket2::SockRef::from(&socket);
+            sock_ref.set_tos_v4(tos)?;
+        }
         socket.bind(self.local_addr)?;
         let stream = socket.connect(destination).await?;
-        configure_tcp_socket(&stream);
+        configure_tcp_socket(&stream, self.tos);
 
         let connection_id = next_connection_id();
         let local_addr = stream.local_addr().unwrap_or(self.local_addr);
@@ -231,6 +239,7 @@ mod tests {
             connection_map.clone(),
             inbound_tx,
             "127.0.0.1:5060".parse().unwrap(),
+            None,
         );
 
         // Send via pool
@@ -279,6 +288,7 @@ mod tests {
             connection_map,
             inbound_tx,
             "127.0.0.1:5060".parse().unwrap(),
+            None,
         );
 
         let id1 = pool
@@ -317,6 +327,7 @@ mod tests {
             connection_map,
             inbound_tx,
             "127.0.0.1:5060".parse().unwrap(),
+            None,
         );
 
         let id1 = pool

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::hep::HepSender;
 use crate::gateway::DispatcherManager;
 use crate::script::engine::{ScriptEngine, spawn_file_watcher};
@@ -215,6 +215,14 @@ impl SiphonServer {
         let mut listen_addrs = std::collections::HashMap::new();
         let mut advertised_addrs: std::collections::HashMap<transport::Transport, String> = std::collections::HashMap::new();
 
+        // DSCP → TOS byte resolution helper.
+        // Per-entry overrides the global listen.dscp (default CS3 = 24 → TOS 96).
+        let global_dscp = config.listen.dscp;
+        let resolve_tos = |entry: &config::ListenEntry| -> Option<u32> {
+            let dscp = entry.dscp().or(global_dscp)?;
+            if dscp == 0 { None } else { Some(config::dscp_to_tos(dscp)) }
+        };
+
         // UDP
         for entry in &config.listen.udp {
             let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
@@ -228,8 +236,9 @@ impl SiphonServer {
             if let Some(adv) = entry.advertise() {
                 advertised_addrs.entry(transport::Transport::Udp).or_insert_with(|| adv.to_string());
             }
-            info!(addr = %addr, "starting UDP transport");
-            transport::udp::listen(addr, inbound_tx.clone(), udp_outbound_rx.clone(), Arc::clone(&transport_acl)).await;
+            let tos = resolve_tos(entry);
+            info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting UDP transport");
+            transport::udp::listen(addr, inbound_tx.clone(), udp_outbound_rx.clone(), Arc::clone(&transport_acl), tos).await;
         }
 
         // TCP
@@ -246,8 +255,9 @@ impl SiphonServer {
             if let Some(adv) = entry.advertise() {
                 advertised_addrs.entry(transport::Transport::Tcp).or_insert_with(|| adv.to_string());
             }
-            info!(addr = %addr, "starting TCP transport");
-            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl)).await;
+            let tos = resolve_tos(entry);
+            info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TCP transport");
+            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos).await;
         }
 
         // TLS
@@ -268,8 +278,9 @@ impl SiphonServer {
                 if let Some(adv) = entry.advertise() {
                     advertised_addrs.entry(transport::Transport::Tls).or_insert_with(|| adv.to_string());
                 }
-                info!(addr = %addr, "starting TLS transport");
-                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map)).await;
+                let tos = resolve_tos(entry);
+                info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TLS transport");
+                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map), tos).await;
             }
         }
 
@@ -287,8 +298,9 @@ impl SiphonServer {
             if let Some(adv) = entry.advertise() {
                 advertised_addrs.entry(transport::Transport::WebSocket).or_insert_with(|| adv.to_string());
             }
-            info!(addr = %addr, "starting WS transport");
-            transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl)).await;
+            let tos = resolve_tos(entry);
+            info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WS transport");
+            transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl), tos).await;
         }
 
         // WSS
@@ -306,8 +318,9 @@ impl SiphonServer {
                 if let Some(adv) = entry.advertise() {
                     advertised_addrs.entry(transport::Transport::WebSocketSecure).or_insert_with(|| adv.to_string());
                 }
-                info!(addr = %addr, "starting WSS transport");
-                transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl)).await;
+                let tos = resolve_tos(entry);
+                info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WSS transport");
+                transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl), tos).await;
             }
         }
 
@@ -325,8 +338,9 @@ impl SiphonServer {
             if let Some(adv) = entry.advertise() {
                 advertised_addrs.entry(transport::Transport::Sctp).or_insert_with(|| adv.to_string());
             }
-            info!(addr = %addr, "starting SCTP transport");
-            transport::sctp::listen(addr, inbound_tx.clone(), sctp_outbound_rx.clone(), Arc::clone(&sctp_connection_map), Arc::clone(&transport_acl)).await;
+            let tos = resolve_tos(entry);
+            info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting SCTP transport");
+            transport::sctp::listen(addr, inbound_tx.clone(), sctp_outbound_rx.clone(), Arc::clone(&sctp_connection_map), Arc::clone(&transport_acl), tos).await;
         }
 
         let local_addr = first_listen_addr.unwrap_or_else(|| {
@@ -335,10 +349,15 @@ impl SiphonServer {
         });
 
         // --- Connection pool ---
+        // Use global DSCP for the connection pool (outbound TCP connections).
+        let pool_tos = global_dscp
+            .filter(|&d| d > 0)
+            .map(config::dscp_to_tos);
         let connection_pool = Arc::new(transport::pool::ConnectionPool::new(
             Arc::clone(&tcp_connection_map),
             inbound_tx.clone(),
             local_addr,
+            pool_tos,
         ));
 
         drop(inbound_tx);
