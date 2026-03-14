@@ -2008,6 +2008,254 @@ _srs = MockSrs()
 _timer = MockTimer()
 
 
+# ---------------------------------------------------------------------------
+# Metrics namespace — custom Prometheus metrics
+# ---------------------------------------------------------------------------
+
+class _MockMetricChild:
+    """Labeled child for mock counter/gauge/histogram.
+
+    Tracks a single value for testing assertions.
+    """
+
+    def __init__(self) -> None:
+        self.value: float = 0.0
+
+    def inc(self, n: float = 1.0) -> None:
+        """Increment (counter or gauge)."""
+        self.value += n
+
+    def dec(self, n: float = 1.0) -> None:
+        """Decrement (gauge only)."""
+        self.value -= n
+
+    def set(self, v: float) -> None:
+        """Set absolute value (gauge only)."""
+        self.value = v
+
+    def observe(self, v: float) -> None:
+        """Observe a value (histogram only). Tracks sum for testing."""
+        self.value += v
+
+
+class MockCounter:
+    """Mock Prometheus counter.
+
+    Usage::
+
+        from siphon import metrics
+
+        c = metrics.counter("my_total", "My counter")
+        c.inc()
+        c.inc(5)
+
+    With labels::
+
+        c = metrics.counter("my_total", "My counter", labels=["method"])
+        c.labels(method="INVITE").inc()
+    """
+
+    def __init__(self, name: str, help: str,
+                 labels: "list[str] | None" = None) -> None:
+        self.name = name
+        self.help = help
+        self.label_names: list[str] = labels or []
+        self._value: float = 0.0
+        self._children: dict[tuple, _MockMetricChild] = {}
+
+    def inc(self, n: float = 1.0) -> None:
+        """Increment the counter (no-label metrics only)."""
+        self._value += n
+
+    def labels(self, **kwargs: str) -> _MockMetricChild:
+        """Return a labeled child counter."""
+        key = tuple(kwargs.get(name, "") for name in self.label_names)
+        if key not in self._children:
+            self._children[key] = _MockMetricChild()
+        return self._children[key]
+
+    def clear(self) -> None:
+        self._value = 0.0
+        self._children.clear()
+
+
+class MockGauge:
+    """Mock Prometheus gauge.
+
+    Usage::
+
+        from siphon import metrics
+
+        g = metrics.gauge("my_active", "Active things")
+        g.inc()
+        g.dec()
+        g.set(42)
+    """
+
+    def __init__(self, name: str, help: str,
+                 labels: "list[str] | None" = None) -> None:
+        self.name = name
+        self.help = help
+        self.label_names: list[str] = labels or []
+        self._value: float = 0.0
+        self._children: dict[tuple, _MockMetricChild] = {}
+
+    def inc(self, n: float = 1.0) -> None:
+        """Increment the gauge (no-label metrics only)."""
+        self._value += n
+
+    def dec(self, n: float = 1.0) -> None:
+        """Decrement the gauge (no-label metrics only)."""
+        self._value -= n
+
+    def set(self, v: float) -> None:
+        """Set absolute value (no-label metrics only)."""
+        self._value = v
+
+    def labels(self, **kwargs: str) -> _MockMetricChild:
+        """Return a labeled child gauge."""
+        key = tuple(kwargs.get(name, "") for name in self.label_names)
+        if key not in self._children:
+            self._children[key] = _MockMetricChild()
+        return self._children[key]
+
+    def clear(self) -> None:
+        self._value = 0.0
+        self._children.clear()
+
+
+class MockHistogram:
+    """Mock Prometheus histogram.
+
+    Usage::
+
+        from siphon import metrics
+
+        h = metrics.histogram("my_duration_seconds", "Duration",
+                              buckets=[0.1, 0.5, 1.0])
+        h.observe(0.3)
+    """
+
+    def __init__(self, name: str, help: str,
+                 labels: "list[str] | None" = None,
+                 buckets: "list[float] | None" = None) -> None:
+        self.name = name
+        self.help = help
+        self.label_names: list[str] = labels or []
+        self.buckets: list[float] = buckets or []
+        self._observations: list[float] = []
+        self._children: dict[tuple, _MockMetricChild] = {}
+
+    def observe(self, v: float) -> None:
+        """Observe a value (no-label metrics only)."""
+        self._observations.append(v)
+
+    def labels(self, **kwargs: str) -> _MockMetricChild:
+        """Return a labeled child histogram."""
+        key = tuple(kwargs.get(name, "") for name in self.label_names)
+        if key not in self._children:
+            self._children[key] = _MockMetricChild()
+        return self._children[key]
+
+    def clear(self) -> None:
+        self._observations.clear()
+        self._children.clear()
+
+
+class MockMetrics:
+    """Mock ``metrics`` namespace — custom Prometheus metrics from scripts.
+
+    Usage::
+
+        from siphon import metrics
+
+        counter = metrics.counter("bgcf_calls_total", "Total calls",
+                                  labels=["direction"])
+        counter.labels(direction="outbound").inc()
+
+        gauge = metrics.gauge("bgcf_calls_active", "Active calls")
+        gauge.inc()
+
+        hist = metrics.histogram("bgcf_setup_seconds", "Setup time",
+                                 buckets=[0.1, 0.5, 1.0])
+        hist.observe(0.3)
+
+    Test helper::
+
+        from siphon_sdk.mock_module import get_metrics
+        m = get_metrics()
+        c = m.counter("test_total", "Test")
+        c.inc()
+        assert c._value == 1.0
+    """
+
+    def __init__(self) -> None:
+        self._registered: dict[str, Any] = {}
+
+    def counter(self, name: str, help: str,
+                labels: "list[str] | None" = None) -> MockCounter:
+        """Create a new counter metric.
+
+        Args:
+            name: Metric name (e.g. ``"bgcf_calls_total"``).
+            help: Description string.
+            labels: Optional list of label names.
+
+        Returns:
+            A MockCounter handle.
+        """
+        if name in self._registered:
+            raise ValueError(f"metric '{name}' is already registered")
+        counter = MockCounter(name, help, labels)
+        self._registered[name] = counter
+        return counter
+
+    def gauge(self, name: str, help: str,
+              labels: "list[str] | None" = None) -> MockGauge:
+        """Create a new gauge metric.
+
+        Args:
+            name: Metric name (e.g. ``"bgcf_calls_active"``).
+            help: Description string.
+            labels: Optional list of label names.
+
+        Returns:
+            A MockGauge handle.
+        """
+        if name in self._registered:
+            raise ValueError(f"metric '{name}' is already registered")
+        gauge = MockGauge(name, help, labels)
+        self._registered[name] = gauge
+        return gauge
+
+    def histogram(self, name: str, help: str,
+                  labels: "list[str] | None" = None,
+                  buckets: "list[float] | None" = None) -> MockHistogram:
+        """Create a new histogram metric.
+
+        Args:
+            name: Metric name (e.g. ``"bgcf_setup_seconds"``).
+            help: Description string.
+            labels: Optional list of label names.
+            buckets: Optional list of bucket boundaries.
+
+        Returns:
+            A MockHistogram handle.
+        """
+        if name in self._registered:
+            raise ValueError(f"metric '{name}' is already registered")
+        histogram = MockHistogram(name, help, labels, buckets)
+        self._registered[name] = histogram
+        return histogram
+
+    def clear(self) -> None:
+        """Reset all registered metrics."""
+        self._registered.clear()
+
+
+_metrics = MockMetrics()
+
+
 def install() -> ModuleType:
     """Install the mock ``siphon`` module into ``sys.modules``.
 
@@ -2037,6 +2285,7 @@ def install() -> ModuleType:
     mod.presence = _presence  # type: ignore[attr-defined]
     mod.srs = _srs  # type: ignore[attr-defined]
     mod.timer = _timer  # type: ignore[attr-defined]
+    mod.metrics = _metrics  # type: ignore[attr-defined]
 
     # Also install the _siphon_registry mock
     registry_mod = ModuleType("_siphon_registry")
@@ -2064,6 +2313,7 @@ def reset() -> None:
     _diameter.clear()
     _presence.clear()
     _srs.clear()
+    _metrics.clear()
     _auth._allow = False
     _auth._credentials.clear()
     _proxy._utils._rate_limit_allow = True
@@ -2145,3 +2395,8 @@ def get_srs() -> MockSrs:
 def get_timer() -> MockTimer:
     """Access the mock timer singleton."""
     return _timer
+
+
+def get_metrics() -> MockMetrics:
+    """Access the mock metrics singleton."""
+    return _metrics

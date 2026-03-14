@@ -14,6 +14,7 @@ pub mod diameter;
 pub mod gateway;
 pub mod li;
 pub mod log;
+pub mod metrics;
 pub mod presence;
 pub mod proxy_utils;
 pub mod registrant;
@@ -58,6 +59,9 @@ static DIAMETER_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Optional presence singleton — set only when presence is needed.
 static PRESENCE_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// Metrics singleton — always available (like log).
+static METRICS_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// The Registrar Arc — stored so the dispatcher can subscribe to change events.
 static REGISTRAR_ARC: OnceLock<std::sync::Arc<crate::registrar::Registrar>> = OnceLock::new();
@@ -223,6 +227,20 @@ pub fn set_presence_singleton(
     Ok(())
 }
 
+/// Store the metrics singleton for injection into the siphon module.
+///
+/// Always called at startup (metrics are always available, like log).
+pub fn set_metrics_singleton(
+    python: Python<'_>,
+    py_metrics: metrics::PyMetricsNamespace,
+) -> Result<()> {
+    let metrics_py: Py<PyAny> = Py::new(python, py_metrics)
+        .map_err(|error| SiphonError::Script(format!("Py::new(metrics): {error}")))?
+        .into_any();
+    let _ = METRICS_SINGLETON.set(metrics_py);
+    Ok(())
+}
+
 /// Ensure the `_siphon_registry` module exists in `sys.modules`.
 ///
 /// Idempotent — safe to call multiple times.
@@ -349,6 +367,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("presence", presence_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr presence: {error}")))?;
+    }
+
+    // Inject metrics singleton (always available).
+    if let Some(metrics_py) = METRICS_SINGLETON.get() {
+        module
+            .setattr("metrics", metrics_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr metrics: {error}")))?;
     }
 
     let sys = python

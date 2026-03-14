@@ -4,15 +4,23 @@
 //! registrations, dialogs, and transport connections. Metrics are collected
 //! inline (at the call site) and scraped via the HTTP admin API `/metrics`.
 
+pub mod custom;
+
+use std::sync::{Arc, OnceLock};
+
 use prometheus::{
     Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
     IntGauge, Opts, Registry, TextEncoder,
 };
-use std::sync::OnceLock;
 use tracing::error;
+
+use self::custom::CustomMetrics;
 
 /// Global metrics registry — initialized once at startup.
 static METRICS: OnceLock<SiphonMetrics> = OnceLock::new();
+
+/// Custom metrics registered by Python scripts.
+static CUSTOM_METRICS: OnceLock<Arc<CustomMetrics>> = OnceLock::new();
 
 /// Access the global metrics instance. Returns `None` if not initialized.
 pub fn metrics() -> Option<&'static SiphonMetrics> {
@@ -33,8 +41,16 @@ pub fn init() -> Result<(), prometheus::Error> {
         return Ok(());
     }
     let metrics = SiphonMetrics::new()?;
+    let custom = Arc::new(CustomMetrics::new(&metrics.registry));
+    let _ = CUSTOM_METRICS.set(custom);
     let _ = METRICS.set(metrics);
     Ok(())
+}
+
+/// Access the custom metrics store (for script-defined metrics).
+/// Returns `None` before `init()` is called.
+pub fn custom_metrics() -> Option<&'static Arc<CustomMetrics>> {
+    CUSTOM_METRICS.get()
 }
 
 /// All SIPhon metrics in one struct for easy access.

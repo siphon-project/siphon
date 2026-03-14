@@ -480,3 +480,30 @@ class _TimerNamespace:
 
 
 timer = _TimerNamespace()
+
+
+# ---------------------------------------------------------------------------
+# Metrics namespace (stub — replaced by Rust at startup)
+# ---------------------------------------------------------------------------
+
+class _MetricsNamespace:
+    """Custom Prometheus metrics from Python scripts (stub).
+
+    Usage:
+        from siphon import metrics
+
+        counter = metrics.counter("my_total", "My counter")
+        counter.inc()
+    """
+
+    def counter(self, name, help, labels=None):
+        raise NotImplementedError("metrics.counter() not available — metrics not initialized")
+
+    def gauge(self, name, help, labels=None):
+        raise NotImplementedError("metrics.gauge() not available — metrics not initialized")
+
+    def histogram(self, name, help, labels=None, buckets=None):
+        raise NotImplementedError("metrics.histogram() not available — metrics not initialized")
+
+
+metrics = _MetricsNamespace()
