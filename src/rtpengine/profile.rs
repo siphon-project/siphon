@@ -150,22 +150,20 @@ impl ProfileRegistry {
 
     fn builtin_srs_recording() -> ProfileEntry {
         // SIPREC SRS recording profile:
-        // - replace origin + session-connection so RTPEngine rewrites o=/c=
+        // - replace origin so RTPEngine rewrites o= line
         // - media handover + port latching for NAT/SIPREC source port flexibility
-        // - trust-address to accept RTP from any source
-        // - ICE remove, DTLS off (recording sink, no oer security needed)
-        // - direction public/public (both sides are external-facing)
+        // - ICE remove, DTLS off (recording sink, no peer security needed)
         ProfileEntry {
             offer: NgFlags {
                 transport_protocol: Some("RTP/AVP".into()),
                 ice: Some("remove".into()),
                 dtls: Some("off".into()),
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec![
                     "media handover".into(),
                     "port latching".into(),
                 ],
-                direction: vec!["public".into(), "public".into()],
+                direction: vec![],
                 record_call: true,
                 record_path: None,
             },
@@ -173,12 +171,12 @@ impl ProfileRegistry {
                 transport_protocol: Some("RTP/AVP".into()),
                 ice: Some("remove".into()),
                 dtls: Some("off".into()),
-                replace: vec!["origin".into(), "session-connection".into()],
+                replace: vec!["origin".into()],
                 flags: vec![
                     "media handover".into(),
                     "port latching".into(),
                 ],
-                direction: vec!["public".into(), "public".into()],
+                direction: vec![],
                 record_call: true,
                 record_path: None,
             },

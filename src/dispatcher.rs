@@ -24,7 +24,7 @@ use crate::script::api::log::PyLogNamespace;
 use crate::script::api::registrar::PyRegistrar;
 use crate::script::api::reply::PyReply;
 use crate::script::api::request::{LocalDomains, PyRequest, RequestAction};
-use crate::script::engine::{HandlerKind, ScriptEngine};
+use crate::script::engine::{HandlerKind, ScriptEngine, run_coroutine};
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::headers::via::Via;
 use crate::sip::message::{Method, RequestLine, SipMessage, StartLine, StatusLine, Version};
@@ -2491,18 +2491,6 @@ fn is_coroutine(python: Python<'_>, obj: &Bound<'_, pyo3::PyAny>) -> PyResult<bo
     let asyncio = python.import("asyncio")?;
     let result = asyncio.call_method1("iscoroutine", (obj,))?;
     result.is_truthy()
-}
-
-fn run_coroutine(python: Python<'_>, coroutine: &Bound<'_, pyo3::PyAny>) -> PyResult<()> {
-    let asyncio = python.import("asyncio")?;
-    // block_in_place allows us to block in a tokio multi-threaded runtime
-    // while asyncio.run() drives the Python event loop. The tokio runtime
-    // continues on other threads, so tokio-backed futures (e.g. rtpengine
-    // UDP I/O) can still make progress.
-    tokio::task::block_in_place(|| {
-        asyncio.call_method1("run", (coroutine,))
-    })?;
-    Ok(())
 }
 
 /// Build a SIP response from a request, copying mandatory headers.
@@ -6389,7 +6377,8 @@ fn handle_srs_invite(
         // it since this SDP goes into the SIP 200 OK answer (RFC 3264 §5).
         let local_ip = state.local_addr.ip().to_string();
         if let Some(mut sdp) = answer_sdp {
-            fix_srs_answer_sdp_direction(&mut sdp);
+            // combine_srs_answer_sdps already sets a=recvonly — no direction
+            // flip needed.  Only sanitize the o=/s= identity lines.
             sanitize_sdp_identity(&mut sdp, "siphon", Some(&local_ip));
             response_builder = response_builder
                 .header("Content-Type", "application/sdp".to_string())

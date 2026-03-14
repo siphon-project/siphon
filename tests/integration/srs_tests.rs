@@ -301,7 +301,8 @@ fn srs_recording_profile_has_record_call() {
     assert_eq!(profile.offer.dtls.as_deref(), Some("off"));
     assert!(profile.offer.flags.contains(&"media handover".to_string()));
     assert!(profile.offer.flags.contains(&"port latching".to_string()));
-    assert!(profile.offer.replace.contains(&"session-connection".to_string()));
+    assert!(profile.offer.replace.contains(&"origin".to_string()));
+    assert!(profile.offer.direction.is_empty(), "direction should be empty (use RTPEngine default)");
 }
 
 #[test]
