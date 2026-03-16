@@ -54,6 +54,8 @@ pub enum HandlerKind {
     B2buaRefer,
     /// `@registrar.on_change` — registration state change callback.
     RegistrarOnChange,
+    /// `@registration.on_change` — outbound registration state change callback.
+    RegistrantOnChange,
     /// `@srs.on_invite` — inbound SIPREC INVITE to SRS.
     SrsOnInvite,
     /// `@srs.on_session_end` — recording session completed.
@@ -539,6 +541,7 @@ fn extract_handlers(
             "b2bua.on_bye" => HandlerKind::B2buaBye,
             "b2bua.on_refer" => HandlerKind::B2buaRefer,
             "registrar.on_change" => HandlerKind::RegistrarOnChange,
+            "registration.on_change" => HandlerKind::RegistrantOnChange,
             "srs.on_invite" => HandlerKind::SrsOnInvite,
             "srs.on_session_end" => HandlerKind::SrsOnSessionEnd,
             "timer.every" => {
@@ -773,6 +776,20 @@ def on_reg_change(aor, event_type, contacts):
         let state = compile_temp_script(source).unwrap();
         assert_eq!(state.handlers.len(), 1);
         assert!(state.handlers_for(&HandlerKind::RegistrarOnChange).len() == 1);
+    }
+
+    #[test]
+    fn registration_on_change_decorator_registers_handler() {
+        let source = r#"
+from siphon import registration
+
+@registration.on_change
+def on_trunk_change(aor, event_type, state):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert!(state.handlers_for(&HandlerKind::RegistrantOnChange).len() == 1);
     }
 
     #[test]

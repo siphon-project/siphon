@@ -1419,11 +1419,16 @@ class MockRegistration:
             "transport": transport or "udp",
             "state": "registered",
             "expires_in": interval or 3600,
+            "failure_count": 0,
         }
+        self._fire_on_change(aor, "registered")
 
     def remove(self, aor: str) -> bool:
         """Remove an outbound registration by AoR."""
-        return self._entries.pop(aor, None) is not None
+        removed = self._entries.pop(aor, None) is not None
+        if removed:
+            self._fire_on_change(aor, "deregistered")
+        return removed
 
     def refresh(self, aor: str) -> bool:
         """Force an immediate re-registration for an AoR."""
@@ -1449,9 +1454,44 @@ class MockRegistration:
         """Number of configured registrations."""
         return len(self._entries)
 
+    @staticmethod
+    def on_change(fn: Callable) -> Callable:
+        """Register a handler for outbound registration state changes.
+
+        The handler receives ``(aor, event_type, state)`` where:
+          - ``aor``: str -- Address of Record (e.g. "sip:trunk@carrier.com")
+          - ``event_type``: str -- ``"registered"``, ``"refreshed"``,
+            ``"failed"``, or ``"deregistered"``
+          - ``state``: dict -- ``{"expires_in": int, "failure_count": int,
+            "registrar": str}``
+
+        Usage::
+
+            @registration.on_change
+            def on_trunk_change(aor, event_type, state):
+                ...
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("registration.on_change", None, fn, is_async)
+        return fn
+
     def clear(self) -> None:
         """Reset all registrations (test helper)."""
+        aors = list(self._entries.keys())
         self._entries.clear()
+        for aor in aors:
+            self._fire_on_change(aor, "deregistered")
+
+    def _fire_on_change(self, aor: str, event_type: str) -> None:
+        """Invoke all on_change handlers registered via decorator."""
+        entry = self._entries.get(aor)
+        state = {
+            "expires_in": entry["expires_in"] if entry else 0,
+            "failure_count": entry.get("failure_count", 0) if entry else 0,
+            "registrar": entry["registrar"] if entry else "",
+        }
+        for _, fn, _, _meta in _registry.handlers.get("registration.on_change", []):
+            fn(aor, event_type, state)
 
 
 # ---------------------------------------------------------------------------

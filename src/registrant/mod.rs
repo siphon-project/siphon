@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::auth::{
@@ -28,6 +29,23 @@ use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::{Method, SipMessage};
 use crate::sip::uri::SipUri;
 use crate::transport::{ConnectionId, OutboundMessage, OutboundRouter, Transport};
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+/// A registrant state change event emitted by the manager.
+#[derive(Debug, Clone)]
+pub enum RegistrantEvent {
+    /// Registration succeeded (first time or after failure).
+    Registered { aor: String },
+    /// Re-registration succeeded (was already registered).
+    Refreshed { aor: String },
+    /// Registration failed (non-auth error or auth exhaustion).
+    Failed { aor: String, status_code: u16 },
+    /// De-registration sent (shutdown or manual remove).
+    Deregistered { aor: String },
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -175,6 +193,8 @@ pub struct RegistrantManager {
     pub retry_interval: Duration,
     /// Maximum retry interval (backoff cap).
     pub max_retry_interval: Duration,
+    /// Broadcast channel for registrant state change events.
+    event_sender: broadcast::Sender<RegistrantEvent>,
 }
 
 impl RegistrantManager {
@@ -183,12 +203,24 @@ impl RegistrantManager {
         retry_interval: Duration,
         max_retry_interval: Duration,
     ) -> Self {
+        let (event_sender, _) = broadcast::channel(64);
         Self {
             entries: DashMap::new(),
             default_interval,
             retry_interval,
             max_retry_interval,
+            event_sender,
         }
+    }
+
+    /// Subscribe to registrant state change events.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<RegistrantEvent> {
+        self.event_sender.subscribe()
+    }
+
+    /// Emit a registrant event (best-effort, ignores if no receivers).
+    fn emit_event(&self, event: RegistrantEvent) {
+        let _ = self.event_sender.send(event);
     }
 
     /// Add a new registration entry.
@@ -199,7 +231,11 @@ impl RegistrantManager {
 
     /// Remove a registration entry by AoR.
     pub fn remove(&self, aor: &str) -> Option<RegistrantEntry> {
-        self.entries.remove(aor).map(|(_, entry)| entry)
+        let removed = self.entries.remove(aor).map(|(_, entry)| entry);
+        if removed.is_some() {
+            self.emit_event(RegistrantEvent::Deregistered { aor: aor.to_string() });
+        }
+        removed
     }
 
     /// Get number of entries.
@@ -229,6 +265,15 @@ impl RegistrantManager {
                 )
             })
             .collect()
+    }
+
+    /// Get extended info for a single entry (used by dispatcher for event callbacks).
+    ///
+    /// Returns `(expires_in, failure_count, registrar_uri)`.
+    pub fn entry_info(&self, aor: &str) -> Option<(u64, u32, String)> {
+        self.entries.get(aor).map(|entry| {
+            (entry.expires_in(), entry.failure_count, entry.registrar_uri.clone())
+        })
     }
 
     /// Force an immediate refresh for a specific AoR.
@@ -391,6 +436,7 @@ impl RegistrantManager {
     /// Handle a successful 200 OK response.
     pub fn handle_success(&self, aor: &str, granted_expires: u32) {
         if let Some(mut entry) = self.entries.get_mut(aor) {
+            let was_registered = entry.state == RegistrantState::Registered;
             let refresh_at = Duration::from_secs((granted_expires as u64) / 2);
             entry.state = RegistrantState::Registered;
             entry.expires_at = Some(Instant::now() + Duration::from_secs(granted_expires as u64));
@@ -403,6 +449,13 @@ impl RegistrantManager {
                 refresh_in = ?refresh_at,
                 "registered successfully"
             );
+            let aor_owned = entry.aor.clone();
+            drop(entry);
+            if was_registered {
+                self.emit_event(RegistrantEvent::Refreshed { aor: aor_owned });
+            } else {
+                self.emit_event(RegistrantEvent::Registered { aor: aor_owned });
+            }
         }
     }
 
@@ -449,6 +502,10 @@ impl RegistrantManager {
                     }
                 }
             }
+
+            let aor_owned = entry.aor.clone();
+            drop(entry);
+            self.emit_event(RegistrantEvent::Failed { aor: aor_owned, status_code });
         }
     }
 
@@ -976,5 +1033,83 @@ mod tests {
         let debug = format!("{:?}", manager);
         assert!(debug.contains("RegistrantManager"));
         assert!(debug.contains("entries"));
+    }
+
+    #[test]
+    fn event_emitted_on_first_registration() {
+        let manager = make_manager();
+        let mut receiver = manager.subscribe_events();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        manager.handle_success("sip:alice@carrier.com", 3600);
+
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(event, RegistrantEvent::Registered { ref aor } if aor == "sip:alice@carrier.com"));
+    }
+
+    #[test]
+    fn event_emitted_on_refresh() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+        manager.handle_success("sip:alice@carrier.com", 3600);
+
+        let mut receiver = manager.subscribe_events();
+        // Second success while already Registered → Refreshed
+        manager.handle_success("sip:alice@carrier.com", 3600);
+
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(event, RegistrantEvent::Refreshed { ref aor } if aor == "sip:alice@carrier.com"));
+    }
+
+    #[test]
+    fn event_emitted_on_failure() {
+        let manager = make_manager();
+        let mut receiver = manager.subscribe_events();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        manager.handle_failure("sip:alice@carrier.com", 503);
+
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(event, RegistrantEvent::Failed { ref aor, status_code: 503 } if aor == "sip:alice@carrier.com"));
+    }
+
+    #[test]
+    fn event_emitted_on_remove() {
+        let manager = make_manager();
+        let mut receiver = manager.subscribe_events();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        manager.remove("sip:alice@carrier.com");
+
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(event, RegistrantEvent::Deregistered { ref aor } if aor == "sip:alice@carrier.com"));
+    }
+
+    #[test]
+    fn no_event_on_remove_nonexistent() {
+        let manager = make_manager();
+        let mut receiver = manager.subscribe_events();
+
+        manager.remove("sip:nobody@carrier.com");
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn entry_info_returns_data() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+        manager.handle_success("sip:alice@carrier.com", 3600);
+
+        let (expires_in, failure_count, registrar) = manager.entry_info("sip:alice@carrier.com").unwrap();
+        assert!(expires_in > 0);
+        assert_eq!(failure_count, 0);
+        assert_eq!(registrar, "sip:registrar.carrier.com:5060");
+    }
+
+    #[test]
+    fn entry_info_none_for_missing() {
+        let manager = make_manager();
+        assert!(manager.entry_info("sip:nobody@carrier.com").is_none());
     }
 }

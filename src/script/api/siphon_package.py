@@ -351,6 +351,24 @@ class _RegistrationNamespace:
     def count(self):
         raise NotImplementedError("registration.count() not available — no registrant in config")
 
+    @staticmethod
+    def on_change(fn):
+        """Register a handler for outbound registration state changes.
+
+        The handler receives (aor, event_type, state) where:
+          - aor: str — Address of Record (e.g. "sip:trunk@carrier.com")
+          - event_type: str — "registered", "refreshed", "failed", or "deregistered"
+          - state: dict — {"expires_in": int, "failure_count": int, "registrar": str}
+
+        Usage:
+            @registration.on_change
+            def on_trunk_change(aor, event_type, state):
+                ...
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("registration.on_change", None, fn, is_async)
+        return fn
+
 
 # ---------------------------------------------------------------------------
 # Module-level singletons

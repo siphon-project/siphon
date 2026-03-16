@@ -431,6 +431,97 @@ pub async fn run(
         });
     }
 
+    // Spawn background task: registrant change event → on_change handlers
+    if let Some(ref registrant) = state.registrant_manager {
+        let mut event_receiver = registrant.subscribe_events();
+        let state_for_events = Arc::clone(&state);
+        let registrant = Arc::clone(registrant);
+        tokio::spawn(async move {
+            while let Ok(event) = event_receiver.recv().await {
+                let (aor, event_type) = match &event {
+                    crate::registrant::RegistrantEvent::Registered { aor } => {
+                        (aor.clone(), "registered")
+                    }
+                    crate::registrant::RegistrantEvent::Refreshed { aor } => {
+                        (aor.clone(), "refreshed")
+                    }
+                    crate::registrant::RegistrantEvent::Failed { aor, .. } => {
+                        (aor.clone(), "failed")
+                    }
+                    crate::registrant::RegistrantEvent::Deregistered { aor } => {
+                        (aor.clone(), "deregistered")
+                    }
+                };
+
+                // Quick check if any handlers exist (avoids spawn_blocking overhead)
+                {
+                    let engine_state = state_for_events.engine.state();
+                    if engine_state
+                        .handlers_for(&HandlerKind::RegistrantOnChange)
+                        .is_empty()
+                    {
+                        continue;
+                    }
+                }
+
+                // Build state dict for the callback
+                let (expires_in, failure_count, registrar_uri) = registrant
+                    .entry_info(&aor)
+                    .unwrap_or((0, 0, String::new()));
+
+                let event_type_str = event_type.to_string();
+                let state_ref = Arc::clone(&state_for_events);
+
+                // Invoke Python handlers in a blocking context
+                tokio::task::spawn_blocking(move || {
+                    let engine_state = state_ref.engine.state();
+                    let handlers =
+                        engine_state.handlers_for(&HandlerKind::RegistrantOnChange);
+
+                    pyo3::Python::attach(|python| {
+                        let py_state = pyo3::types::PyDict::new(python);
+                        if py_state.set_item("expires_in", expires_in).is_err()
+                            || py_state.set_item("failure_count", failure_count).is_err()
+                            || py_state.set_item("registrar", &registrar_uri).is_err()
+                        {
+                            error!("PyDict creation failed for registration on_change state");
+                            return;
+                        }
+
+                        for handler in handlers {
+                            let callable = handler.callable.bind(python);
+                            let result = callable.call1((
+                                aor.as_str(),
+                                event_type_str.as_str(),
+                                &py_state,
+                            ));
+                            match result {
+                                Ok(ret) => {
+                                    if handler.is_async {
+                                        if let Err(error) = run_coroutine(python, &ret) {
+                                            tracing::error!(
+                                                %error,
+                                                "async registration.on_change handler error"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        %error,
+                                        "registration.on_change handler failed"
+                                    );
+                                }
+                            }
+                        }
+                    });
+                })
+                .await
+                .ok();
+            }
+        });
+    }
+
     info!("dispatcher started");
 
     while let Ok(inbound) = inbound_rx.recv_async().await {
