@@ -333,7 +333,7 @@ class _LiNamespace:
 class _RegistrationNamespace:
     """Outbound registration operations (stub)."""
 
-    def add(self, aor, registrar, /, user, password, interval=None, realm=None, contact=None, transport=None):
+    def add(self, aor, registrar, *, user, password, interval=None, realm=None, contact=None, transport=None):
         raise NotImplementedError("registration.add() not available — no registrant in config")
 
     def remove(self, aor):
