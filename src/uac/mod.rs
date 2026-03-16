@@ -35,16 +35,19 @@ struct PendingRequest {
 pub struct UacSender {
     outbound: Arc<OutboundRouter>,
     local_addr: SocketAddr,
+    /// SIP domain used in From header (first configured domain).
+    domain: String,
     /// Pending requests keyed by branch parameter.
     pending: Arc<DashMap<String, PendingRequest>>,
     cseq_counter: std::sync::atomic::AtomicU32,
 }
 
 impl UacSender {
-    pub fn new(outbound: Arc<OutboundRouter>, local_addr: SocketAddr) -> Self {
+    pub fn new(outbound: Arc<OutboundRouter>, local_addr: SocketAddr, domain: String) -> Self {
         Self {
             outbound,
             local_addr,
+            domain,
             pending: Arc::new(DashMap::new()),
             cseq_counter: std::sync::atomic::AtomicU32::new(1),
         }
@@ -66,15 +69,15 @@ impl UacSender {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let via = format!(
-            "SIP/2.0/{} {};branch={}",
-            transport, self.local_addr, branch
+            "SIP/2.0/{} {}:{};branch={}",
+            transport, self.domain, self.local_addr.port(), branch
         );
 
         let message = match SipMessageBuilder::new()
             .request(Method::Options, request_uri.clone())
             .via(via)
             .to(format!("<{request_uri}>"))
-            .from(format!("<sip:siphon@{}>;tag=uac-{}", self.local_addr.ip(), cseq))
+            .from(format!("<sip:siphon@{}>;tag=uac-{}", self.domain, cseq))
             .call_id(format!("uac-keepalive-{}", uuid::Uuid::new_v4()))
             .cseq(format!("{cseq} OPTIONS"))
             .max_forwards(70)
@@ -217,7 +220,7 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let sender = UacSender::new(router, "127.0.0.1:5060".parse().unwrap());
+        let sender = UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), "localhost".to_string());
         let receivers = vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx];
         (sender, receivers)
     }

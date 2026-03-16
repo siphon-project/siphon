@@ -445,8 +445,23 @@ async fn probe_destination(
     uac_sender: &UacSender,
     failure_threshold: u32,
 ) {
-    let request_uri = SipUri::new(dest.address.ip().to_string())
-        .with_port(dest.address.port());
+    // Build R-URI from the gateway's configured URI hostname (not the resolved IP).
+    let host_part = dest.uri
+        .strip_prefix("sip:")
+        .or_else(|| dest.uri.strip_prefix("sips:"))
+        .unwrap_or(&dest.uri);
+    let (host, port) = if let Some((h, p)) = host_part.rsplit_once(':') {
+        (h.to_string(), p.parse::<u16>().unwrap_or(dest.address.port()))
+    } else {
+        (host_part.to_string(), dest.address.port())
+    };
+    let mut request_uri = SipUri::new(host).with_port(port);
+    if dest.transport != Transport::Udp {
+        request_uri = request_uri.with_param(
+            "transport".to_string(),
+            Some(dest.transport.to_string().to_lowercase()),
+        );
+    }
 
     let receiver = uac_sender.send_options(
         dest.address,
@@ -952,7 +967,7 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let uac_sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap()));
+        let uac_sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), "localhost".to_string()));
         let manager = Arc::new(DispatcherManager::new());
 
         manager.add_group(DispatcherGroup::new(
