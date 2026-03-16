@@ -120,7 +120,7 @@ pub async fn listen(
                         debug!(
                             destination = %outbound.destination,
                             connection_id = ?connection_id,
-                            "TLS outbound: created new connection via pool"
+                            "TLS outbound: sent via pool"
                         );
                     }
                     Err(error) => {
