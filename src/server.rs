@@ -941,18 +941,28 @@ fn init_registrant(
             .or_else(|| entry_config.registrar.strip_prefix("sips:"))
             .unwrap_or(&entry_config.registrar);
 
-        let destination: std::net::SocketAddr = registrar_host
-            .parse()
-            .or_else(|_| format!("{registrar_host}:5060").parse())
-            .unwrap_or_else(|_: std::net::AddrParseError| {
-                warn!(host = %registrar_host, "invalid registrant host, falling back to 0.0.0.0:5060");
-                std::net::SocketAddr::from(([0, 0, 0, 0], 5060))
-            });
-
         let transport_type = match entry_config.transport.as_str() {
             "tcp" => transport::Transport::Tcp,
             "tls" => transport::Transport::Tls,
             _ => transport::Transport::Udp,
+        };
+
+        let default_port: u16 = if transport_type == transport::Transport::Tls { 5061 } else { 5060 };
+        let address_str = if registrar_host.contains(':') {
+            registrar_host.to_string()
+        } else {
+            format!("{registrar_host}:{default_port}")
+        };
+        let destination = match resolve_gateway_address(&address_str) {
+            Ok(addr) => addr,
+            Err(error) => {
+                error!(
+                    host = %registrar_host,
+                    error = %error,
+                    "cannot resolve registrant host, skipping entry"
+                );
+                continue;
+            }
         };
 
         let entry = RegistrantEntry::new(
