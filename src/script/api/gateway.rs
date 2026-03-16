@@ -281,7 +281,7 @@ impl PyDestination {
     fn from_destination(dest: &Destination) -> Self {
         Self {
             uri: dest.uri.clone(),
-            address: dest.address.to_string(),
+            address: dest.address().to_string(),
             healthy: dest.is_healthy(),
             weight: dest.weight,
             priority: dest.priority,

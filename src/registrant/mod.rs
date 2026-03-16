@@ -86,6 +86,8 @@ pub struct RegistrantEntry {
     pub registrar_uri: String,
     /// Resolved destination for sending REGISTER.
     pub destination: SocketAddr,
+    /// Original hostname:port for DNS re-resolution on failure.
+    pub address_str: Option<String>,
     /// Transport to use (default: UDP).
     pub transport: Transport,
     /// Authentication credentials.
@@ -127,6 +129,7 @@ impl RegistrantEntry {
             aor,
             registrar_uri,
             destination,
+            address_str: None,
             transport,
             credentials,
             interval_secs,
@@ -425,6 +428,27 @@ impl RegistrantManager {
                 retry_in = ?backoff,
                 "registration failed"
             );
+
+            // Re-resolve DNS to try a different IP on next attempt
+            if let Some(ref address_str) = entry.address_str {
+                use std::net::ToSocketAddrs;
+                if let Ok(mut addrs) = address_str.to_socket_addrs() {
+                    let old = entry.destination;
+                    let new_addr = addrs.find(|a| *a != old)
+                        .or_else(|| address_str.to_socket_addrs().ok()?.next());
+                    if let Some(new_addr) = new_addr {
+                        if new_addr != old {
+                            info!(
+                                aor = %entry.aor,
+                                old = %old,
+                                new = %new_addr,
+                                "re-resolved registrar to different IP"
+                            );
+                            entry.destination = new_addr;
+                        }
+                    }
+                }
+            }
         }
     }
 

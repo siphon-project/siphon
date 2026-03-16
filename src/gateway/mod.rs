@@ -69,8 +69,10 @@ impl Algorithm {
 pub struct Destination {
     /// SIP URI to route to (e.g. "sip:gw1.carrier.com:5060").
     pub uri: String,
-    /// Socket address for sending.
-    pub address: SocketAddr,
+    /// Original address string for DNS re-resolution (e.g. "gw1.carrier.com:5060").
+    pub address_str: Option<String>,
+    /// Resolved socket address for sending (updated on DNS re-resolution).
+    address: std::sync::Mutex<SocketAddr>,
     /// Transport protocol.
     pub transport: Transport,
     /// Weight for weighted round-robin (higher = more traffic).
@@ -95,7 +97,8 @@ impl Destination {
     ) -> Self {
         Self {
             uri,
-            address,
+            address_str: None,
+            address: std::sync::Mutex::new(address),
             transport,
             weight,
             priority,
@@ -103,6 +106,21 @@ impl Destination {
             healthy: AtomicBool::new(true),
             failures: AtomicU32::new(0),
         }
+    }
+
+    /// Get the current resolved address.
+    pub fn address(&self) -> SocketAddr {
+        *self.address.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Update the resolved address (after DNS re-resolution).
+    pub fn set_address(&self, address: SocketAddr) {
+        *self.address.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = address;
+    }
+
+    pub fn with_address_str(mut self, address_str: String) -> Self {
+        self.address_str = Some(address_str);
+        self
     }
 
     pub fn with_attrs(mut self, attrs: HashMap<String, String>) -> Self {
@@ -450,10 +468,11 @@ async fn probe_destination(
         .strip_prefix("sip:")
         .or_else(|| dest.uri.strip_prefix("sips:"))
         .unwrap_or(&dest.uri);
+    let current_addr = dest.address();
     let (host, port) = if let Some((h, p)) = host_part.rsplit_once(':') {
-        (h.to_string(), p.parse::<u16>().unwrap_or(dest.address.port()))
+        (h.to_string(), p.parse::<u16>().unwrap_or(current_addr.port()))
     } else {
-        (host_part.to_string(), dest.address.port())
+        (host_part.to_string(), current_addr.port())
     };
     let mut request_uri = SipUri::new(host).with_port(port);
     if dest.transport != Transport::Udp {
@@ -464,7 +483,7 @@ async fn probe_destination(
     }
 
     let receiver = uac_sender.send_options(
-        dest.address,
+        current_addr,
         dest.transport,
         request_uri,
     );
@@ -490,6 +509,28 @@ async fn probe_destination(
                     warn!(uri = %dest.uri, "marking destination down after {count} failures");
                 }
                 dest.mark_down();
+
+                // Re-resolve DNS to try a different IP on next probe
+                if let Some(ref address_str) = dest.address_str {
+                    use std::net::ToSocketAddrs;
+                    if let Ok(mut addrs) = address_str.to_socket_addrs() {
+                        let old = dest.address();
+                        // Pick a different address than the current one if available
+                        let new_addr = addrs.find(|a| *a != old)
+                            .or_else(|| address_str.to_socket_addrs().ok()?.next());
+                        if let Some(new_addr) = new_addr {
+                            if new_addr != old {
+                                info!(
+                                    uri = %dest.uri,
+                                    old = %old,
+                                    new = %new_addr,
+                                    "re-resolved destination to different IP"
+                                );
+                                dest.set_address(new_addr);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

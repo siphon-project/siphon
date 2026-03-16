@@ -805,16 +805,20 @@ fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
                 "tls" => transport::Transport::Tls,
                 _ => transport::Transport::Udp,
             };
-            destinations.push(
-                Destination::new(
-                    dest_config.uri.clone(),
-                    address,
-                    transport_type,
-                    dest_config.weight,
-                    dest_config.priority,
-                )
-                .with_attrs(dest_config.attrs.clone()),
-            );
+            // Store original hostname string for DNS re-resolution on failure
+            let is_hostname = address_str.parse::<std::net::SocketAddr>().is_err();
+            let mut dest = Destination::new(
+                dest_config.uri.clone(),
+                address,
+                transport_type,
+                dest_config.weight,
+                dest_config.priority,
+            )
+            .with_attrs(dest_config.attrs.clone());
+            if is_hostname {
+                dest = dest.with_address_str(address_str.clone());
+            }
+            destinations.push(dest);
         }
 
         let probe = ProbeConfig {
@@ -968,7 +972,8 @@ fn init_registrant(
             }
         };
 
-        let entry = RegistrantEntry::new(
+        let is_hostname = address_str.parse::<std::net::SocketAddr>().is_err();
+        let mut entry = RegistrantEntry::new(
             entry_config.aor.clone(),
             entry_config.registrar.clone(),
             destination,
@@ -981,6 +986,9 @@ fn init_registrant(
             entry_config.interval.unwrap_or(registrant_config.default_interval),
             entry_config.contact.clone(),
         );
+        if is_hostname {
+            entry.address_str = Some(address_str.clone());
+        }
         manager.add(entry);
     }
 
