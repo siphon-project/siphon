@@ -1002,7 +1002,10 @@ fn init_registrant(
         ).await;
     });
 
-    let _ = shutdown_tx;
+    // Keep shutdown_tx alive — dropping it would cause the registration
+    // loop's shutdown.changed() to resolve immediately on every select tick,
+    // starving the sleep branch and preventing REGISTERs from being sent.
+    std::mem::forget(shutdown_tx);
 
     // Inject registration Python API
     let py_manager = Arc::clone(&manager);
