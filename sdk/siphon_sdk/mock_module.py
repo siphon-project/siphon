@@ -1393,7 +1393,7 @@ class MockRegistration:
     def __init__(self) -> None:
         self._entries: dict[str, dict] = {}
 
-    def add(self, aor: str, registrar: str, /, user: str, password: str,
+    def add(self, aor: str, registrar: str, *, user: str, password: str,
             interval: Optional[int] = None, realm: Optional[str] = None,
             contact: Optional[str] = None, transport: Optional[str] = None) -> None:
         """Add a new outbound registration.

@@ -780,13 +780,19 @@ fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
 
         let mut destinations = Vec::new();
         for dest_config in &group_config.destinations {
-            let address = match dest_config.address.parse::<std::net::SocketAddr>() {
+            let address_str = dest_config
+                .address
+                .clone()
+                .unwrap_or_else(|| extract_address_from_uri(&dest_config.uri));
+
+            let address = match resolve_gateway_address(&address_str) {
                 Ok(addr) => addr,
-                Err(parse_error) => {
+                Err(error) => {
                     error!(
-                        address = %dest_config.address,
-                        error = %parse_error,
-                        "invalid gateway destination address, skipping"
+                        address = %address_str,
+                        uri = %dest_config.uri,
+                        error = %error,
+                        "cannot resolve gateway destination address, skipping"
                     );
                     continue;
                 }
@@ -831,6 +837,39 @@ fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
     });
 
     Some(manager)
+}
+
+/// Extract a host:port string from a SIP URI (best-effort).
+fn extract_address_from_uri(uri: &str) -> String {
+    let host_part = uri
+        .strip_prefix("sip:")
+        .or_else(|| uri.strip_prefix("sips:"))
+        .unwrap_or(uri);
+
+    if host_part.contains(':') {
+        host_part.to_string()
+    } else {
+        format!("{host_part}:5060")
+    }
+}
+
+/// Resolve a gateway address string to a `SocketAddr`.
+///
+/// Accepts either a raw IP:port (`"10.0.0.1:5060"`) or a hostname:port
+/// (`"gw.carrier.com:5060"`). Hostnames are resolved via system DNS.
+fn resolve_gateway_address(address: &str) -> Result<std::net::SocketAddr, String> {
+    // Fast path: raw IP:port
+    if let Ok(addr) = address.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+
+    // Slow path: DNS resolution (hostname:port)
+    use std::net::ToSocketAddrs;
+    address
+        .to_socket_addrs()
+        .map_err(|e| format!("{e}"))?
+        .next()
+        .ok_or_else(|| "DNS returned no addresses".to_string())
 }
 
 type LiState = (

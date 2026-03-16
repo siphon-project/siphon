@@ -51,7 +51,7 @@ impl PyRegistration {
     ///     contact: Optional Contact URI (auto-generated if omitted).
     ///     transport: Transport protocol: "udp" (default), "tcp", "tls".
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (aor, registrar, /, user, password, interval=None, realm=None, contact=None, transport=None))]
+    #[pyo3(signature = (aor, registrar, *, user, password, interval=None, realm=None, contact=None, transport=None))]
     fn add(
         &self,
         aor: &str,
@@ -69,20 +69,38 @@ impl PyRegistration {
             _ => Transport::Udp,
         };
 
-        // Resolve registrar address from URI
+        // Resolve registrar address from URI — supports both IP:port and hostname
         let registrar_host = registrar
             .strip_prefix("sip:")
             .or_else(|| registrar.strip_prefix("sips:"))
             .unwrap_or(registrar);
 
-        let destination: std::net::SocketAddr = registrar_host
+        let host_with_port = if registrar_host.contains(':') {
+            registrar_host.to_string()
+        } else {
+            format!("{registrar_host}:5060")
+        };
+
+        let destination: std::net::SocketAddr = host_with_port
             .parse()
-            .unwrap_or_else(|_| {
-                // Try adding default port
-                format!("{registrar_host}:5060")
-                    .parse()
-                    .unwrap_or(std::net::SocketAddr::from(([0, 0, 0, 0], 5060)))
-            });
+            .or_else(|_| {
+                // Not a raw IP:port — try DNS resolution
+                use std::net::ToSocketAddrs;
+                host_with_port
+                    .to_socket_addrs()
+                    .map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "cannot resolve registrar address '{registrar}': {e}"
+                        ))
+                    })
+                    .and_then(|mut addrs| {
+                        addrs.next().ok_or_else(|| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "DNS returned no addresses for '{registrar}'"
+                            ))
+                        })
+                    })
+            })?;
 
         let entry = RegistrantEntry::new(
             aor.to_string(),

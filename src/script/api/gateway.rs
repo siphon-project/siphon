@@ -148,13 +148,11 @@ impl PyGateway {
                 .transpose()?
                 .unwrap_or_else(|| extract_address_from_uri(&uri));
 
-            let address = address_str
-                .parse::<std::net::SocketAddr>()
-                .map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "invalid address '{address_str}': {e}"
-                    ))
-                })?;
+            let address = resolve_address(&address_str).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "cannot resolve address '{address_str}': {e}"
+                ))
+            })?;
 
             let weight: u32 = dict
                 .get_item("weight")?
@@ -237,6 +235,22 @@ fn extract_address_from_uri(uri: &str) -> String {
     } else {
         format!("{host_part}:5060")
     }
+}
+
+/// Resolve an address string (IP:port or hostname:port) to a `SocketAddr`.
+fn resolve_address(address: &str) -> Result<std::net::SocketAddr, String> {
+    // Fast path: raw IP:port
+    if let Ok(addr) = address.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+
+    // Slow path: DNS resolution
+    use std::net::ToSocketAddrs;
+    address
+        .to_socket_addrs()
+        .map_err(|e| format!("{e}"))?
+        .next()
+        .ok_or_else(|| "DNS returned no addresses".to_string())
 }
 
 /// Python-visible destination returned from gateway.select() and gateway.list().

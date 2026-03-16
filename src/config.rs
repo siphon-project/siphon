@@ -1166,7 +1166,9 @@ pub struct GatewayDestConfig {
     /// SIP URI to route to (e.g. "sip:gw1.carrier.com:5060").
     pub uri: String,
     /// Socket address for sending (e.g. "10.0.0.1:5060").
-    pub address: String,
+    /// If omitted, resolved from the URI hostname.
+    #[serde(default)]
+    pub address: Option<String>,
     /// Transport protocol: "udp" (default), "tcp", "tls".
     #[serde(default = "default_gateway_transport")]
     pub transport: String,
