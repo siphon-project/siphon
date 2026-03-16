@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -21,9 +22,16 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
 use crate::transport::{
-    ConnectionId, InboundMessage, Transport, CONNECTION_IDLE_TIMEOUT,
+    ConnectionId, InboundMessage, Transport,
     configure_tcp_socket, next_connection_id,
 };
+
+/// Idle timeout for pooled outbound connections (shorter than inbound).
+///
+/// Outbound pool connections are used for probes and registrant — if no
+/// response comes back within this window the connection is dead and should
+/// be torn down so the next send creates a fresh one.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Key for a pooled connection: destination address + transport type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -200,7 +208,7 @@ impl ConnectionPool {
         tokio::spawn(async move {
             let mut buffer = BytesMut::zeroed(65536);
             loop {
-                match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.read(&mut buffer)).await
+                match tokio::time::timeout(POOL_IDLE_TIMEOUT, reader.read(&mut buffer)).await
                 {
                     Ok(Ok(0)) => {
                         info!("pool: TCP connection {:?} to {} closed by peer", connection_id, destination);
@@ -228,7 +236,7 @@ impl ConnectionPool {
                         info!(
                             "pool: TCP connection {:?} idle timeout ({}s)",
                             connection_id,
-                            CONNECTION_IDLE_TIMEOUT.as_secs()
+                            POOL_IDLE_TIMEOUT.as_secs()
                         );
                         break;
                     }
@@ -329,7 +337,7 @@ impl ConnectionPool {
         tokio::spawn(async move {
             let mut buffer = BytesMut::zeroed(65536);
             loop {
-                match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.read(&mut buffer)).await
+                match tokio::time::timeout(POOL_IDLE_TIMEOUT, reader.read(&mut buffer)).await
                 {
                     Ok(Ok(0)) => {
                         info!("pool: TLS connection {:?} to {} closed by peer", connection_id, destination);
@@ -357,7 +365,7 @@ impl ConnectionPool {
                         info!(
                             "pool: TLS connection {:?} idle timeout ({}s)",
                             connection_id,
-                            CONNECTION_IDLE_TIMEOUT.as_secs()
+                            POOL_IDLE_TIMEOUT.as_secs()
                         );
                         break;
                     }
