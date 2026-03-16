@@ -17,6 +17,7 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
 use crate::transport::{
@@ -50,6 +51,65 @@ pub struct ConnectionPool {
     local_addr: SocketAddr,
     /// Pre-computed TOS byte (DSCP << 2) for DSCP/DiffServ marking.
     tos: Option<u32>,
+    /// TLS connector for outbound TLS connections.
+    tls_connector: TlsConnector,
+}
+
+/// Build a permissive TLS client config that accepts any server certificate.
+///
+/// SIP trunks and interconnect peers rarely present certificates chained to
+/// public CAs, so we disable verification by default (same as OpenSIPS/Kamailio
+/// `tls_verify_server = 0`).
+fn build_outbound_tls_config() -> Arc<tokio_rustls::rustls::ClientConfig> {
+    use tokio_rustls::rustls;
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+
+    Arc::new(config)
+}
+
+/// Certificate verifier that accepts any server certificate (no verification).
+#[derive(Debug)]
+struct NoVerify;
+
+impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+        _server_name: &tokio_rustls::rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: tokio_rustls::rustls::pki_types::UnixTime,
+    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error> {
+        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+        tokio_rustls::rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 impl ConnectionPool {
@@ -65,6 +125,7 @@ impl ConnectionPool {
             inbound_tx,
             local_addr,
             tos,
+            tls_connector: TlsConnector::from(build_outbound_tls_config()),
         }
     }
 
@@ -207,6 +268,135 @@ impl ConnectionPool {
         Ok(connection_id)
     }
 
+    /// Send data to a destination, creating or reusing a pooled TLS connection.
+    ///
+    /// Returns the `ConnectionId` used (so responses can be correlated).
+    pub async fn send_tls(
+        &self,
+        destination: SocketAddr,
+        data: Bytes,
+    ) -> Result<ConnectionId, std::io::Error> {
+        let key = PoolKey {
+            destination,
+            transport: Transport::Tls,
+        };
+
+        // Try existing connection first
+        if let Some(entry) = self.connections.get(&key) {
+            if !entry.sender.is_closed()
+                && entry.sender.send(data.clone()).await.is_ok()
+            {
+                return Ok(entry.connection_id);
+            }
+            // Connection dead — remove and create new
+            drop(entry);
+            self.connections.remove(&key);
+        }
+
+        // Create new TCP connection, then wrap with TLS handshake.
+        // Unlike TCP pool connections we do NOT bind to a specific local port —
+        // the TLS listen port (5061) is for inbound only; outbound uses ephemeral.
+        let tcp_stream = tokio::net::TcpStream::connect(destination).await?;
+        configure_tcp_socket(&tcp_stream, self.tos);
+
+        // TLS handshake — use the destination IP as SNI
+        let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(
+            destination.ip().to_string()
+        ).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let tls_stream = self.tls_connector.connect(server_name, tcp_stream).await?;
+
+        let connection_id = next_connection_id();
+        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(self.local_addr);
+        let (mut reader, mut writer) = tokio::io::split(tls_stream);
+
+        // Per-connection write channel
+        let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(64);
+
+        // Register in the shared connection map
+        self.connection_map.insert(connection_id, write_tx.clone());
+
+        debug!(
+            destination = %destination,
+            connection_id = ?connection_id,
+            "pool: opened outbound TLS connection"
+        );
+
+        // Read task — responses from the remote server come back here
+        let inbound_tx = self.inbound_tx.clone();
+        let conn_map = self.connection_map.clone();
+        let connections = self.connections.clone();
+        let key_for_cleanup = key;
+        tokio::spawn(async move {
+            let mut buffer = BytesMut::zeroed(65536);
+            loop {
+                match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.read(&mut buffer)).await
+                {
+                    Ok(Ok(0)) => {
+                        info!("pool: TLS connection {:?} to {} closed by peer", connection_id, destination);
+                        break;
+                    }
+                    Ok(Ok(size)) => {
+                        let response_data = Bytes::copy_from_slice(&buffer[..size]);
+                        let message = InboundMessage {
+                            connection_id,
+                            transport: Transport::Tls,
+                            local_addr,
+                            remote_addr: destination,
+                            data: response_data,
+                        };
+                        if let Err(error) = inbound_tx.send_async(message).await {
+                            error!("pool: TLS inbound enqueue failed: {}", error);
+                            break;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        warn!("pool: TLS read error on {:?}: {}", connection_id, error);
+                        break;
+                    }
+                    Err(_) => {
+                        info!(
+                            "pool: TLS connection {:?} idle timeout ({}s)",
+                            connection_id,
+                            CONNECTION_IDLE_TIMEOUT.as_secs()
+                        );
+                        break;
+                    }
+                }
+            }
+            conn_map.remove(&connection_id);
+            connections.remove(&key_for_cleanup);
+        });
+
+        // Write task
+        tokio::spawn(async move {
+            while let Some(data) = write_rx.recv().await {
+                if let Err(error) = writer.write_all(&data).await {
+                    warn!("pool: TLS write error on {:?}: {}", connection_id, error);
+                    break;
+                }
+            }
+        });
+
+        // Send the initial data
+        if write_tx.send(data).await.is_err() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pooled TLS connection closed immediately",
+            ));
+        }
+
+        // Store in pool
+        self.connections.insert(
+            key,
+            PoolEntry {
+                connection_id,
+                sender: write_tx,
+            },
+        );
+
+        Ok(connection_id)
+    }
+
     /// Number of active pooled connections.
     pub fn active_connections(&self) -> usize {
         self.connections.len()
@@ -217,8 +407,13 @@ impl ConnectionPool {
 mod tests {
     use super::*;
 
+    fn ensure_crypto_provider() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    }
+
     #[tokio::test]
     async fn pool_connects_and_sends() {
+        ensure_crypto_provider();
         // Start a TCP server
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -269,6 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_reuses_connection() {
+        ensure_crypto_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
 
@@ -307,6 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_reconnects_on_dead_connection() {
+        ensure_crypto_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
 

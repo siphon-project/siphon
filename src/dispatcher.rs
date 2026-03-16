@@ -2380,11 +2380,26 @@ fn send_to_target(
                 }
                 connection_id
             } else {
-                warn!(
-                    destination = %destination,
-                    "no TLS connection available for destination (no inbound connection to reuse)"
-                );
-                fallback_connection_id
+                // No inbound connection to reuse — create outbound TLS via pool
+                let pool = Arc::clone(&state.connection_pool);
+                let data_clone = data;
+                match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(pool.send_tls(destination, data_clone))
+                }) {
+                    Ok(connection_id) => {
+                        debug!(
+                            destination = %destination,
+                            connection_id = ?connection_id,
+                            "relayed via TLS pool"
+                        );
+                        connection_id
+                    }
+                    Err(error) => {
+                        error!(destination = %destination, "TLS pool send failed: {error}");
+                        fallback_connection_id
+                    }
+                }
             }
         }
         _ => {

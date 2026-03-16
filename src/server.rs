@@ -278,6 +278,21 @@ impl SiphonServer {
             transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos).await;
         }
 
+        // --- Connection pool ---
+        // Created before TLS listen so outbound TLS messages can use it.
+        let pool_tos = global_dscp
+            .filter(|&d| d > 0)
+            .map(config::dscp_to_tos);
+        let pool_local_addr = first_listen_addr.unwrap_or_else(||
+            "0.0.0.0:5060".parse().unwrap()
+        );
+        let connection_pool = Arc::new(transport::pool::ConnectionPool::new(
+            Arc::clone(&tcp_connection_map),
+            inbound_tx.clone(),
+            pool_local_addr,
+            pool_tos,
+        ));
+
         // TLS
         let tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>> =
             Arc::new(dashmap::DashMap::new());
@@ -298,7 +313,7 @@ impl SiphonServer {
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TLS transport");
-                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map), tos).await;
+                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map), tos, Some(Arc::clone(&connection_pool))).await;
             }
         }
 
@@ -365,18 +380,6 @@ impl SiphonServer {
             eprintln!("No listen addresses configured");
             std::process::exit(1);
         });
-
-        // --- Connection pool ---
-        // Use global DSCP for the connection pool (outbound TCP connections).
-        let pool_tos = global_dscp
-            .filter(|&d| d > 0)
-            .map(config::dscp_to_tos);
-        let connection_pool = Arc::new(transport::pool::ConnectionPool::new(
-            Arc::clone(&tcp_connection_map),
-            inbound_tx.clone(),
-            local_addr,
-            pool_tos,
-        ));
 
         drop(inbound_tx);
 

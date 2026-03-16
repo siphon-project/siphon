@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::TlsServerConfig;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
+use crate::transport::pool::ConnectionPool;
 
 /// Build a `TlsAcceptor` from the certificate and key paths in config.
 pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
@@ -95,6 +96,7 @@ pub async fn listen(
     acl: Arc<TransportAcl>,
     addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
     tos: Option<u32>,
+    pool: Option<Arc<ConnectionPool>>,
 ) {
     let acceptor = build_tls_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
@@ -102,12 +104,31 @@ pub async fn listen(
     });
 
     // Spawn a task that distributes outbound messages to per-connection senders.
+    // When no existing connection matches, fall back to the connection pool to
+    // create a new outbound TLS connection (needed for registrant, probes, etc.).
     let connection_map_clone = connection_map.clone();
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
             if let Some(sender) = connection_map_clone.get(&outbound.connection_id) {
                 if let Err(error) = sender.send(outbound.data).await {
                     warn!("TLS outbound send failed for connection {:?}: {}", outbound.connection_id, error);
+                }
+            } else if let Some(ref pool) = pool {
+                // No existing connection — create outbound TLS via pool
+                match pool.send_tls(outbound.destination, outbound.data).await {
+                    Ok(connection_id) => {
+                        debug!(
+                            destination = %outbound.destination,
+                            connection_id = ?connection_id,
+                            "TLS outbound: created new connection via pool"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            destination = %outbound.destination,
+                            "TLS outbound pool connect failed: {error}"
+                        );
+                    }
                 }
             } else {
                 debug!("TLS outbound: connection {:?} not found (may have closed)", outbound.connection_id);
@@ -364,6 +385,7 @@ mod tests {
             test_acl(),
             Arc::new(DashMap::new()),
             None,
+            None,
         )
         .await;
 
@@ -411,6 +433,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             Arc::new(DashMap::new()),
+            None,
             None,
         )
         .await;
@@ -483,6 +506,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             Arc::clone(&addr_map),
+            None,
             None,
         )
         .await;
