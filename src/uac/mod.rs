@@ -4,6 +4,7 @@
 //! any feature that needs to originate SIP requests without an
 //! inbound trigger.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -35,22 +36,31 @@ struct PendingRequest {
 pub struct UacSender {
     outbound: Arc<OutboundRouter>,
     local_addr: SocketAddr,
-    /// SIP domain used in From header (first configured domain).
-    domain: String,
+    /// Per-transport listen addresses for Via/From headers.
+    listen_addrs: HashMap<Transport, SocketAddr>,
     /// Pending requests keyed by branch parameter.
     pending: Arc<DashMap<String, PendingRequest>>,
     cseq_counter: std::sync::atomic::AtomicU32,
 }
 
 impl UacSender {
-    pub fn new(outbound: Arc<OutboundRouter>, local_addr: SocketAddr, domain: String) -> Self {
+    pub fn new(
+        outbound: Arc<OutboundRouter>,
+        local_addr: SocketAddr,
+        listen_addrs: HashMap<Transport, SocketAddr>,
+    ) -> Self {
         Self {
             outbound,
             local_addr,
-            domain,
+            listen_addrs,
             pending: Arc::new(DashMap::new()),
             cseq_counter: std::sync::atomic::AtomicU32::new(1),
         }
+    }
+
+    /// Return the listen address for a given transport, falling back to `local_addr`.
+    fn addr_for(&self, transport: &Transport) -> SocketAddr {
+        self.listen_addrs.get(transport).copied().unwrap_or(self.local_addr)
     }
 
     /// Send an OPTIONS request to a target address.
@@ -68,16 +78,17 @@ impl UacSender {
             .cseq_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        let addr = self.addr_for(&transport);
         let via = format!(
             "SIP/2.0/{} {}:{};branch={}",
-            transport, self.domain, self.local_addr.port(), branch
+            transport, addr.ip(), addr.port(), branch
         );
 
         let message = match SipMessageBuilder::new()
             .request(Method::Options, request_uri.clone())
             .via(via)
             .to(format!("<{request_uri}>"))
-            .from(format!("<sip:siphon@{}>;tag=uac-{}", self.domain, cseq))
+            .from(format!("<sip:siphon@{}>;tag=uac-{}", addr.ip(), cseq))
             .call_id(format!("uac-keepalive-{}", uuid::Uuid::new_v4()))
             .cseq(format!("{cseq} OPTIONS"))
             .max_forwards(70)
@@ -220,7 +231,7 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let sender = UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), "localhost".to_string());
+        let sender = UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), HashMap::new());
         let receivers = vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx];
         (sender, receivers)
     }

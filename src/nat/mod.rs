@@ -174,7 +174,7 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), "localhost".to_string()));
+        let sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), std::collections::HashMap::new()));
         let receivers = vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx];
         (sender, receivers)
     }

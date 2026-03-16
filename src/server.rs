@@ -429,17 +429,7 @@ impl SiphonServer {
         }
 
         // --- UAC sender ---
-        // Via/From host: advertised_address > first domain > local IP (not 0.0.0.0)
-        let uac_host = config.advertised_address.clone()
-            .or_else(|| {
-                if local_addr.ip().is_unspecified() {
-                    config.domain.local.first().cloned()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| local_addr.ip().to_string());
-        let uac_sender = Arc::new(UacSender::new(Arc::clone(&outbound_senders), local_addr, uac_host));
+        let uac_sender = Arc::new(UacSender::new(Arc::clone(&outbound_senders), local_addr, listen_addrs.clone()));
 
         // Wire UAC sender into proxy.send_request() Python API
         {
