@@ -165,6 +165,29 @@ impl SiphonServer {
             });
         }
 
+        // --- Initialize metrics ---
+        if let Err(error) = crate::metrics::init() {
+            error!("Failed to initialize metrics: {error}");
+        }
+
+        // --- Initialize custom metrics namespace for Python scripts ---
+        // Must happen before script engine so `from siphon import metrics` works.
+        if let Some(custom) = crate::metrics::custom_metrics() {
+            pyo3::Python::attach(|python| {
+                let py_metrics =
+                    crate::script::api::metrics::PyMetricsNamespace::new(
+                        std::sync::Arc::clone(custom),
+                    );
+                if let Err(error) =
+                    crate::script::api::set_metrics_singleton(python, py_metrics)
+                {
+                    error!("failed to store metrics singleton: {error}");
+                } else {
+                    info!("metrics namespace registered for Python scripts");
+                }
+            });
+        }
+
         // --- Script engine ---
         let engine = if let Some(source) = self.embedded_script {
             Arc::new(ScriptEngine::new_embedded(source).unwrap_or_else(|error| {
@@ -183,28 +206,6 @@ impl SiphonServer {
 
         // Start any @timer.every() handlers registered in the script.
         engine.restart_timers();
-
-        // --- Initialize metrics ---
-        if let Err(error) = crate::metrics::init() {
-            error!("Failed to initialize metrics: {error}");
-        }
-
-        // --- Initialize custom metrics namespace for Python scripts ---
-        if let Some(custom) = crate::metrics::custom_metrics() {
-            pyo3::Python::attach(|python| {
-                let py_metrics =
-                    crate::script::api::metrics::PyMetricsNamespace::new(
-                        std::sync::Arc::clone(custom),
-                    );
-                if let Err(error) =
-                    crate::script::api::set_metrics_singleton(python, py_metrics)
-                {
-                    error!("failed to store metrics singleton: {error}");
-                } else {
-                    info!("metrics namespace registered for Python scripts");
-                }
-            });
-        }
 
         // --- Build transport ACL ---
         let transport_acl = build_transport_acl(&config);
