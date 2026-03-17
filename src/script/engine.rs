@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use pyo3::prelude::*;
-use pyo3::types::PyModule;
+use pyo3::types::{PyDict, PyModule};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{ReloadMode, ScriptConfig};
@@ -228,6 +228,32 @@ impl ScriptEngine {
         })
     }
 
+    /// Create the engine from pre-compiled Python bytecode (`.pyc` format).
+    ///
+    /// The bytecode is loaded via `marshal.loads()` and executed directly,
+    /// skipping the compilation step. Hot-reload is disabled.
+    pub fn new_from_bytecode(pyc: &[u8]) -> Result<Self> {
+        let script_path = PathBuf::from("<embedded>");
+
+        Python::initialize();
+
+        let state = Self::load_bytecode(&script_path, pyc)?;
+
+        info!(
+            handlers = state.handlers.len(),
+            "bytecode script loaded"
+        );
+
+        let state = Arc::new(ArcSwap::from_pointee(state));
+
+        Ok(Self {
+            state,
+            script_path,
+            reload_mode: ReloadMode::Sighup,
+            timer_handles: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
     /// Get a snapshot of the current script state.
     /// This is cheap — just an `Arc` clone.
     pub fn state(&self) -> arc_swap::Guard<Arc<ScriptState>> {
@@ -320,6 +346,74 @@ impl ScriptEngine {
 
         Python::attach(|python| {
             Self::compile_source(python, path, &source)
+        })
+    }
+
+    /// Load pre-compiled bytecode (.pyc) and execute it. Used for embedded bytecode.
+    fn load_bytecode(path: &Path, pyc: &[u8]) -> Result<ScriptState> {
+        // .pyc files have a 16-byte header: 4-byte magic, 4-byte flags,
+        // 4-byte timestamp, 4-byte source size. The rest is marshalled code.
+        if pyc.len() < 16 {
+            return Err(SiphonError::Script(
+                "bytecode too short (missing .pyc header)".into(),
+            ));
+        }
+
+        let bytecode_payload = &pyc[16..];
+
+        Python::attach(|python| {
+            let registry_module = get_or_create_registry(python)?;
+            super::api::install_siphon_module(python)?;
+
+            // Clear the handler registry.
+            registry_module
+                .getattr("clear")
+                .map_err(|error| SiphonError::Script(format!("registry.clear: {error}")))?
+                .call0()
+                .map_err(|error| SiphonError::Script(format!("registry.clear(): {error}")))?;
+
+            // Unmarshal the code object from the bytecode payload.
+            let marshal = python
+                .import("marshal")
+                .map_err(|error| SiphonError::Script(format!("import marshal: {error}")))?;
+            let code_object = marshal
+                .call_method1("loads", (bytecode_payload,))
+                .map_err(|error| SiphonError::Script(format!("marshal.loads: {error}")))?;
+
+            // Execute the code object in a proper module namespace so imports work.
+            let globals = PyDict::new(python);
+            let builtins = python
+                .import("builtins")
+                .map_err(|error| SiphonError::Script(format!("import builtins: {error}")))?;
+            globals
+                .set_item("__builtins__", &*builtins)
+                .map_err(|error| SiphonError::Script(format!("set __builtins__: {error}")))?;
+            globals
+                .set_item("__name__", "siphon_user_script")
+                .map_err(|error| SiphonError::Script(format!("set __name__: {error}")))?;
+            builtins
+                .getattr("exec")
+                .map_err(|error| SiphonError::Script(format!("builtins.exec: {error}")))?
+                .call1((code_object, &*globals))
+                .map_err(|error| {
+                    SiphonError::Script(format!(
+                        "bytecode execution failed for {}: {error}",
+                        path.display()
+                    ))
+                })?;
+
+            let handlers = extract_handlers(python, &registry_module)?;
+
+            debug!(
+                path = %path.display(),
+                handler_count = handlers.len(),
+                "bytecode loaded and handlers extracted"
+            );
+
+            Ok(ScriptState {
+                source_path: path.to_owned(),
+                handlers,
+            })
         })
     }
 
@@ -1200,5 +1294,99 @@ def route(request):
         let state = compile_temp_script(source).unwrap();
         assert!(state.timer_handlers().is_empty());
         assert!(!state.has_timer_handlers());
+    }
+
+    /// Helper: compile Python source to .pyc bytes using py_compile + marshal.
+    fn source_to_pyc(source: &str) -> Vec<u8> {
+        Python::initialize();
+        Python::attach(|python| {
+            let mut file = NamedTempFile::with_suffix(".py").unwrap();
+            file.write_all(source.as_bytes()).unwrap();
+            file.flush().unwrap();
+
+            let pyc_path = file.path().with_extension("pyc");
+            let py_compile = python.import("py_compile").unwrap();
+            py_compile
+                .call_method1(
+                    "compile",
+                    (file.path().to_str().unwrap(), pyc_path.to_str().unwrap()),
+                )
+                .unwrap();
+
+            std::fs::read(&pyc_path).unwrap()
+        })
+    }
+
+    #[test]
+    fn bytecode_loads_proxy_handler() {
+        let source = r#"
+from siphon import proxy
+
+@proxy.on_request
+def route(request):
+    pass
+"#;
+        let pyc = source_to_pyc(source);
+        let state =
+            ScriptEngine::load_bytecode(Path::new("<test>"), &pyc).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert_eq!(state.handlers[0].kind, HandlerKind::ProxyRequest(None));
+    }
+
+    #[test]
+    fn bytecode_loads_multiple_handlers() {
+        let source = r#"
+from siphon import proxy, b2bua
+
+@proxy.on_request("REGISTER")
+def handle_register(request):
+    pass
+
+@b2bua.on_invite
+async def new_call(call):
+    pass
+"#;
+        let pyc = source_to_pyc(source);
+        let state =
+            ScriptEngine::load_bytecode(Path::new("<test>"), &pyc).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+        assert_eq!(
+            state.handlers[0].kind,
+            HandlerKind::ProxyRequest(Some("REGISTER".to_owned()))
+        );
+        assert_eq!(state.handlers[1].kind, HandlerKind::B2buaInvite);
+        assert!(state.handlers[1].is_async);
+    }
+
+    #[test]
+    fn bytecode_too_short_returns_error() {
+        let result = ScriptEngine::load_bytecode(Path::new("<test>"), &[0u8; 8]);
+        assert!(result.is_err());
+        let error = format!("{}", result.unwrap_err());
+        assert!(error.contains("too short"));
+    }
+
+    #[test]
+    fn bytecode_corrupt_payload_returns_error() {
+        // Valid-length header but garbage payload
+        let mut bad_pyc = vec![0u8; 16];
+        bad_pyc.extend_from_slice(b"\xff\xff\xff\xff");
+        let result = ScriptEngine::load_bytecode(Path::new("<test>"), &bad_pyc);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_from_bytecode_creates_engine() {
+        let source = r#"
+from siphon import proxy
+
+@proxy.on_request
+def route(request):
+    pass
+"#;
+        let pyc = source_to_pyc(source);
+        let engine = ScriptEngine::new_from_bytecode(&pyc).unwrap();
+        assert_eq!(engine.state().handlers.len(), 1);
+        assert!(!engine.auto_reload());
     }
 }

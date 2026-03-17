@@ -31,6 +31,7 @@ pub struct SiphonServer {
     config_path: Option<String>,
     config_string: Option<String>,
     embedded_script: Option<&'static str>,
+    embedded_bytecode: Option<&'static [u8]>,
 }
 
 impl SiphonServer {
@@ -40,6 +41,7 @@ impl SiphonServer {
             config_path: None,
             config_string: None,
             embedded_script: None,
+            embedded_bytecode: None,
         }
     }
 
@@ -61,6 +63,14 @@ impl SiphonServer {
     /// Hot-reload is automatically disabled for embedded scripts.
     pub fn embedded_script(mut self, source: &'static str) -> Self {
         self.embedded_script = Some(source);
+        self
+    }
+
+    /// Embed pre-compiled Python bytecode into the binary.
+    /// Expects a `.pyc` file (16-byte header + marshalled code object).
+    /// Hot-reload is automatically disabled.
+    pub fn embedded_bytecode(mut self, pyc: &'static [u8]) -> Self {
+        self.embedded_bytecode = Some(pyc);
         self
     }
 
@@ -104,7 +114,7 @@ impl SiphonServer {
         // --- Initialise structured logging ---
         let _log_guard = init_logging(&config.log);
 
-        let script_desc = if self.embedded_script.is_some() {
+        let script_desc = if self.embedded_script.is_some() || self.embedded_bytecode.is_some() {
             "<embedded>".to_owned()
         } else {
             config.script.path.clone()
@@ -189,7 +199,12 @@ impl SiphonServer {
         }
 
         // --- Script engine ---
-        let engine = if let Some(source) = self.embedded_script {
+        let engine = if let Some(bytecode) = self.embedded_bytecode {
+            Arc::new(ScriptEngine::new_from_bytecode(bytecode).unwrap_or_else(|error| {
+                eprintln!("Failed to load embedded bytecode: {error}");
+                std::process::exit(1);
+            }))
+        } else if let Some(source) = self.embedded_script {
             Arc::new(ScriptEngine::new_embedded(source).unwrap_or_else(|error| {
                 eprintln!("Failed to load embedded script: {error}");
                 std::process::exit(1);
