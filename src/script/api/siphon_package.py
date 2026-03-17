@@ -358,7 +358,8 @@ class _RegistrationNamespace:
         The handler receives (aor, event_type, state) where:
           - aor: str — Address of Record (e.g. "sip:trunk@carrier.com")
           - event_type: str — "registered", "refreshed", "failed", or "deregistered"
-          - state: dict — {"expires_in": int, "failure_count": int, "registrar": str}
+          - state: dict — {"expires_in": int, "failure_count": int, "registrar": str,
+            "status_code": int (only present when event_type is "failed")}
 
         Usage:
             @registration.on_change

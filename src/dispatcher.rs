@@ -438,18 +438,18 @@ pub async fn run(
         let registrant = Arc::clone(registrant);
         tokio::spawn(async move {
             while let Ok(event) = event_receiver.recv().await {
-                let (aor, event_type) = match &event {
+                let (aor, event_type, failed_status_code) = match &event {
                     crate::registrant::RegistrantEvent::Registered { aor } => {
-                        (aor.clone(), "registered")
+                        (aor.clone(), "registered", None)
                     }
                     crate::registrant::RegistrantEvent::Refreshed { aor } => {
-                        (aor.clone(), "refreshed")
+                        (aor.clone(), "refreshed", None)
                     }
-                    crate::registrant::RegistrantEvent::Failed { aor, .. } => {
-                        (aor.clone(), "failed")
+                    crate::registrant::RegistrantEvent::Failed { aor, status_code } => {
+                        (aor.clone(), "failed", Some(*status_code))
                     }
                     crate::registrant::RegistrantEvent::Deregistered { aor } => {
-                        (aor.clone(), "deregistered")
+                        (aor.clone(), "deregistered", None)
                     }
                 };
 
@@ -480,9 +480,14 @@ pub async fn run(
 
                     pyo3::Python::attach(|python| {
                         let py_state = pyo3::types::PyDict::new(python);
+                        let status_code_ok = match failed_status_code {
+                            Some(code) => py_state.set_item("status_code", code).is_ok(),
+                            None => true,
+                        };
                         if py_state.set_item("expires_in", expires_in).is_err()
                             || py_state.set_item("failure_count", failure_count).is_err()
                             || py_state.set_item("registrar", &registrar_uri).is_err()
+                            || !status_code_ok
                         {
                             error!("PyDict creation failed for registration on_change state");
                             return;

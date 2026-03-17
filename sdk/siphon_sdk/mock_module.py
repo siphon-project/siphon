@@ -1463,7 +1463,8 @@ class MockRegistration:
           - ``event_type``: str -- ``"registered"``, ``"refreshed"``,
             ``"failed"``, or ``"deregistered"``
           - ``state``: dict -- ``{"expires_in": int, "failure_count": int,
-            "registrar": str}``
+            "registrar": str, "status_code": int}`` (``status_code`` only
+            present when ``event_type`` is ``"failed"``)
 
         Usage::
 
@@ -1482,7 +1483,7 @@ class MockRegistration:
         for aor in aors:
             self._fire_on_change(aor, "deregistered")
 
-    def _fire_on_change(self, aor: str, event_type: str) -> None:
+    def _fire_on_change(self, aor: str, event_type: str, status_code: int | None = None) -> None:
         """Invoke all on_change handlers registered via decorator."""
         entry = self._entries.get(aor)
         state = {
@@ -1490,6 +1491,8 @@ class MockRegistration:
             "failure_count": entry.get("failure_count", 0) if entry else 0,
             "registrar": entry["registrar"] if entry else "",
         }
+        if status_code is not None:
+            state["status_code"] = status_code
         for _, fn, _, _meta in _registry.handlers.get("registration.on_change", []):
             fn(aor, event_type, state)
 
