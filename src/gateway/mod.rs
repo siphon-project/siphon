@@ -1008,7 +1008,7 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let uac_sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), std::collections::HashMap::new()));
+        let uac_sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), std::collections::HashMap::new(), std::collections::HashMap::new(), None, None));
         let manager = Arc::new(DispatcherManager::new());
 
         manager.add_group(DispatcherGroup::new(

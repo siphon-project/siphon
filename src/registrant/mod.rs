@@ -11,6 +11,7 @@
 //! - Applies exponential backoff on failure.
 //! - Sends de-registration (Expires: 0) on shutdown.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -25,6 +26,8 @@ use tracing::{debug, info, warn};
 use crate::auth::{
     self, DigestChallenge, DigestCredentials, NonceCounter,
 };
+use crate::hep::HepSender;
+use crate::uac::resolve_via_addr;
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::{Method, SipMessage};
 use crate::sip::uri::SipUri;
@@ -598,6 +601,9 @@ pub async fn registration_loop(
     manager: Arc<RegistrantManager>,
     outbound: Arc<OutboundRouter>,
     local_addr: SocketAddr,
+    advertised_addrs: HashMap<Transport, String>,
+    advertised_address: Option<String>,
+    hep_sender: Option<Arc<HepSender>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let tick_interval = Duration::from_secs(5);
@@ -611,6 +617,13 @@ pub async fn registration_loop(
                         manager.build_register(&aor, local_addr, manager.default_interval)
                     {
                         let data = Bytes::from(message.to_bytes());
+
+                        // HEP capture — outbound REGISTER
+                        if let Some(ref hep) = hep_sender {
+                            let via_addr = resolve_via_addr(local_addr, &transport, &advertised_addrs, advertised_address.as_deref());
+                            hep.capture_outbound(via_addr, destination, transport, &data);
+                        }
+
                         let outbound_message = OutboundMessage {
                             connection_id: ConnectionId::default(),
                             transport,
@@ -631,6 +644,13 @@ pub async fn registration_loop(
                     let dereg_messages = manager.build_deregistrations(local_addr);
                     for (message, destination, transport) in dereg_messages {
                         let data = Bytes::from(message.to_bytes());
+
+                        // HEP capture — outbound de-registration
+                        if let Some(ref hep) = hep_sender {
+                            let via_addr = resolve_via_addr(local_addr, &transport, &advertised_addrs, advertised_address.as_deref());
+                            hep.capture_outbound(via_addr, destination, transport, &data);
+                        }
+
                         let outbound_message = OutboundMessage {
                             connection_id: ConnectionId::default(),
                             transport,

@@ -13,6 +13,55 @@ use dashmap::DashMap;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
+use crate::hep::HepSender;
+
+/// Resolve the effective source address for a given transport, replacing
+/// unspecified (0.0.0.0 / ::) with the configured advertised address.
+///
+/// Resolution order:
+/// 1. Per-transport advertised address (e.g. `advertised_addrs[Tls] = "1.2.3.4"`)
+/// 2. Global `advertised_address` from config
+/// 3. Localhost fallback (127.0.0.1 or ::1)
+pub fn resolve_via_addr(
+    local_addr: SocketAddr,
+    transport: &Transport,
+    advertised_addrs: &HashMap<Transport, String>,
+    advertised_address: Option<&str>,
+) -> SocketAddr {
+    if local_addr.ip().is_unspecified() {
+        // Check per-transport advertised address first
+        if let Some(adv) = advertised_addrs.get(transport) {
+            if let Ok(ip) = adv.parse::<std::net::IpAddr>() {
+                return SocketAddr::new(ip, local_addr.port());
+            }
+            warn!(
+                transport = %transport,
+                value = %adv,
+                "advertised address is not a valid IP, falling back"
+            );
+        }
+        // Fall back to global advertised_address
+        let fallback = if local_addr.is_ipv6() { "::1" } else { "127.0.0.1" };
+        let host = advertised_address.unwrap_or(fallback);
+        match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, local_addr.port()),
+            Err(_) => {
+                warn!(
+                    value = %host,
+                    "global advertised_address is not a valid IP, using localhost"
+                );
+                let ip = if local_addr.is_ipv6() {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                } else {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                };
+                SocketAddr::new(ip, local_addr.port())
+            }
+        }
+    } else {
+        local_addr
+    }
+}
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::{Method, SipMessage};
 use crate::sip::uri::SipUri;
@@ -38,6 +87,12 @@ pub struct UacSender {
     local_addr: SocketAddr,
     /// Per-transport listen addresses for Via/From headers.
     listen_addrs: HashMap<Transport, SocketAddr>,
+    /// Per-transport advertised addresses (e.g. TLS → "1.2.3.4").
+    advertised_addrs: HashMap<Transport, String>,
+    /// Global advertised address fallback from config.
+    advertised_address: Option<String>,
+    /// HEP capture sender (if tracing is enabled).
+    hep_sender: Option<Arc<HepSender>>,
     /// Pending requests keyed by branch parameter.
     pending: Arc<DashMap<String, PendingRequest>>,
     cseq_counter: std::sync::atomic::AtomicU32,
@@ -48,19 +103,27 @@ impl UacSender {
         outbound: Arc<OutboundRouter>,
         local_addr: SocketAddr,
         listen_addrs: HashMap<Transport, SocketAddr>,
+        advertised_addrs: HashMap<Transport, String>,
+        advertised_address: Option<String>,
+        hep_sender: Option<Arc<HepSender>>,
     ) -> Self {
         Self {
             outbound,
             local_addr,
             listen_addrs,
+            advertised_addrs,
+            advertised_address,
+            hep_sender,
             pending: Arc::new(DashMap::new()),
             cseq_counter: std::sync::atomic::AtomicU32::new(1),
         }
     }
 
-    /// Return the listen address for a given transport, falling back to `local_addr`.
+    /// Return the effective address for a given transport, resolving
+    /// unspecified (0.0.0.0) addresses via advertised address config.
     fn addr_for(&self, transport: &Transport) -> SocketAddr {
-        self.listen_addrs.get(transport).copied().unwrap_or(self.local_addr)
+        let addr = self.listen_addrs.get(transport).copied().unwrap_or(self.local_addr);
+        resolve_via_addr(addr, transport, &self.advertised_addrs, self.advertised_address.as_deref())
     }
 
     /// Send an OPTIONS request to a target address.
@@ -105,6 +168,11 @@ impl UacSender {
         };
 
         let data = Bytes::from(message.to_bytes());
+
+        // HEP capture — outbound OPTIONS
+        if let Some(ref hep) = self.hep_sender {
+            hep.capture_outbound(addr, destination, transport, &data);
+        }
 
         let outbound_message = OutboundMessage {
             connection_id: ConnectionId::default(),
@@ -173,6 +241,13 @@ impl UacSender {
         transport: Transport,
     ) {
         let data = Bytes::from(message.to_bytes());
+
+        // HEP capture — outbound fire-and-forget
+        if let Some(ref hep) = self.hep_sender {
+            let addr = self.addr_for(&transport);
+            hep.capture_outbound(addr, destination, transport, &data);
+        }
+
         let outbound_message = OutboundMessage {
             connection_id: ConnectionId::default(),
             transport,
@@ -231,7 +306,7 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let sender = UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), HashMap::new());
+        let sender = UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), HashMap::new(), HashMap::new(), None, None);
         let receivers = vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx];
         (sender, receivers)
     }
@@ -370,5 +445,68 @@ mod tests {
         let outbound = udp_rx.try_recv().unwrap();
         assert_eq!(outbound.destination, "10.0.0.5:5060".parse().unwrap());
         assert!(!outbound.data.is_empty());
+    }
+
+    // --- resolve_via_addr tests ---
+
+    #[test]
+    fn resolve_via_addr_non_unspecified_passthrough() {
+        let addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+        let result = resolve_via_addr(addr, &Transport::Udp, &HashMap::new(), None);
+        assert_eq!(result, addr);
+    }
+
+    #[test]
+    fn resolve_via_addr_per_transport_override() {
+        let addr: SocketAddr = "0.0.0.0:5060".parse().unwrap();
+        let mut addrs = HashMap::new();
+        addrs.insert(Transport::Udp, "203.0.113.1".to_string());
+        let result = resolve_via_addr(addr, &Transport::Udp, &addrs, None);
+        assert_eq!(result, "203.0.113.1:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_via_addr_global_fallback() {
+        let addr: SocketAddr = "0.0.0.0:5060".parse().unwrap();
+        let result = resolve_via_addr(addr, &Transport::Udp, &HashMap::new(), Some("198.51.100.5"));
+        assert_eq!(result, "198.51.100.5:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_via_addr_localhost_fallback_on_no_config() {
+        let addr: SocketAddr = "0.0.0.0:5060".parse().unwrap();
+        let result = resolve_via_addr(addr, &Transport::Udp, &HashMap::new(), None);
+        assert_eq!(result, "127.0.0.1:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_via_addr_ipv6_localhost_fallback() {
+        let addr: SocketAddr = "[::]:5060".parse().unwrap();
+        let result = resolve_via_addr(addr, &Transport::Udp, &HashMap::new(), None);
+        assert_eq!(result, "[::1]:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_via_addr_invalid_global_falls_back_to_localhost() {
+        let addr: SocketAddr = "0.0.0.0:5060".parse().unwrap();
+        let result = resolve_via_addr(addr, &Transport::Udp, &HashMap::new(), Some("not-an-ip"));
+        assert_eq!(result, "127.0.0.1:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_via_addr_invalid_per_transport_falls_through() {
+        let addr: SocketAddr = "0.0.0.0:5060".parse().unwrap();
+        let mut addrs = HashMap::new();
+        addrs.insert(Transport::Udp, "not-valid".to_string());
+        // Should skip invalid per-transport and use global
+        let result = resolve_via_addr(addr, &Transport::Udp, &addrs, Some("192.0.2.1"));
+        assert_eq!(result, "192.0.2.1:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_via_addr_preserves_port() {
+        let addr: SocketAddr = "0.0.0.0:5080".parse().unwrap();
+        let result = resolve_via_addr(addr, &Transport::Tcp, &HashMap::new(), Some("10.1.1.1"));
+        assert_eq!(result.port(), 5080);
     }
 }

@@ -429,7 +429,14 @@ impl SiphonServer {
         }
 
         // --- UAC sender ---
-        let uac_sender = Arc::new(UacSender::new(Arc::clone(&outbound_senders), local_addr, listen_addrs.clone()));
+        let uac_sender = Arc::new(UacSender::new(
+            Arc::clone(&outbound_senders),
+            local_addr,
+            listen_addrs.clone(),
+            advertised_addrs.clone(),
+            config.advertised_address.clone(),
+            hep_sender.clone(),
+        ));
 
         // Wire UAC sender into proxy.send_request() Python API
         {
@@ -484,7 +491,7 @@ impl SiphonServer {
         }
 
         // --- Outbound registration ---
-        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr);
+        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &advertised_addrs, &hep_sender);
 
         // --- LI tasks ---
         spawn_li_tasks(li_state, &config);
@@ -931,6 +938,8 @@ fn init_registrant(
     config: &Config,
     outbound_senders: &Arc<transport::OutboundRouter>,
     local_addr: std::net::SocketAddr,
+    advertised_addrs: &std::collections::HashMap<transport::Transport, String>,
+    hep_sender: &Option<Arc<HepSender>>,
 ) -> Option<Arc<crate::registrant::RegistrantManager>> {
     use crate::registrant::{RegistrantCredentials, RegistrantEntry, RegistrantManager};
 
@@ -1001,11 +1010,17 @@ fn init_registrant(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let loop_manager = Arc::clone(&manager);
     let loop_outbound = Arc::clone(outbound_senders);
+    let loop_advertised_addrs = advertised_addrs.clone();
+    let loop_advertised_address = config.advertised_address.clone();
+    let loop_hep_sender = hep_sender.clone();
     tokio::spawn(async move {
         crate::registrant::registration_loop(
             loop_manager,
             loop_outbound,
             local_addr,
+            loop_advertised_addrs,
+            loop_advertised_address,
+            loop_hep_sender,
             shutdown_rx,
         ).await;
     });
