@@ -7,10 +7,14 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, OnceLock};
 
+use dashmap::DashMap;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::Regex;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -627,6 +631,293 @@ fn evaluate_spt_condition(
 
     // No condition matched — should not happen for a well-formed SPT.
     false
+}
+
+// ---------------------------------------------------------------------------
+// IfcStore — thread-safe per-user + global iFC store
+// ---------------------------------------------------------------------------
+
+/// Result of iFC evaluation — AS + metadata needed for ISC routing.
+#[derive(Debug, Clone)]
+pub struct MatchedApplicationServer {
+    /// SIP URI of the Application Server.
+    pub server_name: String,
+    /// Default handling when AS is unreachable:
+    /// 0 = SESSION_CONTINUED, 1 = SESSION_TERMINATED.
+    pub default_handling: u32,
+    /// Opaque service info passed to the AS.
+    pub service_info: Option<String>,
+    /// Priority (lower = evaluated first).
+    pub priority: i32,
+    /// Whether to include original REGISTER request body.
+    pub include_register_request: bool,
+    /// Whether to include original REGISTER response body.
+    pub include_register_response: bool,
+}
+
+impl From<&InitialFilterCriteria> for MatchedApplicationServer {
+    fn from(ifc: &InitialFilterCriteria) -> Self {
+        Self {
+            server_name: ifc.application_server.server_name.clone(),
+            default_handling: ifc.default_handling,
+            service_info: ifc.application_server.service_info.clone(),
+            priority: ifc.priority,
+            include_register_request: ifc.application_server.include_register_request,
+            include_register_response: ifc.application_server.include_register_response,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IfcBackendWriter — fire-and-forget Redis persistence for iFC profiles
+// ---------------------------------------------------------------------------
+
+/// Commands sent to the iFC backend writer task.
+enum IfcBackendCommand {
+    Save { aor: String, xml: String },
+    Remove { aor: String },
+}
+
+/// Handle for sending write-through commands to the iFC backend task.
+///
+/// Sends are fire-and-forget; failures are logged by the background task.
+#[derive(Debug, Clone)]
+pub struct IfcBackendWriter {
+    sender: mpsc::UnboundedSender<IfcBackendCommand>,
+}
+
+impl IfcBackendWriter {
+    /// Enqueue a save (raw XML for an AoR) to the backend.
+    pub fn save(&self, aor: &str, xml: &str) {
+        let _ = self.sender.send(IfcBackendCommand::Save {
+            aor: aor.to_string(),
+            xml: xml.to_string(),
+        });
+    }
+
+    /// Enqueue a remove (iFC profile for an AoR) from the backend.
+    pub fn remove(&self, aor: &str) {
+        let _ = self.sender.send(IfcBackendCommand::Remove {
+            aor: aor.to_string(),
+        });
+    }
+}
+
+/// Spawn the iFC backend writer task using a Redis connection.
+///
+/// Returns an [`IfcBackendWriter`] handle. The task runs until the sender
+/// is dropped (i.e., until the `IfcStore` is dropped).
+#[cfg(feature = "redis-backend")]
+pub fn spawn_ifc_backend_writer(
+    mut connection: redis::aio::MultiplexedConnection,
+    key_prefix: String,
+) -> IfcBackendWriter {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        use redis::AsyncCommands;
+
+        while let Some(command) = receiver.recv().await {
+            match command {
+                IfcBackendCommand::Save { aor, xml } => {
+                    let key = format!("{key_prefix}{aor}");
+                    let result: Result<(), redis::RedisError> =
+                        connection.set(&key, xml.as_str()).await;
+                    if let Err(error) = result {
+                        warn!(aor, %error, "iFC backend write-through save failed");
+                    }
+                }
+                IfcBackendCommand::Remove { aor } => {
+                    let key = format!("{key_prefix}{aor}");
+                    let result: Result<(), redis::RedisError> = connection.del(&key).await;
+                    if let Err(error) = result {
+                        warn!(aor, %error, "iFC backend write-through remove failed");
+                    }
+                }
+            }
+        }
+    });
+
+    IfcBackendWriter { sender }
+}
+
+/// Restore iFC profiles from Redis into an `IfcStore`.
+///
+/// Scans for all keys with the given prefix, loads the raw XML, parses it,
+/// and stores the parsed profiles in the store.
+///
+/// Returns `(profile_count, ifc_count)` — number of AoRs restored and total iFCs.
+#[cfg(feature = "redis-backend")]
+pub async fn restore_ifc_profiles(
+    connection: &mut redis::aio::MultiplexedConnection,
+    key_prefix: &str,
+    store: &IfcStore,
+) -> Result<(usize, usize), String> {
+    use redis::AsyncCommands;
+
+    let pattern = format!("{key_prefix}*");
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(&pattern)
+        .query_async(connection)
+        .await
+        .map_err(|error| format!("KEYS scan failed: {error}"))?;
+
+    let mut profile_count = 0usize;
+    let mut ifc_count = 0usize;
+
+    for key in &keys {
+        let xml: Option<String> = connection.get(key).await.map_err(|error| {
+            format!("GET {key} failed: {error}")
+        })?;
+
+        if let Some(xml) = xml {
+            let aor = key.strip_prefix(key_prefix).unwrap_or(key);
+            match parse_service_profile(&xml) {
+                Ok(ifcs) => {
+                    ifc_count += ifcs.len();
+                    profile_count += 1;
+                    store.profiles.insert(aor.to_string(), ifcs);
+                    // Also store the raw XML for potential re-persistence.
+                    store.raw_xml.insert(aor.to_string(), xml);
+                }
+                Err(error) => {
+                    warn!(aor, %error, "skipping invalid iFC XML from Redis");
+                }
+            }
+        }
+    }
+
+    Ok((profile_count, ifc_count))
+}
+
+// ---------------------------------------------------------------------------
+// IfcStore — thread-safe per-user + global iFC store with optional persistence
+// ---------------------------------------------------------------------------
+
+/// Thread-safe store for per-user and global Initial Filter Criteria.
+///
+/// The S-CSCF stores per-user iFC profiles received from the HSS via Cx SAR,
+/// and optionally a set of global/static iFCs loaded from config as a fallback.
+///
+/// Evaluation checks per-user profiles first, falling back to global rules.
+///
+/// When a backend writer is configured (via `set_backend_writer`), profile
+/// changes are persisted to Redis asynchronously for crash recovery.
+pub struct IfcStore {
+    /// Per-user iFC profiles (AoR → parsed iFCs).
+    profiles: DashMap<String, Vec<InitialFilterCriteria>>,
+    /// Raw XML per AoR — kept for Redis persistence (we persist XML, not structs).
+    raw_xml: DashMap<String, String>,
+    /// Global/static iFCs from config (fallback when no per-user profile exists).
+    global: Vec<InitialFilterCriteria>,
+    /// Optional backend writer for Redis persistence.
+    backend_writer: OnceLock<IfcBackendWriter>,
+}
+
+impl IfcStore {
+    /// Create a new store with optional global/static iFCs.
+    pub fn new(global: Vec<InitialFilterCriteria>) -> Self {
+        Self {
+            profiles: DashMap::new(),
+            raw_xml: DashMap::new(),
+            global,
+            backend_writer: OnceLock::new(),
+        }
+    }
+
+    /// Set the backend writer for Redis persistence.
+    ///
+    /// Must be called once at startup, before any user script runs.
+    pub fn set_backend_writer(&self, writer: IfcBackendWriter) {
+        let _ = self.backend_writer.set(writer);
+    }
+
+    /// Store a parsed iFC profile for an AoR (from Cx SAR user_data XML).
+    ///
+    /// Replaces any existing profile for that AoR.
+    pub fn store_profile(&self, aor: &str, ifcs: Vec<InitialFilterCriteria>) {
+        self.profiles.insert(aor.to_string(), ifcs);
+    }
+
+    /// Store raw iFC XML for an AoR — parses, stores, and persists to backend.
+    ///
+    /// Returns the number of iFCs parsed, or an error if the XML is invalid.
+    pub fn store_profile_xml(&self, aor: &str, xml: &str) -> Result<usize, IfcError> {
+        let ifcs = parse_service_profile(xml)?;
+        let count = ifcs.len();
+        self.profiles.insert(aor.to_string(), ifcs);
+        self.raw_xml.insert(aor.to_string(), xml.to_string());
+
+        // Persist to Redis (fire-and-forget).
+        if let Some(writer) = self.backend_writer.get() {
+            writer.save(aor, xml);
+        }
+
+        Ok(count)
+    }
+
+    /// Remove the stored profile for an AoR.
+    ///
+    /// Returns `true` if a profile was actually removed.
+    pub fn remove_profile(&self, aor: &str) -> bool {
+        let removed = self.profiles.remove(aor).is_some();
+        self.raw_xml.remove(aor);
+
+        // Remove from Redis (fire-and-forget).
+        if removed {
+            if let Some(writer) = self.backend_writer.get() {
+                writer.remove(aor);
+            }
+        }
+
+        removed
+    }
+
+    /// Check whether a profile is stored for an AoR.
+    pub fn has_profile(&self, aor: &str) -> bool {
+        self.profiles.contains_key(aor)
+    }
+
+    /// Evaluate iFCs for a request, returning matching Application Servers.
+    ///
+    /// Checks per-user profile first; falls back to global rules if no
+    /// per-user profile exists for the given AoR.
+    pub fn evaluate(
+        &self,
+        aor: &str,
+        method: &str,
+        request_uri: &str,
+        headers: &[(String, String)],
+        session_case: SessionCase,
+    ) -> Vec<MatchedApplicationServer> {
+        if let Some(user_ifcs) = self.profiles.get(aor) {
+            Self::evaluate_ifcs(&user_ifcs, method, request_uri, headers, session_case)
+        } else {
+            Self::evaluate_ifcs(&self.global, method, request_uri, headers, session_case)
+        }
+    }
+
+    /// Number of stored per-user profiles.
+    pub fn profile_count(&self) -> usize {
+        self.profiles.len()
+    }
+
+    fn evaluate_ifcs(
+        ifcs: &[InitialFilterCriteria],
+        method: &str,
+        request_uri: &str,
+        headers: &[(String, String)],
+        session_case: SessionCase,
+    ) -> Vec<MatchedApplicationServer> {
+        let mut sorted: Vec<&InitialFilterCriteria> = ifcs.iter().collect();
+        sorted.sort_by_key(|ifc| ifc.priority);
+
+        sorted
+            .into_iter()
+            .filter(|ifc| matches_ifc(ifc, method, request_uri, headers, session_case))
+            .map(MatchedApplicationServer::from)
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,5 +1640,202 @@ mod tests {
         assert_eq!(app_server.service_info.as_deref(), Some("mmtel;conference"));
         assert!(app_server.include_register_request);
         assert!(app_server.include_register_response);
+    }
+
+    // -----------------------------------------------------------------------
+    // IfcStore tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn store_new_empty() {
+        let store = IfcStore::new(vec![]);
+        assert_eq!(store.profile_count(), 0);
+        assert!(!store.has_profile("sip:alice@example.com"));
+    }
+
+    #[test]
+    fn store_and_evaluate_per_user() {
+        let store = IfcStore::new(vec![]);
+
+        let xml = simple_ifc_xml();
+        let count = store.store_profile_xml("sip:alice@example.com", xml).unwrap();
+        assert_eq!(count, 1);
+        assert!(store.has_profile("sip:alice@example.com"));
+        assert_eq!(store.profile_count(), 1);
+
+        let results = store.evaluate(
+            "sip:alice@example.com",
+            "INVITE",
+            "sip:bob@example.com",
+            &[],
+            SessionCase::Originating,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].server_name, "sip:mmtel@example.com");
+        assert_eq!(results[0].priority, 0);
+        assert_eq!(results[0].default_handling, 0);
+    }
+
+    #[test]
+    fn store_fallback_to_global() {
+        let global_ifcs = parse_service_profile(simple_ifc_xml()).unwrap();
+        let store = IfcStore::new(global_ifcs);
+
+        // No per-user profile → should use global rules.
+        let results = store.evaluate(
+            "sip:unknown@example.com",
+            "INVITE",
+            "sip:bob@example.com",
+            &[],
+            SessionCase::Originating,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].server_name, "sip:mmtel@example.com");
+    }
+
+    #[test]
+    fn store_per_user_overrides_global() {
+        let global_ifcs = parse_service_profile(simple_ifc_xml()).unwrap();
+        let store = IfcStore::new(global_ifcs);
+
+        // Store a different profile for alice.
+        let custom_xml = concat!(
+            "<ServiceProfile>\n",
+            "  <InitialFilterCriteria>\n",
+            "    <Priority>5</Priority>\n",
+            "    <TriggerPoint>\n",
+            "      <ConditionTypeCNF>1</ConditionTypeCNF>\n",
+            "      <SPT>\n",
+            "        <ConditionNegated>0</ConditionNegated>\n",
+            "        <Group>0</Group>\n",
+            "        <Method>INVITE</Method>\n",
+            "      </SPT>\n",
+            "    </TriggerPoint>\n",
+            "    <ApplicationServer>\n",
+            "      <ServerName>sip:custom-as@alice.com</ServerName>\n",
+            "      <DefaultHandling>1</DefaultHandling>\n",
+            "    </ApplicationServer>\n",
+            "  </InitialFilterCriteria>\n",
+            "</ServiceProfile>\n",
+        );
+        store.store_profile_xml("sip:alice@example.com", custom_xml).unwrap();
+
+        let results = store.evaluate(
+            "sip:alice@example.com",
+            "INVITE",
+            "sip:bob@example.com",
+            &[],
+            SessionCase::Originating,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].server_name, "sip:custom-as@alice.com");
+        assert_eq!(results[0].default_handling, 1);
+        assert_eq!(results[0].priority, 5);
+    }
+
+    #[test]
+    fn store_remove_profile() {
+        let store = IfcStore::new(vec![]);
+
+        store.store_profile_xml("sip:alice@example.com", simple_ifc_xml()).unwrap();
+        assert!(store.has_profile("sip:alice@example.com"));
+
+        assert!(store.remove_profile("sip:alice@example.com"));
+        assert!(!store.has_profile("sip:alice@example.com"));
+
+        // Removing non-existent profile returns false.
+        assert!(!store.remove_profile("sip:alice@example.com"));
+    }
+
+    #[test]
+    fn store_invalid_xml() {
+        let store = IfcStore::new(vec![]);
+        // Malformed XML that the parser cannot handle.
+        let result = store.store_profile_xml("sip:alice@example.com", "<<<totally broken");
+        assert!(result.is_err());
+        assert!(!store.has_profile("sip:alice@example.com"));
+    }
+
+    #[test]
+    fn store_empty_service_profile() {
+        let store = IfcStore::new(vec![]);
+        // Valid XML but no iFCs — should succeed with count 0.
+        let result = store.store_profile_xml(
+            "sip:alice@example.com",
+            "<ServiceProfile></ServiceProfile>",
+        );
+        assert_eq!(result.unwrap(), 0);
+        assert!(store.has_profile("sip:alice@example.com"));
+    }
+
+    #[test]
+    fn store_evaluate_no_match() {
+        let store = IfcStore::new(vec![]);
+        store.store_profile_xml("sip:alice@example.com", simple_ifc_xml()).unwrap();
+
+        // REGISTER doesn't match the INVITE-only trigger.
+        let results = store.evaluate(
+            "sip:alice@example.com",
+            "REGISTER",
+            "sip:bob@example.com",
+            &[],
+            SessionCase::Originating,
+        );
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn store_thread_safety() {
+        let store = Arc::new(IfcStore::new(vec![]));
+        let mut handles = vec![];
+
+        for i in 0..10 {
+            let store_clone = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let aor = format!("sip:user{}@example.com", i);
+                store_clone
+                    .store_profile_xml(&aor, simple_ifc_xml())
+                    .unwrap();
+                let results = store_clone.evaluate(
+                    &aor,
+                    "INVITE",
+                    "sip:bob@example.com",
+                    &[],
+                    SessionCase::Originating,
+                );
+                assert_eq!(results.len(), 1);
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(store.profile_count(), 10);
+    }
+
+    #[test]
+    fn matched_application_server_from_ifc() {
+        let ifcs = parse_service_profile(concat!(
+            "<ServiceProfile>\n",
+            "  <InitialFilterCriteria>\n",
+            "    <Priority>3</Priority>\n",
+            "    <ApplicationServer>\n",
+            "      <ServerName>sip:as@example.com</ServerName>\n",
+            "      <DefaultHandling>1</DefaultHandling>\n",
+            "      <ServiceInfo>mmtel</ServiceInfo>\n",
+            "      <IncludeRegisterRequest>1</IncludeRegisterRequest>\n",
+            "    </ApplicationServer>\n",
+            "  </InitialFilterCriteria>\n",
+            "</ServiceProfile>\n",
+        ))
+        .unwrap();
+
+        let matched = MatchedApplicationServer::from(&ifcs[0]);
+        assert_eq!(matched.server_name, "sip:as@example.com");
+        assert_eq!(matched.default_handling, 1);
+        assert_eq!(matched.service_info.as_deref(), Some("mmtel"));
+        assert_eq!(matched.priority, 3);
+        assert!(matched.include_register_request);
+        assert!(!matched.include_register_response);
     }
 }

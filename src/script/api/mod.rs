@@ -12,6 +12,7 @@ pub mod call;
 pub mod cdr;
 pub mod diameter;
 pub mod gateway;
+pub mod isc;
 pub mod li;
 pub mod log;
 pub mod metrics;
@@ -62,6 +63,17 @@ static PRESENCE_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Metrics singleton — always available (like log).
 static METRICS_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// Optional ISC singleton — always available (iFC store for per-user + global rules).
+static ISC_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// The IfcStore Arc — stored so the backend can wire Redis persistence.
+static IFC_STORE_ARC: OnceLock<std::sync::Arc<crate::ifc::IfcStore>> = OnceLock::new();
+
+/// Get the shared IfcStore (set during iFC initialization).
+pub fn ifc_store_arc() -> Option<&'static std::sync::Arc<crate::ifc::IfcStore>> {
+    IFC_STORE_ARC.get()
+}
 
 /// The Registrar Arc — stored so the dispatcher can subscribe to change events.
 static REGISTRAR_ARC: OnceLock<std::sync::Arc<crate::registrar::Registrar>> = OnceLock::new();
@@ -241,6 +253,23 @@ pub fn set_metrics_singleton(
     Ok(())
 }
 
+/// Store the ISC singleton for injection into the siphon module.
+///
+/// Always called at startup — the iFC store is always available (even if
+/// no global iFCs are configured, per-user profiles can be stored dynamically).
+pub fn set_isc_singleton(
+    python: Python<'_>,
+    py_isc: isc::PyIsc,
+    store: std::sync::Arc<crate::ifc::IfcStore>,
+) -> Result<()> {
+    let isc_py: Py<PyAny> = Py::new(python, py_isc)
+        .map_err(|error| SiphonError::Script(format!("Py::new(isc): {error}")))?
+        .into_any();
+    let _ = ISC_SINGLETON.set(isc_py);
+    let _ = IFC_STORE_ARC.set(store);
+    Ok(())
+}
+
 /// Ensure the `_siphon_registry` module exists in `sys.modules`.
 ///
 /// Idempotent — safe to call multiple times.
@@ -374,6 +403,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("metrics", metrics_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr metrics: {error}")))?;
+    }
+
+    // Inject ISC singleton (always available — iFC store).
+    if let Some(isc_py) = ISC_SINGLETON.get() {
+        module
+            .setattr("isc", isc_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr isc: {error}")))?;
     }
 
     let sys = python

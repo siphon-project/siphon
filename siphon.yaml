@@ -509,6 +509,21 @@ auth:
 #       peers: ["cdf1"]
 
 # ---------------------------------------------------------------------------
+# ISC — Initial Filter Criteria (3GPP TS 29.228)
+# ---------------------------------------------------------------------------
+# Initial Filter Criteria define which Application Servers a SIP request must
+# be routed through at the S-CSCF. iFCs are typically downloaded per-user from
+# the HSS via Diameter Cx SAR, but can also be loaded from static XML.
+#
+# When the registrar backend is Redis, iFC profiles are automatically persisted
+# and restored on restart (avoids HSS storm on S-CSCF restart).
+#
+# isc:
+#   ifc_xml_path: "/etc/siphon/ifc.xml"     # path to ServiceProfile XML
+#   # ifc_xml: "<ServiceProfile>...</ServiceProfile>"  # inline XML (alternative)
+#   ifc_key_prefix: "siphon:ifc:"            # Redis key prefix (default)
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 log:

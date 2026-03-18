@@ -526,3 +526,44 @@ class _MetricsNamespace:
 
 
 metrics = _MetricsNamespace()
+
+
+# ---------------------------------------------------------------------------
+# ISC namespace (stub — replaced by Rust at startup)
+# ---------------------------------------------------------------------------
+
+class _IscNamespace:
+    """Initial Filter Criteria evaluation for ISC routing (stub).
+
+    Used by the S-CSCF to determine which Application Servers a SIP
+    request must be routed through, based on the subscriber's service
+    profile received from the HSS via Diameter Cx SAR.
+
+    Usage:
+        from siphon import isc
+
+        # Store per-user iFC profile (from Cx SAR user_data XML)
+        count = isc.store_profile("sip:alice@ims.example.com", ifc_xml)
+
+        # Evaluate iFCs for a request
+        matches = isc.evaluate("sip:alice@ims.example.com", "INVITE",
+                               "sip:bob@example.com", headers, "originating")
+    """
+
+    def store_profile(self, aor, ifc_xml):
+        raise NotImplementedError("isc.store_profile() not available — ISC not initialized")
+
+    def remove_profile(self, aor):
+        raise NotImplementedError("isc.remove_profile() not available — ISC not initialized")
+
+    def has_profile(self, aor):
+        raise NotImplementedError("isc.has_profile() not available — ISC not initialized")
+
+    def evaluate(self, aor, method, ruri, headers, session_case="originating"):
+        raise NotImplementedError("isc.evaluate() not available — ISC not initialized")
+
+    def profile_count(self):
+        raise NotImplementedError("isc.profile_count() not available — ISC not initialized")
+
+
+isc = _IscNamespace()

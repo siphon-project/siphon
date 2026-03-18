@@ -26,7 +26,7 @@ Config: examples/ims_scscf.yaml
 Note: In a lab without a real HSS, local AKA credentials (aka_credentials
       in the YAML config) substitute for Diameter Cx MAR/SAR.
 """
-from siphon import proxy, registrar, auth, diameter, presence, log
+from siphon import proxy, registrar, auth, diameter, presence, isc, log
 
 REALM = "ims.example.com"
 SCSCF_URI = f"sip:scscf.{REALM}:6060"
@@ -65,11 +65,16 @@ def handle_register(request):
         if result:
             log.info(f"SAR result_code={result.get('result_code')}")
             user_data_xml = result.get("user_data")
+            if user_data_xml:
+                count = isc.store_profile(public_id, user_data_xml)
+                log.info(f"stored {count} iFC rules for {public_id}")
         else:
             log.warn("SAR failed — proceeding with local data")
 
     if is_dereg:
         registrar.save(request)
+        if diameter.peer_count() > 0:
+            isc.remove_profile(public_id)
         request.reply(200, "OK")
         log.info(f"deregistered {request.from_uri}")
         return
@@ -210,16 +215,43 @@ def handle_request(request):
             icid = request.generate_icid()
             request.set_header("P-Charging-Vector", f'icid-value="{icid}"')
 
-        # iFC evaluation would happen here in production:
-        # Each matching iFC routes the request to an Application Server.
-        # The AS processes and returns the request to S-CSCF for the next iFC.
+        # Evaluate originating iFCs — route through matching Application Servers.
+        aor = str(request.from_uri)
+        headers = [("P-Asserted-Identity", request.get_header("P-Asserted-Identity") or "")]
+        matches = isc.evaluate(aor, request.method, str(request.ruri),
+                               headers, "originating")
+        if matches:
+            # Route to the first matching AS. The AS processes the request
+            # and returns it to the S-CSCF (via Route header) for the next
+            # iFC or final routing. Full ISC chaining is handled by the
+            # AS sending back through the S-CSCF's Route.
+            target_as = matches[0]["server_name"]
+            log.info(f"iFC: routing to AS {target_as} "
+                     f"(priority={matches[0]['priority']}, "
+                     f"default_handling={matches[0]['default_handling']})")
+            request.record_route()
+            # Prepend Route so the request returns to S-CSCF after AS processing.
+            request.prepend_route(f"<sip:orig@{REALM}:6060;lr>")
+            request.relay(target_as)
+            return
 
     else:
         log.info(f"terminating {request.method} to {request.ruri}")
 
-        # iFC evaluation for terminating side would happen here.
+        # Evaluate terminating iFCs for the called user.
+        aor = str(request.ruri)
+        headers = []
+        matches = isc.evaluate(aor, request.method, str(request.ruri),
+                               headers, "terminating")
+        if matches:
+            target_as = matches[0]["server_name"]
+            log.info(f"iFC: routing to AS {target_as} "
+                     f"(priority={matches[0]['priority']})")
+            request.record_route()
+            request.relay(target_as)
+            return
 
-    # After iFC evaluation, perform location lookup for the target.
+    # After iFC evaluation (or no iFCs matched), perform location lookup.
     contacts = registrar.lookup(str(request.ruri))
     if not contacts:
         request.reply(404, "User Not Found")

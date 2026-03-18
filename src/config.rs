@@ -1768,6 +1768,15 @@ pub struct IscConfig {
     pub ifc_xml_path: Option<String>,
     /// Inline iFC XML (alternative to file path).
     pub ifc_xml: Option<String>,
+    /// Redis key prefix for iFC profile persistence (default: "siphon:ifc:").
+    /// When the registrar backend is Redis, iFC profiles are automatically
+    /// persisted and restored alongside registrations.
+    #[serde(default = "default_ifc_key_prefix")]
+    pub ifc_key_prefix: String,
+}
+
+fn default_ifc_key_prefix() -> String {
+    "siphon:ifc:".to_owned()
 }
 
 // ---------------------------------------------------------------------------

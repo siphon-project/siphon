@@ -524,29 +524,47 @@ impl SiphonServer {
         };
 
         // --- iFC evaluation engine ---
-        if let Some(ref isc_config) = config.isc {
-            let xml = if let Some(ref path) = isc_config.ifc_xml_path {
-                match std::fs::read_to_string(path) {
-                    Ok(contents) => Some(contents),
-                    Err(error) => {
-                        error!("failed to read iFC XML from {path}: {error}");
-                        None
+        {
+            let global_ifcs = if let Some(ref isc_config) = config.isc {
+                let xml = if let Some(ref path) = isc_config.ifc_xml_path {
+                    match std::fs::read_to_string(path) {
+                        Ok(contents) => Some(contents),
+                        Err(error) => {
+                            error!("failed to read iFC XML from {path}: {error}");
+                            None
+                        }
                     }
+                } else {
+                    isc_config.ifc_xml.clone()
+                };
+
+                if let Some(xml) = xml {
+                    match crate::ifc::parse_service_profile(&xml) {
+                        Ok(ifcs) => {
+                            info!(count = ifcs.len(), "iFC rules loaded from config");
+                            ifcs
+                        }
+                        Err(error) => {
+                            error!("failed to parse iFC XML: {error}");
+                            vec![]
+                        }
+                    }
+                } else {
+                    vec![]
                 }
             } else {
-                isc_config.ifc_xml.clone()
+                vec![]
             };
 
-            if let Some(xml) = xml {
-                match crate::ifc::parse_service_profile(&xml) {
-                    Ok(ifcs) => {
-                        info!(count = ifcs.len(), "iFC rules loaded");
-                    }
-                    Err(error) => {
-                        error!("failed to parse iFC XML: {error}");
-                    }
+            let ifc_store = Arc::new(crate::ifc::IfcStore::new(global_ifcs));
+            pyo3::Python::attach(|python| {
+                let py_isc = crate::script::api::isc::PyIsc::new(Arc::clone(&ifc_store));
+                if let Err(error) = crate::script::api::set_isc_singleton(python, py_isc, Arc::clone(&ifc_store)) {
+                    error!("failed to store ISC singleton: {error}");
+                } else {
+                    info!("ISC namespace registered for injection");
                 }
-            }
+            });
         }
 
         // --- SBI client ---
@@ -721,18 +739,19 @@ async fn init_registrar_backend(config: &Config) {
 
     match config.registrar.backend {
         RegistrarBackendType::Redis => {
-            let redis_config = match &config.registrar.redis {
-                Some(cfg) => backend::RedisBackendConfig {
-                    url: cfg.url.clone(),
-                    urls: Vec::new(),
-                    key_prefix: cfg.key_prefix.clone(),
-                    shard_count: 0,
-                    ttl_slack_secs: cfg.ttl_slack_secs as u64,
-                },
+            let redis_cfg = match &config.registrar.redis {
+                Some(redis_cfg) => redis_cfg,
                 None => {
                     error!("registrar backend is redis but no redis config provided");
                     return;
                 }
+            };
+            let redis_config = backend::RedisBackendConfig {
+                url: redis_cfg.url.clone(),
+                urls: Vec::new(),
+                key_prefix: redis_cfg.key_prefix.clone(),
+                shard_count: 0,
+                ttl_slack_secs: redis_cfg.ttl_slack_secs as u64,
             };
             match backend::RedisBackend::connect(redis_config).await {
                 Ok(redis_backend) => {
@@ -745,6 +764,9 @@ async fn init_registrar_backend(config: &Config) {
                         }
                     }
                     registrar.set_backend_writer(backend::spawn_backend_writer(redis_backend));
+
+                    // --- iFC profile persistence (shares the same Redis instance) ---
+                    init_ifc_redis_backend(&redis_cfg.url, config).await;
                 }
                 Err(err) => {
                     error!(%err, "failed to connect to Redis registrar backend");
@@ -783,6 +805,59 @@ async fn init_registrar_backend(config: &Config) {
         }
         RegistrarBackendType::Memory | RegistrarBackendType::Python => {}
     }
+}
+
+/// Initialize iFC Redis persistence — restore profiles and wire the backend writer.
+///
+/// Called from `init_registrar_backend` when the registrar uses a Redis backend,
+/// reusing the same Redis instance for iFC profile storage.
+#[cfg(feature = "redis-backend")]
+async fn init_ifc_redis_backend(redis_url: &str, config: &Config) {
+    use crate::script::api::ifc_store_arc;
+
+    let ifc_store = match ifc_store_arc() {
+        Some(store) => store,
+        None => return,
+    };
+
+    let ifc_key_prefix = config
+        .isc
+        .as_ref()
+        .map(|isc| isc.ifc_key_prefix.clone())
+        .unwrap_or_else(|| "siphon:ifc:".to_owned());
+
+    let client = match redis::Client::open(redis_url) {
+        Ok(client) => client,
+        Err(error) => {
+            error!(%error, "failed to open Redis client for iFC backend");
+            return;
+        }
+    };
+
+    let mut connection = match client.get_multiplexed_async_connection().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            error!(%error, "failed to connect to Redis for iFC backend");
+            return;
+        }
+    };
+
+    // Restore iFC profiles from Redis.
+    match crate::ifc::restore_ifc_profiles(&mut connection, &ifc_key_prefix, ifc_store).await {
+        Ok((profiles, ifcs)) => {
+            if profiles > 0 {
+                info!(profiles, ifcs, "restored iFC profiles from Redis");
+            }
+        }
+        Err(error) => {
+            error!(error, "failed to restore iFC profiles from Redis");
+        }
+    }
+
+    // Wire the backend writer for ongoing persistence.
+    let writer = crate::ifc::spawn_ifc_backend_writer(connection, ifc_key_prefix);
+    ifc_store.set_backend_writer(writer);
+    info!("iFC Redis backend writer initialized");
 }
 
 fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {

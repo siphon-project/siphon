@@ -2299,6 +2299,128 @@ class MockMetrics:
 _metrics = MockMetrics()
 
 
+class MockIsc:
+    """Mock ISC namespace — Initial Filter Criteria evaluation for testing.
+
+    Store per-user iFC profiles and evaluate them against requests.
+
+    Example::
+
+        from siphon_sdk import mock_module
+        mock_module.install()
+
+        from siphon import isc
+
+        # Store a profile (in mock, stores raw XML string)
+        count = isc.store_profile("sip:alice@example.com", ifc_xml)
+
+        # Evaluate — returns pre-configured matches
+        matches = isc.evaluate("sip:alice@example.com", "INVITE",
+                               "sip:bob@example.com", [], "originating")
+    """
+
+    def __init__(self) -> None:
+        self._profiles: dict[str, str] = {}  # aor -> raw XML (stored for has_profile)
+        self._eval_results: dict[str, list[dict]] = {}  # aor -> list of match dicts
+
+    def store_profile(self, aor: str, ifc_xml: str) -> int:
+        """Parse and store an iFC XML profile for an AoR.
+
+        In the mock, the XML is stored as-is (no actual parsing).
+        Use ``set_eval_results()`` to configure what ``evaluate()`` returns.
+
+        Args:
+            aor: Address of Record.
+            ifc_xml: Raw iFC XML string.
+
+        Returns:
+            Number of iFCs "parsed" (always 1 in mock unless configured otherwise).
+        """
+        self._profiles[aor] = ifc_xml
+        return 1
+
+    def remove_profile(self, aor: str) -> bool:
+        """Remove a stored profile.
+
+        Args:
+            aor: Address of Record.
+
+        Returns:
+            ``True`` if a profile was removed.
+        """
+        removed = aor in self._profiles
+        self._profiles.pop(aor, None)
+        self._eval_results.pop(aor, None)
+        return removed
+
+    def has_profile(self, aor: str) -> bool:
+        """Check if a profile is stored for an AoR.
+
+        Args:
+            aor: Address of Record.
+
+        Returns:
+            ``True`` if a profile exists.
+        """
+        return aor in self._profiles
+
+    def evaluate(
+        self,
+        aor: str,
+        method: str,
+        ruri: str,
+        headers: "list[tuple[str, str]]",
+        session_case: str = "originating",
+    ) -> list[dict]:
+        """Evaluate iFCs for a request.
+
+        Returns pre-configured results (via ``set_eval_results``) or an empty list.
+
+        Args:
+            aor: Address of Record.
+            method: SIP method (e.g. ``"INVITE"``).
+            ruri: Request-URI string.
+            headers: List of (name, value) tuples.
+            session_case: Session case string.
+
+        Returns:
+            List of dicts with keys: ``server_name``, ``default_handling``,
+            ``service_info``, ``priority``.
+        """
+        return list(self._eval_results.get(aor, []))
+
+    def profile_count(self) -> int:
+        """Number of stored per-user iFC profiles."""
+        return len(self._profiles)
+
+    # -- Test helpers (not in the real Rust API) --
+
+    def set_eval_results(self, aor: str, results: list[dict]) -> None:
+        """Configure what ``evaluate()`` returns for a given AoR.
+
+        Args:
+            aor: Address of Record.
+            results: List of dicts, each with keys ``server_name``,
+                ``default_handling``, ``service_info``, ``priority``.
+
+        Example::
+
+            isc.set_eval_results("sip:alice@example.com", [
+                {"server_name": "sip:as1@example.com", "default_handling": 0,
+                 "service_info": None, "priority": 0},
+            ])
+        """
+        self._eval_results[aor] = results
+
+    def clear(self) -> None:
+        """Reset all stored profiles and evaluation results."""
+        self._profiles.clear()
+        self._eval_results.clear()
+
+
+_isc = MockIsc()
+
+
 def install() -> ModuleType:
     """Install the mock ``siphon`` module into ``sys.modules``.
 
@@ -2329,6 +2451,7 @@ def install() -> ModuleType:
     mod.srs = _srs  # type: ignore[attr-defined]
     mod.timer = _timer  # type: ignore[attr-defined]
     mod.metrics = _metrics  # type: ignore[attr-defined]
+    mod.isc = _isc  # type: ignore[attr-defined]
 
     # Also install the _siphon_registry mock
     registry_mod = ModuleType("_siphon_registry")
@@ -2357,6 +2480,7 @@ def reset() -> None:
     _presence.clear()
     _srs.clear()
     _metrics.clear()
+    _isc.clear()
     _auth._allow = False
     _auth._credentials.clear()
     _proxy._utils._rate_limit_allow = True
@@ -2443,3 +2567,8 @@ def get_timer() -> MockTimer:
 def get_metrics() -> MockMetrics:
     """Access the mock metrics singleton."""
     return _metrics
+
+
+def get_isc() -> MockIsc:
+    """Access the mock ISC singleton."""
+    return _isc

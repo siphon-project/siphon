@@ -94,23 +94,35 @@ diameter:
 # ---------------------------------------------------------------------------
 # Initial Filter Criteria (iFC) — application server routing
 # ---------------------------------------------------------------------------
-# iFCs are XML documents downloaded from the HSS during SAR.
-# They define which application servers should be triggered for
-# each request type (originating/terminating).
+# iFCs are typically downloaded per-user from the HSS via Diameter Cx SAR
+# (stored via isc.store_profile() in the script). For lab testing without
+# an HSS, static iFCs can be loaded from XML:
 #
-# For lab testing, static iFCs can be configured:
 # isc:
-#   filter_criteria:
-#     - priority: 0
-#       trigger:
-#         method: "INVITE"
-#         session_case: originating
-#       application_server: "sip:as1.ims.example.com:5060"
-#     - priority: 1
-#       trigger:
-#         method: "INVITE"
-#         session_case: terminating
-#       application_server: "sip:voicemail.ims.example.com:5060"
+#   ifc_xml: |
+#     <ServiceProfile>
+#       <InitialFilterCriteria>
+#         <Priority>0</Priority>
+#         <TriggerPoint>
+#           <ConditionTypeCNF>1</ConditionTypeCNF>
+#           <SPT>
+#             <ConditionNegated>0</ConditionNegated>
+#             <Group>0</Group>
+#             <Method>INVITE</Method>
+#           </SPT>
+#           <SPT>
+#             <ConditionNegated>0</ConditionNegated>
+#             <Group>0</Group>
+#             <SessionCase>0</SessionCase>
+#           </SPT>
+#         </TriggerPoint>
+#         <ApplicationServer>
+#           <ServerName>sip:mmtel.ims.example.com:5060</ServerName>
+#           <DefaultHandling>0</DefaultHandling>
+#         </ApplicationServer>
+#       </InitialFilterCriteria>
+#     </ServiceProfile>
+#   ifc_key_prefix: "siphon:ifc:"   # Redis persistence key prefix
 
 # ---------------------------------------------------------------------------
 # Transaction timers
