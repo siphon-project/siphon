@@ -169,6 +169,10 @@ pub struct ProbeConfig {
     pub enabled: bool,
     pub interval: Duration,
     pub failure_threshold: u32,
+    /// User part for the From URI in OPTIONS probes (default: "siphon").
+    pub from_user: Option<String>,
+    /// Host part for the From URI in OPTIONS probes (default: local IP).
+    pub from_domain: Option<String>,
 }
 
 impl Default for ProbeConfig {
@@ -177,6 +181,8 @@ impl Default for ProbeConfig {
             enabled: true,
             interval: Duration::from_secs(30),
             failure_threshold: 3,
+            from_user: None,
+            from_domain: None,
         }
     }
 }
@@ -430,6 +436,8 @@ pub fn spawn_health_probers(
         let uac = Arc::clone(&uac_sender);
         let interval = group.probe_config.interval;
         let threshold = group.probe_config.failure_threshold;
+        let from_user = group.probe_config.from_user.clone();
+        let from_domain = group.probe_config.from_domain.clone();
 
         info!(
             group = %group.name,
@@ -442,7 +450,7 @@ pub fn spawn_health_probers(
             let mut tick = tokio::time::interval(interval);
             loop {
                 tick.tick().await;
-                probe_group(&group, &uac, threshold).await;
+                probe_group(&group, &uac, threshold, from_user.as_deref(), from_domain.as_deref()).await;
             }
         });
     }
@@ -452,9 +460,11 @@ async fn probe_group(
     group: &DispatcherGroup,
     uac_sender: &UacSender,
     failure_threshold: u32,
+    from_user: Option<&str>,
+    from_domain: Option<&str>,
 ) {
     for dest in group.all_destinations() {
-        probe_destination(dest, uac_sender, failure_threshold).await;
+        probe_destination(dest, uac_sender, failure_threshold, from_user, from_domain).await;
     }
 }
 
@@ -462,6 +472,8 @@ async fn probe_destination(
     dest: &Destination,
     uac_sender: &UacSender,
     failure_threshold: u32,
+    from_user: Option<&str>,
+    from_domain: Option<&str>,
 ) {
     // Build R-URI from the gateway's configured URI hostname (not the resolved IP).
     let host_part = dest.uri
@@ -482,10 +494,12 @@ async fn probe_destination(
         );
     }
 
-    let receiver = uac_sender.send_options(
+    let receiver = uac_sender.send_options_with_identity(
         current_addr,
         dest.transport,
         request_uri,
+        from_user,
+        from_domain,
     );
 
     let result = tokio::time::timeout(Duration::from_secs(5), receiver).await;
@@ -933,11 +947,15 @@ mod tests {
             enabled: true,
             interval: Duration::from_secs(10),
             failure_threshold: 5,
+            from_user: Some("bgcf".to_string()),
+            from_domain: Some("example.com".to_string()),
         });
 
         assert!(group.probe_config.enabled);
         assert_eq!(group.probe_config.interval, Duration::from_secs(10));
         assert_eq!(group.probe_config.failure_threshold, 5);
+        assert_eq!(group.probe_config.from_user.as_deref(), Some("bgcf"));
+        assert_eq!(group.probe_config.from_domain.as_deref(), Some("example.com"));
     }
 
     #[test]
@@ -1008,7 +1026,7 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let uac_sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), std::collections::HashMap::new(), std::collections::HashMap::new(), None, None));
+        let uac_sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), std::collections::HashMap::new(), std::collections::HashMap::new(), None, None, None));
         let manager = Arc::new(DispatcherManager::new());
 
         manager.add_group(DispatcherGroup::new(
@@ -1019,7 +1037,7 @@ mod tests {
 
         // Probe with threshold=1 — first failure should mark down
         let group = manager.get_group("test").unwrap();
-        probe_group(&group, &uac_sender, 1).await;
+        probe_group(&group, &uac_sender, 1, None, None).await;
 
         let status = group.status();
         assert_eq!(status[0].1, false);

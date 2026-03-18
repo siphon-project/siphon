@@ -93,6 +93,8 @@ pub struct UacSender {
     advertised_address: Option<String>,
     /// HEP capture sender (if tracing is enabled).
     hep_sender: Option<Arc<HepSender>>,
+    /// User-Agent header value (from `server.user_agent_header` config).
+    user_agent_header: Option<String>,
     /// Pending requests keyed by branch parameter.
     pending: Arc<DashMap<String, PendingRequest>>,
     cseq_counter: std::sync::atomic::AtomicU32,
@@ -106,6 +108,7 @@ impl UacSender {
         advertised_addrs: HashMap<Transport, String>,
         advertised_address: Option<String>,
         hep_sender: Option<Arc<HepSender>>,
+        user_agent_header: Option<String>,
     ) -> Self {
         Self {
             outbound,
@@ -114,6 +117,7 @@ impl UacSender {
             advertised_addrs,
             advertised_address,
             hep_sender,
+            user_agent_header,
             pending: Arc::new(DashMap::new()),
             cseq_counter: std::sync::atomic::AtomicU32::new(1),
         }
@@ -136,6 +140,18 @@ impl UacSender {
         transport: Transport,
         request_uri: SipUri,
     ) -> oneshot::Receiver<UacResult> {
+        self.send_options_with_identity(destination, transport, request_uri, None, None)
+    }
+
+    /// Send an OPTIONS request with custom From identity.
+    pub fn send_options_with_identity(
+        &self,
+        destination: SocketAddr,
+        transport: Transport,
+        request_uri: SipUri,
+        from_user: Option<&str>,
+        from_domain: Option<&str>,
+    ) -> oneshot::Receiver<UacResult> {
         let branch = format!("z9hG4bK-uac-{}", uuid::Uuid::new_v4());
         let cseq = self
             .cseq_counter
@@ -147,16 +163,27 @@ impl UacSender {
             transport, addr.ip(), addr.port(), branch
         );
 
-        let message = match SipMessageBuilder::new()
+        let from_name = from_user.unwrap_or("siphon");
+        let from_host_str = from_domain
+            .map(|domain| domain.to_string())
+            .unwrap_or_else(|| addr.ip().to_string());
+        let from_uri = format!("<sip:{from_name}@{from_host_str}>;tag=uac-{cseq}");
+
+        let mut builder = SipMessageBuilder::new()
             .request(Method::Options, request_uri.clone())
             .via(via)
             .to(format!("<{request_uri}>"))
-            .from(format!("<sip:siphon@{}>;tag=uac-{}", addr.ip(), cseq))
+            .from(from_uri)
             .call_id(format!("uac-keepalive-{}", uuid::Uuid::new_v4()))
             .cseq(format!("{cseq} OPTIONS"))
             .max_forwards(70)
-            .content_length(0)
-            .build()
+            .content_length(0);
+
+        if let Some(ref user_agent) = self.user_agent_header {
+            builder = builder.header("User-Agent", user_agent.clone());
+        }
+
+        let message = match builder.build()
         {
             Ok(message) => message,
             Err(error) => {
@@ -306,7 +333,7 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let sender = UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), HashMap::new(), HashMap::new(), None, None);
+        let sender = UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), HashMap::new(), HashMap::new(), None, None, None);
         let receivers = vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx];
         (sender, receivers)
     }
@@ -445,6 +472,99 @@ mod tests {
         let outbound = udp_rx.try_recv().unwrap();
         assert_eq!(outbound.destination, "10.0.0.5:5060".parse().unwrap());
         assert!(!outbound.data.is_empty());
+    }
+
+    // --- resolve_via_addr tests ---
+
+    #[test]
+    fn send_options_includes_user_agent_when_configured() {
+        let (udp_tx, udp_rx) = flume::unbounded();
+        let (tcp_tx, _tcp_rx) = flume::unbounded();
+        let (tls_tx, _tls_rx) = flume::unbounded();
+        let (ws_tx, _ws_rx) = flume::unbounded();
+        let (wss_tx, _wss_rx) = flume::unbounded();
+        let (sctp_tx, _sctp_rx) = flume::unbounded();
+
+        let router = Arc::new(OutboundRouter {
+            udp: udp_tx, tcp: tcp_tx, tls: tls_tx, ws: ws_tx, wss: wss_tx, sctp: sctp_tx,
+        });
+
+        let sender = UacSender::new(
+            router, "127.0.0.1:5060".parse().unwrap(),
+            HashMap::new(), HashMap::new(), None, None,
+            Some("SIPhon/0.1".to_string()),
+        );
+
+        let _receiver = sender.send_options(
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("10.0.0.1".to_string()),
+        );
+
+        let outbound = udp_rx.try_recv().unwrap();
+        let raw = String::from_utf8_lossy(&outbound.data);
+        assert!(raw.contains("User-Agent: SIPhon/0.1"), "missing User-Agent header: {raw}");
+    }
+
+    #[test]
+    fn send_options_with_identity_overrides_from() {
+        let (udp_tx, udp_rx) = flume::unbounded();
+        let (tcp_tx, _tcp_rx) = flume::unbounded();
+        let (tls_tx, _tls_rx) = flume::unbounded();
+        let (ws_tx, _ws_rx) = flume::unbounded();
+        let (wss_tx, _wss_rx) = flume::unbounded();
+        let (sctp_tx, _sctp_rx) = flume::unbounded();
+
+        let router = Arc::new(OutboundRouter {
+            udp: udp_tx, tcp: tcp_tx, tls: tls_tx, ws: ws_tx, wss: wss_tx, sctp: sctp_tx,
+        });
+
+        let sender = UacSender::new(
+            router, "127.0.0.1:5060".parse().unwrap(),
+            HashMap::new(), HashMap::new(), None, None, None,
+        );
+
+        let _receiver = sender.send_options_with_identity(
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("10.0.0.1".to_string()),
+            Some("bgcf"),
+            Some("sip.connect.example.com"),
+        );
+
+        let outbound = udp_rx.try_recv().unwrap();
+        let raw = String::from_utf8_lossy(&outbound.data);
+        assert!(raw.contains("sip:bgcf@sip.connect.example.com"), "From should use configured user and domain: {raw}");
+    }
+
+    #[test]
+    fn send_options_omits_user_agent_when_not_configured() {
+        let (sender, rxs) = make_uac_sender();
+
+        let _receiver = sender.send_options(
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("10.0.0.1".to_string()),
+        );
+
+        let outbound = rxs[0].try_recv().unwrap();
+        let raw = String::from_utf8_lossy(&outbound.data);
+        assert!(!raw.contains("User-Agent:"), "should not have User-Agent: {raw}");
+    }
+
+    #[test]
+    fn send_options_from_falls_back_to_ip_without_domain() {
+        let (sender, rxs) = make_uac_sender();
+
+        let _receiver = sender.send_options(
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("10.0.0.1".to_string()),
+        );
+
+        let outbound = rxs[0].try_recv().unwrap();
+        let raw = String::from_utf8_lossy(&outbound.data);
+        assert!(raw.contains("sip:siphon@127.0.0.1"), "From should use IP fallback: {raw}");
     }
 
     // --- resolve_via_addr tests ---

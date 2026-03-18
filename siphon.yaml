@@ -303,6 +303,8 @@ auth:
 #         enabled: true           # SIP OPTIONS health probing
 #         interval_secs: 15       # probe every 15 seconds
 #         failure_threshold: 3    # mark down after 3 consecutive failures
+#         from_user: "siphon"     # user part in From URI of OPTIONS probes
+#         from_domain: "sip.example.com"  # host part in From URI (default: local IP)
 #       destinations:
 #         - uri: "sip:gw1.carrier.com:5060"
 #           address: "10.0.0.1:5060"

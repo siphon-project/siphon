@@ -444,6 +444,9 @@ impl SiphonServer {
         }
 
         // --- UAC sender ---
+        let uac_user_agent = config.server.as_ref()
+            .and_then(|server| server.user_agent_header.clone())
+            .or_else(|| Some(format!("SIPhon/{}", env!("CARGO_PKG_VERSION"))));
         let uac_sender = Arc::new(UacSender::new(
             Arc::clone(&outbound_senders),
             local_addr,
@@ -451,6 +454,7 @@ impl SiphonServer {
             advertised_addrs.clone(),
             config.advertised_address.clone(),
             hep_sender.clone(),
+            uac_user_agent,
         ));
 
         // Wire UAC sender into proxy.send_request() Python API
@@ -922,6 +926,8 @@ fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
             enabled: group_config.probe.enabled,
             interval: std::time::Duration::from_secs(group_config.probe.interval_secs as u64),
             failure_threshold: group_config.probe.failure_threshold,
+            from_user: group_config.probe.from_user.clone(),
+            from_domain: group_config.probe.from_domain.clone(),
         };
 
         manager.add_group(

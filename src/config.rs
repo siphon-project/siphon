@@ -1148,6 +1148,10 @@ pub struct GatewayProbeConfig {
     /// Consecutive failures before marking down. Default: 3.
     #[serde(default = "default_gateway_failure_threshold")]
     pub failure_threshold: u32,
+    /// User part for the From URI in OPTIONS probes. Default: `"siphon"`.
+    pub from_user: Option<String>,
+    /// Host part for the From URI in OPTIONS probes. Default: local IP.
+    pub from_domain: Option<String>,
 }
 
 impl Default for GatewayProbeConfig {
@@ -1156,6 +1160,8 @@ impl Default for GatewayProbeConfig {
             enabled: true,
             interval_secs: 30,
             failure_threshold: 3,
+            from_user: None,
+            from_domain: None,
         }
     }
 }
