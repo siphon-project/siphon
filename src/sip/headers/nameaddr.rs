@@ -317,4 +317,22 @@ mod tests {
         let na = NameAddr::parse("Bob Smith <sip:bob@biloxi.com>;tag=abc").unwrap();
         assert_eq!(na.display_name.as_deref(), Some("Bob Smith"));
     }
+
+    #[test]
+    fn tel_uri_with_tag() {
+        let na = NameAddr::parse(
+            "<tel:8367;phone-context=ims.mnc001.mcc001.3gppnetwork.org>;tag=0TleWIZ"
+        ).unwrap();
+        assert_eq!(na.uri.scheme, "tel");
+        assert_eq!(na.uri.user.as_deref(), Some("8367"));
+        assert_eq!(na.tag.as_deref(), Some("0TleWIZ"));
+    }
+
+    #[test]
+    fn tel_uri_global_with_tag() {
+        let na = NameAddr::parse("<tel:+15551234567>;tag=abc123").unwrap();
+        assert_eq!(na.uri.scheme, "tel");
+        assert_eq!(na.uri.user.as_deref(), Some("+15551234567"));
+        assert_eq!(na.tag.as_deref(), Some("abc123"));
+    }
 }

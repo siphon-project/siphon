@@ -68,14 +68,22 @@ impl fmt::Display for SipUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:", self.scheme)?;
 
-        if let Some(ref user) = self.user {
-            write!(f, "{user}@")?;
-        }
+        if self.scheme == "tel" {
+            // tel: URI: tel:subscriber;params (no @host:port)
+            if let Some(ref user) = self.user {
+                write!(f, "{user}")?;
+            }
+        } else {
+            // sip:/sips: URI: scheme:user@host:port
+            if let Some(ref user) = self.user {
+                write!(f, "{user}@")?;
+            }
 
-        write!(f, "{}", format_sip_host(&self.host))?;
+            write!(f, "{}", format_sip_host(&self.host))?;
 
-        if let Some(port) = self.port {
-            write!(f, ":{port}")?;
+            if let Some(port) = self.port {
+                write!(f, ":{port}")?;
+            }
         }
 
         for (name, value) in &self.params {
@@ -179,6 +187,32 @@ mod tests {
         let uri = SipUri::new("biloxi.com".to_string())
             .with_user("bob".to_string());
         assert_eq!(uri.to_string(), "sip:bob@biloxi.com");
+    }
+
+    #[test]
+    fn tel_uri_display_global() {
+        let uri = SipUri {
+            scheme: "tel".to_string(),
+            user: Some("+15551234567".to_string()),
+            host: String::new(),
+            port: None,
+            params: Vec::new(),
+            headers: Vec::new(),
+        };
+        assert_eq!(uri.to_string(), "tel:+15551234567");
+    }
+
+    #[test]
+    fn tel_uri_display_with_phone_context() {
+        let uri = SipUri {
+            scheme: "tel".to_string(),
+            user: Some("8367".to_string()),
+            host: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            port: None,
+            params: vec![("phone-context".to_string(), Some("ims.mnc001.mcc001.3gppnetwork.org".to_string()))],
+            headers: Vec::new(),
+        };
+        assert_eq!(uri.to_string(), "tel:8367;phone-context=ims.mnc001.mcc001.3gppnetwork.org");
     }
 }
 

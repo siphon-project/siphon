@@ -91,6 +91,11 @@ pub fn parse_uri_standalone(input: &str) -> Result<SipUri, String> {
 
 /// Parse SIP URI: sip:user@host:port;params?headers
 fn parse_uri(input: &str) -> IResult<&str, SipUri> {
+    // tel: URIs (RFC 3966) — common in IMS
+    if let Some(rest) = input.strip_prefix("tel:") {
+        return parse_tel_uri(rest);
+    }
+
     let (input, scheme) = alt((tag("sip:"), tag("sips:"))).parse(input)?;
     let scheme = scheme.trim_end_matches(':').to_string();
 
@@ -142,6 +147,37 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
         port,
         params,
         headers,
+    }))
+}
+
+/// Parse tel: URI (RFC 3966): tel:+1234567890;phone-context=example.com
+///
+/// Maps to SipUri with scheme="tel", user=subscriber, host=phone-context
+/// domain (or empty if global number), no port.
+fn parse_tel_uri(input: &str) -> IResult<&str, SipUri> {
+    // Subscriber number: digits, +, -, . (visual separators)
+    let (input, subscriber) = take_while1(|c: char| {
+        c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | '(' | ')')
+    })(input)?;
+
+    // Parse parameters (;phone-context=..., ;isub=..., etc.)
+    let (input, params) = opt(parse_uri_params).parse(input)?;
+    let params = params.unwrap_or_default();
+
+    // Extract phone-context as the host equivalent
+    let host = params
+        .iter()
+        .find(|(name, _)| name == "phone-context")
+        .and_then(|(_, value)| value.clone())
+        .unwrap_or_default();
+
+    Ok((input, SipUri {
+        scheme: "tel".to_string(),
+        user: Some(subscriber.to_string()),
+        host,
+        port: None,
+        params,
+        headers: Vec::new(),
     }))
 }
 
@@ -277,4 +313,44 @@ fn parse_crlf(input: &str) -> IResult<&str, &str> {
         tag("\r\n"),
         tag("\n"),
     )).parse(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tel_uri_global_number() {
+        let uri = parse_uri_standalone("tel:+15551234567").unwrap();
+        assert_eq!(uri.scheme, "tel");
+        assert_eq!(uri.user.as_deref(), Some("+15551234567"));
+        assert!(uri.host.is_empty());
+    }
+
+    #[test]
+    fn tel_uri_with_phone_context() {
+        let uri = parse_uri_standalone(
+            "tel:8367;phone-context=ims.mnc001.mcc001.3gppnetwork.org"
+        ).unwrap();
+        assert_eq!(uri.scheme, "tel");
+        assert_eq!(uri.user.as_deref(), Some("8367"));
+        assert_eq!(uri.host, "ims.mnc001.mcc001.3gppnetwork.org");
+        assert!(uri.params.iter().any(|(n, _)| n == "phone-context"));
+    }
+
+    #[test]
+    fn tel_uri_roundtrip() {
+        let input = "tel:8367;phone-context=ims.example.com";
+        let uri = parse_uri_standalone(input).unwrap();
+        assert_eq!(uri.to_string(), input);
+    }
+
+    #[test]
+    fn sip_uri_still_works() {
+        let uri = parse_uri_standalone("sip:alice@atlanta.com:5060;transport=tcp").unwrap();
+        assert_eq!(uri.scheme, "sip");
+        assert_eq!(uri.user.as_deref(), Some("alice"));
+        assert_eq!(uri.host, "atlanta.com");
+        assert_eq!(uri.port, Some(5060));
+    }
 }
