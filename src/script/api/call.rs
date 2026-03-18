@@ -533,6 +533,49 @@ impl PyCall {
         self.outbound_credentials = Some((username.to_string(), password.to_string()));
     }
 
+    /// Set the user part of the Request-URI.
+    ///
+    /// Usage in Python:
+    ///   call.set_ruri_user("+33123456789")
+    fn set_ruri_user(&self, value: &str) -> PyResult<()> {
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        if let crate::sip::message::StartLine::Request(ref mut request_line) = message.start_line {
+            request_line.request_uri.user = Some(value.to_string());
+        }
+        Ok(())
+    }
+
+    /// Set the user part of the From header URI.
+    ///
+    /// Usage in Python:
+    ///   call.set_from_user("+33123456789")
+    fn set_from_user(&self, value: &str) -> PyResult<()> {
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        let from_raw = message.headers.get("From")
+            .or_else(|| message.headers.get("f"))
+            .cloned();
+        if let Some(raw) = from_raw {
+            if let Ok(nameaddr) = crate::sip::headers::nameaddr::NameAddr::parse(&raw) {
+                let mut uri = nameaddr.uri;
+                uri.user = Some(value.to_string());
+                let mut new_from = if let Some(ref display) = nameaddr.display_name {
+                    format!("\"{display}\" <{uri}>")
+                } else {
+                    format!("<{uri}>")
+                };
+                if let Some(ref tag) = nameaddr.tag {
+                    new_from.push_str(&format!(";tag={tag}"));
+                }
+                message.headers.set("From", new_from);
+            }
+        }
+        Ok(())
+    }
+
     /// Copy the A-leg Call-ID to the B-leg instead of generating a new one.
     ///
     /// By default the B2BUA generates a fresh Call-ID for each B-leg to fully
@@ -740,6 +783,30 @@ mod tests {
         assert_eq!(stored.call_id, "other-call@host");
         assert_eq!(stored.from_tag, "ft");
         assert_eq!(stored.to_tag, "tt");
+    }
+
+    #[test]
+    fn call_set_ruri_user() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        call.set_ruri_user("+33123456789").unwrap();
+        let msg = message.lock().unwrap();
+        if let crate::sip::message::StartLine::Request(ref rl) = msg.start_line {
+            assert_eq!(rl.request_uri.user.as_deref(), Some("+33123456789"));
+        } else {
+            panic!("expected request start line");
+        }
+    }
+
+    #[test]
+    fn call_set_from_user() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        call.set_from_user("+33999888777").unwrap();
+        let msg = message.lock().unwrap();
+        let from = msg.headers.get("From").unwrap();
+        assert!(from.contains("+33999888777@atlanta.com"), "From should contain new user: {from}");
+        assert!(from.contains(";tag=abc"), "From should preserve tag: {from}");
     }
 
     #[test]

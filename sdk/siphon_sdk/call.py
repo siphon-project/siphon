@@ -316,6 +316,41 @@ class Call:
             extras={"username": username, "password": password},
         ))
 
+    def set_ruri_user(self, value: str) -> None:
+        """Set the user part of the Request-URI.
+
+        Args:
+            value: New user part (e.g. ``"+33123456789"``).
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                call.set_ruri_user("+33123456789")
+                call.dial("sip:gw@carrier.example.com")
+        """
+        self._ruri = f"sip:{value}@{self._ruri.split('@', 1)[-1]}" if '@' in self._ruri else self._ruri
+
+    def set_from_user(self, value: str) -> None:
+        """Set the user part of the From header URI.
+
+        Preserves display name and tag parameter while replacing the user part.
+
+        Args:
+            value: New user part (e.g. ``"+33123456789"``).
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                call.set_from_user("+33123456789")
+                call.dial("sip:gw@carrier.example.com")
+        """
+        # In the mock, just update the from_uri string
+        old = self._from_uri
+        if '@' in old:
+            self._from_uri = f"{value}@{old.split('@', 1)[-1]}"
+
     # -- Header access ---------------------------------------------------------
 
     def get_header(self, name: str) -> Optional[str]:
