@@ -3350,16 +3350,19 @@ fn handle_ack_via_session(
         if let Some(client_branch) = session.get_client_branch(client_key) {
             let mut ack_downstream = message.clone();
 
-            // Replace Via with our own (set preserves header position)
+            // Pop our own Route entry (loose routing — RFC 3261 §16.12)
+            if core::check_loose_route(&ack_downstream.headers) {
+                core::pop_top_route(&mut ack_downstream.headers);
+            }
+
+            // Add our Via on top (preserving existing Vias)
             let transport_str = format!("{}", client_branch.transport);
-            let via_value = format!(
-                "SIP/2.0/{} {}:{};branch={}",
-                transport_str.to_uppercase(),
-                state.via_host(&client_branch.transport),
-                state.via_port(&client_branch.transport),
-                TransactionKey::generate_branch(),
+            core::add_via(
+                &mut ack_downstream.headers,
+                &transport_str,
+                &state.via_host(&client_branch.transport),
+                Some(state.via_port(&client_branch.transport)),
             );
-            ack_downstream.headers.set("Via", via_value);
 
             let data = Bytes::from(ack_downstream.to_bytes());
             debug!(
