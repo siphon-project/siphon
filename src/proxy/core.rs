@@ -183,6 +183,17 @@ pub fn pop_top_route(headers: &mut SipHeaders) -> Option<RouteEntry> {
     Some(removed)
 }
 
+/// Return the URI of the topmost Route header, if any.
+///
+/// RFC 3261 §16.6 step 6: when Route headers are present the proxy
+/// must forward to the first Route URI (for loose-routed requests)
+/// rather than the Request-URI.
+pub fn next_hop_from_route(headers: &SipHeaders) -> Option<String> {
+    let route_raw = headers.get("Route")?;
+    let entries = RouteEntry::parse_multi(route_raw).ok()?;
+    entries.first().map(|entry| entry.uri.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -331,6 +342,31 @@ mod tests {
 
         super::pop_top_route(&mut headers);
         assert!(!headers.has("Route"));
+    }
+
+    #[test]
+    fn next_hop_from_route_returns_top_uri() {
+        let mut headers = SipHeaders::new();
+        headers.add("Route", "<sip:scscf.example.com;lr>, <sip:pcscf.example.com;lr>".to_string());
+        let hop = super::next_hop_from_route(&headers).unwrap();
+        assert!(hop.contains("scscf.example.com"));
+    }
+
+    #[test]
+    fn next_hop_from_route_none_when_no_route() {
+        let headers = SipHeaders::new();
+        assert!(super::next_hop_from_route(&headers).is_none());
+    }
+
+    #[test]
+    fn next_hop_from_route_after_pop() {
+        let mut headers = SipHeaders::new();
+        headers.add("Route", "<sip:us.example.com;lr>, <sip:next.example.com;lr>".to_string());
+        // Pop our own Route (simulates loose_route())
+        super::pop_top_route(&mut headers);
+        // Next hop should now be the next proxy
+        let hop = super::next_hop_from_route(&headers).unwrap();
+        assert!(hop.contains("next.example.com"));
     }
 
     #[test]

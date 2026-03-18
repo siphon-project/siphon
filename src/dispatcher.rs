@@ -1273,16 +1273,22 @@ fn relay_request(
     on_reply_callback: Option<Py<PyAny>>,
     on_failure_callback: Option<Py<PyAny>>,
 ) {
-    // Determine target URI string
+    // Determine target URI string (RFC 3261 §16.6 step 6):
+    // 1. Explicit next-hop from script
+    // 2. Top Route header URI (loose-routing — remaining after loose_route() popped ours)
+    // 3. Request-URI (no Route headers)
     let target_uri_string = match next_hop {
         Some(hop) => hop.to_string(),
         None => {
-            // Use the Request-URI
-            match &message.start_line {
-                StartLine::Request(request_line) => request_line.request_uri.to_string(),
-                _ => {
-                    error!("relay called on non-request");
-                    return;
+            if let Some(route_uri) = core::next_hop_from_route(&message.headers) {
+                route_uri
+            } else {
+                match &message.start_line {
+                    StartLine::Request(request_line) => request_line.request_uri.to_string(),
+                    _ => {
+                        error!("relay called on non-request");
+                        return;
+                    }
                 }
             }
         }

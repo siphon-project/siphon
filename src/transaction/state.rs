@@ -630,8 +630,9 @@ impl Ict {
                 vec![Action::CancelTimer(TimerName::A), Action::Timeout, Action::Terminated]
             }
             (IctState::Calling, IctEvent::Provisional(response)) => {
+                // RFC 3261 §17.1.1.2: provisional response stops retransmissions
                 self.state = IctState::Proceeding;
-                vec![Action::PassToTu(response)]
+                vec![Action::CancelTimer(TimerName::A), Action::PassToTu(response)]
             }
             (IctState::Calling, IctEvent::Response2xx(response)) => {
                 // 2xx to INVITE: transaction layer steps aside
@@ -671,13 +672,9 @@ impl Ict {
 
             // -- Proceeding --
             (IctState::Proceeding, IctEvent::TimerA) => {
-                // FIX: Handle Timer A in Proceeding state (RFC 3261 §17.1.1.2)
-                // Retransmit INVITE and restart Timer A (capped at T2)
-                self.timer_a_interval = self.timers.next_retransmit(self.timer_a_interval);
-                vec![
-                    Action::SendMessage(self.request.clone()),
-                    Action::StartTimer(TimerName::A, self.timer_a_interval),
-                ]
+                // RFC 3261 §17.1.1.2: SHOULD NOT retransmit in Proceeding.
+                // Timer A should already be cancelled, but absorb stale fires.
+                vec![]
             }
             (IctState::Proceeding, IctEvent::Provisional(response)) => {
                 vec![Action::PassToTu(response)]
@@ -1150,6 +1147,8 @@ mod tests {
         let actions = ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
         assert_eq!(ict.state, IctState::Proceeding);
         assert!(has_pass_to_tu(&actions));
+        // RFC 3261 §17.1.1.2: Timer A cancelled on provisional
+        assert!(has_cancel_timer(&actions, TimerName::A));
     }
 
     #[test]
@@ -1249,36 +1248,21 @@ mod tests {
         assert_eq!(ict.timer_a_interval, Duration::from_millis(4000)); // still capped
     }
 
-    /// Verify Timer A fires in Proceeding state: retransmits the INVITE
-    /// and restarts Timer A with a T2-capped interval.
+    /// Verify stale Timer A fires in Proceeding state are absorbed
+    /// without retransmission (RFC 3261 §17.1.1.2: SHOULD NOT retransmit).
     #[test]
-    fn ict_proceeding_timer_a_retransmits() {
+    fn ict_proceeding_timer_a_no_retransmit() {
         let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
         assert_eq!(ict.timer_a_interval, Duration::from_millis(500));
 
-        // Enter Proceeding
-        ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
+        // Enter Proceeding — Timer A should be cancelled
+        let actions = ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
         assert_eq!(ict.state, IctState::Proceeding);
+        assert!(has_cancel_timer(&actions, TimerName::A));
 
-        // Timer A should retransmit in Proceeding
+        // Stale Timer A fire should produce no actions (no retransmit)
         let actions = ict.process(IctEvent::TimerA);
-        assert!(has_send(&actions));
-        assert!(has_timer(&actions, TimerName::A));
-        // Interval doubled: 500 → 1000
-        assert_eq!(ict.timer_a_interval, Duration::from_millis(1000));
-
-        // Fire again — should still retransmit
-        let actions = ict.process(IctEvent::TimerA);
-        assert!(has_send(&actions));
-        assert!(has_timer(&actions, TimerName::A));
-        assert_eq!(ict.timer_a_interval, Duration::from_millis(2000));
-
-        // Verify T2 capping works in Proceeding too
-        ict.process(IctEvent::TimerA);
-        assert_eq!(ict.timer_a_interval, Duration::from_millis(4000));
-
-        ict.process(IctEvent::TimerA);
-        assert_eq!(ict.timer_a_interval, Duration::from_millis(4000)); // capped at T2
+        assert!(actions.is_empty(), "Timer A in Proceeding must not retransmit");
     }
 
     /// Verify Timer A is cancelled when a non-2xx final response arrives
