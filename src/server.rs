@@ -510,7 +510,7 @@ impl SiphonServer {
         }
 
         // --- Outbound registration ---
-        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &advertised_addrs, &hep_sender);
+        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender);
 
         // --- LI tasks ---
         spawn_li_tasks(li_state, &config);
@@ -1034,6 +1034,7 @@ fn init_registrant(
     config: &Config,
     outbound_senders: &Arc<transport::OutboundRouter>,
     local_addr: std::net::SocketAddr,
+    listen_addrs: &std::collections::HashMap<transport::Transport, std::net::SocketAddr>,
     advertised_addrs: &std::collections::HashMap<transport::Transport, String>,
     hep_sender: &Option<Arc<HepSender>>,
 ) -> Option<Arc<crate::registrant::RegistrantManager>> {
@@ -1106,6 +1107,7 @@ fn init_registrant(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let loop_manager = Arc::clone(&manager);
     let loop_outbound = Arc::clone(outbound_senders);
+    let loop_listen_addrs = listen_addrs.clone();
     let loop_advertised_addrs = advertised_addrs.clone();
     let loop_advertised_address = config.advertised_address.clone();
     let loop_hep_sender = hep_sender.clone();
@@ -1114,6 +1116,7 @@ fn init_registrant(
             loop_manager,
             loop_outbound,
             local_addr,
+            loop_listen_addrs,
             loop_advertised_addrs,
             loop_advertised_address,
             loop_hep_sender,

@@ -4139,6 +4139,7 @@ fn handle_registrant_response(
                     registrant.build_register_with_auth(
                         &aor,
                         state.local_addr,
+                        &state.listen_addrs,
                         &challenge,
                         is_proxy_auth,
                         registrant.default_interval,

@@ -291,13 +291,23 @@ impl RegistrantManager {
     }
 
     /// Build a REGISTER request for an entry.
+    ///
+    /// `listen_addrs` maps each transport to its listen address. The entry's
+    /// transport is used to pick the correct local address (and port) for the
+    /// Contact and Via headers. Falls back to `local_addr` when no
+    /// transport-specific address is configured.
     pub fn build_register(
         &self,
         aor: &str,
         local_addr: SocketAddr,
+        listen_addrs: &HashMap<Transport, SocketAddr>,
         expires: u32,
     ) -> Option<(SipMessage, String, SocketAddr, Transport)> {
         let mut entry = self.entries.get_mut(aor)?;
+        let effective_addr = listen_addrs
+            .get(&entry.transport)
+            .copied()
+            .unwrap_or(local_addr);
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
 
@@ -312,11 +322,11 @@ impl RegistrantManager {
         let contact = entry
             .contact_uri
             .clone()
-            .unwrap_or_else(|| format!("sip:{}@{}", entry.credentials.username, local_addr));
+            .unwrap_or_else(|| default_contact_uri(&entry.credentials.username, effective_addr, entry.transport));
 
         let via = format!(
             "SIP/2.0/{} {};branch={}",
-            entry.transport, local_addr, branch
+            entry.transport, effective_addr, branch
         );
 
         let message = SipMessageBuilder::new()
@@ -356,11 +366,16 @@ impl RegistrantManager {
         &self,
         aor: &str,
         local_addr: SocketAddr,
+        listen_addrs: &HashMap<Transport, SocketAddr>,
         challenge: &DigestChallenge,
         is_proxy_auth: bool,
         expires: u32,
     ) -> Option<(SipMessage, String, SocketAddr, Transport)> {
         let mut entry = self.entries.get_mut(aor)?;
+        let effective_addr = listen_addrs
+            .get(&entry.transport)
+            .copied()
+            .unwrap_or(local_addr);
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
 
@@ -374,11 +389,11 @@ impl RegistrantManager {
         let contact = entry
             .contact_uri
             .clone()
-            .unwrap_or_else(|| format!("sip:{}@{}", entry.credentials.username, local_addr));
+            .unwrap_or_else(|| default_contact_uri(&entry.credentials.username, effective_addr, entry.transport));
 
         let via = format!(
             "SIP/2.0/{} {};branch={}",
-            entry.transport, local_addr, branch
+            entry.transport, effective_addr, branch
         );
 
         let nc = entry.nonce_counter.next();
@@ -532,6 +547,7 @@ impl RegistrantManager {
     pub fn build_deregistrations(
         &self,
         local_addr: SocketAddr,
+        listen_addrs: &HashMap<Transport, SocketAddr>,
     ) -> Vec<(SipMessage, SocketAddr, Transport)> {
         // Collect AoRs first to avoid deadlock: iter() holds a read lock on
         // each DashMap shard, and build_register() needs a write lock (get_mut).
@@ -545,7 +561,7 @@ impl RegistrantManager {
         let mut result = Vec::new();
         for aor in &registered_aors {
             if let Some((message, _branch, destination, transport)) =
-                self.build_register(aor, local_addr, 0)
+                self.build_register(aor, local_addr, listen_addrs, 0)
             {
                 result.push((message, destination, transport));
             }
@@ -601,6 +617,7 @@ pub async fn registration_loop(
     manager: Arc<RegistrantManager>,
     outbound: Arc<OutboundRouter>,
     local_addr: SocketAddr,
+    listen_addrs: HashMap<Transport, SocketAddr>,
     advertised_addrs: HashMap<Transport, String>,
     advertised_address: Option<String>,
     hep_sender: Option<Arc<HepSender>>,
@@ -614,7 +631,7 @@ pub async fn registration_loop(
                 let due = manager.entries_due();
                 for aor in due {
                     if let Some((message, branch, destination, transport)) =
-                        manager.build_register(&aor, local_addr, manager.default_interval)
+                        manager.build_register(&aor, local_addr, &listen_addrs, manager.default_interval)
                     {
                         let data = Bytes::from(message.to_bytes());
 
@@ -641,7 +658,7 @@ pub async fn registration_loop(
             result = shutdown.changed() => {
                 if result.is_ok() && *shutdown.borrow() {
                     info!("registrant shutting down — de-registering all bindings");
-                    let dereg_messages = manager.build_deregistrations(local_addr);
+                    let dereg_messages = manager.build_deregistrations(local_addr, &listen_addrs);
                     for (message, destination, transport) in dereg_messages {
                         let data = Bytes::from(message.to_bytes());
 
@@ -664,6 +681,21 @@ pub async fn registration_loop(
             }
         }
     }
+}
+
+/// Build a default Contact URI from the entry's username, effective address, and transport.
+///
+/// Appends `;transport=<proto>` for non-UDP transports (UDP is the default per RFC 3261).
+fn default_contact_uri(username: &str, address: SocketAddr, transport: Transport) -> String {
+    let transport_param = match transport {
+        Transport::Udp => "",
+        Transport::Tcp => ";transport=tcp",
+        Transport::Tls => ";transport=tls",
+        Transport::WebSocket => ";transport=ws",
+        Transport::WebSocketSecure => ";transport=wss",
+        Transport::Sctp => ";transport=sctp",
+    };
+    format!("sip:{}@{}{}", username, address, transport_param)
 }
 
 /// Simple PRNG for cnonce generation — not cryptographic, just unique enough.
@@ -768,6 +800,7 @@ mod tests {
         let result = manager.build_register(
             "sip:alice@carrier.com",
             "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
             3600,
         );
         assert!(result.is_some());
@@ -792,6 +825,42 @@ mod tests {
     }
 
     #[test]
+    fn build_register_tls_uses_correct_port_and_transport() {
+        let manager = make_manager();
+        let mut entry = make_entry("sip:trunk@carrier.com");
+        entry.transport = Transport::Tls;
+        entry.destination = "10.0.0.1:5061".parse().unwrap();
+        manager.add(entry);
+
+        let mut listen = HashMap::new();
+        listen.insert(Transport::Tls, "172.16.0.153:5061".parse().unwrap());
+
+        let result = manager.build_register(
+            "sip:trunk@carrier.com",
+            "172.16.0.153:5060".parse().unwrap(),
+            &listen,
+            3600,
+        );
+        assert!(result.is_some());
+
+        let (message, _, _, transport) = result.unwrap();
+        assert_eq!(transport, Transport::Tls);
+
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        // Contact should use TLS listen port and transport param
+        assert!(
+            raw.contains("172.16.0.153:5061;transport=tls"),
+            "Contact should use TLS port 5061 and transport=tls: {raw}"
+        );
+        // Via should also use TLS port
+        assert!(
+            raw.contains("SIP/2.0/TLS 172.16.0.153:5061"),
+            "Via should use TLS port 5061: {raw}"
+        );
+    }
+
+    #[test]
     fn handle_success_transitions_to_registered() {
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
@@ -800,6 +869,7 @@ mod tests {
         let _ = manager.build_register(
             "sip:alice@carrier.com",
             "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
             3600,
         );
 
@@ -979,6 +1049,7 @@ mod tests {
         let result = manager.build_register_with_auth(
             "sip:alice@carrier.com",
             "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
             &challenge,
             false,
             3600,
@@ -1009,7 +1080,7 @@ mod tests {
         // Register only alice
         manager.handle_success("sip:alice@carrier.com", 3600);
 
-        let dereg = manager.build_deregistrations("127.0.0.1:5060".parse().unwrap());
+        let dereg = manager.build_deregistrations("127.0.0.1:5060".parse().unwrap(), &HashMap::new());
         assert_eq!(dereg.len(), 1);
 
         let bytes = dereg[0].0.to_bytes();
