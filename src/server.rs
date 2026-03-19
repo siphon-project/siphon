@@ -512,7 +512,7 @@ impl SiphonServer {
         }
 
         // --- Outbound registration ---
-        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender);
+        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, Arc::clone(&tls_addr_map));
 
         // --- LI tasks ---
         spawn_li_tasks(li_state, &config);
@@ -1040,6 +1040,7 @@ fn init_registrant(
     listen_addrs: &std::collections::HashMap<transport::Transport, std::net::SocketAddr>,
     advertised_addrs: &std::collections::HashMap<transport::Transport, String>,
     hep_sender: &Option<Arc<HepSender>>,
+    tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>>,
 ) -> Option<Arc<crate::registrant::RegistrantManager>> {
     use crate::registrant::{RegistrantCredentials, RegistrantEntry, RegistrantManager};
 
@@ -1114,6 +1115,7 @@ fn init_registrant(
     let loop_advertised_addrs = advertised_addrs.clone();
     let loop_advertised_address = config.advertised_address.clone();
     let loop_hep_sender = hep_sender.clone();
+    let loop_tls_addr_map = Some(tls_addr_map);
     tokio::spawn(async move {
         crate::registrant::registration_loop(
             loop_manager,
@@ -1123,6 +1125,7 @@ fn init_registrant(
             loop_advertised_addrs,
             loop_advertised_address,
             loop_hep_sender,
+            loop_tls_addr_map,
             shutdown_rx,
         ).await;
     });

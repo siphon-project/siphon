@@ -134,6 +134,8 @@ pub struct RegistrantEntry {
     pub call_id: String,
     /// Number of consecutive failures.
     pub failure_count: u32,
+    /// When the last REGISTER was sent (for transaction timeout detection).
+    pub last_sent_at: Option<Instant>,
 }
 
 impl RegistrantEntry {
@@ -163,6 +165,7 @@ impl RegistrantEntry {
             nonce_counter: NonceCounter::new(),
             call_id: format!("reg-{}", uuid::Uuid::new_v4()),
             failure_count: 0,
+            last_sent_at: None,
         }
     }
 
@@ -350,6 +353,7 @@ impl RegistrantManager {
 
         if expires > 0 {
             entry.state = RegistrantState::Registering;
+            entry.last_sent_at = Some(Instant::now());
         }
 
         match message {
@@ -421,6 +425,7 @@ impl RegistrantManager {
         };
 
         entry.state = RegistrantState::Challenging;
+        entry.last_sent_at = Some(Instant::now());
 
         let message = SipMessageBuilder::new()
             .request(Method::Register, request_uri)
@@ -461,6 +466,7 @@ impl RegistrantManager {
             entry.next_attempt = Instant::now() + refresh_at;
             entry.failure_count = 0;
             entry.backoff = Duration::from_secs(5);
+            entry.last_sent_at = None;
             info!(
                 aor = %entry.aor,
                 expires = granted_expires,
@@ -543,6 +549,29 @@ impl RegistrantManager {
             .collect()
     }
 
+    /// RFC 3261 Timer F — non-INVITE transaction timeout (32 seconds).
+    const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(32);
+
+    /// Find entries stuck in `Registering` or `Challenging` past the
+    /// transaction timeout (RFC 3261 Timer F, 32s).  The registration
+    /// loop should treat these as transport-level failures.
+    pub fn entries_timed_out(&self) -> Vec<String> {
+        let now = Instant::now();
+        self.entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    RegistrantState::Registering | RegistrantState::Challenging
+                ) && entry
+                    .last_sent_at
+                    .map(|sent| now.duration_since(sent) > Self::TRANSACTION_TIMEOUT)
+                    .unwrap_or(false)
+            })
+            .map(|entry| entry.aor.clone())
+            .collect()
+    }
+
     /// Build de-registration (Expires: 0) for all active entries.
     pub fn build_deregistrations(
         &self,
@@ -621,6 +650,7 @@ pub async fn registration_loop(
     advertised_addrs: HashMap<Transport, String>,
     advertised_address: Option<String>,
     hep_sender: Option<Arc<HepSender>>,
+    tls_addr_map: Option<Arc<dashmap::DashMap<SocketAddr, ConnectionId>>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let tick_interval = Duration::from_secs(5);
@@ -628,6 +658,35 @@ pub async fn registration_loop(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(tick_interval) => {
+                // Detect connection loss on connection-oriented transports
+                // (TLS/TCP/SCTP).  The pool removes dead connections from
+                // tls_addr_map; if the registrar destination is gone, force
+                // an immediate re-register instead of waiting for the
+                // refresh timer.
+                if let Some(ref addr_map) = tls_addr_map {
+                    let stale: Vec<String> = manager.entries.iter()
+                        .filter(|entry| {
+                            entry.state == RegistrantState::Registered
+                                && matches!(entry.transport, Transport::Tls | Transport::Tcp | Transport::Sctp)
+                                && !addr_map.iter().any(|e| e.key().ip() == entry.destination.ip())
+                        })
+                        .map(|entry| entry.aor.clone())
+                        .collect();
+                    for aor in stale {
+                        warn!(aor = %aor, "connection lost — forcing immediate re-register");
+                        manager.refresh(&aor);
+                    }
+                }
+
+                // Time out entries stuck in Registering/Challenging (RFC 3261
+                // Timer F — 32s).  Catches dead sockets where no response
+                // ever arrives.
+                let timed_out = manager.entries_timed_out();
+                for aor in &timed_out {
+                    warn!(aor = %aor, "REGISTER transaction timed out — no response received");
+                    manager.handle_failure(aor, 0);
+                }
+
                 let due = manager.entries_due();
                 for aor in due {
                     if let Some((message, branch, destination, transport)) =
@@ -1202,5 +1261,92 @@ mod tests {
     fn entry_info_none_for_missing() {
         let manager = make_manager();
         assert!(manager.entry_info("sip:nobody@carrier.com").is_none());
+    }
+
+    #[test]
+    fn build_register_sets_last_sent_at() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        // Before building: no last_sent_at
+        assert!(manager.entries.get("sip:alice@carrier.com").unwrap().last_sent_at.is_none());
+
+        manager.build_register(
+            "sip:alice@carrier.com",
+            "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
+            3600,
+        );
+
+        // After building: last_sent_at should be set
+        assert!(manager.entries.get("sip:alice@carrier.com").unwrap().last_sent_at.is_some());
+    }
+
+    #[test]
+    fn success_clears_last_sent_at() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        manager.build_register(
+            "sip:alice@carrier.com",
+            "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
+            3600,
+        );
+        assert!(manager.entries.get("sip:alice@carrier.com").unwrap().last_sent_at.is_some());
+
+        manager.handle_success("sip:alice@carrier.com", 3600);
+        assert!(manager.entries.get("sip:alice@carrier.com").unwrap().last_sent_at.is_none());
+    }
+
+    #[test]
+    fn entries_timed_out_not_triggered_before_timeout() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        // Send a REGISTER (sets state to Registering + last_sent_at)
+        manager.build_register(
+            "sip:alice@carrier.com",
+            "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
+            3600,
+        );
+
+        // Should not be timed out yet (just sent)
+        assert!(manager.entries_timed_out().is_empty());
+    }
+
+    #[test]
+    fn entries_timed_out_triggered_after_timeout() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        manager.build_register(
+            "sip:alice@carrier.com",
+            "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
+            3600,
+        );
+
+        // Simulate passage of time by backdating last_sent_at
+        manager.entries.get_mut("sip:alice@carrier.com").unwrap().last_sent_at =
+            Some(Instant::now() - Duration::from_secs(33));
+
+        let timed_out = manager.entries_timed_out();
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0], "sip:alice@carrier.com");
+    }
+
+    #[test]
+    fn entries_timed_out_not_triggered_for_registered() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        // Registered entries should never time out (even with stale last_sent_at)
+        manager.handle_success("sip:alice@carrier.com", 3600);
+        manager.entries.get_mut("sip:alice@carrier.com").unwrap().last_sent_at =
+            Some(Instant::now() - Duration::from_secs(60));
+
+        assert!(manager.entries_timed_out().is_empty());
     }
 }
