@@ -592,7 +592,6 @@ impl SiphonServer {
                         Arc::clone(registrar),
                         Arc::clone(&uac_sender),
                         Arc::clone(&tls_addr_map),
-                        registrant_manager.clone(),
                     );
                 }
             }

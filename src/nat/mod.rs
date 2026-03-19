@@ -14,7 +14,6 @@ use tracing::{debug, info, warn};
 
 use crate::config::NatKeepaliveConfig;
 use crate::registrar::Registrar;
-use crate::registrant::RegistrantManager;
 use crate::sip::uri::SipUri;
 use crate::transport::{ConnectionId, Transport};
 use crate::uac::UacSender;
@@ -57,7 +56,6 @@ pub fn spawn_keepalive(
     registrar: Arc<Registrar>,
     uac_sender: Arc<UacSender>,
     tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
-    registrant_manager: Option<Arc<RegistrantManager>>,
 ) {
     if !config.enabled {
         info!("NAT keepalive disabled");
@@ -79,7 +77,7 @@ pub fn spawn_keepalive(
 
         loop {
             tick.tick().await;
-            ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, threshold, registrant_manager.as_deref()).await;
+            ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, threshold).await;
         }
     });
 }
@@ -99,7 +97,6 @@ async fn ping_all_contacts(
     tls_addr_map: &DashMap<SocketAddr, ConnectionId>,
     tracker: &FailureTracker,
     threshold: u32,
-    registrant_manager: Option<&RegistrantManager>,
 ) {
     let contacts = registrar.all_contacts();
     let nat_count = contacts.iter().filter(|(_, c)| c.source_addr.is_some()).count();
@@ -110,16 +107,6 @@ async fn ping_all_contacts(
             Some(addr) => addr,
             None => continue,
         };
-
-        // Skip contacts whose AoR matches an outbound registrant entry.
-        // These are siphon's own registrations at upstream carriers —
-        // not remote clients behind NAT.
-        if let Some(manager) = registrant_manager {
-            if manager.state(&aor).is_some() {
-                debug!(aor = %aor, "skipping registrant self-contact");
-                continue;
-            }
-        }
 
         let contact_uri_string = contact.uri.to_string();
         let tracker_key = format!("{aor}|{contact_uri_string}");
@@ -145,7 +132,16 @@ async fn ping_all_contacts(
         // for NAT'd TLS clients. Instead, look up the connection in tls_addr_map
         // and send directly on it.
         if transport == Transport::Tls {
+            let pool_entries: Vec<String> = tls_addr_map.iter()
+                .map(|entry| format!("{}→{:?}", entry.key(), entry.value()))
+                .collect();
             if let Some(connection_id) = lookup_tls_connection(tls_addr_map, source_addr) {
+                debug!(
+                    aor = %aor,
+                    source_addr = %source_addr,
+                    connection_id = ?connection_id,
+                    "keepalive: TLS connection found, sending OPTIONS"
+                );
                 let receiver = uac_sender.send_options_on_connection(
                     source_addr, transport, request_uri, connection_id,
                 );
@@ -161,7 +157,13 @@ async fn ping_all_contacts(
                     }
                 }
             } else {
-                // No TLS connection available — connection is dead
+                warn!(
+                    aor = %aor,
+                    contact = %contact_uri_string,
+                    source_addr = %source_addr,
+                    tls_addr_map_entries = ?pool_entries,
+                    "keepalive: no TLS connection found for source_addr"
+                );
                 record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
             }
             continue;
@@ -278,7 +280,7 @@ mod tests {
         // Each call to ping_all_contacts will send OPTIONS and wait 5s for response,
         // which will timeout since nobody is answering.
         // Use threshold=1 to avoid long test.
-        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1, None).await;
+        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1).await;
 
         // After 1 failure with threshold=1, contact should be removed
         assert!(!registrar.is_registered("sip:alice@example.com"));
@@ -300,7 +302,7 @@ mod tests {
             .unwrap();
 
         let tracker = FailureTracker::new();
-        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1, None).await;
+        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1).await;
 
         // Contact should still be registered — it was skipped
         assert!(registrar.is_registered("sip:alice@example.com"));
