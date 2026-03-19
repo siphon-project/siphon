@@ -14,7 +14,6 @@ use tracing::{debug, info, warn};
 
 use crate::config::NatKeepaliveConfig;
 use crate::registrar::Registrar;
-use crate::sip::uri::SipUri;
 use crate::transport::{ConnectionId, Transport};
 use crate::uac::UacSender;
 
@@ -124,8 +123,10 @@ async fn ping_all_contacts(
             })
             .unwrap_or(Transport::Udp);
 
-        let request_uri = SipUri::new(source_addr.ip().to_string())
-            .with_port(source_addr.port());
+        // Use the contact URI as the R-URI — the peer registered with this
+        // address, so its `is_local` check will match.  Using the NAT'd
+        // source_addr IP would produce an R-URI the peer doesn't recognise.
+        let request_uri = contact.uri.clone();
 
         // For TLS: send OPTIONS on the existing connection (connection reuse).
         // The UacSender would create a new outbound connection, which won't work
@@ -221,6 +222,7 @@ fn record_keepalive_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sip::uri::SipUri;
     use crate::registrar::RegistrarConfig;
     use crate::transport::{OutboundMessage, OutboundRouter};
     use std::net::SocketAddr;
