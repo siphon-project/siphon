@@ -31,7 +31,6 @@ def route(request):
         if not auth.require_digest(request, realm=DOMAIN):
             return
         registrar.save(request)
-        request.reply(200, "OK")
         return
 
     # PUBLISH — handle locally as Event State Compositor (RFC 3903)

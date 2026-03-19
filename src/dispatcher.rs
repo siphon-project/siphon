@@ -2654,6 +2654,13 @@ fn build_response(
         builder = builder.header("Proxy-Authenticate", proxy_auth.clone());
     }
 
+    // Copy Expires header for REGISTER responses (RFC 3261 §10.3 step 8).
+    // The registrar.save() method sets this on the request to communicate
+    // the granted expires value to the response builder.
+    if let Some(expires) = request.headers.get("Expires") {
+        builder = builder.header("Expires", expires.clone());
+    }
+
     // Copy SIP-ETag for PUBLISH responses (RFC 3903 §4.1)
     if let Some(sip_etag) = request.headers.get("SIP-ETag") {
         builder = builder.header("SIP-ETag", sip_etag.clone());
@@ -6743,6 +6750,28 @@ mod tests {
         let request = sample_invite();
         let response = build_response(&request, 200, "OK", None);
         assert!(response.headers.get("Server").is_none());
+    }
+
+    #[test]
+    fn build_response_copies_expires_header() {
+        let mut request = sample_invite();
+        request.headers.set("Expires", "600".to_string());
+        let response = build_response(&request, 200, "OK", None);
+        assert_eq!(
+            response.headers.get("Expires").unwrap(),
+            "600",
+            "Expires header should be copied from request to response"
+        );
+    }
+
+    #[test]
+    fn build_response_omits_expires_when_absent() {
+        let request = sample_invite();
+        let response = build_response(&request, 200, "OK", None);
+        assert!(
+            response.headers.get("Expires").is_none(),
+            "Expires should not appear in response when not set on request"
+        );
     }
 
     #[test]

@@ -48,7 +48,6 @@ def handle_register(request):
     registrar.save(request)
 
     if is_dereg:
-        request.reply(200, "OK")
         log.info(f"deregistered {request.from_uri}")
         return
 
@@ -62,7 +61,6 @@ def handle_register(request):
     # The "orig" parameter marks originating-session routing (3GPP TS 24.229).
     request.set_header("Service-Route", f"<sip:orig@{REALM}:6060;lr>")
 
-    request.reply(200, "OK")
     log.info(f"registered {request.from_uri} at S-CSCF")
 
 

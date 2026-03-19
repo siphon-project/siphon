@@ -75,7 +75,6 @@ def handle_register(request):
         registrar.save(request)
         if diameter.peer_count() > 0:
             isc.remove_profile(public_id)
-        request.reply(200, "OK")
         log.info(f"deregistered {request.from_uri}")
         return
 
@@ -103,7 +102,6 @@ def handle_register(request):
     # Store service routes for this user (used by registrar.service_route()).
     registrar.set_service_routes(str(request.from_uri), [f"sip:orig@{REALM}:6060;lr"])
 
-    request.reply(200, "OK")
     log.info(f"registered {request.from_uri} at S-CSCF")
 
 

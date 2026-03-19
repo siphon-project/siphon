@@ -23,7 +23,6 @@ def route(request):
 
     if request.method == "REGISTER":
         registrar.save(request)
-        request.reply(200, "OK")
         return
 
     contacts = registrar.lookup(request.ruri)

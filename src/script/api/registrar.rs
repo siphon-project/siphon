@@ -130,9 +130,15 @@ impl PyRegistrar {
     /// Extracts the AoR from the To header and the Contact header(s) from the
     /// message. If `force` is True, all existing contacts are removed first.
     #[pyo3(signature = (request, force=false))]
-    fn save(&self, request: &PyRequest, force: bool) -> PyResult<()> {
+    /// Save contact bindings from a REGISTER and send 200 OK with granted
+    /// Expires (like OpenSIPS `save("location")`).
+    ///
+    /// Stores the contacts, sets the Expires header to the granted value
+    /// (capped by `max_expires`), and sends a 200 OK reply.  The script
+    /// should **not** call `request.reply()` after `save()`.
+    fn save(&self, request: &mut PyRequest, force: bool) -> PyResult<bool> {
         let message = request.message();
-        let message = message.lock().map_err(|error| {
+        let mut message = message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
 
@@ -147,7 +153,10 @@ impl PyRegistrar {
         if let Some(contact_raw) = message.headers.get("Contact") {
             if contact_raw.trim() == "*" {
                 self.inner.remove_all(&aor);
-                return Ok(());
+                message.headers.set("Expires", "0".to_string());
+                drop(message);
+                request.set_reply(200, "OK".to_string());
+                return Ok(true);
             }
         }
 
@@ -186,6 +195,9 @@ impl PyRegistrar {
             .cloned()
             .unwrap_or_default();
 
+        // Track the granted expires (capped by max_expires) for the response.
+        let mut granted_expires = 0u32;
+
         for raw in &contact_values {
             let nameaddrs = match NameAddr::parse_multi(raw) {
                 Ok(addrs) => addrs,
@@ -197,6 +209,10 @@ impl PyRegistrar {
                     .expires
                     .unwrap_or(default_expires);
                 let q = nameaddr.q.unwrap_or(1.0);
+
+                // The registrar caps expires at max_expires internally.
+                let capped = std::cmp::min(expires, self.inner.config.max_expires);
+                granted_expires = std::cmp::max(granted_expires, capped);
 
                 self.inner
                     .save_with_source(
@@ -224,7 +240,16 @@ impl PyRegistrar {
             }
         }
 
-        Ok(())
+        // Set the Expires header to the granted value so build_response()
+        // copies it into the 200 OK (RFC 3261 §10.3 step 8).
+        message.headers.set("Expires", granted_expires.to_string());
+        drop(message);
+
+        // Send 200 OK — the dispatcher's build_response() will include
+        // the Expires header we just set.
+        request.set_reply(200, "OK".to_string());
+
+        Ok(true)
     }
 
     /// Look up contacts for a URI string or SipUri.
@@ -479,6 +504,7 @@ fn normalize_aor(uri: &str) -> String {
 mod tests {
     use super::*;
     use crate::registrar::RegistrarConfig;
+    use crate::script::api::request::RequestAction;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
     use crate::sip::message::Method;
@@ -524,10 +550,10 @@ mod tests {
     #[test]
     fn save_and_lookup() {
         let registrar = make_registrar();
-        let (request, py_reg) =
+        let (mut request, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1:5060>", &registrar);
 
-        py_reg.save(&request, false).unwrap();
+        py_reg.save(&mut request, false).unwrap();
 
         let contacts = py_reg.lookup_str("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
@@ -540,21 +566,21 @@ mod tests {
     #[test]
     fn is_registered_after_save() {
         let registrar = make_registrar();
-        let (request, py_reg) =
+        let (mut request, py_reg) =
             make_register_request("<sip:bob@example.com>", "<sip:bob@10.0.0.2>", &registrar);
 
         assert!(!py_reg.is_registered_str("sip:bob@example.com"));
-        py_reg.save(&request, false).unwrap();
+        py_reg.save(&mut request, false).unwrap();
         assert!(py_reg.is_registered_str("sip:bob@example.com"));
     }
 
     #[test]
     fn wildcard_deregister() {
         let registrar = make_registrar();
-        let (request, py_reg) =
+        let (mut request, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
 
-        py_reg.save(&request, false).unwrap();
+        py_reg.save(&mut request, false).unwrap();
         assert!(py_reg.is_registered_str("sip:alice@example.com"));
 
         // Wildcard Contact: *
@@ -572,26 +598,26 @@ mod tests {
             .build()
             .unwrap();
 
-        let dereg_request = PyRequest::new(
+        let mut dereg_request = PyRequest::new(
             Arc::new(Mutex::new(message)),
             "udp".to_string(),
             "10.0.0.1".to_string(),
             5060,
         );
-        py_reg.save(&dereg_request, false).unwrap();
+        py_reg.save(&mut dereg_request, false).unwrap();
         assert!(!py_reg.is_registered_str("sip:alice@example.com"));
     }
 
     #[test]
     fn force_save_clears_existing() {
         let registrar = make_registrar();
-        let (request1, py_reg) =
+        let (mut request1, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
-        py_reg.save(&request1, false).unwrap();
+        py_reg.save(&mut request1, false).unwrap();
 
-        let (request2, _) =
+        let (mut request2, _) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.2>", &registrar);
-        py_reg.save(&request2, true).unwrap();
+        py_reg.save(&mut request2, true).unwrap();
 
         let contacts = py_reg.lookup_str("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
@@ -643,12 +669,12 @@ mod tests {
     #[test]
     fn lookup_ignores_transport_param() {
         let registrar = make_registrar();
-        let (request, py_reg) = make_register_request(
+        let (mut request, py_reg) = make_register_request(
             "<sip:alice@example.com>",
             "<sip:alice@10.0.0.1:5060>",
             &registrar,
         );
-        py_reg.save(&request, false).unwrap();
+        py_reg.save(&mut request, false).unwrap();
 
         // Lookup with transport param should still find the contact
         let contacts = py_reg.lookup_str("sip:alice@example.com;transport=tcp");
@@ -671,13 +697,13 @@ mod tests {
     #[test]
     fn contact_with_q_and_expires_params() {
         let registrar = make_registrar();
-        let (request, py_reg) = make_register_request(
+        let (mut request, py_reg) = make_register_request(
             "<sip:alice@example.com>",
             "<sip:alice@10.0.0.1>;q=0.7;expires=1800",
             &registrar,
         );
 
-        py_reg.save(&request, false).unwrap();
+        py_reg.save(&mut request, false).unwrap();
         let contacts = py_reg.lookup_str("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
         assert!((contacts[0].q() - 0.7).abs() < 0.01);
@@ -689,15 +715,128 @@ mod tests {
     #[test]
     fn expire_removes_all_contacts() {
         let registrar = make_registrar();
-        let (request, py_reg) =
+        let (mut request, py_reg) =
             make_register_request("<sip:carol@example.com>", "<sip:carol@10.0.0.3>", &registrar);
 
-        py_reg.save(&request, false).unwrap();
+        py_reg.save(&mut request, false).unwrap();
         assert!(py_reg.is_registered_str("sip:carol@example.com"));
 
         // expire() should remove all contacts
         registrar.remove_all("sip:carol@example.com");
         assert!(!py_reg.is_registered_str("sip:carol@example.com"));
         assert!(py_reg.lookup_str("sip:carol@example.com").is_empty());
+    }
+
+    #[test]
+    fn save_caps_expires_and_sets_reply() {
+        // Registrar with max_expires=600 — client requests 3600, should get 600.
+        let registrar = Arc::new(Registrar::new(RegistrarConfig {
+            default_expires: 3600,
+            max_expires: 600,
+            min_expires: 60,
+            max_contacts: 10,
+        }));
+
+        let uri = SipUri::new("example.com".to_string());
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, uri)
+            .via("SIP/2.0/TLS 10.0.0.1:5061;branch=z9hG4bK-reg".to_string())
+            .to("<sip:trunk@carrier.com>".to_string())
+            .from("<sip:trunk@carrier.com>;tag=reg-tag".to_string())
+            .call_id("reg-trunk@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header("Contact", "<sip:trunk@10.0.0.1:5061;transport=tls>".to_string())
+            .header("Expires", "3600".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let mut request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "tls".to_string(),
+            "10.0.0.1".to_string(),
+            5061,
+        );
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        // save() should return true and set the reply action
+        let result = py_reg.save(&mut request, false).unwrap();
+        assert!(result);
+
+        // The reply action should be 200 OK
+        assert_eq!(
+            *request.action(),
+            RequestAction::Reply {
+                code: 200,
+                reason: "OK".to_string(),
+            }
+        );
+
+        // The Expires header on the request should be capped to 600
+        // (build_response copies it to the 200 OK)
+        let message = request.message();
+        let message = message.lock().unwrap();
+        assert_eq!(
+            message.headers.get("Expires").unwrap(),
+            "600",
+            "Expires should be capped to max_expires (600), not the requested 3600"
+        );
+
+        // The contact should be stored with the capped expires
+        let contacts = py_reg.lookup_str("sip:trunk@carrier.com");
+        assert_eq!(contacts.len(), 1);
+        assert!(
+            contacts[0].expires() <= 600,
+            "stored contact expires should be capped at 600, got {}",
+            contacts[0].expires()
+        );
+    }
+
+    #[test]
+    fn save_sends_reply_for_wildcard_deregister() {
+        let registrar = make_registrar();
+        let (mut request, py_reg) =
+            make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
+
+        py_reg.save(&mut request, false).unwrap();
+        assert!(py_reg.is_registered_str("sip:alice@example.com"));
+
+        let uri = SipUri::new("example.com".to_string());
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, uri)
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-dereg2".to_string())
+            .to("<sip:alice@example.com>".to_string())
+            .from("<sip:alice@example.com>;tag=dereg2-tag".to_string())
+            .call_id("reg-call@host".to_string())
+            .cseq("3 REGISTER".to_string())
+            .header("Contact", "*".to_string())
+            .header("Expires", "0".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let mut dereg_request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+        );
+
+        let result = py_reg.save(&mut dereg_request, false).unwrap();
+        assert!(result);
+
+        // save() should have sent 200 OK for wildcard deregister
+        assert_eq!(
+            *dereg_request.action(),
+            RequestAction::Reply {
+                code: 200,
+                reason: "OK".to_string(),
+            }
+        );
+
+        // Expires should be 0 for deregistration
+        let message = dereg_request.message();
+        let message = message.lock().unwrap();
+        assert_eq!(message.headers.get("Expires").unwrap(), "0");
     }
 }

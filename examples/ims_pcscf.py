@@ -95,7 +95,6 @@ def handle_register(request):
     # Add Service-Route so subsequent requests from this UE route through us.
     request.set_header("Service-Route", f"<{PCSCF_URI}>")
 
-    request.reply(200, "OK")
     log.info(f"registered {request.from_uri}")
 
 

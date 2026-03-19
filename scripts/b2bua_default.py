@@ -25,7 +25,6 @@ def route(request):
         if not auth.require_digest(request, realm=DOMAIN):
             return
         registrar.save(request)
-        request.reply(200, "OK")
         return
 
 

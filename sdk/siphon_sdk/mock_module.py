@@ -351,8 +351,12 @@ class MockRegistrar:
         self._service_routes: dict[str, list[str]] = {}
         self._on_change_callbacks: list[Callable] = []
 
-    def save(self, request: Any, force: bool = False) -> None:
-        """Save contact bindings from a REGISTER request.
+    def save(self, request: Any, force: bool = False) -> bool:
+        """Save contact bindings from a REGISTER request and send the 200 OK reply.
+
+        Stores the contact bindings and automatically sends a ``200 OK`` reply
+        to the REGISTER request with the granted ``Expires`` header — the script
+        must **not** call ``request.reply(200, "OK")`` afterwards.
 
         In the mock, extracts the To URI as AoR and stores a default
         contact binding.
@@ -360,6 +364,17 @@ class MockRegistrar:
         Args:
             request: The REGISTER request object.
             force: If ``True``, evict all existing contacts first.
+
+        Returns:
+            ``True`` on success.
+
+        Example::
+
+            if request.method == "REGISTER":
+                if not auth.require_digest(request, realm=DOMAIN):
+                    return
+                registrar.save(request)  # sends 200 OK automatically
+                return
         """
         aor = str(request.to_uri) if request.to_uri else str(request.ruri)
         if force:
@@ -373,6 +388,7 @@ class MockRegistrar:
         # Fire on_change callbacks
         event_type = "refreshed" if already_exists else "registered"
         self._fire_on_change(aor, event_type)
+        return True
 
     def lookup(self, uri: Union[str, SipUri]) -> list[Contact]:
         """Look up contacts for an address-of-record.
