@@ -14,7 +14,12 @@ use crate::sip::uri::SipUri;
 use crate::sip::headers::SipHeaders;
 
 /// Parse a SIP message (request or response)
+///
+/// Leading CRLFs are stripped per RFC 3261 §7.5:
+/// "Implementations processing SIP messages over stream-oriented
+/// transports MUST ignore any CRLF appearing before the start-line."
 pub fn parse_sip_message(input: &str) -> IResult<&str, SipMessage> {
+    let input = input.trim_start_matches("\r\n");
     let (input, start_line) = parse_start_line(input)?;
     let (input, headers) = parse_headers(input)?;
     let (input, body) = parse_body(input, &headers)?;
@@ -352,5 +357,55 @@ mod tests {
         assert_eq!(uri.user.as_deref(), Some("alice"));
         assert_eq!(uri.host, "atlanta.com");
         assert_eq!(uri.port, Some(5060));
+    }
+
+    /// RFC 3261 §7.5: leading CRLFs before start-line must be ignored
+    #[test]
+    fn leading_crlf_stripped() {
+        let raw = concat!(
+            "\r\n",
+            "\r\n",
+            "INVITE sip:bob@biloxi.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776\r\n",
+            "From: <sip:alice@atlanta.com>;tag=1234\r\n",
+            "To: <sip:bob@biloxi.com>\r\n",
+            "Call-ID: a84b4c76e66710@pc33.atlanta.com\r\n",
+            "CSeq: 314159 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let (_, message) = parse_sip_message(raw).unwrap();
+        match &message.start_line {
+            StartLine::Request(rl) => {
+                assert_eq!(rl.method, Method::Invite);
+                assert_eq!(rl.request_uri.user.as_deref(), Some("bob"));
+            }
+            _ => panic!("expected request"),
+        }
+    }
+
+    /// Single leading CRLF should also work
+    #[test]
+    fn single_leading_crlf_stripped() {
+        let raw = concat!(
+            "\r\n",
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776\r\n",
+            "From: <sip:alice@atlanta.com>;tag=1234\r\n",
+            "To: <sip:bob@biloxi.com>;tag=5678\r\n",
+            "Call-ID: a84b4c76e66710@pc33.atlanta.com\r\n",
+            "CSeq: 314159 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let (_, message) = parse_sip_message(raw).unwrap();
+        match &message.start_line {
+            StartLine::Response(sl) => {
+                assert_eq!(sl.status_code, 200);
+                assert_eq!(sl.reason_phrase, "OK");
+            }
+            _ => panic!("expected response"),
+        }
     }
 }

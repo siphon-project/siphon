@@ -222,6 +222,13 @@ pub async fn listen(
 
                                         // Extract all complete SIP messages from the buffer
                                         loop {
+                                            // Strip leading CRLFs — keepalive pings per RFC 3261 §7.5
+                                            while accumulator.len() >= 2 && &accumulator[..2] == b"\r\n" {
+                                                let _ = accumulator.split_to(2);
+                                            }
+                                            if accumulator.is_empty() {
+                                                break;
+                                            }
                                             let message_len = match crate::transport::tcp::extract_sip_message_length(&accumulator) {
                                                 Some(len) if len <= accumulator.len() => len,
                                                 _ => break, // incomplete message, need more data

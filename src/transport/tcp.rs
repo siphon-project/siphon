@@ -124,6 +124,13 @@ pub async fn listen(
 
                                         // Extract all complete SIP messages from the buffer
                                         loop {
+                                            // Strip leading CRLFs — keepalive pings per RFC 3261 §7.5
+                                            while accumulator.len() >= 2 && &accumulator[..2] == b"\r\n" {
+                                                let _ = accumulator.split_to(2);
+                                            }
+                                            if accumulator.is_empty() {
+                                                break;
+                                            }
                                             let message_len = match extract_sip_message_length(&accumulator) {
                                                 Some(len) if len <= accumulator.len() => len,
                                                 _ => break, // incomplete message, need more data
@@ -209,10 +216,12 @@ fn extract_content_length(headers: &[u8]) -> Option<usize> {
     // Search line-by-line for Content-Length or compact form "l:"
     for line in headers.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        // Case-insensitive prefix match
-        let (name, value) = line.split_at(
-            line.iter().position(|&b| b == b':')?
-        );
+        // Skip lines without a colon (request-line, empty lines from keepalive CRLFs)
+        let colon_pos = match line.iter().position(|&b| b == b':') {
+            Some(pos) => pos,
+            None => continue,
+        };
+        let (name, value) = line.split_at(colon_pos);
         let value = &value[1..]; // skip the ':'
         let name_lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
         let name_trimmed = name_lower.trim_ascii();
@@ -282,5 +291,49 @@ mod tests {
         connection_map.insert(conn, tx);
         connection_map.remove(&conn);
         assert!(connection_map.get(&conn).is_none());
+    }
+
+    #[test]
+    fn extract_length_with_body() {
+        let message = b"INVITE sip:bob@example.com SIP/2.0\r\n\
+                         Content-Length: 5\r\n\
+                         \r\n\
+                         hello";
+        assert_eq!(extract_sip_message_length(message), Some(message.len()));
+    }
+
+    #[test]
+    fn extract_length_no_body() {
+        let message = b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(extract_sip_message_length(message), Some(message.len()));
+    }
+
+    #[test]
+    fn extract_length_missing_content_length_defaults_to_zero() {
+        let message = b"SIP/2.0 200 OK\r\nVia: SIP/2.0/TCP host\r\n\r\n";
+        assert_eq!(extract_sip_message_length(message), Some(message.len()));
+    }
+
+    #[test]
+    fn extract_length_incomplete_headers() {
+        let partial = b"INVITE sip:bob@example.com SIP/2.0\r\nContent-Length: 5\r\n";
+        assert_eq!(extract_sip_message_length(partial), None);
+    }
+
+    #[test]
+    fn extract_content_length_with_leading_crlf() {
+        // Simulates a buffer where a keepalive CRLF preceded the message
+        // and was included in the header block. The ? operator must not
+        // short-circuit on the empty first line.
+        let headers = b"\r\nINVITE sip:bob@example.com SIP/2.0\r\n\
+                         Content-Length: 440\r\n\
+                         Via: SIP/2.0/TCP host;branch=z9hG4bK123";
+        assert_eq!(extract_content_length(headers), Some(440));
+    }
+
+    #[test]
+    fn extract_content_length_compact_form() {
+        let headers = b"INVITE sip:bob@example.com SIP/2.0\r\nl: 200";
+        assert_eq!(extract_content_length(headers), Some(200));
     }
 }
