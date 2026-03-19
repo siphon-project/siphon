@@ -408,10 +408,15 @@ impl Registrar {
     /// Remove a specific contact URI from an AoR.
     pub fn remove_contact(&self, aor: &str, contact_uri: &str) {
         if let Some(mut entry) = self.bindings.get_mut(aor) {
+            let before = entry.value().len();
             entry.value_mut().retain(|c| c.uri.to_string() != contact_uri);
+            let removed = entry.value().len() < before;
             if entry.value().is_empty() {
                 drop(entry);
                 self.bindings.remove(aor);
+            }
+            if removed {
+                self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
             }
         }
     }
@@ -910,6 +915,28 @@ mod tests {
         registrar.remove_contact("sip:alice@example.com", "sip:alice@10.0.0.1");
         assert!(!registrar.is_registered("sip:alice@example.com"));
         assert_eq!(registrar.bindings.len(), 0);
+    }
+
+    #[test]
+    fn remove_contact_emits_deregistered_event() {
+        let registrar = Registrar::default();
+        registrar
+            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+
+        let mut receiver = registrar.subscribe_events();
+        registrar.remove_contact("sip:alice@example.com", "sip:alice@10.0.0.1");
+
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(event, RegistrationEvent::Deregistered { ref aor } if aor == "sip:alice@example.com"));
+    }
+
+    #[test]
+    fn remove_contact_no_event_for_nonexistent() {
+        let registrar = Registrar::default();
+        let mut receiver = registrar.subscribe_events();
+        registrar.remove_contact("sip:alice@example.com", "sip:alice@10.0.0.1");
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

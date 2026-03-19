@@ -24,18 +24,29 @@ use crate::config::CrlfKeepaliveConfig;
 pub struct CrlfPongTracker {
     /// ConnectionId → consecutive missed pong count.
     missed: DashMap<ConnectionId, u32>,
+    /// Connections that have responded to at least one CRLF ping.
+    /// Only close connections that demonstrate CRLF support — peers
+    /// that never respond simply don't implement RFC 5626 §4.4.1.
+    pong_seen: DashMap<ConnectionId, ()>,
 }
 
 impl CrlfPongTracker {
     pub fn new() -> Self {
         Self {
             missed: DashMap::new(),
+            pong_seen: DashMap::new(),
         }
     }
 
     /// Called by the dispatcher when a bare CRLF arrives on a connection.
     pub fn record_pong(&self, id: ConnectionId) {
         self.missed.remove(&id);
+        self.pong_seen.insert(id, ());
+    }
+
+    /// Returns true if this connection ever responded to a CRLF ping.
+    pub fn has_seen_pong(&self, id: ConnectionId) -> bool {
+        self.pong_seen.contains_key(&id)
     }
 
     /// Called by the keepalive task before sending a ping.
@@ -49,6 +60,7 @@ impl CrlfPongTracker {
     /// Remove tracking state for a closed connection.
     fn remove(&self, id: ConnectionId) {
         self.missed.remove(&id);
+        self.pong_seen.remove(&id);
     }
 }
 
@@ -92,16 +104,29 @@ pub fn spawn(
                     let missed = pong_tracker.record_ping(id);
 
                     if missed > threshold {
-                        warn!(
-                            connection_id = id.0,
-                            missed = missed,
-                            "closing unresponsive connection (CRLF keepalive timeout)"
-                        );
-                        // Dropping the sender closes the mpsc channel, which
-                        // causes the write task to exit and triggers cleanup
-                        // in tcp.rs / tls.rs.
-                        map.remove(&id);
-                        pong_tracker.remove(id);
+                        if pong_tracker.has_seen_pong(id) {
+                            // Peer previously responded but stopped — connection
+                            // is likely dead.
+                            warn!(
+                                connection_id = id.0,
+                                missed = missed,
+                                "closing unresponsive connection (CRLF keepalive timeout)"
+                            );
+                            // Dropping the sender closes the mpsc channel, which
+                            // causes the write task to exit and triggers cleanup
+                            // in tcp.rs / tls.rs.
+                            map.remove(&id);
+                            pong_tracker.remove(id);
+                        } else {
+                            // Peer never responded to any CRLF ping — it probably
+                            // doesn't support RFC 5626 §4.4.1.  Don't kill the
+                            // connection; just stop tracking missed pings for it.
+                            debug!(
+                                connection_id = id.0,
+                                "peer does not support CRLF keepalive — skipping"
+                            );
+                            pong_tracker.remove(id);
+                        }
                         continue;
                     }
 
@@ -177,13 +202,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evicts_after_threshold() {
+    async fn evicts_after_threshold_when_peer_supported_crlf() {
         let map: ConnectionMap = Arc::new(DashMap::new());
         let (tx, _rx) = mpsc::channel(16);
         let id = ConnectionId(99);
         map.insert(id, tx);
 
         let tracker = Arc::new(CrlfPongTracker::new());
+        // Simulate peer responding once (proves CRLF support)
+        tracker.record_pong(id);
 
         let config = CrlfKeepaliveConfig {
             enabled: true,
@@ -200,6 +227,33 @@ mod tests {
         assert!(
             map.get(&id).is_none(),
             "connection should have been evicted after threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_evict_peer_without_crlf_support() {
+        let map: ConnectionMap = Arc::new(DashMap::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let id = ConnectionId(100);
+        map.insert(id, tx);
+
+        let tracker = Arc::new(CrlfPongTracker::new());
+        // No pong recorded — peer doesn't support CRLF keepalive
+
+        let config = CrlfKeepaliveConfig {
+            enabled: true,
+            interval_secs: 1,
+            failure_threshold: 2,
+        };
+
+        spawn(config, vec![Arc::clone(&map)], Arc::clone(&tracker));
+
+        // After 3+ ticks, connection should NOT be evicted (peer doesn't support CRLF)
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+
+        assert!(
+            map.get(&id).is_some(),
+            "connection should NOT be evicted — peer never responded to CRLF"
         );
     }
 }
