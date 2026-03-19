@@ -147,6 +147,19 @@ impl PyRequest {
         &self.source_ip
     }
 
+    /// Get the transport name (Rust-side accessor).
+    pub fn transport_name(&self) -> &str {
+        &self.transport_name
+    }
+
+    /// Get the source address as a SocketAddr (for registrar received tracking).
+    pub fn source_socket_addr(&self) -> Option<std::net::SocketAddr> {
+        self.source_ip
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| std::net::SocketAddr::new(ip, self.source_port))
+    }
+
     /// Get Via transport override (set by `force_send_via`).
     pub fn via_transport_override(&self) -> Option<&str> {
         self.via_transport_override.as_deref()

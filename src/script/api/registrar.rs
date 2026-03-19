@@ -23,6 +23,9 @@ pub struct PyContact {
     q_value: f32,
     /// Seconds remaining until this contact expires.
     expires_remaining: u64,
+    /// Source address of the REGISTER (for NAT traversal routing).
+    /// Format: "sip:ip:port;transport=proto" — like OpenSIPS received_avp.
+    received_string: Option<String>,
 }
 
 #[pymethods]
@@ -45,6 +48,17 @@ impl PyContact {
         self.expires_remaining
     }
 
+    /// The received address (source IP:port of the REGISTER).
+    ///
+    /// Returns `None` if the contact was not saved with source address info.
+    /// When present, this should be used for routing instead of `uri` — the
+    /// Contact URI may contain a private/NAT address, while `received` has
+    /// the actual reachable address (like OpenSIPS `received_avp`).
+    #[getter]
+    fn received(&self) -> Option<&str> {
+        self.received_string.as_deref()
+    }
+
     fn __str__(&self) -> &str {
         &self.uri_string
     }
@@ -59,10 +73,17 @@ impl PyContact {
 
 impl PyContact {
     pub fn from_rust_contact(contact: &Contact) -> Self {
+        let received_string = contact.source_addr.map(|addr| {
+            // Build a SIP URI from source address + transport, matching the
+            // format OpenSIPS uses for its received_avp / $param(received).
+            let transport = contact.source_transport.as_deref().unwrap_or("udp");
+            format!("sip:{}:{};transport={}", addr.ip(), addr.port(), transport)
+        });
         Self {
             uri_string: contact.uri.to_string(),
             q_value: contact.q,
             expires_remaining: contact.remaining_seconds(),
+            received_string,
         }
     }
 }
@@ -130,6 +151,10 @@ impl PyRegistrar {
             }
         }
 
+        // Extract source address for NAT traversal (like OpenSIPS received_avp).
+        let source_addr = request.source_socket_addr();
+        let source_transport = Some(request.transport_name().to_string());
+
         // Extract expires from Expires header or default
         let default_expires = message
             .headers
@@ -174,7 +199,16 @@ impl PyRegistrar {
                 let q = nameaddr.q.unwrap_or(1.0);
 
                 self.inner
-                    .save(&aor, nameaddr.uri, expires, q, call_id.clone(), cseq_seq)
+                    .save_with_source(
+                        &aor,
+                        nameaddr.uri,
+                        expires,
+                        q,
+                        call_id.clone(),
+                        cseq_seq,
+                        source_addr,
+                        source_transport.clone(),
+                    )
                     .map_err(|error| match error {
                         RegistrarError::IntervalTooBrief { min_expires } => {
                             pyo3::exceptions::PyValueError::new_err(format!(
@@ -628,6 +662,7 @@ mod tests {
             uri_string: "sip:alice@10.0.0.1".to_string(),
             q_value: 1.0,
             expires_remaining: 3600,
+            received_string: None,
         };
         assert_eq!(contact.__str__(), "sip:alice@10.0.0.1");
         assert!(contact.__repr__().contains("q=1"));

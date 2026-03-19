@@ -50,8 +50,10 @@ pub struct Contact {
     pub call_id: String,
     /// CSeq sequence number (for replay protection).
     pub cseq: u32,
-    /// Source address the REGISTER came from (for NAT keepalive).
+    /// Source address the REGISTER came from (for NAT traversal routing).
     pub source_addr: Option<SocketAddr>,
+    /// Transport protocol the REGISTER arrived on (for received URI construction).
+    pub source_transport: Option<String>,
     /// RFC 5627 GRUU: `+sip.instance` (URN, e.g. "urn:uuid:f81d4fae-...").
     pub sip_instance: Option<String>,
     /// RFC 5626 Outbound: `reg-id` parameter.
@@ -175,10 +177,15 @@ impl Registrar {
         call_id: String,
         cseq: u32,
     ) -> Result<(), RegistrarError> {
-        self.save_with_source(aor, uri, expires_secs, q, call_id, cseq, None)
+        self.save_with_source(aor, uri, expires_secs, q, call_id, cseq, None, None)
     }
 
     /// Save a contact binding with the source address of the REGISTER request.
+    ///
+    /// When `source_addr` is provided, it is stored alongside the contact for
+    /// NAT traversal routing — like OpenSIPS's `received_avp`. On lookup, the
+    /// `PyContact.received` property returns a SIP URI built from this address,
+    /// which scripts can use instead of the Contact URI to reach NATed clients.
     #[allow(clippy::too_many_arguments)]
     pub fn save_with_source(
         &self,
@@ -189,6 +196,7 @@ impl Registrar {
         call_id: String,
         cseq: u32,
         source_addr: Option<SocketAddr>,
+        source_transport: Option<String>,
     ) -> Result<(), RegistrarError> {
         let expires_secs = std::cmp::min(expires_secs, self.config.max_expires);
 
@@ -206,6 +214,7 @@ impl Registrar {
             call_id,
             cseq,
             source_addr,
+            source_transport,
             sip_instance: None,
             reg_id: None,
             pending: false,
@@ -422,7 +431,7 @@ impl Registrar {
         reg_id: Option<u32>,
     ) -> Result<(), RegistrarError> {
         // Delegate to save_with_source first
-        self.save_with_source(aor, uri.clone(), expires_secs, q, call_id, cseq, source_addr)?;
+        self.save_with_source(aor, uri.clone(), expires_secs, q, call_id, cseq, source_addr, None)?;
 
         // Then patch the sip_instance and reg_id onto the saved contact
         if sip_instance.is_some() || reg_id.is_some() {
@@ -557,6 +566,7 @@ impl Registrar {
             call_id,
             cseq,
             source_addr: None,
+            source_transport: None,
             sip_instance: None,
             reg_id: None,
             pending: true,
@@ -821,6 +831,7 @@ mod tests {
             call_id: "test".to_string(),
             cseq: 1,
             source_addr: None,
+            source_transport: None,
             sip_instance: None,
             reg_id: None,
             pending: false,
@@ -843,6 +854,7 @@ mod tests {
                 call_id: "old".to_string(),
                 cseq: 1,
                 source_addr: None,
+                source_transport: None,
                 sip_instance: None,
                 reg_id: None,
                 pending: false,
@@ -1006,12 +1018,13 @@ mod tests {
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
                 3600, 1.0, "c1".into(), 1,
-                Some(addr),
+                Some(addr), Some("tls".to_string()),
             )
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
         assert_eq!(contacts[0].source_addr, Some(addr));
+        assert_eq!(contacts[0].source_transport.as_deref(), Some("tls"));
     }
 
     #[test]

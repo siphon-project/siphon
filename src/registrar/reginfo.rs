@@ -283,6 +283,7 @@ mod tests {
             call_id: "test-call-id".to_string(),
             cseq: 1,
             source_addr: None,
+            source_transport: None,
             sip_instance: None,
             reg_id: None,
             pending: false,

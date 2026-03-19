@@ -33,6 +33,9 @@ pub struct StoredContact {
     pub cseq: u32,
     /// Source address (if known).
     pub source_addr: Option<String>,
+    /// Transport protocol the REGISTER arrived on (e.g. "udp", "tcp", "tls").
+    #[serde(default)]
+    pub source_transport: Option<String>,
     /// RFC 5627 sip.instance.
     pub sip_instance: Option<String>,
     /// RFC 5626 reg-id.
@@ -56,6 +59,7 @@ impl StoredContact {
             call_id: contact.call_id.clone(),
             cseq: contact.cseq,
             source_addr: contact.source_addr.map(|a| a.to_string()),
+            source_transport: contact.source_transport.clone(),
             sip_instance: contact.sip_instance.clone(),
             reg_id: contact.reg_id,
         }
@@ -105,6 +109,7 @@ impl StoredContact {
             call_id: self.call_id.clone(),
             cseq: self.cseq,
             source_addr,
+            source_transport: self.source_transport.clone(),
             sip_instance: self.sip_instance.clone(),
             reg_id: self.reg_id,
             pending: false,
@@ -947,6 +952,7 @@ mod tests {
             call_id: "call-1".to_string(),
             cseq: 1,
             source_addr: None,
+            source_transport: None,
             sip_instance: None,
             reg_id: None,
         }
@@ -1157,6 +1163,7 @@ mod tests {
                 call_id: "c1".to_string(),
                 cseq: 1,
                 source_addr: None,
+                source_transport: None,
                 sip_instance: None,
                 reg_id: None,
             }])
@@ -1172,6 +1179,7 @@ mod tests {
                     call_id: "c2".to_string(),
                     cseq: 1,
                     source_addr: None,
+                    source_transport: None,
                     sip_instance: None,
                     reg_id: None,
                 },
@@ -1183,6 +1191,7 @@ mod tests {
                     call_id: "c3".to_string(),
                     cseq: 2,
                     source_addr: None,
+                    source_transport: None,
                     sip_instance: None,
                     reg_id: None,
                 },
@@ -1214,6 +1223,7 @@ mod tests {
                 call_id: "c1".to_string(),
                 cseq: 1,
                 source_addr: None,
+                source_transport: None,
                 sip_instance: None,
                 reg_id: None,
             }])
@@ -1246,6 +1256,7 @@ mod tests {
                 call_id: "c1".to_string(),
                 cseq: 1,
                 source_addr: None,
+                source_transport: None,
                 sip_instance: None,
                 reg_id: None,
             }])
