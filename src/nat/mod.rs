@@ -134,7 +134,7 @@ async fn ping_all_contacts(
         // and send directly on it.
         if transport == Transport::Tls {
             if let Some(connection_id) = lookup_tls_connection(tls_addr_map, source_addr) {
-                info!(
+                debug!(
                     aor = %aor,
                     source_addr = %source_addr,
                     connection_id = ?connection_id,
@@ -147,7 +147,7 @@ async fn ping_all_contacts(
                 match result {
                     Ok(Ok(crate::uac::UacResult::Response(response))) => {
                         let status = response.status_code().unwrap_or(0);
-                        info!(aor = %aor, contact = %contact_uri_string, status, "keepalive response (TLS reuse)");
+                        debug!(aor = %aor, contact = %contact_uri_string, status, "keepalive response (TLS reuse)");
                         tracker.record_success(&tracker_key);
                     }
                     Ok(Ok(other)) => {
