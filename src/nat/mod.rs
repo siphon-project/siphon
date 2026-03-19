@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::NatKeepaliveConfig;
 use crate::registrar::Registrar;
+use crate::registrant::RegistrantManager;
 use crate::sip::uri::SipUri;
 use crate::transport::{ConnectionId, Transport};
 use crate::uac::UacSender;
@@ -56,7 +57,7 @@ pub fn spawn_keepalive(
     registrar: Arc<Registrar>,
     uac_sender: Arc<UacSender>,
     tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
-    listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
+    registrant_manager: Option<Arc<RegistrantManager>>,
 ) {
     if !config.enabled {
         info!("NAT keepalive disabled");
@@ -65,13 +66,6 @@ pub fn spawn_keepalive(
 
     let interval = Duration::from_secs(config.interval_secs as u64);
     let threshold = config.failure_threshold;
-
-    // Collect all local listen IPs so we can skip contacts that point
-    // to siphon itself (e.g. registrant self-contacts).
-    let local_ips: std::collections::HashSet<std::net::IpAddr> = listen_addrs
-        .values()
-        .map(|addr| addr.ip())
-        .collect();
 
     info!(
         interval_secs = config.interval_secs,
@@ -85,7 +79,7 @@ pub fn spawn_keepalive(
 
         loop {
             tick.tick().await;
-            ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, threshold, &local_ips).await;
+            ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, threshold, registrant_manager.as_deref()).await;
         }
     });
 }
@@ -105,7 +99,7 @@ async fn ping_all_contacts(
     tls_addr_map: &DashMap<SocketAddr, ConnectionId>,
     tracker: &FailureTracker,
     threshold: u32,
-    local_ips: &std::collections::HashSet<std::net::IpAddr>,
+    registrant_manager: Option<&RegistrantManager>,
 ) {
     let contacts = registrar.all_contacts();
     let nat_count = contacts.iter().filter(|(_, c)| c.source_addr.is_some()).count();
@@ -117,17 +111,15 @@ async fn ping_all_contacts(
             None => continue,
         };
 
-        // Skip contacts whose URI host resolves to one of siphon's own
-        // listen addresses.  These are registrant self-contacts (siphon
-        // registered itself upstream), not remote clients behind NAT.
-        let contact_host_ip = contact.uri.host.parse::<std::net::IpAddr>().ok();
-        if let Some(ip) = contact_host_ip {
-            if local_ips.contains(&ip) {
-                debug!(aor = %aor, contact = %contact.uri, "skipping self-contact (local listen address)");
+        // Skip contacts whose AoR matches an outbound registrant entry.
+        // These are siphon's own registrations at upstream carriers —
+        // not remote clients behind NAT.
+        if let Some(manager) = registrant_manager {
+            if manager.state(&aor).is_some() {
+                debug!(aor = %aor, "skipping registrant self-contact");
                 continue;
             }
         }
-
 
         let contact_uri_string = contact.uri.to_string();
         let tracker_key = format!("{aor}|{contact_uri_string}");
@@ -286,8 +278,7 @@ mod tests {
         // Each call to ping_all_contacts will send OPTIONS and wait 5s for response,
         // which will timeout since nobody is answering.
         // Use threshold=1 to avoid long test.
-        let local_ips = std::collections::HashSet::new();
-        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1, &local_ips).await;
+        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1, None).await;
 
         // After 1 failure with threshold=1, contact should be removed
         assert!(!registrar.is_registered("sip:alice@example.com"));
@@ -309,8 +300,7 @@ mod tests {
             .unwrap();
 
         let tracker = FailureTracker::new();
-        let local_ips = std::collections::HashSet::new();
-        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1, &local_ips).await;
+        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1, None).await;
 
         // Contact should still be registered — it was skipped
         assert!(registrar.is_registered("sip:alice@example.com"));
