@@ -100,10 +100,23 @@ async fn ping_all_contacts(
         let contact_uri_string = contact.uri.to_string();
         let tracker_key = format!("{aor}|{contact_uri_string}");
 
+        let transport = contact
+            .source_transport
+            .as_deref()
+            .and_then(|t| match t {
+                "udp" => Some(Transport::Udp),
+                "tcp" => Some(Transport::Tcp),
+                "tls" => Some(Transport::Tls),
+                "ws" => Some(Transport::WebSocket),
+                "wss" => Some(Transport::WebSocketSecure),
+                _ => None,
+            })
+            .unwrap_or(Transport::Udp);
+
         let request_uri = SipUri::new(source_addr.ip().to_string())
             .with_port(source_addr.port());
 
-        let receiver = uac_sender.send_options(source_addr, Transport::Udp, request_uri);
+        let receiver = uac_sender.send_options(source_addr, transport, request_uri);
 
         // Wait for response with a 5-second timeout
         let result = tokio::time::timeout(Duration::from_secs(5), receiver).await;

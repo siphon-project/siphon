@@ -5103,7 +5103,8 @@ fn handle_b2bua_response(
                             // Resolve target
                             if let Some(relay_target) = resolve_target(target_uri, &state.dns_resolver) {
                                 let destination = relay_target.address;
-                                let transport = relay_target.transport.unwrap_or(Transport::Udp);
+                                let b_leg_transport = b_leg_dest.map(|(_, t)| t).unwrap_or(Transport::Udp);
+                                let transport = relay_target.transport.unwrap_or(b_leg_transport);
 
                                 // Build retry INVITE from stored A-leg INVITE
                                 let Ok(original) = invite_arc.lock() else {
@@ -5217,7 +5218,8 @@ fn handle_b2bua_response(
                             // Resolve target
                             if let Some(relay_target) = resolve_target(target_uri, &state.dns_resolver) {
                                 let destination = relay_target.address;
-                                let transport = relay_target.transport.unwrap_or(Transport::Udp);
+                                let b_leg_transport = b_leg_dest.map(|(_, t)| t).unwrap_or(Transport::Udp);
+                                let transport = relay_target.transport.unwrap_or(b_leg_transport);
 
                                 // Build retry INVITE from stored A-leg INVITE
                                 let Ok(original) = invite_arc.lock() else {
