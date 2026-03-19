@@ -132,15 +132,12 @@ async fn ping_all_contacts(
         // for NAT'd TLS clients. Instead, look up the connection in tls_addr_map
         // and send directly on it.
         if transport == Transport::Tls {
-            let pool_entries: Vec<String> = tls_addr_map.iter()
-                .map(|entry| format!("{}→{:?}", entry.key(), entry.value()))
-                .collect();
             if let Some(connection_id) = lookup_tls_connection(tls_addr_map, source_addr) {
-                debug!(
+                info!(
                     aor = %aor,
                     source_addr = %source_addr,
                     connection_id = ?connection_id,
-                    "keepalive: TLS connection found, sending OPTIONS"
+                    "keepalive: sending OPTIONS on TLS connection"
                 );
                 let receiver = uac_sender.send_options_on_connection(
                     source_addr, transport, request_uri, connection_id,
@@ -149,19 +146,31 @@ async fn ping_all_contacts(
                 match result {
                     Ok(Ok(crate::uac::UacResult::Response(response))) => {
                         let status = response.status_code().unwrap_or(0);
-                        debug!(aor = %aor, contact = %contact_uri_string, status, "keepalive response (TLS reuse)");
+                        info!(aor = %aor, contact = %contact_uri_string, status, "keepalive response (TLS reuse)");
                         tracker.record_success(&tracker_key);
                     }
-                    _ => {
+                    Ok(Ok(other)) => {
+                        warn!(aor = %aor, result = ?other, "keepalive: unexpected UAC result");
+                        record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
+                    }
+                    Ok(Err(error)) => {
+                        warn!(aor = %aor, %error, "keepalive: UAC channel error");
+                        record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
+                    }
+                    Err(_) => {
+                        warn!(aor = %aor, source_addr = %source_addr, connection_id = ?connection_id, "keepalive: OPTIONS timed out (5s)");
                         record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
                     }
                 }
             } else {
+                let map_entries: Vec<String> = tls_addr_map.iter()
+                    .map(|entry| format!("{}→{:?}", entry.key(), entry.value()))
+                    .collect();
                 warn!(
                     aor = %aor,
                     contact = %contact_uri_string,
                     source_addr = %source_addr,
-                    tls_addr_map_entries = ?pool_entries,
+                    tls_addr_map = ?map_entries,
                     "keepalive: no TLS connection found for source_addr"
                 );
                 record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
