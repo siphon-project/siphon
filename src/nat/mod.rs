@@ -5,6 +5,7 @@
 //! pings, and deregisters contacts that fail to respond after
 //! `failure_threshold` consecutive failures.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use tracing::{debug, info, warn};
 use crate::config::NatKeepaliveConfig;
 use crate::registrar::Registrar;
 use crate::sip::uri::SipUri;
-use crate::transport::Transport;
+use crate::transport::{ConnectionId, Transport};
 use crate::uac::UacSender;
 
 /// Tracks consecutive failure count per contact.
@@ -54,6 +55,7 @@ pub fn spawn_keepalive(
     config: NatKeepaliveConfig,
     registrar: Arc<Registrar>,
     uac_sender: Arc<UacSender>,
+    tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
 ) {
     if !config.enabled {
         info!("NAT keepalive disabled");
@@ -75,15 +77,24 @@ pub fn spawn_keepalive(
 
         loop {
             tick.tick().await;
-            ping_all_contacts(&registrar, &uac_sender, &tracker, threshold).await;
+            ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, threshold).await;
         }
     });
+}
+
+/// Look up a TLS connection ID from the addr_map (exact match, then IP-only fallback).
+fn lookup_tls_connection(
+    tls_addr_map: &DashMap<SocketAddr, ConnectionId>,
+    addr: SocketAddr,
+) -> Option<ConnectionId> {
+    tls_addr_map.get(&addr).map(|r| *r.value())
 }
 
 /// Send OPTIONS pings to all registered contacts with a source address.
 async fn ping_all_contacts(
     registrar: &Registrar,
     uac_sender: &UacSender,
+    tls_addr_map: &DashMap<SocketAddr, ConnectionId>,
     tracker: &FailureTracker,
     threshold: u32,
 ) {
@@ -116,6 +127,34 @@ async fn ping_all_contacts(
         let request_uri = SipUri::new(source_addr.ip().to_string())
             .with_port(source_addr.port());
 
+        // For TLS: send OPTIONS on the existing connection (connection reuse).
+        // The UacSender would create a new outbound connection, which won't work
+        // for NAT'd TLS clients. Instead, look up the connection in tls_addr_map
+        // and send directly on it.
+        if transport == Transport::Tls {
+            if let Some(connection_id) = lookup_tls_connection(tls_addr_map, source_addr) {
+                let receiver = uac_sender.send_options_on_connection(
+                    source_addr, transport, request_uri, connection_id,
+                );
+                let result = tokio::time::timeout(Duration::from_secs(5), receiver).await;
+                match result {
+                    Ok(Ok(crate::uac::UacResult::Response(response))) => {
+                        let status = response.status_code().unwrap_or(0);
+                        debug!(aor = %aor, contact = %contact_uri_string, status, "keepalive response (TLS reuse)");
+                        tracker.record_success(&tracker_key);
+                    }
+                    _ => {
+                        record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
+                    }
+                }
+            } else {
+                // No TLS connection available — connection is dead
+                record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
+            }
+            continue;
+        }
+
+        // Non-TLS: use the UAC sender as before (creates outbound connection)
         let receiver = uac_sender.send_options(source_addr, transport, request_uri);
 
         // Wait for response with a 5-second timeout
@@ -124,34 +163,30 @@ async fn ping_all_contacts(
         match result {
             Ok(Ok(crate::uac::UacResult::Response(response))) => {
                 let status = response.status_code().unwrap_or(0);
-                debug!(
-                    aor = %aor,
-                    contact = %contact_uri_string,
-                    status = status,
-                    "keepalive response"
-                );
+                debug!(aor = %aor, contact = %contact_uri_string, status, "keepalive response");
                 tracker.record_success(&tracker_key);
             }
             _ => {
-                let count = tracker.record_failure(&tracker_key);
-                warn!(
-                    aor = %aor,
-                    contact = %contact_uri_string,
-                    failures = count,
-                    "keepalive failed"
-                );
-
-                if count >= threshold {
-                    warn!(
-                        aor = %aor,
-                        contact = %contact_uri_string,
-                        "deregistering unresponsive contact after {count} failures"
-                    );
-                    registrar.remove_contact(&aor, &contact_uri_string);
-                    tracker.remove(&tracker_key);
-                }
+                record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
             }
         }
+    }
+}
+
+fn record_keepalive_failure(
+    registrar: &Registrar,
+    tracker: &FailureTracker,
+    aor: &str,
+    contact_uri_string: &str,
+    tracker_key: &str,
+    threshold: u32,
+) {
+    let count = tracker.record_failure(tracker_key);
+    warn!(aor = %aor, contact = %contact_uri_string, failures = count, "keepalive failed");
+    if count >= threshold {
+        warn!(aor = %aor, contact = %contact_uri_string, "deregistering unresponsive contact after {count} failures");
+        registrar.remove_contact(aor, contact_uri_string);
+        tracker.remove(tracker_key);
     }
 }
 
@@ -163,7 +198,7 @@ async fn ping_all_contacts(
 mod tests {
     use super::*;
     use crate::registrar::RegistrarConfig;
-    use crate::transport::{OutboundRouter, OutboundMessage};
+    use crate::transport::{OutboundMessage, OutboundRouter};
     use std::net::SocketAddr;
 
     fn make_registrar() -> Arc<Registrar> {
@@ -188,8 +223,7 @@ mod tests {
         });
 
         let sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), std::collections::HashMap::new(), std::collections::HashMap::new(), None, None, None));
-        let receivers = vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx];
-        (sender, receivers)
+        (sender, vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx])
     }
 
     #[test]
@@ -210,6 +244,7 @@ mod tests {
     async fn ping_deregisters_after_threshold() {
         let registrar = make_registrar();
         let (uac_sender, _rxs) = make_uac_sender();
+        let tls_addr_map = Arc::new(DashMap::new());
 
         let source: SocketAddr = "192.168.1.100:50000".parse().unwrap();
 
@@ -230,7 +265,7 @@ mod tests {
         // Each call to ping_all_contacts will send OPTIONS and wait 5s for response,
         // which will timeout since nobody is answering.
         // Use threshold=1 to avoid long test.
-        ping_all_contacts(&registrar, &uac_sender, &tracker, 1).await;
+        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1).await;
 
         // After 1 failure with threshold=1, contact should be removed
         assert!(!registrar.is_registered("sip:alice@example.com"));
@@ -240,6 +275,7 @@ mod tests {
     async fn ping_skips_contacts_without_source_addr() {
         let registrar = make_registrar();
         let (uac_sender, _rxs) = make_uac_sender();
+        let tls_addr_map = Arc::new(DashMap::new());
 
         // Contact without source_addr
         registrar
@@ -251,7 +287,7 @@ mod tests {
             .unwrap();
 
         let tracker = FailureTracker::new();
-        ping_all_contacts(&registrar, &uac_sender, &tracker, 1).await;
+        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1).await;
 
         // Contact should still be registered — it was skipped
         assert!(registrar.is_registered("sip:alice@example.com"));

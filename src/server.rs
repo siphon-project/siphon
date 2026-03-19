@@ -293,8 +293,15 @@ impl SiphonServer {
             transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos).await;
         }
 
+        // TLS maps — created before pool so pool can register connections for reuse.
+        let tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>> =
+            Arc::new(dashmap::DashMap::new());
+        let tls_connection_map: Arc<dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>> =
+            Arc::new(dashmap::DashMap::new());
+
         // --- Connection pool ---
         // Created before TLS listen so outbound TLS messages can use it.
+        // Gets tls_addr_map so pool TLS connections are discoverable by the dispatcher.
         let pool_tos = global_dscp
             .filter(|&d| d > 0)
             .map(config::dscp_to_tos);
@@ -306,13 +313,8 @@ impl SiphonServer {
             inbound_tx.clone(),
             pool_local_addr,
             pool_tos,
+            Some(Arc::clone(&tls_addr_map)),
         ));
-
-        // TLS
-        let tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>> =
-            Arc::new(dashmap::DashMap::new());
-        let tls_connection_map: Arc<dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>> =
-            Arc::new(dashmap::DashMap::new());
         if let Some(ref tls_config) = config.tls {
             for entry in &config.listen.tls {
                 let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
@@ -589,6 +591,7 @@ impl SiphonServer {
                         keepalive_config.clone(),
                         Arc::clone(registrar),
                         Arc::clone(&uac_sender),
+                        Arc::clone(&tls_addr_map),
                     );
                 }
             }

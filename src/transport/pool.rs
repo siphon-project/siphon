@@ -61,6 +61,10 @@ pub struct ConnectionPool {
     tos: Option<u32>,
     /// TLS connector for outbound TLS connections.
     tls_connector: TlsConnector,
+    /// TLS address map — registers outbound TLS pool connections so the
+    /// dispatcher can reuse them for inbound routing (e.g., INVITEs to
+    /// registered trunks). Like OpenSIPS connection reuse.
+    tls_addr_map: Option<Arc<DashMap<SocketAddr, ConnectionId>>>,
 }
 
 /// Build a permissive TLS client config that accepts any server certificate.
@@ -126,6 +130,7 @@ impl ConnectionPool {
         inbound_tx: flume::Sender<InboundMessage>,
         local_addr: SocketAddr,
         tos: Option<u32>,
+        tls_addr_map: Option<Arc<DashMap<SocketAddr, ConnectionId>>>,
     ) -> Self {
         Self {
             connections: Arc::new(DashMap::new()),
@@ -134,6 +139,7 @@ impl ConnectionPool {
             local_addr,
             tos,
             tls_connector: TlsConnector::from(build_outbound_tls_config()),
+            tls_addr_map,
         }
     }
 
@@ -323,27 +329,35 @@ impl ConnectionPool {
         // Register in the shared connection map
         self.connection_map.insert(connection_id, write_tx.clone());
 
+        // Register in TLS addr_map so the dispatcher can reuse this connection
+        // for inbound routing (e.g., INVITEs to registered trunks).
+        if let Some(ref addr_map) = self.tls_addr_map {
+            addr_map.insert(destination, connection_id);
+        }
+
         debug!(
             destination = %destination,
             connection_id = ?connection_id,
             "pool: opened outbound TLS connection"
         );
 
-        // Read task — responses from the remote server come back here
+        // Read task — bidirectional: responses AND incoming requests come back here.
+        // No idle timeout — the connection stays alive until peer close or error.
+        // TCP keepalive (configured at socket level) handles dead peer detection.
         let inbound_tx = self.inbound_tx.clone();
         let conn_map = self.connection_map.clone();
         let connections = self.connections.clone();
+        let tls_addr_map = self.tls_addr_map.clone();
         let key_for_cleanup = key;
         tokio::spawn(async move {
             let mut buffer = BytesMut::zeroed(65536);
             loop {
-                match tokio::time::timeout(POOL_IDLE_TIMEOUT, reader.read(&mut buffer)).await
-                {
-                    Ok(Ok(0)) => {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => {
                         info!("pool: TLS connection {:?} to {} closed by peer", connection_id, destination);
                         break;
                     }
-                    Ok(Ok(size)) => {
+                    Ok(size) => {
                         let response_data = Bytes::copy_from_slice(&buffer[..size]);
                         let message = InboundMessage {
                             connection_id,
@@ -357,22 +371,17 @@ impl ConnectionPool {
                             break;
                         }
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         warn!("pool: TLS read error on {:?}: {}", connection_id, error);
-                        break;
-                    }
-                    Err(_) => {
-                        info!(
-                            "pool: TLS connection {:?} idle timeout ({}s)",
-                            connection_id,
-                            POOL_IDLE_TIMEOUT.as_secs()
-                        );
                         break;
                     }
                 }
             }
             conn_map.remove(&connection_id);
             connections.remove(&key_for_cleanup);
+            if let Some(ref addr_map) = tls_addr_map {
+                addr_map.remove(&destination);
+            }
         });
 
         // Write task
@@ -443,6 +452,7 @@ mod tests {
             inbound_tx,
             "127.0.0.1:5060".parse().unwrap(),
             None,
+            None,
         );
 
         // Send via pool
@@ -493,6 +503,7 @@ mod tests {
             inbound_tx,
             "127.0.0.1:5060".parse().unwrap(),
             None,
+            None,
         );
 
         let id1 = pool
@@ -532,6 +543,7 @@ mod tests {
             connection_map,
             inbound_tx,
             "127.0.0.1:5060".parse().unwrap(),
+            None,
             None,
         );
 

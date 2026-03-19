@@ -143,12 +143,43 @@ impl UacSender {
         self.send_options_with_identity(destination, transport, request_uri, None, None)
     }
 
+    /// Send an OPTIONS request on a specific existing connection (TLS reuse).
+    ///
+    /// Like `send_options()` but uses the given `connection_id` instead of
+    /// `ConnectionId::default()`, so the message is sent on an existing
+    /// connection rather than creating a new one.
+    pub fn send_options_on_connection(
+        &self,
+        destination: SocketAddr,
+        transport: Transport,
+        request_uri: SipUri,
+        connection_id: ConnectionId,
+    ) -> oneshot::Receiver<UacResult> {
+        self.send_options_on_connection_inner(destination, transport, request_uri, connection_id, None, None)
+    }
+
     /// Send an OPTIONS request with custom From identity.
     pub fn send_options_with_identity(
         &self,
         destination: SocketAddr,
         transport: Transport,
         request_uri: SipUri,
+        from_user: Option<&str>,
+        from_domain: Option<&str>,
+    ) -> oneshot::Receiver<UacResult> {
+        self.send_options_on_connection_inner(
+            destination, transport, request_uri,
+            ConnectionId::default(), from_user, from_domain,
+        )
+    }
+
+    /// Inner OPTIONS send — supports both default (pool) and specific connection ID.
+    fn send_options_on_connection_inner(
+        &self,
+        destination: SocketAddr,
+        transport: Transport,
+        request_uri: SipUri,
+        connection_id: ConnectionId,
         from_user: Option<&str>,
         from_domain: Option<&str>,
     ) -> oneshot::Receiver<UacResult> {
@@ -202,7 +233,7 @@ impl UacSender {
         }
 
         let outbound_message = OutboundMessage {
-            connection_id: ConnectionId::default(),
+            connection_id,
             transport,
             destination,
             data,
