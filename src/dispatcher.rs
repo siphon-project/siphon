@@ -1389,12 +1389,6 @@ fn relay_request(
         "relaying request"
     );
 
-    // HEP capture — outbound relayed request
-    if let Some(ref hep) = state.hep_sender {
-        let local = state.listen_addrs.get(&outbound_transport).copied().unwrap_or(state.local_addr);
-        hep.capture_outbound(local, destination, outbound_transport, &data);
-    }
-
     // Send to target — use resolved transport, with connection pool for TCP/TLS
     let connection_id = send_to_target(data, &target, inbound.transport, inbound.connection_id, state);
 
@@ -1600,12 +1594,6 @@ fn relay_fork_branch(
     }
 
     let data = Bytes::from(relayed.to_bytes());
-
-    // HEP capture — outbound fork branch
-    if let Some(ref hep) = state.hep_sender {
-        let local = state.listen_addrs.get(&outbound_transport).copied().unwrap_or(state.local_addr);
-        hep.capture_outbound(local, destination, outbound_transport, &data);
-    }
 
     // Send via pool for TCP/TLS, direct channel for UDP
     let connection_id = send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state);
@@ -2427,6 +2415,12 @@ fn send_to_target(
     let transport = target.transport.unwrap_or(fallback_transport);
     let destination = target.address;
 
+    // HEP capture — outbound (sent to network)
+    if let Some(ref hep) = state.hep_sender {
+        let local = state.listen_addrs.get(&transport).copied().unwrap_or(state.local_addr);
+        hep.capture_outbound(local, destination, transport, &data);
+    }
+
     match transport {
         Transport::Tcp => {
             // Use connection pool for outbound TCP
@@ -3001,25 +2995,17 @@ fn build_b2bua_ack_for_non2xx(
     }
 }
 
-/// Serialize a SIP message and send it to a specific destination.
-fn send_message(
-    message: SipMessage,
+/// Send raw bytes to a specific destination via the outbound channel,
+/// with automatic HEP capture.  Used for connection-affine sends (CANCELs,
+/// in-dialog ACKs, registrant retries) that must reuse a specific connection.
+fn send_outbound(
+    data: Bytes,
     transport: Transport,
     destination: SocketAddr,
     connection_id: ConnectionId,
     state: &DispatcherState,
 ) {
-    let data = Bytes::from(message.to_bytes());
-
-    debug!(
-        destination = %destination,
-        size = data.len(),
-        "sending message"
-    );
-
     // HEP capture — outbound (sent to network)
-    // Use the per-transport listen address so HEP reports the correct source
-    // port (e.g. 5061 for TLS instead of the generic local_addr on 5060).
     if let Some(ref hep) = state.hep_sender {
         let local = state.listen_addrs.get(&transport).copied().unwrap_or(state.local_addr);
         hep.capture_outbound(local, destination, transport, &data);
@@ -3037,6 +3023,25 @@ fn send_message(
     }
 }
 
+/// Serialize a SIP message and send it to a specific destination.
+fn send_message(
+    message: SipMessage,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    state: &DispatcherState,
+) {
+    let data = Bytes::from(message.to_bytes());
+
+    debug!(
+        destination = %destination,
+        size = data.len(),
+        "sending message"
+    );
+
+    send_outbound(data, transport, destination, connection_id, state);
+}
+
 /// Send a SIP message to the B-leg, using the TCP connection pool for TCP/TLS
 /// or the direct outbound channel for UDP. This ensures in-dialog messages
 /// (ACK, BYE) reach the B-leg over the correct transport.
@@ -3047,13 +3052,6 @@ fn send_b2bua_to_bleg(
     state: &DispatcherState,
 ) {
     let data = Bytes::from(message.to_bytes());
-
-    // HEP capture
-    if let Some(ref hep) = state.hep_sender {
-        let local = state.listen_addrs.get(&transport).copied().unwrap_or(state.local_addr);
-        hep.capture_outbound(local, destination, transport, &data);
-    }
-
     let target = RelayTarget {
         address: destination,
         transport: Some(transport),
@@ -3180,18 +3178,14 @@ fn cancel_other_fork_branches(
             cancel.headers.set("Via", via_value);
 
             let data = Bytes::from(cancel.to_bytes());
+
             debug!(
                 client_key = %client_key,
                 destination = %client_branch.destination,
                 "fork: cancelling branch"
             );
 
-            let _ = state.outbound.send(OutboundMessage {
-                connection_id: client_branch.connection_id,
-                transport: client_branch.transport,
-                destination: client_branch.destination,
-                data,
-            });
+            send_outbound(data, client_branch.transport, client_branch.destination, client_branch.connection_id, state);
         }
     }
 }
@@ -3378,19 +3372,7 @@ fn handle_ack_via_session(
                 "relaying ACK for 2xx downstream via session"
             );
 
-            if let Some(ref hep) = state.hep_sender {
-                let local = state.listen_addrs.get(&client_branch.transport).copied().unwrap_or(state.local_addr);
-                hep.capture_outbound(local, client_branch.destination, client_branch.transport, &data);
-            }
-
-            if let Err(error) = state.outbound.send(OutboundMessage {
-                connection_id: client_branch.connection_id,
-                transport: client_branch.transport,
-                destination: client_branch.destination,
-                data,
-            }) {
-                error!("failed to relay ACK to {}: {error}", client_branch.destination);
-            }
+            send_outbound(data, client_branch.transport, client_branch.destination, client_branch.connection_id, state);
         }
     }
 }
@@ -3446,20 +3428,14 @@ fn handle_cancel_via_session(
             cancel_downstream.headers.set("Via", via_value);
 
             let data = Bytes::from(cancel_downstream.to_bytes());
+
             debug!(
                 client_key = %client_key,
                 destination = %client_branch.destination,
                 "forwarding CANCEL downstream via session"
             );
 
-            if let Err(error) = state.outbound.send(OutboundMessage {
-                connection_id: client_branch.connection_id,
-                transport: client_branch.transport,
-                destination: client_branch.destination,
-                data,
-            }) {
-                error!("failed to forward CANCEL to {}: {error}", client_branch.destination);
-            }
+            send_outbound(data, client_branch.transport, client_branch.destination, client_branch.connection_id, state);
         }
     }
 
@@ -4054,12 +4030,6 @@ fn b2bua_send_b_leg_invite(
 
     let data = Bytes::from(b_leg_invite.to_bytes());
 
-    // HEP capture
-    if let Some(ref hep) = state.hep_sender {
-        let local = state.listen_addrs.get(&outbound_transport).copied().unwrap_or(state.local_addr);
-        hep.capture_outbound(local, destination, outbound_transport, &data);
-    }
-
     // Send via pool for TCP/TLS, direct channel for UDP
     send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
 
@@ -4179,16 +4149,7 @@ fn handle_registrant_response(
                     )
                 {
                     let data = bytes::Bytes::from(retry_message.to_bytes());
-                    let outbound_message = crate::transport::OutboundMessage {
-                        connection_id: crate::transport::ConnectionId::default(),
-                        transport,
-                        destination,
-                        data,
-                    };
-                    if let Err(error) = state.outbound.send(outbound_message) {
-                        warn!(aor = %aor, %error, "failed to send authenticated REGISTER");
-                        registrant.handle_failure(&aor, status_code);
-                    }
+                    send_outbound(data, transport, destination, crate::transport::ConnectionId::default(), state);
                 } else {
                     registrant.handle_failure(&aor, status_code);
                 }
