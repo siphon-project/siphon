@@ -4117,10 +4117,27 @@ fn handle_registrant_response(
 
     match status_code {
         200 => {
-            // Parse Expires from Contact or Expires header
+            // Parse granted expires: top-level Expires header first,
+            // then Contact expires= parameter (RFC 3261 §10.2.4),
+            // finally fall back to the originally requested value.
             let expires = message.headers.get("Expires")
                 .and_then(|v| v.trim().parse::<u32>().ok())
-                .unwrap_or(3600);
+                .or_else(|| {
+                    // Extract expires= parameter from Contact header
+                    message.headers.get("Contact")
+                        .and_then(|contact| {
+                            contact.split(';')
+                                .find_map(|param| {
+                                    let param = param.trim();
+                                    if let Some(value) = param.strip_prefix("expires=") {
+                                        value.trim().trim_matches('"').parse::<u32>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                        })
+                })
+                .unwrap_or(registrant.default_interval);
             registrant.handle_success(&aor, expires);
         }
         401 | 407 => {
