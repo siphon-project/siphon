@@ -199,6 +199,8 @@ pub struct RegistrantManager {
     pub retry_interval: Duration,
     /// Maximum retry interval (backoff cap).
     pub max_retry_interval: Duration,
+    /// User-Agent header value for outbound REGISTERs.
+    user_agent_header: Option<String>,
     /// Broadcast channel for registrant state change events.
     event_sender: broadcast::Sender<RegistrantEvent>,
 }
@@ -208,6 +210,7 @@ impl RegistrantManager {
         default_interval: u32,
         retry_interval: Duration,
         max_retry_interval: Duration,
+        user_agent_header: Option<String>,
     ) -> Self {
         let (event_sender, _) = broadcast::channel(64);
         Self {
@@ -215,6 +218,7 @@ impl RegistrantManager {
             default_interval,
             retry_interval,
             max_retry_interval,
+            user_agent_header,
             event_sender,
         }
     }
@@ -332,7 +336,7 @@ impl RegistrantManager {
             entry.transport, effective_addr, branch
         );
 
-        let message = SipMessageBuilder::new()
+        let mut builder = SipMessageBuilder::new()
             .request(Method::Register, request_uri)
             .via(via)
             .to(format!("<{}>", entry.aor))
@@ -345,8 +349,13 @@ impl RegistrantManager {
             .header("Contact", format!("<{}>", contact))
             .header("Expires", expires.to_string())
             .max_forwards(70)
-            .content_length(0)
-            .build();
+            .content_length(0);
+
+        if let Some(ref user_agent) = self.user_agent_header {
+            builder = builder.header("User-Agent", user_agent.clone());
+        }
+
+        let message = builder.build();
 
         let destination = entry.destination;
         let transport = entry.transport;
@@ -427,7 +436,7 @@ impl RegistrantManager {
         entry.state = RegistrantState::Challenging;
         entry.last_sent_at = Some(Instant::now());
 
-        let message = SipMessageBuilder::new()
+        let mut builder = SipMessageBuilder::new()
             .request(Method::Register, request_uri)
             .via(via)
             .to(format!("<{}>", entry.aor))
@@ -441,8 +450,13 @@ impl RegistrantManager {
             .header("Expires", expires.to_string())
             .header(auth_header_name, auth_header_value)
             .max_forwards(70)
-            .content_length(0)
-            .build();
+            .content_length(0);
+
+        if let Some(ref user_agent) = self.user_agent_header {
+            builder = builder.header("User-Agent", user_agent.clone());
+        }
+
+        let message = builder.build();
 
         let destination = entry.destination;
         let transport = entry.transport;
@@ -784,6 +798,7 @@ mod tests {
             3600,
             Duration::from_secs(60),
             Duration::from_secs(300),
+            Some("SIPhon/test".to_string()),
         )
     }
 
@@ -998,6 +1013,7 @@ mod tests {
             3600,
             Duration::from_secs(10),
             Duration::from_secs(30),
+            None,
         );
         manager.add(make_entry("sip:alice@carrier.com"));
 
@@ -1335,6 +1351,82 @@ mod tests {
         let timed_out = manager.entries_timed_out();
         assert_eq!(timed_out.len(), 1);
         assert_eq!(timed_out[0], "sip:alice@carrier.com");
+    }
+
+    #[test]
+    fn build_register_includes_user_agent() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        let result = manager.build_register(
+            "sip:alice@carrier.com",
+            "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
+            3600,
+        );
+        let (message, _, _, _) = result.unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(
+            raw.contains("User-Agent: SIPhon/test"),
+            "REGISTER should include User-Agent header: {raw}"
+        );
+    }
+
+    #[test]
+    fn build_register_omits_user_agent_when_none() {
+        let manager = RegistrantManager::new(
+            3600,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            None,
+        );
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        let result = manager.build_register(
+            "sip:alice@carrier.com",
+            "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
+            3600,
+        );
+        let (message, _, _, _) = result.unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(
+            !raw.contains("User-Agent:"),
+            "REGISTER should not include User-Agent header when None: {raw}"
+        );
+    }
+
+    #[test]
+    fn build_register_with_auth_includes_user_agent() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        let challenge = DigestChallenge {
+            realm: "carrier.com".to_string(),
+            nonce: "abc123".to_string(),
+            opaque: None,
+            qop: Some("auth".to_string()),
+            algorithm: auth::DigestAlgorithm::Md5,
+            stale: false,
+        };
+
+        let result = manager.build_register_with_auth(
+            "sip:alice@carrier.com",
+            "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
+            &challenge,
+            false,
+            3600,
+        );
+        let (message, _, _, _) = result.unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(
+            raw.contains("User-Agent: SIPhon/test"),
+            "Authenticated REGISTER should include User-Agent header: {raw}"
+        );
     }
 
     #[test]

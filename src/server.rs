@@ -1046,10 +1046,15 @@ fn init_registrant(
 
     let registrant_config = config.registrant.as_ref()?;
 
+    let registrant_user_agent = config.server.as_ref()
+        .and_then(|server| server.user_agent_header.clone())
+        .or_else(|| Some(format!("SIPhon/{}", env!("CARGO_PKG_VERSION"))));
+
     let manager = Arc::new(RegistrantManager::new(
         registrant_config.default_interval,
         std::time::Duration::from_secs(registrant_config.retry_interval),
         std::time::Duration::from_secs(registrant_config.max_retry_interval),
+        registrant_user_agent,
     ));
 
     for entry_config in &registrant_config.entries {
