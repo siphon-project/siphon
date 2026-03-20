@@ -4090,6 +4090,26 @@ fn spawn_b_leg_actor(call_id: &str, b_leg: &Leg, state: &DispatcherState) {
     }
 }
 
+/// Extract the `expires=` parameter value from a Contact header value.
+///
+/// Skips URI parameters inside angle brackets so that only Contact-level
+/// parameters (after the closing `>`) are considered.  Handles both
+/// unquoted (`expires=3600`) and quoted (`expires="3600"`) forms.
+fn parse_contact_expires(contact: &str) -> Option<u32> {
+    // If the Contact contains angle brackets, only look at params after '>'
+    let params_part = if let Some(pos) = contact.find('>') {
+        &contact[pos + 1..]
+    } else {
+        contact
+    };
+    params_part.split(';').find_map(|param| {
+        let param = param.trim();
+        param
+            .strip_prefix("expires=")
+            .and_then(|value| value.trim().trim_matches('"').parse::<u32>().ok())
+    })
+}
+
 /// Handle a response to an outbound registration (z9hG4bK-reg- branch).
 fn handle_registrant_response(
     registrant: &Arc<crate::registrant::RegistrantManager>,
@@ -4123,19 +4143,8 @@ fn handle_registrant_response(
             let expires = message.headers.get("Expires")
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .or_else(|| {
-                    // Extract expires= parameter from Contact header
                     message.headers.get("Contact")
-                        .and_then(|contact| {
-                            contact.split(';')
-                                .find_map(|param| {
-                                    let param = param.trim();
-                                    if let Some(value) = param.strip_prefix("expires=") {
-                                        value.trim().trim_matches('"').parse::<u32>().ok()
-                                    } else {
-                                        None
-                                    }
-                                })
-                        })
+                        .and_then(|contact| parse_contact_expires(contact))
                 })
                 .unwrap_or(registrant.default_interval);
             registrant.handle_success(&aor, expires);
@@ -7333,5 +7342,50 @@ mod tests {
         let original = body.clone();
         fix_srs_answer_sdp_direction(&mut body);
         assert_eq!(body, original);
+    }
+
+    // --- parse_contact_expires tests ---
+
+    #[test]
+    fn contact_expires_bare_param() {
+        assert_eq!(parse_contact_expires("<sip:trunk@10.0.0.1:5060>;expires=3600"), Some(3600));
+    }
+
+    #[test]
+    fn contact_expires_quoted_value() {
+        assert_eq!(parse_contact_expires("<sip:trunk@10.0.0.1:5060>;expires=\"1800\""), Some(1800));
+    }
+
+    #[test]
+    fn contact_expires_ignores_uri_param() {
+        // expires= inside angle brackets is a URI parameter, not a Contact parameter
+        assert_eq!(
+            parse_contact_expires("<sip:trunk@10.0.0.1:5060;expires=0>;expires=3600"),
+            Some(3600),
+        );
+    }
+
+    #[test]
+    fn contact_expires_uri_param_only_ignored() {
+        // Only URI-level expires=, no Contact-level — should return None
+        assert_eq!(parse_contact_expires("<sip:trunk@10.0.0.1:5060;expires=0>"), None);
+    }
+
+    #[test]
+    fn contact_expires_no_angle_brackets() {
+        assert_eq!(parse_contact_expires("sip:trunk@10.0.0.1:5060;expires=600"), Some(600));
+    }
+
+    #[test]
+    fn contact_expires_missing() {
+        assert_eq!(parse_contact_expires("<sip:trunk@10.0.0.1:5060>"), None);
+    }
+
+    #[test]
+    fn contact_expires_with_other_params() {
+        assert_eq!(
+            parse_contact_expires("<sip:trunk@10.0.0.1:5060>;q=0.8;expires=900;+sip.instance=\"<urn:uuid:abc>\""),
+            Some(900),
+        );
     }
 }
