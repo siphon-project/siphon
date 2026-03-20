@@ -183,6 +183,35 @@ pub fn pop_top_route(headers: &mut SipHeaders) -> Option<RouteEntry> {
     Some(removed)
 }
 
+/// Pop all leading Route entries whose URI host matches one of the local domains.
+///
+/// After double Record-Route (transport bridging), an in-dialog request may
+/// carry two consecutive Route headers that both point to us — one per
+/// transport.  RFC 3261 §16.4 says we remove Route entries that indicate
+/// *this* proxy.  This function pops them all in one pass so the relay path
+/// sees the first *external* Route (or falls back to the Request-URI).
+pub fn pop_local_routes(headers: &mut SipHeaders, local_domains: &[String]) {
+    loop {
+        let route_raw = match headers.get("Route") {
+            Some(raw) => raw.clone(),
+            None => break,
+        };
+        let entries = match RouteEntry::parse_multi(&route_raw) {
+            Ok(entries) if !entries.is_empty() => entries,
+            _ => break,
+        };
+        let host = &entries[0].uri.host;
+        let is_local = local_domains
+            .iter()
+            .any(|domain| domain.eq_ignore_ascii_case(host));
+        if is_local {
+            pop_top_route(headers);
+        } else {
+            break;
+        }
+    }
+}
+
 /// Return the URI of the topmost Route header, if any.
 ///
 /// RFC 3261 §16.6 step 6: when Route headers are present the proxy
@@ -455,6 +484,94 @@ mod tests {
         // Inbound should be second — the subscriber sees this as the next hop
         assert!(all_rr[1].contains("transport=tls"),
             "second RR should be inbound transport: {}", all_rr[1]);
+    }
+
+    #[test]
+    fn pop_local_routes_double_rr() {
+        // Simulates in-dialog BYE from subscriber with double Record-Route.
+        // Both Routes point to the proxy (different transports).
+        let mut headers = SipHeaders::new();
+        headers.add(
+            "Route",
+            "<sip:proxy.example.com:5060;transport=tcp;lr>, <sip:external.example.com;lr>".to_string(),
+        );
+
+        let domains = vec![
+            "proxy.example.com".to_string(),
+            "10.0.0.1".to_string(),
+        ];
+        pop_local_routes(&mut headers, &domains);
+
+        // The local Route should be popped, leaving only the external one
+        let remaining = headers.get("Route").unwrap();
+        assert!(remaining.contains("external.example.com"));
+        assert!(!remaining.contains("proxy.example.com"));
+    }
+
+    #[test]
+    fn pop_local_routes_double_rr_both_local() {
+        // Both Routes point to us (TLS + TCP) — typical double Record-Route
+        // scenario after loose_route() already popped the first one.
+        let mut headers = SipHeaders::new();
+        headers.add(
+            "Route",
+            "<sip:10.0.0.1:5060;transport=tcp;lr>, <sip:proxy.example.com:5061;transport=tls;lr>".to_string(),
+        );
+
+        let domains = vec![
+            "proxy.example.com".to_string(),
+            "10.0.0.1".to_string(),
+        ];
+        pop_local_routes(&mut headers, &domains);
+
+        // Both should be popped — no Route header left
+        assert!(!headers.has("Route"), "both local Routes should be removed");
+    }
+
+    #[test]
+    fn pop_local_routes_preserves_external() {
+        // Two local Routes followed by an external one
+        let mut headers = SipHeaders::new();
+        headers.add("Route", "<sip:10.0.0.1:5060;transport=tcp;lr>".to_string());
+        headers.add("Route", "<sip:far-end.example.com:5060;lr>".to_string());
+
+        let domains = vec!["10.0.0.1".to_string()];
+        pop_local_routes(&mut headers, &domains);
+
+        let remaining = headers.get("Route").unwrap();
+        assert!(remaining.contains("far-end.example.com"));
+    }
+
+    #[test]
+    fn pop_local_routes_no_routes() {
+        let mut headers = SipHeaders::new();
+        let domains = vec!["proxy.example.com".to_string()];
+        // Should not panic
+        pop_local_routes(&mut headers, &domains);
+        assert!(!headers.has("Route"));
+    }
+
+    #[test]
+    fn pop_local_routes_case_insensitive() {
+        let mut headers = SipHeaders::new();
+        headers.add("Route", "<sip:PROXY.Example.COM:5060;lr>".to_string());
+
+        let domains = vec!["proxy.example.com".to_string()];
+        pop_local_routes(&mut headers, &domains);
+        assert!(!headers.has("Route"));
+    }
+
+    #[test]
+    fn pop_local_routes_non_local_untouched() {
+        let mut headers = SipHeaders::new();
+        headers.add("Route", "<sip:external.example.com;lr>".to_string());
+
+        let domains = vec!["proxy.example.com".to_string()];
+        pop_local_routes(&mut headers, &domains);
+
+        // Should still be there
+        assert!(headers.has("Route"));
+        assert!(headers.get("Route").unwrap().contains("external.example.com"));
     }
 
     #[test]

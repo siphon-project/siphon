@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 
 use crate::sip::message::{SipMessage, StartLine};
 use crate::sip::uri::SipUri;
+use crate::sip::headers::nameaddr::NameAddr;
 use super::sip_uri::PySipUri;
 
 /// Python-visible SIP reply object.
@@ -20,6 +21,10 @@ use super::sip_uri::PySipUri;
 pub struct PyReply {
     message: Arc<Mutex<SipMessage>>,
     forwarded: bool,
+    /// Source IP of the entity that sent this response (for NAT fixup).
+    response_source_ip: Option<String>,
+    /// Source port of the entity that sent this response (for NAT fixup).
+    response_source_port: Option<u16>,
     /// In B2BUA mode, the A-leg INVITE message.  Used by `rtpengine.answer()`
     /// to automatically correlate with the earlier `offer()` (which used the
     /// A-leg Call-ID/From-tag).
@@ -40,8 +45,20 @@ impl PyReply {
         Self {
             message,
             forwarded: false,
+            response_source_ip: None,
+            response_source_port: None,
             a_leg_message: None,
         }
+    }
+
+    /// Set the source address of the entity that sent this response.
+    ///
+    /// Used by `fix_nated_contact()` to rewrite the Contact URI with
+    /// the observed source address (NAT traversal).
+    pub fn with_response_source(mut self, ip: String, port: u16) -> Self {
+        self.response_source_ip = Some(ip);
+        self.response_source_port = Some(port);
+        self
     }
 
     /// Attach the A-leg INVITE so `rtpengine.answer()` can look up the
@@ -201,6 +218,43 @@ impl PyReply {
     /// Alias for `relay()` (used in P-CSCF and S-CSCF scripts).
     fn forward(&mut self) {
         self.forwarded = true;
+    }
+
+    /// Fix NAT for Contact in this response: rewrite Contact URI host:port
+    /// with the observed source IP:port of the entity that sent this reply.
+    ///
+    /// This is the reply-side equivalent of `request.fix_nated_contact()`.
+    /// Use it when the downstream UAS is behind NAT and its Contact URI
+    /// contains a private address that the upstream UAC cannot reach.
+    fn fix_nated_contact(&self) -> PyResult<()> {
+        let (source_ip, source_port) = match (&self.response_source_ip, self.response_source_port) {
+            (Some(ip), Some(port)) => (ip.clone(), port),
+            _ => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "response source address not available for fix_nated_contact"
+                ));
+            }
+        };
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        if let Some(raw) = message.headers.get("Contact").cloned() {
+            if let Ok(mut nameaddr) = NameAddr::parse(&raw) {
+                nameaddr.uri.host = format_sip_host(&source_ip);
+                nameaddr.uri.port = Some(source_port);
+                message.headers.set("Contact", nameaddr.to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Format a host string for SIP URIs (bracket IPv6 addresses).
+fn format_sip_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
     }
 }
 
@@ -386,6 +440,41 @@ mod tests {
             locked.headers.get("P-Asserted-Identity").map(|s| s.as_str()),
             Some("sip:alice@example.com")
         );
+    }
+
+    #[test]
+    fn fix_nated_contact_rewrites_uri() {
+        let mut response = make_response(200, "OK");
+        response.headers.set("Contact", "<sip:alice@192.168.1.100:6000>".to_string());
+
+        let message = Arc::new(Mutex::new(response));
+        let reply = PyReply::new(Arc::clone(&message))
+            .with_response_source("203.0.113.50".to_string(), 54321);
+
+        reply.fix_nated_contact().unwrap();
+
+        let locked = message.lock().unwrap();
+        let contact = locked.headers.get("Contact").unwrap();
+        assert!(contact.contains("203.0.113.50"), "Contact should contain NATed IP: {contact}");
+        assert!(contact.contains("54321"), "Contact should contain NATed port: {contact}");
+    }
+
+    #[test]
+    fn fix_nated_contact_without_source_returns_error() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message);
+
+        assert!(reply.fix_nated_contact().is_err());
+    }
+
+    #[test]
+    fn fix_nated_contact_no_contact_header_is_noop() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message)
+            .with_response_source("10.0.0.1".to_string(), 5060);
+
+        // Should not error even without Contact header
+        reply.fix_nated_contact().unwrap();
     }
 
     // -----------------------------------------------------------------------

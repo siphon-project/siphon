@@ -125,6 +125,9 @@ struct DispatcherState {
     tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
     /// RFC 5626 CRLF pong tracker (None when crlf_keepalive is not configured).
     crlf_pong_tracker: Option<Arc<crate::transport::crlf_keepalive::CrlfPongTracker>>,
+    /// Automatically rewrite Contact URI in responses with the observed source
+    /// address (from `nat.fix_contact` config).
+    nat_fix_contact: bool,
     /// Name used in SDP `o=` and `s=` lines (from media.sdp_name config).
     sdp_name: String,
     /// Per-call event receivers from B-leg actors.
@@ -152,6 +155,31 @@ impl DispatcherState {
             .get(transport)
             .map(|a| a.port())
             .unwrap_or(self.local_addr.port())
+    }
+
+    /// Check whether a resolved destination points back to one of our own
+    /// listen addresses (loop detection).  Checks the primary `local_addr`
+    /// AND every per-transport listen address in `listen_addrs`.
+    fn is_own_address(&self, destination: &std::net::SocketAddr) -> bool {
+        let ip = destination.ip();
+        let port = destination.port();
+        let ip_matches = |listen_ip: std::net::IpAddr| {
+            ip == listen_ip || ip.is_loopback()
+        };
+
+        // Check primary listen address
+        if port == self.local_addr.port() && ip_matches(self.local_addr.ip()) {
+            return true;
+        }
+
+        // Check all per-transport listen addresses (e.g. TLS on :5061)
+        for addr in self.listen_addrs.values() {
+            if port == addr.port() && ip_matches(addr.ip()) {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -288,6 +316,7 @@ pub async fn run(
         connection_pool,
         tls_addr_map,
         crlf_pong_tracker,
+        nat_fix_contact: config.nat.as_ref().map(|n| n.fix_contact).unwrap_or(false),
         sdp_name: config.media.as_ref()
             .and_then(|m| m.sdp_name.clone())
             .unwrap_or_else(|| "SIPhon".to_string()),
@@ -989,12 +1018,12 @@ fn handle_request(
     );
 
     // Call Python handlers
-    let (action, record_routed, on_reply_cb, on_failure_cb) = Python::attach(|python| {
+    let (action, record_routed, on_reply_cb, on_failure_cb, send_via_transport, send_via_target) = Python::attach(|python| {
         let py_request = match Py::new(python, request) {
             Ok(py) => py,
             Err(error) => {
                 error!("failed to create PyRequest: {error}");
-                return (RequestAction::None, false, None, None);
+                return (RequestAction::None, false, None, None, None, None);
             }
         };
 
@@ -1015,6 +1044,8 @@ fn handle_request(
                                 false,
                                 None,
                                 None,
+                                None,
+                                None,
                             );
                         }
                     }
@@ -1029,6 +1060,8 @@ fn handle_request(
                         false,
                         None,
                         None,
+                        None,
+                        None,
                     );
                 }
             }
@@ -1039,7 +1072,9 @@ fn handle_request(
         let record_routed = borrowed.is_record_routed();
         let on_reply = borrowed.take_on_reply_callback();
         let on_failure = borrowed.take_on_failure_callback();
-        (action, record_routed, on_reply, on_failure)
+        let send_via_transport = borrowed.via_transport_override().map(|s| s.to_string());
+        let send_via_target = borrowed.via_target_override().map(|s| s.to_string());
+        (action, record_routed, on_reply, on_failure, send_via_transport, send_via_target)
     });
 
     // Process the action
@@ -1226,6 +1261,8 @@ fn handle_request(
                 state,
                 on_reply_cb,
                 on_failure_cb,
+                send_via_transport.as_deref(),
+                send_via_target.as_deref(),
             );
         }
         RequestAction::Fork { targets, strategy } => {
@@ -1272,6 +1309,8 @@ fn relay_request(
     state: &DispatcherState,
     on_reply_callback: Option<Py<PyAny>>,
     on_failure_callback: Option<Py<PyAny>>,
+    send_via_transport: Option<&str>,
+    send_via_target: Option<&str>,
 ) {
     // Determine target URI string (RFC 3261 §16.6 step 6):
     // 1. Explicit next-hop from script
@@ -1305,13 +1344,22 @@ fn relay_request(
         }
     };
     let destination = target.address;
-    let outbound_transport = target.transport.unwrap_or(inbound.transport);
+    let mut outbound_transport = target.transport.unwrap_or(inbound.transport);
+
+    // Apply force_send_via transport override from script
+    if let Some(via_transport) = send_via_transport {
+        outbound_transport = match via_transport.to_lowercase().as_str() {
+            "udp" => Transport::Udp,
+            "tcp" => Transport::Tcp,
+            "tls" => Transport::Tls,
+            "ws" => Transport::WebSocket,
+            "wss" => Transport::WebSocketSecure,
+            _ => outbound_transport,
+        };
+    }
 
     // Prevent routing loops — don't relay to ourselves
-    if destination.port() == state.local_addr.port()
-        && (destination.ip() == state.local_addr.ip()
-            || destination.ip().is_loopback())
-    {
+    if state.is_own_address(&destination) {
         // ACK to 2xx is end-to-end and should go to the UAS Contact, not the
         // proxy. If the R-URI still points at us, silently drop rather than
         // generating a response (ACK never gets a response per RFC 3261).
@@ -1344,13 +1392,24 @@ fn relay_request(
         return;
     }
 
-    // Add our Via — use the outbound transport for the Via header
+    // Add our Via — use the outbound transport for the Via header.
+    // If force_send_via set a target, use it as the Via sent-by address.
     let transport_str = format!("{}", outbound_transport);
+    let (via_host, via_port) = if let Some(target_str) = send_via_target {
+        // Parse "host:port" or just "host"
+        if let Some((host, port_str)) = target_str.rsplit_once(':') {
+            (host.to_string(), port_str.parse::<u16>().ok())
+        } else {
+            (target_str.to_string(), None)
+        }
+    } else {
+        (state.via_host(&outbound_transport), Some(state.via_port(&outbound_transport)))
+    };
     let branch = core::add_via(
         &mut relayed.headers,
         &transport_str,
-        &state.via_host(&outbound_transport),
-        Some(state.via_port(&outbound_transport)),
+        &via_host,
+        via_port,
     );
 
     // Add Record-Route if the script requested it.
@@ -1477,7 +1536,7 @@ fn relay_fork_request(
         Some(key) => key.clone(),
         None => {
             // Fall back to single-target relay if no server transaction
-            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None);
+            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None, None, None);
             return;
         }
     };
@@ -1545,10 +1604,8 @@ fn relay_fork_branch(
     let destination = relay_target.address;
     let outbound_transport = relay_target.transport.unwrap_or(inbound.transport);
 
-    // Loop detection
-    if destination.port() == state.local_addr.port()
-        && (destination.ip() == state.local_addr.ip() || destination.ip().is_loopback())
-    {
+    // Loop detection — check all listen addresses (including per-transport)
+    if state.is_own_address(&destination) {
         warn!(target = %target, "fork: loop detected");
         return;
     }
@@ -1986,6 +2043,7 @@ fn handle_response(
                 original_request.clone(),
                 source_addr,
                 transport,
+                inbound.remote_addr,
             );
             if !should_forward {
                 state.session_store.remove_client_key(client_key);
@@ -2259,6 +2317,9 @@ fn handle_response(
 ///
 /// Returns `(message, forwarded)` — if `forwarded` is false, the script
 /// chose to drop the response (no `relay()` called).
+///
+/// `response_source` is the observed source address of the entity that sent
+/// this response (for `reply.fix_nated_contact()`).
 fn run_reply_handlers(
     message: SipMessage,
     status_code: u16,
@@ -2267,7 +2328,18 @@ fn run_reply_handlers(
     original_request: SipMessage,
     source_addr: SocketAddr,
     transport: crate::transport::Transport,
+    response_source: SocketAddr,
 ) -> (SipMessage, bool) {
+    // Automatic NAT Contact fixup on responses (nat.fix_contact: true).
+    // Rewrites the Contact URI host:port with the observed source address
+    // of the entity that sent this response — before Python handlers run,
+    // so scripts see the corrected Contact.
+    let message = if state.nat_fix_contact {
+        fix_response_contact(message, response_source)
+    } else {
+        message
+    };
+
     let engine_state = state.engine.state();
     let reply_handlers = engine_state.handlers_for(&HandlerKind::ProxyReply);
 
@@ -2276,7 +2348,11 @@ fn run_reply_handlers(
     }
 
     let message_arc = Arc::new(std::sync::Mutex::new(message));
-    let reply = PyReply::new(Arc::clone(&message_arc));
+    let reply = PyReply::new(Arc::clone(&message_arc))
+        .with_response_source(
+            response_source.ip().to_string(),
+            response_source.port(),
+        );
 
     // Build a PyRequest from the original request so scripts get (request, reply)
     let request_arc = Arc::new(std::sync::Mutex::new(original_request));
@@ -2348,6 +2424,30 @@ fn run_reply_handlers(
     };
 
     (extracted, forwarded)
+}
+
+/// Rewrite the Contact URI in a response with the observed source address.
+///
+/// This is the automatic equivalent of OpenSIPS's `fix_nated_contact()` in
+/// onreply_route.  When `nat.fix_contact` is enabled, every response gets
+/// its Contact rewritten before forwarding upstream, so in-dialog requests
+/// from the upstream UAC will reach the NATed endpoint's public address.
+fn fix_response_contact(mut message: SipMessage, source: SocketAddr) -> SipMessage {
+    use crate::sip::headers::nameaddr::NameAddr;
+
+    if let Some(raw) = message.headers.get("Contact").cloned() {
+        if let Ok(mut nameaddr) = NameAddr::parse(&raw) {
+            let host = source.ip().to_string();
+            nameaddr.uri.host = if host.contains(':') && !host.starts_with('[') {
+                format!("[{host}]")
+            } else {
+                host
+            };
+            nameaddr.uri.port = Some(source.port());
+            message.headers.set("Contact", nameaddr.to_string());
+        }
+    }
+    message
 }
 
 /// Resolve a SIP URI string to a socket address using DNS (RFC 3263).

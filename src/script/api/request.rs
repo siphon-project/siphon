@@ -570,13 +570,23 @@ impl PyRequest {
     /// strip it and return `True`. The request can then be relayed to
     /// its Request-URI (which is the remote party's Contact URI for
     /// in-dialog requests).
+    ///
+    /// When double Record-Route is in effect (transport bridging, e.g.
+    /// TLS↔TCP), two consecutive Route entries may point to this proxy.
+    /// Both are consumed so that the relay path sees the first *external*
+    /// Route or falls back to the Request-URI.
     fn loose_route(&self) -> PyResult<bool> {
         let mut message = self.lock_mut()?;
         let is_lr = crate::proxy::core::check_loose_route(&message.headers);
         if is_lr {
-            // Strip the top Route that points at us — relay will
-            // forward to the R-URI (the actual destination).
+            // Pop the first (topmost) Route — it was addressed to us.
             crate::proxy::core::pop_top_route(&mut message.headers);
+
+            // Pop any additional Routes that also point to us (double
+            // Record-Route from transport bridging).
+            if let Some(ref domains) = self.local_domains {
+                crate::proxy::core::pop_local_routes(&mut message.headers, domains);
+            }
         }
         Ok(is_lr)
     }
