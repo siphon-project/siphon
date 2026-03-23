@@ -13,13 +13,12 @@
 //! With free-threaded Python 3.14t there is no GIL — multiple Rust worker
 //! threads can call into Python concurrently.
 
-use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+use pyo3::types::PyDict;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{ReloadMode, ScriptConfig};
@@ -444,25 +443,54 @@ impl ScriptEngine {
             .call0()
             .map_err(|error| SiphonError::Script(format!("registry.clear(): {error}")))?;
 
-        // Compile the script into a code object (bytecode).
-        let source_cstr = CString::new(source)
-            .map_err(|error| SiphonError::Script(format!("source contains null byte: {error}")))?;
-        let file_name = CString::new(path.to_str().unwrap_or("<script>"))
-            .map_err(|error| SiphonError::Script(format!("file name CString: {error}")))?;
-        let module_name = CString::new("siphon_user_script")
-            .map_err(|error| SiphonError::Script(format!("module name: {error}")))?;
-        let _code = PyModule::from_code(
-            python,
-            &source_cstr,
-            &file_name,
-            &module_name,
-        )
-        .map_err(|error| {
-            SiphonError::Script(format!(
-                "compilation failed for {}: {error}",
-                path.display()
-            ))
-        })?;
+        // Compile and execute the script in a fresh globals dict.
+        //
+        // We intentionally avoid `PyModule::from_code` here because it
+        // delegates to `PyImport_ExecCodeModuleEx`, which inserts the
+        // module into `sys.modules`.  On subsequent loads (hot-reload),
+        // that API *reuses* the existing module dict instead of creating
+        // a fresh one, which on free-threaded Python 3.14t can leave
+        // stale descriptor state that causes property getters on
+        // `#[pyclass]` objects (e.g. `request.method`) to silently
+        // return incorrect values on the first load.
+        //
+        // Using `compile()` + `exec()` with an isolated dict — the same
+        // approach `load_bytecode` already uses — eliminates the
+        // interaction with `sys.modules` for user scripts entirely.
+        let builtins = python
+            .import("builtins")
+            .map_err(|error| SiphonError::Script(format!("import builtins: {error}")))?;
+        let file_name_str = path.to_str().unwrap_or("<script>");
+        let code_object = builtins
+            .getattr("compile")
+            .map_err(|error| SiphonError::Script(format!("builtins.compile: {error}")))?
+            .call1((source, file_name_str, "exec"))
+            .map_err(|error| {
+                SiphonError::Script(format!(
+                    "compilation failed for {}: {error}",
+                    path.display()
+                ))
+            })?;
+        let globals = PyDict::new(python);
+        globals
+            .set_item("__builtins__", &*builtins)
+            .map_err(|error| SiphonError::Script(format!("set __builtins__: {error}")))?;
+        globals
+            .set_item("__name__", "siphon_user_script")
+            .map_err(|error| SiphonError::Script(format!("set __name__: {error}")))?;
+        globals
+            .set_item("__file__", file_name_str)
+            .map_err(|error| SiphonError::Script(format!("set __file__: {error}")))?;
+        builtins
+            .getattr("exec")
+            .map_err(|error| SiphonError::Script(format!("builtins.exec: {error}")))?
+            .call1((&code_object, &globals))
+            .map_err(|error| {
+                SiphonError::Script(format!(
+                    "script execution failed for {}: {error}",
+                    path.display()
+                ))
+            })?;
 
         // The script has now executed — decorators have registered themselves
         // into the registry module.
