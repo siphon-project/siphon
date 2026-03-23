@@ -4,7 +4,8 @@
 //! All custom metrics are registered into the shared `prometheus::Registry` so they
 //! appear alongside built-in metrics on the `/metrics` endpoint.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 use dashmap::DashMap;
 use prometheus::{
@@ -23,8 +24,8 @@ pub struct CustomMetrics {
     histograms: DashMap<String, HistogramVec>,
     /// Label names stored per metric (needed for `with_label_values` ordering).
     label_names: DashMap<String, Vec<String>>,
-    /// Cardinality tracking: metric name → number of distinct label combos seen.
-    cardinality: DashMap<String, AtomicUsize>,
+    /// Cardinality tracking: metric name → set of distinct label combos seen.
+    cardinality: DashMap<String, Mutex<HashSet<Vec<String>>>>,
 }
 
 impl CustomMetrics {
@@ -63,7 +64,7 @@ impl CustomMetrics {
         self.label_names
             .insert(name.to_owned(), labels.iter().map(|s| (*s).to_owned()).collect());
         self.cardinality
-            .insert(name.to_owned(), AtomicUsize::new(0));
+            .insert(name.to_owned(), Mutex::new(HashSet::new()));
         Ok(())
     }
 
@@ -90,7 +91,7 @@ impl CustomMetrics {
         self.label_names
             .insert(name.to_owned(), labels.iter().map(|s| (*s).to_owned()).collect());
         self.cardinality
-            .insert(name.to_owned(), AtomicUsize::new(0));
+            .insert(name.to_owned(), Mutex::new(HashSet::new()));
         Ok(())
     }
 
@@ -122,7 +123,7 @@ impl CustomMetrics {
         self.label_names
             .insert(name.to_owned(), labels.iter().map(|s| (*s).to_owned()).collect());
         self.cardinality
-            .insert(name.to_owned(), AtomicUsize::new(0));
+            .insert(name.to_owned(), Mutex::new(HashSet::new()));
         Ok(())
     }
 
@@ -139,7 +140,7 @@ impl CustomMetrics {
             .ok_or_else(|| format!("counter '{name}' not registered"))?;
         let label_values = self.resolve_label_values(name, labels)?;
         let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-        self.check_cardinality(name)?;
+        self.check_cardinality(name, &label_values)?;
         counter.with_label_values(&refs).inc_by(value);
         Ok(())
     }
@@ -157,7 +158,7 @@ impl CustomMetrics {
             .ok_or_else(|| format!("gauge '{name}' not registered"))?;
         let label_values = self.resolve_label_values(name, labels)?;
         let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-        self.check_cardinality(name)?;
+        self.check_cardinality(name, &label_values)?;
         gauge.with_label_values(&refs).set(value);
         Ok(())
     }
@@ -175,7 +176,7 @@ impl CustomMetrics {
             .ok_or_else(|| format!("gauge '{name}' not registered"))?;
         let label_values = self.resolve_label_values(name, labels)?;
         let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-        self.check_cardinality(name)?;
+        self.check_cardinality(name, &label_values)?;
         gauge.with_label_values(&refs).add(value);
         Ok(())
     }
@@ -193,7 +194,7 @@ impl CustomMetrics {
             .ok_or_else(|| format!("gauge '{name}' not registered"))?;
         let label_values = self.resolve_label_values(name, labels)?;
         let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-        self.check_cardinality(name)?;
+        self.check_cardinality(name, &label_values)?;
         gauge.with_label_values(&refs).sub(value);
         Ok(())
     }
@@ -211,7 +212,7 @@ impl CustomMetrics {
             .ok_or_else(|| format!("histogram '{name}' not registered"))?;
         let label_values = self.resolve_label_values(name, labels)?;
         let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-        self.check_cardinality(name)?;
+        self.check_cardinality(name, &label_values)?;
         histogram.with_label_values(&refs).observe(value);
         Ok(())
     }
@@ -251,19 +252,19 @@ impl CustomMetrics {
         Ok(values)
     }
 
-    /// Check cardinality and increment the counter for this metric.
-    fn check_cardinality(&self, name: &str) -> Result<(), String> {
-        if let Some(counter) = self.cardinality.get(name) {
-            let current = counter.fetch_add(1, Ordering::Relaxed);
-            if current >= MAX_CARDINALITY {
-                // Don't subtract back — we already incremented, but the metric
-                // operation won't be blocked (it's a soft limit logged as warning).
-                // However, for the Python API we return an error to signal this.
-                counter.fetch_sub(1, Ordering::Relaxed);
+    /// Check cardinality for this metric — only counts distinct label combos.
+    fn check_cardinality(&self, name: &str, label_values: &[String]) -> Result<(), String> {
+        if let Some(seen) = self.cardinality.get(name) {
+            let mut set = seen.lock().unwrap();
+            if set.contains(label_values) {
+                return Ok(());
+            }
+            if set.len() >= MAX_CARDINALITY {
                 return Err(format!(
                     "cardinality limit ({MAX_CARDINALITY}) exceeded for metric '{name}'"
                 ));
             }
+            set.insert(label_values.to_vec());
         }
         Ok(())
     }
