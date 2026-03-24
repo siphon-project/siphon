@@ -114,6 +114,65 @@ registrar:
   #   table: "registrar"
 
 # ---------------------------------------------------------------------------
+# Registrant — Outbound REGISTER Client (Carrier Trunk Registration)
+# ---------------------------------------------------------------------------
+# Maintains outbound REGISTER sessions to upstream registrars (carrier trunks,
+# peering partners). Each entry sends periodic REGISTER requests and handles
+# 401 digest challenges automatically. Exponential backoff on failure.
+#
+# Static entries (known at deploy time):
+#
+# registrant:
+#   default_interval: 3600            # default re-REGISTER interval (seconds)
+#   retry_interval: 60                # base retry on failure (seconds)
+#   max_retry_interval: 300           # backoff cap (seconds)
+#   entries:
+#     - aor: "sip:trunk1@carrier.com"
+#       registrar: "sip:registrar.carrier.com:5060"
+#       user: "trunk1"
+#       password: "secret123"
+#       realm: "carrier.com"          # optional — derived from 401 challenge if omitted
+#       interval: 1800                # optional — overrides default_interval
+#       contact: "sip:trunk1@1.2.3.4" # optional — auto-generated if omitted
+#       transport: "udp"              # "udp" (default), "tcp", "tls"
+#
+#     - aor: "sip:trunk2@peer.net"
+#       registrar: "sip:peer.net:5060"
+#       user: "trunk2"
+#       password: "p33rsecret"
+#       transport: "tcp"
+#
+# Dynamic entries (loaded from database at runtime):
+# Use the `registration` Python API to add/remove entries from scripts.
+# This is useful when trunk credentials are stored in a database and may
+# change without redeploying config. Entries added via Python are identical
+# to YAML-configured ones.
+#
+#   from siphon import registration, timer
+#
+#   def load_trunks():
+#       import sqlite3  # or psycopg2, mysql.connector, etc.
+#       conn = sqlite3.connect("/etc/siphon/trunks.db")
+#       current = {r["aor"] for r in registration.list()}
+#       db_aors = set()
+#       for aor, registrar, user, pw, interval, transport in conn.execute(
+#           "SELECT aor, registrar, user, password, interval, transport "
+#           "FROM trunks WHERE enabled = 1"
+#       ):
+#           db_aors.add(aor)
+#           if aor not in current:
+#               registration.add(aor, registrar, user=user, password=pw,
+#                                interval=interval, transport=transport)
+#       for aor in current - db_aors:
+#           registration.remove(aor)
+#
+#   load_trunks()                           # once at script load
+#
+#   @timer.every(seconds=300, name="trunk_sync")
+#   def sync_trunks():
+#       load_trunks()                       # periodic re-sync
+
+# ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
 auth:
@@ -524,7 +583,6 @@ auth:
 #   ifc_xml_path: "/etc/siphon/ifc.xml"     # path to ServiceProfile XML
 #   # ifc_xml: "<ServiceProfile>...</ServiceProfile>"  # inline XML (alternative)
 #   ifc_key_prefix: "siphon:ifc:"            # Redis key prefix (default)
-
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
