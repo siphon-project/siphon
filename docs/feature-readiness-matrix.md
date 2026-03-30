@@ -109,6 +109,10 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Built-in profile: WSS↔RTP | Implemented | `wss_to_rtp` | DTLS-SRTP/AVPF + ICE ↔ RTP |
 | Built-in profile: RTP passthrough | Implemented | `rtp_passthrough` | IMS-internal |
 | Custom media profiles | Implemented | `media.profiles` | User-defined NG flags |
+| SDP manipulation (`sdp` namespace) | Implemented | None | Parse/modify/apply SDP from Python scripts |
+| SDP attribute get/set/remove | Implemented | None | Session and media-level `a=` attributes |
+| SDP codec filtering | Implemented | None | `filter_codecs()` / `remove_codecs()` |
+| SDP media section removal | Implemented | None | `remove_media("video")` |
 
 ## Gateway Routing & Load Balancing
 

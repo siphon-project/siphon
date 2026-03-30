@@ -2437,6 +2437,15 @@ class MockIsc:
 _isc = MockIsc()
 
 
+# ---------------------------------------------------------------------------
+# SDP namespace
+# ---------------------------------------------------------------------------
+
+from siphon_sdk.sdp import MockSdpNamespace
+
+_sdp = MockSdpNamespace()
+
+
 def install() -> ModuleType:
     """Install the mock ``siphon`` module into ``sys.modules``.
 
@@ -2468,6 +2477,7 @@ def install() -> ModuleType:
     mod.timer = _timer  # type: ignore[attr-defined]
     mod.metrics = _metrics  # type: ignore[attr-defined]
     mod.isc = _isc  # type: ignore[attr-defined]
+    mod.sdp = _sdp  # type: ignore[attr-defined]
 
     # Also install the _siphon_registry mock
     registry_mod = ModuleType("_siphon_registry")

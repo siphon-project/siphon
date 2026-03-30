@@ -567,3 +567,26 @@ class _IscNamespace:
 
 
 isc = _IscNamespace()
+
+
+# ---------------------------------------------------------------------------
+# SDP namespace (stub — replaced by Rust at startup)
+# ---------------------------------------------------------------------------
+
+class _SdpNamespace:
+    """SDP parser and manipulator (stub).
+
+    Usage:
+        from siphon import sdp
+
+        s = sdp.parse(request)
+        s.get_attr("group")
+        s.media[0].set_attr("des", "qos optional local sendrecv")
+        s.apply(request)
+    """
+
+    def parse(self, source):
+        raise NotImplementedError("sdp.parse() not available — SDP namespace not initialized")
+
+
+sdp = _SdpNamespace()

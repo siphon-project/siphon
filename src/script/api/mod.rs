@@ -23,6 +23,7 @@ pub mod registrar;
 pub mod reply;
 pub mod request;
 pub mod rtpengine;
+pub mod sdp;
 pub mod sip_uri;
 pub mod srs;
 
@@ -63,6 +64,9 @@ static PRESENCE_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Metrics singleton — always available (like log).
 static METRICS_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// SDP namespace singleton — always available (stateless parser, no config needed).
+static SDP_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Optional ISC singleton — always available (iFC store for per-user + global rules).
 static ISC_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
@@ -253,6 +257,17 @@ pub fn set_metrics_singleton(
     Ok(())
 }
 
+/// Store the SDP namespace singleton for injection into the siphon module.
+///
+/// Always called at startup — stateless parser, no config needed.
+pub fn set_sdp_singleton(python: Python<'_>) -> Result<()> {
+    let sdp_py: Py<PyAny> = Py::new(python, sdp::PySdpNamespace::new())
+        .map_err(|error| SiphonError::Script(format!("Py::new(sdp): {error}")))?
+        .into_any();
+    let _ = SDP_SINGLETON.set(sdp_py);
+    Ok(())
+}
+
 /// Store the ISC singleton for injection into the siphon module.
 ///
 /// Always called at startup — the iFC store is always available (even if
@@ -403,6 +418,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("metrics", metrics_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr metrics: {error}")))?;
+    }
+
+    // Inject SDP namespace singleton (always available — stateless parser).
+    if let Some(sdp_py) = SDP_SINGLETON.get() {
+        module
+            .setattr("sdp", sdp_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr sdp: {error}")))?;
     }
 
     // Inject ISC singleton (always available — iFC store).

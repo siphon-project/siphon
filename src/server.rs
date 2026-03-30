@@ -198,6 +198,14 @@ impl SiphonServer {
             });
         }
 
+        // --- Initialize SDP namespace for Python scripts ---
+        // Stateless parser — always available, no config needed.
+        pyo3::Python::attach(|python| {
+            if let Err(error) = crate::script::api::set_sdp_singleton(python) {
+                error!("failed to store sdp singleton: {error}");
+            }
+        });
+
         // --- Script engine ---
         let engine = if let Some(bytecode) = self.embedded_bytecode {
             Arc::new(ScriptEngine::new_from_bytecode(bytecode).unwrap_or_else(|error| {

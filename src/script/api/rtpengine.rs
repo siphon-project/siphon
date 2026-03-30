@@ -48,7 +48,7 @@ const DEFAULT_PROFILE: &str = "rtp_passthrough";
 
 /// Extract `Arc<Mutex<SipMessage>>` from a Python object that is either
 /// a `Request`, `Reply`, or `Call`.
-fn extract_message(object: &Bound<'_, PyAny>) -> PyResult<Arc<Mutex<SipMessage>>> {
+pub(super) fn extract_message(object: &Bound<'_, PyAny>) -> PyResult<Arc<Mutex<SipMessage>>> {
     // Try PyRequest first.
     if let Ok(request) = object.cast::<PyRequest>() {
         return Ok(request.borrow().message());
@@ -441,7 +441,7 @@ fn extract_tag(header_value: &str) -> Option<String> {
 }
 
 /// Replace the SIP message body with new SDP and update Content-Length.
-fn replace_body(
+pub(super) fn replace_body(
     message: &Arc<Mutex<SipMessage>>,
     new_body: &[u8],
 ) -> PyResult<()> {

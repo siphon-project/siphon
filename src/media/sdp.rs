@@ -1,10 +1,11 @@
-//! Minimal SDP parser for codec filtering.
+//! SDP parser for codec filtering and attribute manipulation.
 //!
 //! Provides functionality to parse SDP bodies, extract/modify media lines
-//! (`m=`) and codec attributes (`a=rtpmap`), and filter codecs by name.
+//! (`m=`) and codec attributes (`a=rtpmap`), filter codecs by name, and
+//! get/set/remove arbitrary `a=` attributes at session and media level.
 //!
-//! This is NOT a full SDP parser — it handles the common cases needed for
-//! codec filtering in a SIP proxy/B2BUA context.
+//! This is NOT a full RFC 4566 parser — it handles the common cases needed for
+//! SDP manipulation in a SIP proxy/B2BUA context.
 
 use std::collections::HashSet;
 
@@ -25,6 +26,104 @@ pub struct MediaLine {
     pub fmtp: Vec<(u16, String)>,
     /// Other attributes (not rtpmap/fmtp) for this media section.
     pub other_attrs: Vec<String>,
+}
+
+impl MediaLine {
+    /// Return the media-level `c=` connection value, if present.
+    pub fn connection(&self) -> Option<&str> {
+        self.other_attrs
+            .iter()
+            .find(|line| line.starts_with("c="))
+            .map(|line| &line[2..])
+    }
+
+    /// Return all `a=` attribute values (the part after `a=`) from this media
+    /// section, excluding `rtpmap` and `fmtp` (which are stored separately).
+    pub fn attrs(&self) -> Vec<&str> {
+        self.other_attrs
+            .iter()
+            .filter_map(|line| line.strip_prefix("a="))
+            .collect()
+    }
+
+    /// Replace all `a=` lines in `other_attrs` with the given values.
+    ///
+    /// Non-`a=` lines (e.g. `c=`, `b=`) are preserved.
+    pub fn set_attrs(&mut self, values: &[&str]) {
+        self.other_attrs.retain(|line| !line.starts_with("a="));
+        for value in values {
+            self.other_attrs.push(format!("a={value}"));
+        }
+    }
+
+    /// Get the value of the first `a=` attribute matching `name`.
+    ///
+    /// For `a=des:qos mandatory local sendrecv`, `get_attr("des")` returns
+    /// `Some("qos mandatory local sendrecv")`.
+    /// For flag attributes like `a=sendrecv`, returns `Some("")`.
+    /// Returns `None` if no attribute with that name exists.
+    pub fn get_attr(&self, name: &str) -> Option<&str> {
+        self.other_attrs
+            .iter()
+            .filter_map(|line| line.strip_prefix("a="))
+            .find(|attr| attr_matches_name(attr, name))
+            .map(|attr| attr_extract_value(attr))
+    }
+
+    /// Set (replace first or append) an `a=` attribute.
+    ///
+    /// `set_attr("des", "qos optional local sendrecv")` produces
+    /// `a=des:qos optional local sendrecv`.
+    /// `set_attr("sendrecv", "")` produces `a=sendrecv` (flag).
+    pub fn set_attr(&mut self, name: &str, value: &str) {
+        let new_line = if value.is_empty() {
+            format!("a={name}")
+        } else {
+            format!("a={name}:{value}")
+        };
+        // Replace first match, or append.
+        if let Some(pos) = self
+            .other_attrs
+            .iter()
+            .position(|line| line.strip_prefix("a=").is_some_and(|a| attr_matches_name(a, name)))
+        {
+            self.other_attrs[pos] = new_line;
+        } else {
+            self.other_attrs.push(new_line);
+        }
+    }
+
+    /// Remove all `a=` attributes matching `name`.
+    pub fn remove_attr(&mut self, name: &str) {
+        self.other_attrs.retain(|line| {
+            line.strip_prefix("a=")
+                .map_or(true, |attr| !attr_matches_name(attr, name))
+        });
+    }
+
+    /// Check whether an `a=` attribute with the given name exists.
+    pub fn has_attr(&self, name: &str) -> bool {
+        self.other_attrs
+            .iter()
+            .filter_map(|line| line.strip_prefix("a="))
+            .any(|attr| attr_matches_name(attr, name))
+    }
+
+    /// Return codec names derived from `rtpmap` entries and static payload
+    /// type names for formats without an explicit `rtpmap`.
+    pub fn codec_names(&self) -> Vec<String> {
+        self.formats
+            .iter()
+            .filter_map(|&pt| {
+                // Check rtpmap first.
+                if let Some((_, codec)) = self.rtpmap.iter().find(|(rpt, _)| *rpt == pt) {
+                    return Some(codec.split('/').next().unwrap_or(codec).to_string());
+                }
+                // Fall back to well-known static payload types.
+                static_codec_name(pt).map(|name| name.to_string())
+            })
+            .collect()
+    }
 }
 
 /// A parsed SDP body.
@@ -147,6 +246,110 @@ impl SdpBody {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Session-level property accessors
+    // -----------------------------------------------------------------
+
+    /// Return the `o=` (origin) line value, if present.
+    pub fn origin(&self) -> Option<&str> {
+        self.session_lines
+            .iter()
+            .find(|line| line.starts_with("o="))
+            .map(|line| &line[2..])
+    }
+
+    /// Return the `s=` (session name) line value, if present.
+    pub fn session_name(&self) -> Option<&str> {
+        self.session_lines
+            .iter()
+            .find(|line| line.starts_with("s="))
+            .map(|line| &line[2..])
+    }
+
+    /// Return the session-level `c=` (connection) value, if present.
+    pub fn connection(&self) -> Option<&str> {
+        self.session_lines
+            .iter()
+            .find(|line| line.starts_with("c="))
+            .map(|line| &line[2..])
+    }
+
+    // -----------------------------------------------------------------
+    // Session-level attribute (a=) accessors
+    // -----------------------------------------------------------------
+
+    /// Return all session-level `a=` attribute values (the part after `a=`).
+    pub fn session_attrs(&self) -> Vec<&str> {
+        self.session_lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("a="))
+            .collect()
+    }
+
+    /// Replace all session-level `a=` lines with the given values.
+    ///
+    /// Non-`a=` lines (v=, o=, s=, c=, t=, etc.) are preserved.
+    pub fn set_session_attrs(&mut self, values: &[&str]) {
+        self.session_lines.retain(|line| !line.starts_with("a="));
+        for value in values {
+            self.session_lines.push(format!("a={value}"));
+        }
+    }
+
+    /// Get the value of the first session-level `a=` attribute matching `name`.
+    ///
+    /// See [`MediaLine::get_attr`] for the name/value splitting rules.
+    pub fn session_get_attr(&self, name: &str) -> Option<&str> {
+        self.session_lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("a="))
+            .find(|attr| attr_matches_name(attr, name))
+            .map(|attr| attr_extract_value(attr))
+    }
+
+    /// Set (replace first or append) a session-level `a=` attribute.
+    pub fn session_set_attr(&mut self, name: &str, value: &str) {
+        let new_line = if value.is_empty() {
+            format!("a={name}")
+        } else {
+            format!("a={name}:{value}")
+        };
+        if let Some(pos) = self
+            .session_lines
+            .iter()
+            .position(|line| line.strip_prefix("a=").is_some_and(|a| attr_matches_name(a, name)))
+        {
+            self.session_lines[pos] = new_line;
+        } else {
+            self.session_lines.push(new_line);
+        }
+    }
+
+    /// Remove all session-level `a=` attributes matching `name`.
+    pub fn session_remove_attr(&mut self, name: &str) {
+        self.session_lines.retain(|line| {
+            line.strip_prefix("a=")
+                .map_or(true, |attr| !attr_matches_name(attr, name))
+        });
+    }
+
+    /// Check whether a session-level `a=` attribute with the given name exists.
+    pub fn session_has_attr(&self, name: &str) -> bool {
+        self.session_lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("a="))
+            .any(|attr| attr_matches_name(attr, name))
+    }
+
+    // -----------------------------------------------------------------
+    // Media section operations
+    // -----------------------------------------------------------------
+
+    /// Remove all media sections matching the given media type (e.g. `"video"`).
+    pub fn remove_media_by_type(&mut self, media_type: &str) {
+        self.media_sections
+            .retain(|media| media.media_type != media_type);
+    }
 }
 
 impl std::fmt::Display for SdpBody {
@@ -186,6 +389,34 @@ impl std::fmt::Display for SdpBody {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Attribute name matching helpers
+// ---------------------------------------------------------------------------
+
+/// Check if an attribute value (after `a=`) matches the given name.
+///
+/// The attribute name is the part before the first `:`. For flag attributes
+/// (no `:`), the entire string is the name.
+fn attr_matches_name(attr_value: &str, name: &str) -> bool {
+    let attr_name = attr_value.split(':').next().unwrap_or(attr_value);
+    attr_name == name
+}
+
+/// Extract the value portion of an attribute (everything after the first `:`).
+///
+/// For `"des:qos mandatory local sendrecv"` returns `"qos mandatory local sendrecv"`.
+/// For flag attributes like `"sendrecv"` returns `""`.
+fn attr_extract_value(attr_value: &str) -> &str {
+    match attr_value.split_once(':') {
+        Some((_, value)) => value,
+        None => "",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SDP line parsers
+// ---------------------------------------------------------------------------
 
 /// Parse an `m=` line into a MediaLine.
 fn parse_media_line(line: &str) -> MediaLine {
@@ -432,6 +663,325 @@ mod tests {
         assert_eq!(static_codec_name(18), Some("G729"));
         assert_eq!(static_codec_name(99), None);
     }
+
+    // -----------------------------------------------------------------
+    // Attribute accessor tests
+    // -----------------------------------------------------------------
+
+    const SDP_WITH_ATTRS: &str = concat!(
+        "v=0\r\n",
+        "o=alice 2890844526 2890844526 IN IP4 10.0.0.1\r\n",
+        "s=SIPhon\r\n",
+        "c=IN IP4 10.0.0.1\r\n",
+        "t=0 0\r\n",
+        "a=group:BUNDLE audio video\r\n",
+        "a=ice-lite\r\n",
+        "m=audio 49170 RTP/AVP 0 8\r\n",
+        "c=IN IP4 192.168.1.1\r\n",
+        "a=sendrecv\r\n",
+        "a=des:qos mandatory local sendrecv\r\n",
+        "a=ptime:20\r\n",
+        "a=rtpmap:0 PCMU/8000\r\n",
+        "a=rtpmap:8 PCMA/8000\r\n",
+        "m=video 49172 RTP/AVP 96\r\n",
+        "a=sendonly\r\n",
+        "a=rtpmap:96 H264/90000\r\n",
+    );
+
+    #[test]
+    fn attr_helpers() {
+        assert!(attr_matches_name("sendrecv", "sendrecv"));
+        assert!(attr_matches_name("des:qos mandatory", "des"));
+        assert!(!attr_matches_name("des:qos mandatory", "sendrecv"));
+        assert!(!attr_matches_name("sendrecv", "send"));
+
+        assert_eq!(attr_extract_value("sendrecv"), "");
+        assert_eq!(attr_extract_value("des:qos mandatory"), "qos mandatory");
+        assert_eq!(attr_extract_value("ptime:20"), "20");
+    }
+
+    #[test]
+    fn session_properties() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        assert_eq!(
+            sdp.origin(),
+            Some("alice 2890844526 2890844526 IN IP4 10.0.0.1")
+        );
+        assert_eq!(sdp.session_name(), Some("SIPhon"));
+        assert_eq!(sdp.connection(), Some("IN IP4 10.0.0.1"));
+    }
+
+    #[test]
+    fn session_properties_missing() {
+        let sdp = SdpBody::parse("v=0\r\nt=0 0\r\n");
+        assert_eq!(sdp.origin(), None);
+        assert_eq!(sdp.session_name(), None);
+        assert_eq!(sdp.connection(), None);
+    }
+
+    #[test]
+    fn session_attrs() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        let attrs = sdp.session_attrs();
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0], "group:BUNDLE audio video");
+        assert_eq!(attrs[1], "ice-lite");
+    }
+
+    #[test]
+    fn session_get_attr_with_value() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        assert_eq!(sdp.session_get_attr("group"), Some("BUNDLE audio video"));
+    }
+
+    #[test]
+    fn session_get_attr_flag() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        assert_eq!(sdp.session_get_attr("ice-lite"), Some(""));
+    }
+
+    #[test]
+    fn session_get_attr_missing() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        assert_eq!(sdp.session_get_attr("nonexistent"), None);
+    }
+
+    #[test]
+    fn session_has_attr() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        assert!(sdp.session_has_attr("group"));
+        assert!(sdp.session_has_attr("ice-lite"));
+        assert!(!sdp.session_has_attr("sendrecv"));
+    }
+
+    #[test]
+    fn session_set_attr_replace() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        sdp.session_set_attr("group", "BUNDLE audio");
+        assert_eq!(sdp.session_get_attr("group"), Some("BUNDLE audio"));
+        // Should not duplicate.
+        assert_eq!(sdp.session_attrs().len(), 2);
+    }
+
+    #[test]
+    fn session_set_attr_append() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        sdp.session_set_attr("msid-semantic", "WMS *");
+        assert_eq!(sdp.session_get_attr("msid-semantic"), Some("WMS *"));
+        assert_eq!(sdp.session_attrs().len(), 3);
+    }
+
+    #[test]
+    fn session_set_attr_flag() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        sdp.session_set_attr("ice-options", "");
+        assert!(sdp.session_has_attr("ice-options"));
+        assert_eq!(sdp.session_get_attr("ice-options"), Some(""));
+    }
+
+    #[test]
+    fn session_remove_attr() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        sdp.session_remove_attr("ice-lite");
+        assert!(!sdp.session_has_attr("ice-lite"));
+        assert!(sdp.session_has_attr("group"));
+        assert_eq!(sdp.session_attrs().len(), 1);
+    }
+
+    #[test]
+    fn set_session_attrs_bulk() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        sdp.set_session_attrs(&["tool:SIPhon", "recvonly"]);
+        let attrs = sdp.session_attrs();
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0], "tool:SIPhon");
+        assert_eq!(attrs[1], "recvonly");
+        // Non-a= lines preserved.
+        assert!(sdp.origin().is_some());
+        assert!(sdp.session_name().is_some());
+    }
+
+    #[test]
+    fn media_connection() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        assert_eq!(
+            sdp.media_sections[0].connection(),
+            Some("IN IP4 192.168.1.1")
+        );
+        assert_eq!(sdp.media_sections[1].connection(), None);
+    }
+
+    #[test]
+    fn media_attrs() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        let attrs = sdp.media_sections[0].attrs();
+        assert_eq!(attrs.len(), 3);
+        assert_eq!(attrs[0], "sendrecv");
+        assert_eq!(attrs[1], "des:qos mandatory local sendrecv");
+        assert_eq!(attrs[2], "ptime:20");
+    }
+
+    #[test]
+    fn media_get_attr() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        let audio = &sdp.media_sections[0];
+        assert_eq!(
+            audio.get_attr("des"),
+            Some("qos mandatory local sendrecv")
+        );
+        assert_eq!(audio.get_attr("ptime"), Some("20"));
+        assert_eq!(audio.get_attr("sendrecv"), Some(""));
+        assert_eq!(audio.get_attr("nonexistent"), None);
+    }
+
+    #[test]
+    fn media_set_attr_replace() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        let audio = &mut sdp.media_sections[0];
+        audio.set_attr("ptime", "30");
+        assert_eq!(audio.get_attr("ptime"), Some("30"));
+        assert_eq!(audio.attrs().len(), 3);
+    }
+
+    #[test]
+    fn media_set_attr_append() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        let audio = &mut sdp.media_sections[0];
+        audio.set_attr("maxptime", "60");
+        assert_eq!(audio.get_attr("maxptime"), Some("60"));
+        assert_eq!(audio.attrs().len(), 4);
+    }
+
+    #[test]
+    fn media_set_attr_replace_flag_with_value() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        let video = &mut sdp.media_sections[1];
+        assert_eq!(video.get_attr("sendonly"), Some(""));
+        video.remove_attr("sendonly");
+        video.set_attr("recvonly", "");
+        assert!(video.has_attr("recvonly"));
+        assert!(!video.has_attr("sendonly"));
+    }
+
+    #[test]
+    fn media_remove_attr() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        let audio = &mut sdp.media_sections[0];
+        audio.remove_attr("des");
+        assert!(!audio.has_attr("des"));
+        assert!(audio.has_attr("sendrecv"));
+        assert!(audio.has_attr("ptime"));
+    }
+
+    #[test]
+    fn media_has_attr() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        let audio = &sdp.media_sections[0];
+        assert!(audio.has_attr("sendrecv"));
+        assert!(audio.has_attr("des"));
+        assert!(audio.has_attr("ptime"));
+        assert!(!audio.has_attr("rtcp"));
+    }
+
+    #[test]
+    fn set_media_attrs_bulk() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        let audio = &mut sdp.media_sections[0];
+        audio.set_attrs(&["sendonly", "ptime:30"]);
+        let attrs = audio.attrs();
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0], "sendonly");
+        assert_eq!(attrs[1], "ptime:30");
+        // Non-a= lines (c=) preserved.
+        assert!(audio.connection().is_some());
+    }
+
+    #[test]
+    fn media_codec_names() {
+        let sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        let names = sdp.media_sections[0].codec_names();
+        assert_eq!(names, vec!["PCMU", "PCMA"]);
+    }
+
+    #[test]
+    fn media_codec_names_with_dynamic() {
+        let sdp = SdpBody::parse(SAMPLE_SDP);
+        let names = sdp.media_sections[0].codec_names();
+        assert_eq!(names, vec!["PCMU", "PCMA", "opus", "telephone-event"]);
+    }
+
+    #[test]
+    fn media_codec_names_static_only() {
+        let sdp_str = concat!(
+            "v=0\r\n",
+            "o=- 0 0 IN IP4 0.0.0.0\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 5004 RTP/AVP 0 8 18\r\n",
+        );
+        let sdp = SdpBody::parse(sdp_str);
+        let names = sdp.media_sections[0].codec_names();
+        assert_eq!(names, vec!["PCMU", "PCMA", "G729"]);
+    }
+
+    #[test]
+    fn remove_media_by_type() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        assert_eq!(sdp.media_sections.len(), 2);
+        sdp.remove_media_by_type("video");
+        assert_eq!(sdp.media_sections.len(), 1);
+        assert_eq!(sdp.media_sections[0].media_type, "audio");
+    }
+
+    #[test]
+    fn remove_media_by_type_nonexistent() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        sdp.remove_media_by_type("application");
+        assert_eq!(sdp.media_sections.len(), 2);
+    }
+
+    #[test]
+    fn roundtrip_after_attr_mutation() {
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        sdp.media_sections[0].set_attr("des", "qos optional local sendrecv");
+        sdp.session_set_attr("ice-lite", "");
+
+        let output = sdp.to_string();
+        let reparsed = SdpBody::parse(&output);
+
+        assert_eq!(
+            reparsed.media_sections[0].get_attr("des"),
+            Some("qos optional local sendrecv")
+        );
+        assert!(reparsed.session_has_attr("ice-lite"));
+        assert_eq!(
+            reparsed.media_sections[0].get_attr("ptime"),
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn qos_precondition_rewrite() {
+        // The motivating use-case from the user.
+        let mut sdp = SdpBody::parse(SDP_WITH_ATTRS);
+        for media in &mut sdp.media_sections {
+            if let Some(value) = media.get_attr("des") {
+                if value.contains("mandatory") {
+                    let new_value = value.replace("mandatory", "optional");
+                    media.set_attr("des", &new_value);
+                }
+            }
+        }
+        let audio = &sdp.media_sections[0];
+        assert_eq!(
+            audio.get_attr("des"),
+            Some("qos optional local sendrecv")
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Original tests
+    // -----------------------------------------------------------------
 
     #[test]
     fn filter_static_codecs_without_rtpmap() {
