@@ -279,8 +279,27 @@ pub struct PyDestination {
 
 impl PyDestination {
     fn from_destination(dest: &Destination) -> Self {
+        // Bake transport into the URI so call.dial(gw.uri) uses the right
+        // protocol.  Only needed when transport != UDP (the SIP default)
+        // and the URI doesn't already carry a ;transport= parameter.
+        let uri = if dest.transport != Transport::Udp
+            && !dest.uri.to_lowercase().contains(";transport=")
+        {
+            let param = match dest.transport {
+                Transport::Tcp => ";transport=tcp",
+                Transport::Tls => ";transport=tls",
+                Transport::WebSocket => ";transport=ws",
+                Transport::WebSocketSecure => ";transport=wss",
+                Transport::Sctp => ";transport=sctp",
+                Transport::Udp => unreachable!(),
+            };
+            format!("{}{}", dest.uri, param)
+        } else {
+            dest.uri.clone()
+        };
+
         Self {
-            uri: dest.uri.clone(),
+            uri,
             address: dest.address().to_string(),
             healthy: dest.is_healthy(),
             weight: dest.weight,
@@ -507,6 +526,45 @@ mod tests {
         let dests = gw.list("carriers");
         let gw1 = &dests[0];
         assert_eq!(gw1.attrs.get("region").unwrap(), "us-east");
+    }
+
+    #[test]
+    fn from_destination_bakes_transport_into_uri() {
+        let dest = Destination::new(
+            "sip:trunk.example.com".to_string(),
+            "10.0.0.1:5061".parse().unwrap(),
+            Transport::Tls,
+            1,
+            1,
+        );
+        let py = PyDestination::from_destination(&dest);
+        assert_eq!(py.uri, "sip:trunk.example.com;transport=tls");
+    }
+
+    #[test]
+    fn from_destination_udp_no_transport_param() {
+        let dest = Destination::new(
+            "sip:gw.example.com".to_string(),
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            1,
+            1,
+        );
+        let py = PyDestination::from_destination(&dest);
+        assert_eq!(py.uri, "sip:gw.example.com");
+    }
+
+    #[test]
+    fn from_destination_preserves_existing_transport() {
+        let dest = Destination::new(
+            "sip:gw.example.com;transport=tcp".to_string(),
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Tcp,
+            1,
+            1,
+        );
+        let py = PyDestination::from_destination(&dest);
+        assert_eq!(py.uri, "sip:gw.example.com;transport=tcp");
     }
 
     #[test]
