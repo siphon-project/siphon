@@ -1169,15 +1169,18 @@ impl Default for GatewayProbeConfig {
 /// A single destination in a group.
 #[derive(Debug, Deserialize, Clone)]
 pub struct GatewayDestConfig {
-    /// SIP URI to route to (e.g. "sip:gw1.carrier.com:5060").
+    /// SIP URI to route to (e.g. "sip:gw1.carrier.com:5060;transport=tls").
+    /// Port and transport can be embedded in the URI and will be derived
+    /// automatically when `address` / `transport` fields are omitted.
     pub uri: String,
     /// Socket address for sending (e.g. "10.0.0.1:5060").
     /// If omitted, resolved from the URI hostname.
     #[serde(default)]
     pub address: Option<String>,
-    /// Transport protocol: "udp" (default), "tcp", "tls".
-    #[serde(default = "default_gateway_transport")]
-    pub transport: String,
+    /// Transport protocol: "udp", "tcp", "tls".
+    /// If omitted, derived from URI `;transport=` param (default: "udp").
+    #[serde(default)]
+    pub transport: Option<String>,
     /// Weight for weighted round-robin (higher = more traffic). Default: 1.
     #[serde(default = "default_gateway_weight")]
     pub weight: u32,
@@ -1189,6 +1192,25 @@ pub struct GatewayDestConfig {
     pub attrs: std::collections::HashMap<String, String>,
 }
 
+impl GatewayDestConfig {
+    /// Return the effective transport string: explicit field, URI `;transport=`
+    /// param, or `"udp"` as default.
+    pub fn effective_transport(&self) -> String {
+        if let Some(ref transport) = self.transport {
+            return transport.clone();
+        }
+        let uri_lower = self.uri.to_lowercase();
+        if let Some(pos) = uri_lower.find(";transport=") {
+            let after = &uri_lower[pos + 11..];
+            let end = after
+                .find(|c: char| c == ';' || c == '>' || c == ' ')
+                .unwrap_or(after.len());
+            return after[..end].to_string();
+        }
+        "udp".to_string()
+    }
+}
+
 fn default_gateway_algorithm() -> String {
     "weighted".to_string()
 }
@@ -1197,9 +1219,6 @@ fn default_gateway_probe_interval() -> u32 {
 }
 fn default_gateway_failure_threshold() -> u32 {
     3
-}
-fn default_gateway_transport() -> String {
-    "udp".to_string()
 }
 fn default_gateway_weight() -> u32 {
     1
@@ -2451,9 +2470,10 @@ gateway:
         assert_eq!(group1.destinations.len(), 2);
         assert_eq!(group1.destinations[0].uri, "sip:gw1.carrier.com:5060");
         assert_eq!(group1.destinations[0].weight, 3);
-        assert_eq!(group1.destinations[0].transport, "udp"); // default
+        assert_eq!(group1.destinations[0].transport, None); // omitted
+        assert_eq!(group1.destinations[0].effective_transport(), "udp"); // default
         assert_eq!(group1.destinations[0].attrs.get("region").unwrap(), "us-east");
-        assert_eq!(group1.destinations[1].transport, "tcp");
+        assert_eq!(group1.destinations[1].transport, Some("tcp".to_string()));
         assert_eq!(group1.destinations[1].priority, 2);
 
         let group2 = &disp.groups[1];
@@ -3184,5 +3204,54 @@ script:
     fn listen_entry_plain_has_no_dscp() {
         let entry = ListenEntry::Plain("0.0.0.0:5060".to_string());
         assert_eq!(entry.dscp(), None);
+    }
+
+    // --- GatewayDestConfig::effective_transport tests ---
+
+    fn gateway_dest(uri: &str, transport: Option<&str>) -> GatewayDestConfig {
+        GatewayDestConfig {
+            uri: uri.to_string(),
+            address: None,
+            transport: transport.map(|s| s.to_string()),
+            weight: 1,
+            priority: 1,
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn effective_transport_explicit_field_wins() {
+        let dest = gateway_dest("sip:gw.example.com;transport=tls", Some("tcp"));
+        assert_eq!(dest.effective_transport(), "tcp");
+    }
+
+    #[test]
+    fn effective_transport_from_uri_tls() {
+        let dest = gateway_dest("sip:gw.example.com:5061;transport=tls", None);
+        assert_eq!(dest.effective_transport(), "tls");
+    }
+
+    #[test]
+    fn effective_transport_from_uri_tcp() {
+        let dest = gateway_dest("sip:gw.example.com;transport=tcp", None);
+        assert_eq!(dest.effective_transport(), "tcp");
+    }
+
+    #[test]
+    fn effective_transport_case_insensitive() {
+        let dest = gateway_dest("sip:gw.example.com;Transport=TLS", None);
+        assert_eq!(dest.effective_transport(), "tls");
+    }
+
+    #[test]
+    fn effective_transport_param_not_last() {
+        let dest = gateway_dest("sip:gw.example.com;transport=tcp;lr", None);
+        assert_eq!(dest.effective_transport(), "tcp");
+    }
+
+    #[test]
+    fn effective_transport_defaults_to_udp() {
+        let dest = gateway_dest("sip:gw.example.com:5060", None);
+        assert_eq!(dest.effective_transport(), "udp");
     }
 }

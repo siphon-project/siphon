@@ -365,18 +365,19 @@ auth:
 #         from_user: "siphon"     # user part in From URI of OPTIONS probes
 #         from_domain: "sip.example.com"  # host part in From URI (default: local IP)
 #       destinations:
-#         - uri: "sip:gw1.carrier.com:5060"
-#           address: "10.0.0.1:5060"
-#           transport: udp        # udp (default) | tcp | tls
+#         - uri: "sip:gw1.carrier.com:5060"         # port + transport derived from URI
 #           weight: 3             # higher = more traffic (weighted algorithm)
 #           priority: 1           # lower = higher priority (failover tiers)
 #           attrs:                # user-defined metadata for filtering
 #             region: "us-east"
 #             type: "pstn"
-#         - uri: "sip:gw2.carrier.com:5060"
-#           address: "10.0.0.2:5060"
+#         - uri: "sip:gw2.carrier.com:5061;transport=tls"  # TLS on 5061
 #           weight: 1
 #           priority: 2           # failover tier — only used when tier 1 is down
+#
+#         # Optional explicit overrides (normally derived from URI):
+#         # address: "10.0.0.1:5060"   # bypass DNS, send to this IP:port
+#         # transport: tls             # override URI transport param
 #
 #     - name: "sbc-pool"
 #       algorithm: hash           # hash on call-id for sticky sessions

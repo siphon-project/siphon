@@ -912,7 +912,8 @@ fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
                     continue;
                 }
             };
-            let transport_type = match dest_config.transport.as_str() {
+            // Derive transport from config field, or from URI ;transport= param
+            let transport_type = match dest_config.effective_transport().as_str() {
                 "tcp" => transport::Transport::Tcp,
                 "tls" => transport::Transport::Tls,
                 _ => transport::Transport::Udp,

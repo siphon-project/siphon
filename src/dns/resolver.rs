@@ -45,9 +45,13 @@ impl SipResolver {
         // Strip brackets from IPv6 addresses (SIP URIs store as [::1])
         let host = strip_ipv6_brackets(host);
 
+        // Default port: 5061 for sips: or transport=tls, 5060 otherwise
+        let is_tls = scheme == "sips"
+            || transport_hint.is_some_and(|t| t.eq_ignore_ascii_case("tls"));
+        let default_port = if is_tls { 5061 } else { 5060 };
+
         // 1. Numeric IP — no DNS needed
         if let Ok(ip) = host.parse::<IpAddr>() {
-            let default_port = if scheme == "sips" { 5061 } else { 5060 };
             return vec![ResolvedTarget {
                 address: SocketAddr::new(ip, port.unwrap_or(default_port)),
                 transport: transport_hint.map(|s| s.to_string()),
@@ -60,7 +64,6 @@ impl SipResolver {
         }
 
         // 3. No port — try SRV lookup first (RFC 3263 §4)
-        let default_port = if scheme == "sips" { 5061 } else { 5060 };
         let srv_results = self.resolve_srv(host, scheme, transport_hint).await;
         if !srv_results.is_empty() {
             return srv_results;
