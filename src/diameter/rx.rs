@@ -164,10 +164,10 @@ impl MediaComponent {
             inner.extend_from_slice(&flow.encode());
         }
         if let Some(bw) = self.max_bandwidth_ul {
-            inner.extend_from_slice(&encode_avp_u32_3gpp(514, bw)); // Max-Requested-Bandwidth-UL-Rx
+            inner.extend_from_slice(&encode_avp_u32_3gpp(avp::MAX_REQUESTED_BANDWIDTH_UL, bw));
         }
         if let Some(bw) = self.max_bandwidth_dl {
-            inner.extend_from_slice(&encode_avp_u32_3gpp(513, bw)); // Max-Requested-Bandwidth-DL-Rx
+            inner.extend_from_slice(&encode_avp_u32_3gpp(avp::MAX_REQUESTED_BANDWIDTH_DL, bw));
         }
         if let Some(status) = self.flow_status {
             inner.extend_from_slice(&encode_avp_u32_3gpp(avp::FLOW_STATUS, status.as_u32()));
