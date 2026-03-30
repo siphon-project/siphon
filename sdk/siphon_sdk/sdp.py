@@ -555,10 +555,16 @@ class MockSdp:
             lines.append(f"{line}\r\n")
         for media in self._media_sections:
             formats = " ".join(str(pt) for pt in media._formats)
-            lines.append(
-                f"m={media._media_type} {media.port} "
-                f"{media._protocol} {formats}\r\n"
-            )
+            if formats:
+                lines.append(
+                    f"m={media._media_type} {media.port} "
+                    f"{media._protocol} {formats}\r\n"
+                )
+            else:
+                lines.append(
+                    f"m={media._media_type} {media.port} "
+                    f"{media._protocol}\r\n"
+                )
             for attr in media._other_attrs:
                 lines.append(f"{attr}\r\n")
             for pt, codec in media._rtpmap:
@@ -618,9 +624,15 @@ class MockSdpNamespace:
         if isinstance(source, bytes):
             text = source.decode("utf-8")
             return _parse_sdp_string(text)
-        # Try message object (Request/Reply/Call).
-        body = getattr(source, "_body", None) or getattr(source, "body", None)
+        # Try message object (Request/Reply/Call) — must have _body or body attr.
+        if not hasattr(source, "_body") and not hasattr(source, "body"):
+            raise TypeError(
+                "sdp.parse() expects a Request, Reply, Call, str, or bytes"
+            )
+        body = getattr(source, "_body", None)
         if body is None:
+            body = getattr(source, "body", None)
+        if not body:
             raise ValueError("message has no SDP body")
         if isinstance(body, bytes):
             text = body.decode("utf-8")
@@ -631,6 +643,9 @@ class MockSdpNamespace:
                 "sdp.parse() expects a Request, Reply, Call, str, or bytes"
             )
         return _parse_sdp_string(text)
+
+    def __repr__(self) -> str:
+        return "<SdpNamespace>"
 
 
 def _parse_sdp_string(sdp_text: str) -> MockSdp:

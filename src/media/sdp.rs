@@ -361,14 +361,22 @@ impl std::fmt::Display for SdpBody {
         for media in &self.media_sections {
             // m=audio 49170 RTP/AVP 0 8 97
             let formats: Vec<String> = media.formats.iter().map(|pt| pt.to_string()).collect();
-            write!(
-                f,
-                "m={} {} {} {}\r\n",
-                media.media_type,
-                media.port,
-                media.protocol,
-                formats.join(" ")
-            )?;
+            if formats.is_empty() {
+                write!(
+                    f,
+                    "m={} {} {}\r\n",
+                    media.media_type, media.port, media.protocol,
+                )?;
+            } else {
+                write!(
+                    f,
+                    "m={} {} {} {}\r\n",
+                    media.media_type,
+                    media.port,
+                    media.protocol,
+                    formats.join(" ")
+                )?;
+            }
 
             // Other attributes first (c=, b=, etc.)
             for attr in &media.other_attrs {
@@ -426,7 +434,7 @@ fn parse_media_line(line: &str) -> MediaLine {
     let media_type = parts.first().unwrap_or(&"audio").to_string();
     let port = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let protocol = parts.get(2).unwrap_or(&"RTP/AVP").to_string();
-    let formats: Vec<u16> = parts[3..]
+    let formats: Vec<u16> = parts.get(3..).unwrap_or(&[])
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect();
@@ -982,6 +990,46 @@ mod tests {
     // -----------------------------------------------------------------
     // Original tests
     // -----------------------------------------------------------------
+
+    #[test]
+    fn malformed_m_line_no_panic() {
+        // m= with fewer than 4 tokens should not panic.
+        let sdp_str = concat!(
+            "v=0\r\n",
+            "o=- 0 0 IN IP4 0.0.0.0\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 5060\r\n",
+        );
+        let sdp = SdpBody::parse(sdp_str);
+        assert_eq!(sdp.media_sections.len(), 1);
+        assert_eq!(sdp.media_sections[0].media_type, "audio");
+        assert_eq!(sdp.media_sections[0].port, 5060);
+        assert!(sdp.media_sections[0].formats.is_empty());
+    }
+
+    #[test]
+    fn empty_formats_no_trailing_space() {
+        // When all codecs are filtered out, the m= line should not have a trailing space.
+        let sdp_str = concat!(
+            "v=0\r\n",
+            "o=- 0 0 IN IP4 0.0.0.0\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 49170 RTP/AVP 0 8\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+        );
+        let mut sdp = SdpBody::parse(sdp_str);
+        // Filter out everything — no codecs kept.
+        sdp.filter_codecs(&["nonexistent"]);
+        let output = sdp.to_string();
+        assert!(
+            output.contains("m=audio 49170 RTP/AVP\r\n"),
+            "m= line should not have trailing space: {:?}",
+            output
+        );
+    }
 
     #[test]
     fn filter_static_codecs_without_rtpmap() {

@@ -66,8 +66,32 @@ class TestParse:
             ns.parse(NoBody())
 
     def test_parse_unsupported_type_raises(self, ns):
-        with pytest.raises((TypeError, ValueError)):
+        with pytest.raises(TypeError, match="expects a Request"):
             ns.parse(12345)
+
+    def test_parse_empty_string(self, ns):
+        s = ns.parse("")
+        assert len(s.media) == 0
+        assert s.origin is None
+
+    def test_parse_empty_bytes(self, ns):
+        s = ns.parse(b"")
+        assert len(s.media) == 0
+
+    def test_parse_body_attr_fallback(self, ns):
+        """Objects with ``body`` (not ``_body``) are also supported."""
+        class MsgWithBody:
+            body = SAMPLE_SDP.encode("utf-8")
+        s = ns.parse(MsgWithBody())
+        assert s.session_name == "SIPhon"
+
+    def test_parse_falsy_body(self, ns):
+        """Empty bytes body (falsy) should raise ValueError, not fall through."""
+        class EmptyBody:
+            _body = b""
+            body = None
+        with pytest.raises(ValueError, match="no SDP body"):
+            ns.parse(EmptyBody())
 
 
 class TestSessionProperties:
@@ -275,6 +299,9 @@ class TestSerialization:
         assert "SIPhon" in repr(sdp)
         assert "MediaSection" in repr(sdp.media[0])
 
+    def test_namespace_repr(self, ns):
+        assert repr(ns) == "<SdpNamespace>"
+
 
 class TestApply:
     """Applying SDP back to mock message objects."""
@@ -291,6 +318,32 @@ class TestApply:
         s.apply(msg)
 
         assert b"a=ptime:30" in msg._body
+        assert msg._content_type == "application/sdp"
+
+    def test_apply_updates_content_length(self, ns):
+        class MockMsg:
+            _body = SAMPLE_SDP.encode("utf-8")
+            _content_type = "application/sdp"
+            _headers = {}
+
+        msg = MockMsg()
+        s = ns.parse(msg)
+        s.apply(msg)
+
+        assert "Content-Length" in msg._headers
+        assert msg._headers["Content-Length"] == str(len(msg._body))
+
+    def test_apply_overwrites_content_type(self, ns):
+        """apply() always sets Content-Type to application/sdp."""
+        class MockMsg:
+            _body = SAMPLE_SDP.encode("utf-8")
+            _content_type = "multipart/mixed;boundary=abc"
+            _headers = {}
+
+        msg = MockMsg()
+        s = ns.parse(msg)
+        s.apply(msg)
+
         assert msg._content_type == "application/sdp"
 
 

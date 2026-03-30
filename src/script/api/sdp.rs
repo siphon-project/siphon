@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use crate::media::sdp::SdpBody;
 use crate::sip::message::SipMessage;
 
-use super::rtpengine::{extract_message, replace_body};
+use super::rtpengine::{extract_message, extract_sdp_body, replace_body};
 
 // ---------------------------------------------------------------------------
 // PySdpNamespace — the singleton injected as `siphon.sdp`
@@ -430,37 +430,7 @@ fn extract_sdp_from_message(
     let message = message.lock().map_err(|error| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
     })?;
-
-    if message.body.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "message has no SDP body",
-        ));
-    }
-
-    let empty_string = String::new();
-    let content_type = message
-        .headers
-        .get("Content-Type")
-        .or_else(|| message.headers.get("c"))
-        .unwrap_or(&empty_string);
-
-    if content_type.to_ascii_lowercase().contains("multipart/mixed") {
-        let parts = crate::siprec::multipart::parse_multipart(content_type, &message.body)
-            .map_err(|error| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "failed to parse multipart body: {error}"
-                ))
-            })?;
-        let sdp_part = crate::siprec::multipart::find_part(&parts, "application/sdp")
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "multipart body has no application/sdp part",
-                )
-            })?;
-        Ok(sdp_part.body.clone())
-    } else {
-        Ok(message.body.clone())
-    }
+    extract_sdp_body(&message)
 }
 
 // ---------------------------------------------------------------------------

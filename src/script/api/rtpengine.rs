@@ -287,7 +287,7 @@ fn lock_message(
 ///
 /// If the Content-Type is `multipart/mixed`, extracts the `application/sdp`
 /// part from the multipart body. Otherwise returns the raw body as-is.
-fn extract_sdp_body(message: &SipMessage) -> PyResult<Vec<u8>> {
+pub(super) fn extract_sdp_body(message: &SipMessage) -> PyResult<Vec<u8>> {
     let body = &message.body;
     if body.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -452,11 +452,9 @@ pub(super) fn replace_body(
     message
         .headers
         .set("Content-Length", new_body.len().to_string());
-    if message.headers.get("Content-Type").is_none() {
-        message
-            .headers
-            .set("Content-Type", "application/sdp".to_string());
-    }
+    message
+        .headers
+        .set("Content-Type", "application/sdp".to_string());
     Ok(())
 }
 
@@ -579,5 +577,25 @@ mod tests {
     fn extract_sdp_body_empty() {
         let message = test_message(None, b"");
         assert!(extract_sdp_body(&message).is_err());
+    }
+
+    #[test]
+    fn replace_body_always_sets_content_type() {
+        let message = test_message(Some("multipart/mixed;boundary=abc"), b"old body");
+        let message_arc = Arc::new(Mutex::new(message));
+        let new_body = b"v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\n";
+
+        replace_body(&message_arc, new_body).unwrap();
+
+        let guard = message_arc.lock().unwrap();
+        assert_eq!(
+            guard.headers.get("Content-Type"),
+            Some(&"application/sdp".to_string())
+        );
+        assert_eq!(
+            guard.headers.get("Content-Length"),
+            Some(&new_body.len().to_string())
+        );
+        assert_eq!(guard.body, new_body);
     }
 }
