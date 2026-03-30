@@ -83,6 +83,13 @@ pub struct SiphonMetrics {
     // --- Script execution ---
     pub script_executions_total: IntCounterVec,
     pub script_errors_total: IntCounter,
+
+    // --- Diameter ---
+    pub diameter_peers_connected: IntGauge,
+    pub diameter_requests_total: IntCounterVec,
+    pub diameter_request_errors_total: IntCounterVec,
+    pub diameter_request_duration_seconds: HistogramVec,
+    pub diameter_watchdog_failures_total: IntCounter,
 }
 
 impl SiphonMetrics {
@@ -152,6 +159,38 @@ impl SiphonMetrics {
             "Total Python script execution errors",
         )?;
 
+        let diameter_peers_connected = IntGauge::new(
+            "siphon_diameter_peers_connected",
+            "Number of currently connected Diameter peers",
+        )?;
+
+        let diameter_requests_total = IntCounterVec::new(
+            Opts::new("siphon_diameter_requests_total", "Total Diameter requests sent"),
+            &["command"],
+        )?;
+
+        let diameter_request_errors_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_diameter_request_errors_total",
+                "Total Diameter request errors",
+            ),
+            &["error"],
+        )?;
+
+        let diameter_request_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "siphon_diameter_request_duration_seconds",
+                "Diameter request round-trip duration in seconds",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0]),
+            &["command"],
+        )?;
+
+        let diameter_watchdog_failures_total = IntCounter::new(
+            "siphon_diameter_watchdog_failures_total",
+            "Total Diameter watchdog (DWR/DWA) failures indicating dead peers",
+        )?;
+
         // Register all metrics
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(responses_total.clone()))?;
@@ -164,6 +203,11 @@ impl SiphonMetrics {
         registry.register(Box::new(uptime_seconds.clone()))?;
         registry.register(Box::new(script_executions_total.clone()))?;
         registry.register(Box::new(script_errors_total.clone()))?;
+        registry.register(Box::new(diameter_peers_connected.clone()))?;
+        registry.register(Box::new(diameter_requests_total.clone()))?;
+        registry.register(Box::new(diameter_request_errors_total.clone()))?;
+        registry.register(Box::new(diameter_request_duration_seconds.clone()))?;
+        registry.register(Box::new(diameter_watchdog_failures_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -178,6 +222,11 @@ impl SiphonMetrics {
             uptime_seconds,
             script_executions_total,
             script_errors_total,
+            diameter_peers_connected,
+            diameter_requests_total,
+            diameter_request_errors_total,
+            diameter_request_duration_seconds,
+            diameter_watchdog_failures_total,
         })
     }
 }
@@ -283,5 +332,73 @@ mod tests {
 
         let output = encode_metrics();
         assert!(output.contains("siphon_request_duration_seconds"));
+    }
+
+    #[test]
+    fn diameter_peers_connected_gauge() {
+        init().unwrap();
+        let metrics = metrics().unwrap();
+
+        assert_eq!(metrics.diameter_peers_connected.get(), 0);
+        metrics.diameter_peers_connected.inc();
+        metrics.diameter_peers_connected.inc();
+        assert_eq!(metrics.diameter_peers_connected.get(), 2);
+        metrics.diameter_peers_connected.dec();
+        assert_eq!(metrics.diameter_peers_connected.get(), 1);
+
+        let output = encode_metrics();
+        assert!(output.contains("siphon_diameter_peers_connected"));
+    }
+
+    #[test]
+    fn diameter_request_counters() {
+        init().unwrap();
+        let metrics = metrics().unwrap();
+
+        metrics.diameter_requests_total.with_label_values(&["UAR"]).inc();
+        metrics.diameter_requests_total.with_label_values(&["UAR"]).inc();
+        metrics.diameter_requests_total.with_label_values(&["SAR"]).inc();
+
+        assert_eq!(
+            metrics.diameter_requests_total.with_label_values(&["UAR"]).get(),
+            2
+        );
+        assert_eq!(
+            metrics.diameter_requests_total.with_label_values(&["SAR"]).get(),
+            1
+        );
+    }
+
+    #[test]
+    fn diameter_error_and_watchdog_counters() {
+        init().unwrap();
+        let metrics = metrics().unwrap();
+
+        metrics.diameter_request_errors_total.with_label_values(&["timeout"]).inc();
+        metrics.diameter_request_errors_total.with_label_values(&["channel_dropped"]).inc();
+        metrics.diameter_watchdog_failures_total.inc();
+
+        assert_eq!(
+            metrics.diameter_request_errors_total.with_label_values(&["timeout"]).get(),
+            1
+        );
+        assert_eq!(metrics.diameter_watchdog_failures_total.get(), 1);
+
+        let output = encode_metrics();
+        assert!(output.contains("siphon_diameter_request_errors_total"));
+        assert!(output.contains("siphon_diameter_watchdog_failures_total"));
+    }
+
+    #[test]
+    fn diameter_request_duration_histogram() {
+        init().unwrap();
+        let metrics = metrics().unwrap();
+
+        metrics.diameter_request_duration_seconds
+            .with_label_values(&["MAR"])
+            .observe(0.015);
+
+        let output = encode_metrics();
+        assert!(output.contains("siphon_diameter_request_duration_seconds"));
     }
 }

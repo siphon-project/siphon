@@ -109,11 +109,19 @@ impl DiameterPeer {
 
     /// Send a request and wait for the answer.
     pub async fn send_request(&self, msg: Vec<u8>) -> Result<DiameterMessage, String> {
-        // Extract HbH from the message
+        // Extract HbH and command code from the message
         if msg.len() < 20 {
             return Err("message too short".into());
         }
         let hbh = u32::from_be_bytes([msg[12], msg[13], msg[14], msg[15]]);
+        let command_code = u32::from_be_bytes([0, msg[5], msg[6], msg[7]]);
+        let command_label = codec::command_name(command_code, true);
+
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            metrics.diameter_requests_total.with_label_values(&[command_label]).inc();
+        }
+
+        let start = std::time::Instant::now();
 
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(hbh, tx);
@@ -121,13 +129,28 @@ impl DiameterPeer {
         self.write_tx.send(msg).await.map_err(|e| format!("write channel closed: {}", e))?;
 
         match tokio::time::timeout(Duration::from_secs(10), rx).await {
-            Ok(Ok(answer)) => Ok(answer),
+            Ok(Ok(answer)) => {
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.diameter_request_duration_seconds
+                        .with_label_values(&[command_label])
+                        .observe(start.elapsed().as_secs_f64());
+                }
+                Ok(answer)
+            }
             Ok(Err(_)) => {
                 self.pending.lock().await.remove(&hbh);
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.diameter_request_errors_total
+                        .with_label_values(&["channel_dropped"]).inc();
+                }
                 Err("answer channel dropped".into())
             }
             Err(_) => {
                 self.pending.lock().await.remove(&hbh);
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.diameter_request_errors_total
+                        .with_label_values(&["timeout"]).inc();
+                }
                 Err("request timed out (10s)".into())
             }
         }
@@ -265,6 +288,10 @@ fn spawn_connection_tasks(
         shutdown: shutdown.clone(),
     });
 
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics.diameter_peers_connected.inc();
+    }
+
     // Writer task
     let shutdown_w = shutdown.clone();
     tokio::spawn(async move {
@@ -348,6 +375,9 @@ fn spawn_connection_tasks(
                 _ = shutdown_r.notified() => break,
             }
         }
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            metrics.diameter_peers_connected.dec();
+        }
     });
 
     // Watchdog task — sends DWR via send_request() so DWA is correlated
@@ -368,6 +398,9 @@ fn spawn_connection_tasks(
                         Ok(_) => {} // DWA received — peer is alive
                         Err(error) => {
                             warn!("Diameter: watchdog failed ({}), closing connection", error);
+                            if let Some(metrics) = crate::metrics::try_metrics() {
+                                metrics.diameter_watchdog_failures_total.inc();
+                            }
                             peer_w.shutdown();
                             break;
                         }
