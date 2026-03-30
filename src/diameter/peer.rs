@@ -350,7 +350,10 @@ fn spawn_connection_tasks(
         }
     });
 
-    // Watchdog task
+    // Watchdog task — sends DWR via send_request() so DWA is correlated
+    // through the pending map. If DWA doesn't arrive within the request
+    // timeout, the peer is considered dead and we trigger shutdown
+    // (which causes reconnect in client mode per connect_with_retry).
     let peer_w = peer.clone();
     let shutdown_dw = shutdown.clone();
     let watchdog_interval = config.watchdog_interval;
@@ -361,8 +364,13 @@ fn spawn_connection_tasks(
                     let hbh = peer_w.next_hbh();
                     let e2e = peer_w.next_e2e();
                     let dwr = build_dwr(&peer_w.config.origin_host, &peer_w.config.origin_realm, hbh, e2e);
-                    if peer_w.write_tx.send(dwr).await.is_err() {
-                        break;
+                    match peer_w.send_request(dwr).await {
+                        Ok(_) => {} // DWA received — peer is alive
+                        Err(error) => {
+                            warn!("Diameter: watchdog failed ({}), closing connection", error);
+                            peer_w.shutdown();
+                            break;
+                        }
                     }
                 }
                 _ = shutdown_dw.notified() => break,
