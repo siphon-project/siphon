@@ -36,6 +36,7 @@ impl ProfileRegistry {
     pub fn new() -> Self {
         let mut profiles = HashMap::new();
         profiles.insert("srtp_to_rtp".into(), Self::builtin_srtp_to_rtp());
+        profiles.insert("rtp_to_srtp".into(), Self::builtin_rtp_to_srtp());
         profiles.insert("ws_to_rtp".into(), Self::builtin_ws_to_rtp());
         profiles.insert("wss_to_rtp".into(), Self::builtin_wss_to_rtp());
         profiles.insert("rtp_passthrough".into(), Self::builtin_rtp_passthrough());
@@ -93,6 +94,31 @@ impl ProfileRegistry {
                 replace: vec!["origin".into()],
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
+                record_call: false,
+                record_path: None,
+            },
+        }
+    }
+
+    fn builtin_rtp_to_srtp() -> ProfileEntry {
+        ProfileEntry {
+            offer: NgFlags {
+                transport_protocol: Some("RTP/SAVP".into()),
+                ice: Some("remove".into()),
+                dtls: None,
+                replace: vec!["origin".into()],
+                flags: vec![],
+                direction: vec!["internal".into(), "external".into()],
+                record_call: false,
+                record_path: None,
+            },
+            answer: NgFlags {
+                transport_protocol: Some("RTP/AVP".into()),
+                ice: Some("remove".into()),
+                dtls: None,
+                replace: vec!["origin".into()],
+                flags: vec![],
+                direction: vec!["external".into(), "internal".into()],
                 record_call: false,
                 record_path: None,
             },
@@ -327,6 +353,7 @@ mod tests {
     fn default_registry_has_builtins() {
         let registry = ProfileRegistry::new();
         assert!(registry.get("srtp_to_rtp").is_some());
+        assert!(registry.get("rtp_to_srtp").is_some());
         assert!(registry.get("ws_to_rtp").is_some());
         assert!(registry.get("wss_to_rtp").is_some());
         assert!(registry.get("rtp_passthrough").is_some());
@@ -345,12 +372,13 @@ mod tests {
     fn profile_names_sorted() {
         let registry = ProfileRegistry::new();
         let names = registry.profile_names();
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7);
         // Sorted alphabetically
         assert_eq!(names[0], "rtp_passthrough");
-        assert_eq!(names[1], "siprec_src");
-        assert_eq!(names[2], "srs_recording");
-        assert_eq!(names[5], "wss_to_rtp");
+        assert_eq!(names[1], "rtp_to_srtp");
+        assert_eq!(names[2], "siprec_src");
+        assert_eq!(names[3], "srs_recording");
+        assert_eq!(names[6], "wss_to_rtp");
     }
 
     #[test]
@@ -388,7 +416,7 @@ mod tests {
         assert_eq!(entry.answer.dtls.as_deref(), Some("off"));
         // Built-ins still exist
         assert!(registry.get("srtp_to_rtp").is_some());
-        assert_eq!(registry.profile_names().len(), 7);
+        assert_eq!(registry.profile_names().len(), 8);
     }
 
     #[test]
