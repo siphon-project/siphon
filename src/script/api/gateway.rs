@@ -32,7 +32,10 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::gateway::{Algorithm, Destination, DispatcherGroup, DispatcherManager};
+use crate::gateway::{
+    extract_address_from_uri, resolve_address, Algorithm, Destination, DispatcherGroup,
+    DispatcherManager,
+};
 use crate::transport::Transport;
 
 /// Python-visible gateway namespace.
@@ -221,36 +224,6 @@ impl PyGateway {
             None => false,
         }
     }
-}
-
-/// Try to extract a socket address from a SIP URI (best-effort for convenience).
-fn extract_address_from_uri(uri: &str) -> String {
-    let host_part = uri
-        .strip_prefix("sip:")
-        .or_else(|| uri.strip_prefix("sips:"))
-        .unwrap_or(uri);
-
-    if host_part.contains(':') {
-        host_part.to_string()
-    } else {
-        format!("{host_part}:5060")
-    }
-}
-
-/// Resolve an address string (IP:port or hostname:port) to a `SocketAddr`.
-fn resolve_address(address: &str) -> Result<std::net::SocketAddr, String> {
-    // Fast path: raw IP:port
-    if let Ok(addr) = address.parse::<std::net::SocketAddr>() {
-        return Ok(addr);
-    }
-
-    // Slow path: DNS resolution
-    use std::net::ToSocketAddrs;
-    address
-        .to_socket_addrs()
-        .map_err(|e| format!("{e}"))?
-        .next()
-        .ok_or_else(|| "DNS returned no addresses".to_string())
 }
 
 /// Python-visible destination returned from gateway.select() and gateway.list().
@@ -567,23 +540,4 @@ mod tests {
         assert_eq!(py.uri, "sip:gw.example.com;transport=tcp");
     }
 
-    #[test]
-    fn extract_address_from_sip_uri() {
-        assert_eq!(
-            extract_address_from_uri("sip:10.0.0.1:5060"),
-            "10.0.0.1:5060"
-        );
-        assert_eq!(
-            extract_address_from_uri("sip:gw.example.com"),
-            "gw.example.com:5060"
-        );
-        assert_eq!(
-            extract_address_from_uri("sips:gw.example.com:5061"),
-            "gw.example.com:5061"
-        );
-        assert_eq!(
-            extract_address_from_uri("10.0.0.1:5060"),
-            "10.0.0.1:5060"
-        );
-    }
 }

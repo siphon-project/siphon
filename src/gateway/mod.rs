@@ -551,6 +551,53 @@ async fn probe_destination(
 }
 
 // ---------------------------------------------------------------------------
+// URI utilities (shared by server init + Python gateway API)
+// ---------------------------------------------------------------------------
+
+/// Extract a `host:port` address string from a SIP URI (best-effort).
+///
+/// Strips the scheme prefix, `user@`, and any URI parameters (`;transport=tls`,
+/// etc.) before extracting `host:port`. Falls back to port 5060 (or 5061 for
+/// `sips:`).
+pub fn extract_address_from_uri(uri: &str) -> String {
+    let is_sips = uri.starts_with("sips:");
+    let host_part = uri
+        .strip_prefix("sip:")
+        .or_else(|| uri.strip_prefix("sips:"))
+        .unwrap_or(uri);
+
+    // Strip user@ if present
+    let host_part = host_part.split('@').last().unwrap_or(host_part);
+
+    // Strip URI parameters (;transport=tls, ;lr, etc.)
+    let host_port = host_part.split(';').next().unwrap_or(host_part);
+
+    let default_port = if is_sips { 5061 } else { 5060 };
+
+    if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:{default_port}")
+    }
+}
+
+/// Resolve an address string (`IP:port` or `hostname:port`) to a `SocketAddr`.
+pub fn resolve_address(address: &str) -> Result<SocketAddr, String> {
+    // Fast path: raw IP:port
+    if let Ok(addr) = address.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    // Slow path: DNS resolution (hostname:port)
+    use std::net::ToSocketAddrs;
+    address
+        .to_socket_addrs()
+        .map_err(|e| format!("{e}"))?
+        .next()
+        .ok_or_else(|| "DNS returned no addresses".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1397,5 +1444,84 @@ mod tests {
         // Further failures start from 0
         let count = destination.record_failure();
         assert_eq!(count, 1);
+    }
+
+    // --- extract_address_from_uri ---
+
+    #[test]
+    fn extract_address_strips_sip_scheme() {
+        assert_eq!(
+            extract_address_from_uri("sip:gw.example.com:5060"),
+            "gw.example.com:5060"
+        );
+    }
+
+    #[test]
+    fn extract_address_strips_uri_params() {
+        assert_eq!(
+            extract_address_from_uri("sip:gw.example.com:5061;transport=tls"),
+            "gw.example.com:5061"
+        );
+    }
+
+    #[test]
+    fn extract_address_strips_multiple_params() {
+        assert_eq!(
+            extract_address_from_uri("sip:gw.example.com:5060;transport=tcp;lr"),
+            "gw.example.com:5060"
+        );
+    }
+
+    #[test]
+    fn extract_address_strips_user_part() {
+        assert_eq!(
+            extract_address_from_uri("sip:trunk@gw.example.com:5060"),
+            "gw.example.com:5060"
+        );
+    }
+
+    #[test]
+    fn extract_address_default_port_sip() {
+        assert_eq!(
+            extract_address_from_uri("sip:gw.example.com"),
+            "gw.example.com:5060"
+        );
+    }
+
+    #[test]
+    fn extract_address_default_port_sips() {
+        assert_eq!(
+            extract_address_from_uri("sips:gw.example.com"),
+            "gw.example.com:5061"
+        );
+    }
+
+    #[test]
+    fn extract_address_sips_with_params() {
+        assert_eq!(
+            extract_address_from_uri("sips:gw.example.com;transport=tls"),
+            "gw.example.com:5061"
+        );
+    }
+
+    #[test]
+    fn extract_address_bare_ip_port() {
+        assert_eq!(
+            extract_address_from_uri("10.0.0.1:5060"),
+            "10.0.0.1:5060"
+        );
+    }
+
+    // --- resolve_address ---
+
+    #[test]
+    fn resolve_address_parses_ip_port() {
+        let addr = resolve_address("127.0.0.1:5060").unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:5060");
+    }
+
+    #[test]
+    fn resolve_address_rejects_garbage() {
+        assert!(resolve_address("not_valid").is_err());
     }
 }
