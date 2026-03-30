@@ -3934,6 +3934,16 @@ fn b2bua_send_b_leg_invite(
     );
 
     let mut b_leg_invite = original_request.clone();
+
+    // B2BUA: strip A-leg headers that must not leak to the B-leg.
+    // Record-Route/Route belong to the A-leg dialog (independent dialog, RFC 3261).
+    // Authorization/Proxy-Authorization are A-leg credentials — forwarding them is
+    // both a security leak and protocol-incorrect (B-leg hasn't challenged us).
+    b_leg_invite.headers.remove("Record-Route");
+    b_leg_invite.headers.remove("Route");
+    b_leg_invite.headers.remove("Authorization");
+    b_leg_invite.headers.remove("Proxy-Authorization");
+
     // Replace Via with our own (set preserves header position)
     b_leg_invite.headers.set("Via", via_value);
     // Update Request-URI: use dial target for routing (host/port/transport) but
