@@ -82,16 +82,20 @@ impl PyDiameter {
     /// Args:
     ///     public_identity: The user's public identity (e.g. ``"sip:alice@ims.example.com"``).
     ///     visited_network_id: Visited network identifier (defaults to ``""``).
+    ///     user_auth_type: User-Authorization-Type AVP value (3GPP TS 29.229).
+    ///         ``0`` = REGISTRATION, ``1`` = DE_REGISTRATION,
+    ///         ``2`` = REGISTRATION_AND_CAPABILITIES.  Omit to not send the AVP.
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``server_name`` (str or None),
     ///     or ``None`` if no Diameter peer is connected.
-    #[pyo3(signature = (public_identity, visited_network_id=None))]
+    #[pyo3(signature = (public_identity, visited_network_id=None, user_auth_type=None))]
     fn cx_uar<'py>(
         &self,
         python: Python<'py>,
         public_identity: &str,
         visited_network_id: Option<&str>,
+        user_auth_type: Option<u32>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let client = match self.manager.any_client() {
             Some(client) => client,
@@ -104,7 +108,7 @@ impl PyDiameter {
         let visited = visited_network_id.unwrap_or("");
         let answer = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(client.send_uar(public_identity, visited, None))
+                .block_on(client.send_uar(public_identity, visited, user_auth_type))
         });
 
         match answer {
@@ -447,7 +451,20 @@ mod tests {
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
             let result = py_diameter
-                .cx_uar(python, "sip:alice@example.com", None)
+                .cx_uar(python, "sip:alice@example.com", None, None)
+                .unwrap();
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn cx_uar_with_user_auth_type_returns_none_without_peer() {
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        let py_diameter = PyDiameter::new(manager);
+        pyo3::Python::attach(|python| {
+            let result = py_diameter
+                .cx_uar(python, "sip:alice@example.com", None, Some(0))
                 .unwrap();
             assert!(result.is_none());
         });

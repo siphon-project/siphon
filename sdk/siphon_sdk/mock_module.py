@@ -1567,12 +1567,16 @@ class MockDiameter:
     # -- Cx: HSS integration (I-CSCF / S-CSCF) --
 
     def cx_uar(self, public_identity: str,
-               visited_network_id: Optional[str] = None) -> Optional[dict]:
+               visited_network_id: Optional[str] = None,
+               user_auth_type: Optional[int] = None) -> Optional[dict]:
         """Send a User-Authorization-Request to discover S-CSCF assignment.
 
         Args:
             public_identity: User's public identity (e.g. ``"sip:alice@ims.example.com"``).
             visited_network_id: Visited network identifier.
+            user_auth_type: User-Authorization-Type AVP value (3GPP TS 29.229).
+                ``0`` = REGISTRATION, ``1`` = DE_REGISTRATION,
+                ``2`` = REGISTRATION_AND_CAPABILITIES.  Omit to not send the AVP.
 
         Returns:
             Dict with ``result_code`` and ``server_name``, or ``None``.

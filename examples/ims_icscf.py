@@ -14,6 +14,11 @@ Diameter Cx to discover which S-CSCF should handle each request:
                       <--(Cx LIA)-- HSS (returns serving S-CSCF)
               I-CSCF -> S-CSCF
 
+S-CSCF failover: when a REGISTER to the assigned S-CSCF fails with
+408/5xx, the @proxy.on_failure handler re-queries the HSS with
+user_auth_type=2 (REGISTRATION_AND_CAPABILITIES) to get a capabilities
+list and tries the next S-CSCF.
+
 The I-CSCF does NOT authenticate — that's the S-CSCF's job.
 
 Equivalent to: opensips_ims_icscf/opensips.cfg from docker_open5gs
@@ -31,18 +36,30 @@ REALM = "ims.example.com"
 # Set to None to require Diameter Cx for S-CSCF discovery.
 SCSCF_FALLBACK = "sip:scscf.ims.example.com:6060"
 
+# 3GPP TS 29.229 User-Authorization-Type values
+UAT_REGISTRATION = 0
+UAT_DE_REGISTRATION = 1
+UAT_REGISTRATION_AND_CAPABILITIES = 2
 
-def find_scscf_for_register(request):
+
+def find_scscf_for_register(request, user_auth_type=None):
     """Discover the S-CSCF for a REGISTER via Diameter Cx UAR.
 
     Sends a User-Authorization-Request to the HSS, which returns the
     assigned S-CSCF in the Server-Name AVP.
 
+    Args:
+        request: The inbound REGISTER request.
+        user_auth_type: Optional User-Authorization-Type AVP value.
+            Use UAT_REGISTRATION_AND_CAPABILITIES (2) for failover
+            to request a capabilities list instead of the assigned S-CSCF.
+
     Falls back to SCSCF_FALLBACK when no Diameter peer is connected.
     """
     if diameter.peer_count() > 0:
         visited = request.get_header("P-Visited-Network-ID") or REALM
-        result = diameter.cx_uar(str(request.from_uri), visited)
+        result = diameter.cx_uar(str(request.from_uri), visited,
+                                 user_auth_type=user_auth_type)
         if result and result.get("server_name"):
             log.info(f"UAR -> S-CSCF: {result['server_name']}")
             return result["server_name"]
@@ -88,7 +105,35 @@ def handle_register(request):
         return
 
     log.info(f"routing REGISTER to S-CSCF {scscf}")
+    request.set_header("X-I-CSCF-First-SCSCF", scscf)
     request.relay(scscf)
+
+
+@proxy.on_failure
+def register_failure(request, reply):
+    """S-CSCF failover: re-query HSS with REGISTRATION_AND_CAPABILITIES."""
+    if request.method != "REGISTER":
+        reply.relay()
+        return
+
+    if reply.status_code != 408 and reply.status_code < 500:
+        reply.relay()
+        return
+
+    first_scscf = request.get_header("X-I-CSCF-First-SCSCF")
+    log.warn(f"S-CSCF {first_scscf} failed ({reply.status_code}), trying capabilities query")
+
+    next_scscf = find_scscf_for_register(
+        request, user_auth_type=UAT_REGISTRATION_AND_CAPABILITIES)
+
+    if next_scscf and next_scscf != first_scscf:
+        log.info(f"failover REGISTER to S-CSCF {next_scscf}")
+        request.remove_header("X-I-CSCF-First-SCSCF")
+        request.relay(next_scscf)
+        return
+
+    log.error(f"no alternate S-CSCF available for {request.from_uri}")
+    reply.relay()
 
 
 @proxy.on_request("OPTIONS")
