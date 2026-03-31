@@ -172,10 +172,13 @@ impl PyAuth {
             let guard = message.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {e}"))
             })?;
-            guard.headers.get("P-Asserted-Identity")
+            let raw = guard.headers.get("P-Asserted-Identity")
                 .or_else(|| guard.headers.get("From"))
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default();
+            // Strip <>, display name, and ;tag= — Public-Identity AVP must be
+            // a bare SIP URI per TS 29.228 §6.3.2.
+            extract_sip_uri(&raw)
         };
 
         let existing_auth = {
@@ -867,6 +870,25 @@ fn generate_nonce() -> String {
 
 /// Extract the user part from a SIP From/To header value.
 /// e.g. `<sip:alice@example.com>;tag=foo` -> `Some("alice")`
+/// Extract a clean SIP URI from a header value (From, P-Asserted-Identity).
+///
+/// Strips angle brackets, display name, and header-level parameters like `;tag=`.
+/// Returns a bare SIP URI suitable for Diameter AVPs (TS 29.228 §6.3.2).
+///
+/// Examples:
+///   `<sip:alice@example.com>;tag=abc`  → `sip:alice@example.com`
+///   `"Alice" <sip:alice@example.com>`  → `sip:alice@example.com`
+///   `sip:alice@example.com`            → `sip:alice@example.com`
+fn extract_sip_uri(header_value: &str) -> String {
+    if let Some(start) = header_value.find('<') {
+        if let Some(end) = header_value[start..].find('>') {
+            return header_value[start + 1..start + end].to_string();
+        }
+    }
+    // No angle brackets — strip ;tag= and other header-level params
+    header_value.split(';').next().unwrap_or(header_value).trim().to_string()
+}
+
 fn extract_username_from_uri(header_value: &str) -> Option<String> {
     // Find the URI between < > or parse bare URI
     let uri_str = if let Some(start) = header_value.find('<') {
@@ -1219,6 +1241,38 @@ mod tests {
 
         let result = auth.require_www_digest(&mut request, None).unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn extract_sip_uri_strips_angle_brackets_and_tag() {
+        assert_eq!(
+            extract_sip_uri("<sip:206018802445102@ims.mnc001.mcc206.3gppnetwork.org>;tag=yfJqzFRBS1"),
+            "sip:206018802445102@ims.mnc001.mcc206.3gppnetwork.org"
+        );
+    }
+
+    #[test]
+    fn extract_sip_uri_strips_display_name() {
+        assert_eq!(
+            extract_sip_uri("\"Alice\" <sip:alice@example.com>"),
+            "sip:alice@example.com"
+        );
+    }
+
+    #[test]
+    fn extract_sip_uri_bare_uri_unchanged() {
+        assert_eq!(
+            extract_sip_uri("sip:bob@example.com"),
+            "sip:bob@example.com"
+        );
+    }
+
+    #[test]
+    fn extract_sip_uri_bare_uri_strips_tag() {
+        assert_eq!(
+            extract_sip_uri("sip:bob@example.com;tag=abc123"),
+            "sip:bob@example.com"
+        );
     }
 
     #[test]
