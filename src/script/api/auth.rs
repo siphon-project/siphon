@@ -265,13 +265,27 @@ impl PyAuth {
 
             // Normal verification: look up the stored XRES from the first MAR
             let nonce_str = extract_nonce_field(auth_value);
+            let found = nonce_str.as_ref().map_or(false, |n| ims_auth_store().contains_key(n));
+            tracing::debug!(
+                nonce_prefix = nonce_str.as_ref().map(|n| &n[..n.len().min(16)]),
+                found,
+                store_size = ims_auth_store().len(),
+                "IMS auth: cache lookup",
+            );
             let stored = nonce_str.as_ref().and_then(|n| {
                 ims_auth_store().remove(n).map(|(_, v)| v)
             });
 
             if let Some(vector) = stored {
                 if let Some(resp) = extract_response_field(auth_value) {
-                    if resp.as_bytes() == vector.expected_response.as_slice() {
+                    let matches = resp.as_bytes() == vector.expected_response.as_slice();
+                    tracing::debug!(
+                        response = %resp,
+                        expected = %crate::diameter::codec::hex::encode(&vector.expected_response),
+                        matches,
+                        "IMS auth: response comparison",
+                    );
+                    if matches {
                         if let Some(username) = extract_username(auth_value) {
                             request.set_auth_user(username);
                         }
@@ -281,6 +295,7 @@ impl PyAuth {
                 // Response mismatch — re-challenge with a fresh vector
             } else {
                 // No stored vector (expired or replayed nonce) — need fresh MAR
+                tracing::debug!("IMS auth: no cached vector, sending fresh MAR");
             }
         }
 
@@ -658,6 +673,11 @@ impl PyAuth {
         // REGISTER can verify without sending another MAR.
         if let (Some(nonce_bytes), Some(expected_bytes)) = (&hss_nonce, &hss_expected) {
             let nonce_str = base64_encode(nonce_bytes);
+            tracing::debug!(
+                nonce_prefix = &nonce_str[..nonce_str.len().min(16)],
+                xres_len = expected_bytes.len(),
+                "IMS auth: stored pending challenge",
+            );
             ims_auth_store().insert(nonce_str, ImsAuthVector {
                 expected_response: expected_bytes.clone(),
                 ck: hss_ck.clone(),
