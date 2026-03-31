@@ -397,6 +397,26 @@ impl PyRegistrar {
         Ok(self.inner.asserted_identity(&aor))
     }
 
+    /// Store P-Associated-URI list for an AoR.
+    ///
+    /// Called from reply handlers to cache the public identities returned
+    /// by the upstream S-CSCF in the 200 OK to REGISTER.
+    fn set_associated_uris(&self, aor: &str, uris: Vec<String>) -> PyResult<()> {
+        let aor = normalize_aor(aor);
+        self.inner.set_associated_uris(&aor, uris);
+        Ok(())
+    }
+
+    /// Retrieve stored P-Associated-URI list for a URI.
+    ///
+    /// Returns the list of public identities cached from the upstream
+    /// 200 OK to REGISTER, or an empty list if none stored.
+    fn associated_uris(&self, uri: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+        let uri_string = extract_uri_string(uri)?;
+        let aor = normalize_aor(&uri_string);
+        Ok(self.inner.associated_uris(&aor))
+    }
+
     /// Decorator to register a handler for registration state changes.
     ///
     /// The handler receives (aor, event_type, contacts) where:

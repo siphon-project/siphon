@@ -67,6 +67,12 @@ pub enum HandlerKind {
     },
     /// `@diameter.on_rtr` — incoming Registration-Termination-Request from HSS.
     DiameterOnRtr,
+    /// `@diameter.on_rar` — incoming Re-Auth-Request from PCRF (policy change).
+    DiameterOnRar,
+    /// `@diameter.on_asr` — incoming Abort-Session-Request from PCRF.
+    DiameterOnAsr,
+    /// `@sbi.on_event` — incoming PCF event notification (N5).
+    SbiOnEvent,
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +675,9 @@ fn extract_handlers(
             "srs.on_invite" => HandlerKind::SrsOnInvite,
             "srs.on_session_end" => HandlerKind::SrsOnSessionEnd,
             "diameter.on_rtr" => HandlerKind::DiameterOnRtr,
+            "diameter.on_rar" => HandlerKind::DiameterOnRar,
+            "diameter.on_asr" => HandlerKind::DiameterOnAsr,
+            "sbi.on_event" => HandlerKind::SbiOnEvent,
             "timer.every" => {
                 let meta = metadata.ok_or_else(|| {
                     SiphonError::Script("timer.every handler missing metadata".into())

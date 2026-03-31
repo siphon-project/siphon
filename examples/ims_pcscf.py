@@ -172,3 +172,29 @@ def handle_request(request):
             request.relay(contacts[0].uri)
     else:
         request.fork([c.uri for c in contacts])
+
+
+# ---------------------------------------------------------------------------
+# Reply handler: cache P-Associated-URI from upstream 200 OK REGISTER
+# ---------------------------------------------------------------------------
+
+@proxy.on_reply
+def cache_associated_uris(request, reply):
+    """Cache P-Associated-URI from the S-CSCF 200 OK to REGISTER.
+
+    In relay mode (P-CSCF → I-CSCF → S-CSCF), the S-CSCF includes
+    P-Associated-URI in the 200 OK listing all public identities
+    (3GPP TS 24.229 §5.2.2.4). The P-CSCF caches them for later use
+    (e.g. applying PAU to outgoing requests for identity assertion).
+    """
+    if request.method != "REGISTER" or reply.status_code != 200:
+        reply.relay()
+        return
+
+    pau = reply.get_header("P-Associated-URI")
+    if pau:
+        aor = str(request.from_uri)
+        registrar.set_associated_uris(aor, [pau])
+        log.info(f"cached P-Associated-URI for {aor}: {pau}")
+
+    reply.relay()

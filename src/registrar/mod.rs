@@ -107,6 +107,8 @@ pub struct Registrar {
     service_routes: DashMap<Aor, Vec<String>>,
     /// AoR → P-Asserted-Identity (IMS: stored from SAR user profile).
     asserted_identities: DashMap<Aor, String>,
+    /// AoR → P-Associated-URI list (from upstream 200 OK to REGISTER).
+    associated_uris: DashMap<Aor, Vec<String>>,
     pub config: RegistrarConfig,
     /// Broadcast channel for registration change events.
     event_sender: broadcast::Sender<RegistrationEvent>,
@@ -131,6 +133,7 @@ impl Registrar {
             bindings: DashMap::new(),
             service_routes: DashMap::new(),
             asserted_identities: DashMap::new(),
+            associated_uris: DashMap::new(),
             config,
             event_sender,
             backend_writer: OnceLock::new(),
@@ -284,6 +287,7 @@ impl Registrar {
     pub fn remove_all(&self, aor: &str) {
         self.bindings.remove(aor);
         self.service_routes.remove(aor);
+        self.associated_uris.remove(aor);
         if let Some(writer) = self.backend_writer.get() {
             writer.remove(aor);
         }
@@ -298,6 +302,7 @@ impl Registrar {
     pub fn clear_bindings(&self, aor: &str) {
         self.bindings.remove(aor);
         self.service_routes.remove(aor);
+        self.associated_uris.remove(aor);
         if let Some(writer) = self.backend_writer.get() {
             writer.remove(aor);
         }
@@ -548,6 +553,23 @@ impl Registrar {
     /// Retrieve stored Service-Route headers for an AoR.
     pub fn service_routes(&self, aor: &str) -> Vec<String> {
         self.service_routes
+            .get(aor)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// Store P-Associated-URI list for an AoR (from upstream 200 OK to REGISTER).
+    pub fn set_associated_uris(&self, aor: &str, uris: Vec<String>) {
+        if uris.is_empty() {
+            self.associated_uris.remove(aor);
+        } else {
+            self.associated_uris.insert(aor.to_string(), uris);
+        }
+    }
+
+    /// Retrieve stored P-Associated-URI list for an AoR.
+    pub fn associated_uris(&self, aor: &str) -> Vec<String> {
+        self.associated_uris
             .get(aor)
             .map(|entry| entry.value().clone())
             .unwrap_or_default()
@@ -1185,5 +1207,34 @@ mod tests {
         assert!(matches!(event, RegistrationEvent::Deregistered { .. }));
         // No second event
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn associated_uris_set_get_clear() {
+        let registrar = Registrar::default();
+        let aor = "sip:alice@ims.example.com";
+
+        // Initially empty
+        assert!(registrar.associated_uris(aor).is_empty());
+
+        // Store PAU list
+        let uris = vec![
+            "sip:alice@ims.example.com".to_string(),
+            "tel:+1234567890".to_string(),
+        ];
+        registrar.set_associated_uris(aor, uris.clone());
+        assert_eq!(registrar.associated_uris(aor), uris);
+
+        // Clear with empty vec
+        registrar.set_associated_uris(aor, Vec::new());
+        assert!(registrar.associated_uris(aor).is_empty());
+
+        // Re-store and clear via remove_all
+        registrar.set_associated_uris(aor, uris.clone());
+        registrar
+            .save(aor, contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+        registrar.remove_all(aor);
+        assert!(registrar.associated_uris(aor).is_empty());
     }
 }

@@ -349,6 +349,7 @@ class MockRegistrar:
         self._store: dict[str, list[Contact]] = {}
         self._asserted_identities: dict[str, str] = {}
         self._service_routes: dict[str, list[str]] = {}
+        self._associated_uris: dict[str, list[str]] = {}
         self._on_change_callbacks: list[Callable] = []
 
     def save(self, request: Any, force: bool = False) -> bool:
@@ -489,6 +490,32 @@ class MockRegistrar:
         """
         return list(self._service_routes.get(str(uri), []))
 
+    def set_associated_uris(self, aor: str, uris: list[str]) -> None:
+        """Store P-Associated-URI list for an AoR.
+
+        Called from reply handlers to cache the public identities returned
+        by the upstream S-CSCF in the 200 OK to REGISTER.
+
+        Args:
+            aor: Address-of-record string.
+            uris: List of P-Associated-URI strings.
+        """
+        if uris:
+            self._associated_uris[str(aor)] = list(uris)
+        else:
+            self._associated_uris.pop(str(aor), None)
+
+    def associated_uris(self, uri: Union[str, SipUri]) -> list[str]:
+        """Get stored P-Associated-URI list for a URI.
+
+        Args:
+            uri: AoR as string or :class:`SipUri`.
+
+        Returns:
+            List of P-Associated-URI strings, or empty list.
+        """
+        return list(self._associated_uris.get(str(uri), []))
+
     @staticmethod
     def on_change(fn: Callable) -> Callable:
         """Register a handler for registration state changes.
@@ -563,6 +590,7 @@ class MockRegistrar:
         self._store.clear()
         self._asserted_identities.clear()
         self._service_routes.clear()
+        self._associated_uris.clear()
         for aor in aors:
             self._fire_on_change(aor, "deregistered")
 
@@ -1756,6 +1784,36 @@ class MockDiameter:
         """
         return fn
 
+    @staticmethod
+    def on_rar(fn: Any) -> Any:
+        """Register a handler for incoming RAR (Re-Auth-Request) from PCRF.
+
+        Handler receives ``(session_id, abort_cause, specific_actions)``.
+        ``specific_actions`` is a list of int values (TS 29.214 Specific-Action).
+
+        Example::
+
+            @diameter.on_rar
+            def handle_rar(session_id, abort_cause, specific_actions):
+                if 2 in specific_actions:
+                    log.warn(f"Bearer lost for session {session_id}")
+        """
+        return fn
+
+    @staticmethod
+    def on_asr(fn: Any) -> Any:
+        """Register a handler for incoming ASR (Abort-Session-Request) from PCRF.
+
+        Handler receives ``(session_id, abort_cause, origin_host)``.
+
+        Example::
+
+            @diameter.on_asr
+            def handle_asr(session_id, abort_cause, origin_host):
+                log.info(f"Session abort from {origin_host}: {session_id}")
+        """
+        return fn
+
     def clear(self) -> None:
         """Reset all mock peers and responses (test helper)."""
         self._peers.clear()
@@ -2376,6 +2434,117 @@ class MockMetrics:
 _metrics = MockMetrics()
 
 
+class MockSbi:
+    """Mock SBI namespace for testing scripts that use ``from siphon import sbi``.
+
+    Provides mock N5/Npcf policy authorization methods.
+
+    Example::
+
+        from siphon_sdk import mock_module
+        mock_module.install()
+
+        from siphon import sbi
+        result = sbi.create_session(sip_call_id="call-1", ue_ipv4="10.0.0.1")
+        assert result["authorized"] is True
+    """
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, dict] = {}
+        self._next_session_id: int = 1
+        self._authorized: bool = True
+
+    def create_session(self, af_app_id: Optional[str] = None,
+                       sip_call_id: Optional[str] = None,
+                       supi: Optional[str] = None,
+                       ue_ipv4: Optional[str] = None,
+                       ue_ipv6: Optional[str] = None,
+                       dnn: Optional[str] = None,
+                       notif_uri: Optional[str] = None,
+                       media_type: str = "AUDIO",
+                       flow_status: str = "ENABLED") -> Optional[dict]:
+        """Create an N5 app session for QoS policy authorization.
+
+        Args:
+            af_app_id: Application Function identifier.
+            sip_call_id: SIP Call-ID for correlation.
+            supi: Subscription Permanent Identifier.
+            ue_ipv4: UE IPv4 address.
+            ue_ipv6: UE IPv6 address.
+            dnn: Data Network Name.
+            notif_uri: Notification URI for PCF events.
+            media_type: Media type (default ``"AUDIO"``).
+            flow_status: Flow status (default ``"ENABLED"``).
+
+        Returns:
+            Dict with ``app_session_id`` and ``authorized``, or ``None``.
+        """
+        session_id = f"mock-n5-{self._next_session_id}"
+        self._next_session_id += 1
+        self._sessions[session_id] = {
+            "sip_call_id": sip_call_id,
+            "ue_ipv4": ue_ipv4,
+        }
+        return {"app_session_id": session_id, "authorized": self._authorized}
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete an N5 app session.
+
+        Args:
+            session_id: The app session ID from ``create_session()``.
+
+        Returns:
+            ``True`` on success, ``False`` if session not found.
+        """
+        return self._sessions.pop(session_id, None) is not None
+
+    def update_session(self, session_id: str,
+                       media_type: str = "AUDIO",
+                       flow_status: str = "ENABLED") -> Optional[dict]:
+        """Update an N5 app session (media renegotiation).
+
+        Args:
+            session_id: The app session ID to update.
+            media_type: Media type (default ``"AUDIO"``).
+            flow_status: Flow status (default ``"ENABLED"``).
+
+        Returns:
+            Dict with ``app_session_id`` and ``authorized``, or ``None``.
+        """
+        if session_id not in self._sessions:
+            return None
+        return {"app_session_id": session_id, "authorized": self._authorized}
+
+    @staticmethod
+    def on_event(fn: Any) -> Any:
+        """Register a handler for incoming PCF event notifications (N5).
+
+        Handler receives a dict with event notification data.
+
+        Example::
+
+            @sbi.on_event
+            def handle_pcf_event(event):
+                for notif in event.get("ev_notifs", []):
+                    log.info(f"PCF event: {notif['event']}")
+        """
+        return fn
+
+    def set_authorized(self, authorized: bool) -> None:
+        """Configure whether ``create_session`` returns authorized (test helper).
+
+        Args:
+            authorized: Whether sessions should be authorized.
+        """
+        self._authorized = authorized
+
+    def clear(self) -> None:
+        """Reset all mock sessions (test helper)."""
+        self._sessions.clear()
+        self._next_session_id = 1
+        self._authorized = True
+
+
 class MockIsc:
     """Mock ISC namespace — Initial Filter Criteria evaluation for testing.
 
@@ -2496,6 +2665,7 @@ class MockIsc:
 
 
 _isc = MockIsc()
+_sbi = MockSbi()
 
 
 # ---------------------------------------------------------------------------
@@ -2538,6 +2708,7 @@ def install() -> ModuleType:
     mod.timer = _timer  # type: ignore[attr-defined]
     mod.metrics = _metrics  # type: ignore[attr-defined]
     mod.isc = _isc  # type: ignore[attr-defined]
+    mod.sbi = _sbi  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
 
     # Also install the _siphon_registry mock

@@ -1824,6 +1824,8 @@ pub struct SbiYamlConfig {
     pub npcf_url: Option<String>,
     /// Nchf base URL (if not using NRF discovery).
     pub nchf_url: Option<String>,
+    /// Listen address for incoming PCF event notifications (e.g. "0.0.0.0:8080").
+    pub notif_listen: Option<String>,
 }
 
 fn default_sbi_timeout() -> u64 {

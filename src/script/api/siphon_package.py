@@ -450,8 +450,138 @@ class _DiameterNamespace:
         _registry.register("diameter.on_rtr", None, fn, is_async)
         return fn
 
+    @staticmethod
+    def on_rar(fn):
+        """Register handler for incoming RAR (Re-Auth-Request) from PCRF.
+
+        Handler receives (session_id, abort_cause, specific_actions).
+        Siphon auto-sends RAA (result 2001) after the handler returns.
+
+        specific_actions is a list of int values (TS 29.214 Specific-Action):
+            1=CHARGING_CORRELATION_EXCHANGE
+            2=INDICATION_OF_LOSS_OF_BEARER
+            3=INDICATION_OF_RECOVERY_OF_BEARER
+            4=INDICATION_OF_RELEASE_OF_BEARER
+            6=INDICATION_OF_ESTABLISHMENT_OF_BEARER
+            7=IP_CAN_CHANGE
+
+        Usage:
+            @diameter.on_rar
+            def handle_rar(session_id, abort_cause, specific_actions):
+                if 2 in specific_actions:
+                    log.warn(f"Bearer lost for session {session_id}")
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("diameter.on_rar", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_asr(fn):
+        """Register handler for incoming ASR (Abort-Session-Request) from PCRF.
+
+        Handler receives (session_id, abort_cause, origin_host).
+        Siphon auto-sends ASA (result 2001) after the handler returns.
+
+        abort_cause values (TS 29.214):
+            0=BEARER_RELEASED
+            1=INSUFFICIENT_SERVER_RESOURCES
+            2=INSUFFICIENT_BEARER_RESOURCES
+
+        Usage:
+            @diameter.on_asr
+            def handle_asr(session_id, abort_cause, origin_host):
+                log.info(f"Session abort from {origin_host}: {session_id}")
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("diameter.on_asr", None, fn, is_async)
+        return fn
+
 
 diameter = _DiameterNamespace()
+
+
+# ---------------------------------------------------------------------------
+# SBI namespace (5G Service Based Interfaces — N5/Npcf policy authorization)
+# ---------------------------------------------------------------------------
+
+class _SbiNamespace:
+    """Stub SBI namespace with decorator support.
+
+    When ``sbi:`` is configured, the Rust SbiNamespace replaces this.
+    The ``@on_event`` decorator still needs to be available for registration
+    even before the Rust instance is injected (decorators run at import time).
+    """
+
+    def create_session(self, **kwargs):
+        """Create an N5 app session for QoS policy authorization.
+
+        Requires ``sbi:`` configuration with ``npcf_url``.
+
+        Args:
+            af_app_id: Application Function identifier.
+            sip_call_id: SIP Call-ID for correlation.
+            supi: Subscription Permanent Identifier.
+            ue_ipv4: UE IPv4 address.
+            ue_ipv6: UE IPv6 address.
+            dnn: Data Network Name.
+            notif_uri: Notification URI for PCF events.
+            media_type: Media type (default "AUDIO").
+            flow_status: Flow status (default "ENABLED").
+
+        Returns:
+            Dict with ``app_session_id`` and ``authorized``, or None.
+        """
+        raise NotImplementedError(
+            "sbi.create_session() requires sbi: with npcf_url in config"
+        )
+
+    def delete_session(self, session_id):
+        """Delete an N5 app session.
+
+        Args:
+            session_id: The app session ID from create_session().
+
+        Returns:
+            True on success, False on failure.
+        """
+        raise NotImplementedError(
+            "sbi.delete_session() requires sbi: with npcf_url in config"
+        )
+
+    def update_session(self, session_id, **kwargs):
+        """Update an N5 app session (media renegotiation).
+
+        Args:
+            session_id: The app session ID to update.
+            media_type: Media type (default "AUDIO").
+            flow_status: Flow status (default "ENABLED").
+
+        Returns:
+            Dict with ``app_session_id`` and ``authorized``, or None.
+        """
+        raise NotImplementedError(
+            "sbi.update_session() requires sbi: with npcf_url in config"
+        )
+
+    @staticmethod
+    def on_event(fn):
+        """Register handler for incoming PCF event notifications (N5).
+
+        Handler receives a dict with event notification data.
+
+        Usage:
+            @sbi.on_event
+            def handle_pcf_event(event):
+                for notif in event.get("ev_notifs", []):
+                    if notif["event"] == "UP_PATH_CH_EVENT":
+                        log.warn("Bearer path changed")
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("sbi.on_event", None, fn, is_async)
+        return fn
+
+
+sbi = _SbiNamespace()
 
 
 # ---------------------------------------------------------------------------

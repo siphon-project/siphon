@@ -656,7 +656,7 @@ impl SiphonServer {
                                     return;
                                 }
 
-                                // Convert PcfEventNotification to a Python dict
+                                // Convert PcfEventNotification to a Python dict via json.loads
                                 let json_str = match serde_json::to_string(&body) {
                                     Ok(s) => s,
                                     Err(error) => {
@@ -664,31 +664,22 @@ impl SiphonServer {
                                         return;
                                     }
                                 };
-                                let json_mod = match python.import("json") {
-                                    Ok(m) => m,
-                                    Err(error) => {
-                                        tracing::error!(%error, "failed to import json module");
-                                        return;
-                                    }
-                                };
-                                let loads_fn = match json_mod.getattr("loads") {
-                                    Ok(f) => f,
-                                    Err(error) => {
-                                        tracing::error!(%error, "failed to get json.loads");
-                                        return;
-                                    }
-                                };
-                                let py_dict = match loads_fn.call1((&json_str,)) {
-                                    Ok(d) => d,
-                                    Err(error) => {
-                                        tracing::error!(%error, "failed to parse PCF event JSON");
-                                        return;
+                                let py_dict: pyo3::Py<pyo3::PyAny> = {
+                                    use pyo3::types::PyAnyMethods;
+                                    match python.import("json")
+                                        .and_then(|m| m.call_method1("loads", (&json_str,)))
+                                    {
+                                        Ok(d) => d.unbind(),
+                                        Err(error) => {
+                                            tracing::error!(%error, "failed to parse PCF event as Python dict");
+                                            return;
+                                        }
                                     }
                                 };
 
                                 for handler in handlers {
                                     let callable = handler.callable.bind(python);
-                                    let result = callable.call1((&py_dict,));
+                                    let result = callable.call1((py_dict.bind(python),));
                                     match result {
                                         Ok(ret) => {
                                             if handler.is_async {

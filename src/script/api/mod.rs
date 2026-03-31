@@ -23,6 +23,7 @@ pub mod registrar;
 pub mod reply;
 pub mod request;
 pub mod rtpengine;
+pub mod sbi;
 pub mod sdp;
 pub mod sip_uri;
 pub mod srs;
@@ -70,6 +71,9 @@ static SDP_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Optional ISC singleton — always available (iFC store for per-user + global rules).
 static ISC_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// Optional SBI singleton — set only when `sbi` is configured.
+static SBI_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// The IfcStore Arc — stored so the backend can wire Redis persistence.
 static IFC_STORE_ARC: OnceLock<std::sync::Arc<crate::ifc::IfcStore>> = OnceLock::new();
@@ -204,6 +208,20 @@ pub fn set_diameter_singleton(
         .map_err(|error| SiphonError::Script(format!("Py::new(diameter): {error}")))?
         .into_any();
     let _ = DIAMETER_SINGLETON.set(diameter_py);
+    Ok(())
+}
+
+/// Store the SBI singleton for injection into the siphon module.
+///
+/// Called at startup only when `sbi` with `npcf_url` is configured.
+pub fn set_sbi_singleton(
+    python: Python<'_>,
+    py_sbi: sbi::PySbi,
+) -> Result<()> {
+    let sbi_py: Py<PyAny> = Py::new(python, py_sbi)
+        .map_err(|error| SiphonError::Script(format!("Py::new(sbi): {error}")))?
+        .into_any();
+    let _ = SBI_SINGLETON.set(sbi_py);
     Ok(())
 }
 
@@ -432,6 +450,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("isc", isc_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr isc: {error}")))?;
+    }
+
+    // Inject optional SBI singleton.
+    if let Some(sbi_py) = SBI_SINGLETON.get() {
+        module
+            .setattr("sbi", sbi_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr sbi: {error}")))?;
     }
 
     let sys = python

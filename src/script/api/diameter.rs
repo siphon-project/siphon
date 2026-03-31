@@ -390,6 +390,66 @@ impl PyDiameter {
         Ok(func)
     }
 
+    /// Register a handler for incoming Re-Auth-Request (RAR) from the PCRF.
+    ///
+    /// The PCRF sends RAR (command 258) when PCC rules change (e.g. bearer
+    /// loss, QoS modification). Siphon automatically sends RAA (result 2001)
+    /// after the handler returns.
+    ///
+    /// Args:
+    ///     func: Callback ``fn(session_id, abort_cause, specific_actions)``.
+    ///
+    /// Usage:
+    ///
+    /// ```python,ignore
+    /// @diameter.on_rar
+    /// def handle_rar(session_id, abort_cause, specific_actions):
+    ///     if 2 in specific_actions:  # INDICATION_OF_LOSS_OF_BEARER
+    ///         log.warn(f"Bearer lost for session {session_id}")
+    /// ```
+    #[staticmethod]
+    fn on_rar(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let asyncio = python.import("asyncio")?;
+        let is_async = asyncio
+            .call_method1("iscoroutinefunction", (func.bind(python),))?
+            .is_truthy()?;
+        let registry = python.import("_siphon_registry")?;
+        registry.call_method1(
+            "register",
+            ("diameter.on_rar", python.None(), func.bind(python), is_async),
+        )?;
+        Ok(func)
+    }
+
+    /// Register a handler for incoming Abort-Session-Request (ASR) from the PCRF.
+    ///
+    /// The PCRF sends ASR (command 274) to force Rx session teardown. Siphon
+    /// automatically sends ASA (result 2001) after the handler returns.
+    ///
+    /// Args:
+    ///     func: Callback ``fn(session_id, abort_cause, origin_host)``.
+    ///
+    /// Usage:
+    ///
+    /// ```python,ignore
+    /// @diameter.on_asr
+    /// def handle_asr(session_id, abort_cause, origin_host):
+    ///     log.info(f"Session abort from {origin_host}: {session_id}")
+    /// ```
+    #[staticmethod]
+    fn on_asr(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let asyncio = python.import("asyncio")?;
+        let is_async = asyncio
+            .call_method1("iscoroutinefunction", (func.bind(python),))?
+            .is_truthy()?;
+        let registry = python.import("_siphon_registry")?;
+        registry.call_method1(
+            "register",
+            ("diameter.on_asr", python.None(), func.bind(python), is_async),
+        )?;
+        Ok(func)
+    }
+
     #[pyo3(signature = (session_id,))]
     fn rx_str(&self, session_id: &str) -> PyResult<Option<u32>> {
         let client = match self.manager.any_client() {
