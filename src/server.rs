@@ -558,31 +558,55 @@ impl SiphonServer {
             if let Some(ref manager) = diameter_manager {
                 for peer_entry in &diameter_config.peers {
                     let peer_config = diameter_config.to_peer_config(peer_entry);
-                    match crate::diameter::peer::connect(peer_config).await {
-                        Ok((peer, mut incoming_rx)) => {
-                            let client = Arc::new(crate::diameter::DiameterClient::new(Arc::clone(&peer)));
-                            manager.register(peer_entry.name.clone(), client);
-                            info!(peer = %peer_entry.name, "Diameter peer connected");
+                    let peer_name = peer_entry.name.clone();
+                    let manager_for_task = Arc::clone(manager);
+                    let tx = diameter_incoming_tx.clone();
+                    let reconnect_delay = peer_config.reconnect_delay;
 
-                            // Forward incoming Diameter requests to the shared channel
-                            let tx = diameter_incoming_tx.clone();
-                            let peer_for_forward = Arc::clone(&peer);
-                            tokio::spawn(async move {
-                                while let Some(request) = incoming_rx.recv().await {
-                                    if tx.send((request, Arc::clone(&peer_for_forward))).await.is_err() {
-                                        break;
+                    // Spawn a persistent reconnect task per peer — reconnects
+                    // when the connection drops (watchdog failure, TCP reset, etc.)
+                    // and re-registers the client in the DiameterManager.
+                    tokio::spawn(async move {
+                        loop {
+                            match crate::diameter::peer::connect(peer_config.clone()).await {
+                                Ok((peer, mut incoming_rx)) => {
+                                    let client = Arc::new(
+                                        crate::diameter::DiameterClient::new(Arc::clone(&peer)),
+                                    );
+                                    manager_for_task.register(peer_name.clone(), client);
+                                    info!(peer = %peer_name, "Diameter peer connected");
+
+                                    // Forward incoming requests until the peer disconnects
+                                    let tx_inner = tx.clone();
+                                    let peer_for_forward = Arc::clone(&peer);
+                                    while let Some(request) = incoming_rx.recv().await {
+                                        if tx_inner
+                                            .send((request, Arc::clone(&peer_for_forward)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
+
+                                    // incoming_rx closed — peer disconnected
+                                    warn!(peer = %peer_name, "Diameter peer disconnected, reconnecting");
                                 }
-                            });
+                                Err(error) => {
+                                    warn!(
+                                        peer = %peer_name, %error,
+                                        "Diameter connection failed, retrying in {reconnect_delay}s",
+                                    );
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(reconnect_delay)).await;
                         }
-                        Err(error) => {
-                            warn!(peer = %peer_entry.name, %error, "failed to connect Diameter peer");
-                        }
-                    }
+                    });
                 }
             }
         }
-        drop(diameter_incoming_tx); // Drop the sender so the channel closes when all peers disconnect
+        // Do NOT drop diameter_incoming_tx here — the reconnect tasks hold clones
+        // and the channel must stay open for the lifetime of the process.
 
         // --- Outbound registration ---
         let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, Arc::clone(&tls_addr_map));
