@@ -277,18 +277,18 @@ impl PyAuth {
             });
 
             if let Some(vector) = stored {
-                // For AKAv1-MD5 (RFC 3310): the "password" is hex(XRES).
-                // Compute HA1 = MD5(username:realm:hex(XRES)) and verify the
-                // Digest response using standard RFC 2617 computation.
+                // Per RFC 3310 §3.3: for AKAv1-MD5, raw XRES bytes are used
+                // directly as the "password" in HA1 = MD5(username:realm:XRES).
+                // Not hex-encoded, not base64-encoded — raw binary bytes.
                 if let Some(fields) = DigestFields::parse(auth_value) {
-                    let xres_hex = crate::diameter::codec::hex::encode(
-                        &vector.expected_response,
+                    let ha1 = md5_ha1_aka(
+                        &fields.username, realm, &vector.expected_response,
                     );
-                    let ha1 = md5_hex(&format!("{}:{}:{}", fields.username, realm, xres_hex));
                     let matches = fields.verify(&ha1, "REGISTER");
                     tracing::debug!(
                         response = %fields.response,
-                        xres_hex = %xres_hex,
+                        xres_len = vector.expected_response.len(),
+                        ha1 = %ha1,
                         matches,
                         "IMS auth: AKAv1-MD5 digest verification",
                     );
@@ -899,6 +899,21 @@ impl DigestFields {
 /// Compute MD5 hex digest of a string.
 fn md5_hex(input: &str) -> String {
     format!("{:x}", md5::compute(input.as_bytes()))
+}
+
+/// Compute HA1 = MD5(username:realm:password) where password is raw bytes.
+///
+/// Per RFC 3310 §3.3, for AKAv1-MD5 the RES/XRES bytes are used directly
+/// as the "password" — not hex-encoded, not base64-encoded.  The MD5 input
+/// is: `username` `:` `realm` `:` `<raw bytes>`.
+fn md5_ha1_aka(username: &str, realm: &str, password_bytes: &[u8]) -> String {
+    let mut ctx = md5::Context::new();
+    ctx.consume(username.as_bytes());
+    ctx.consume(b":");
+    ctx.consume(realm.as_bytes());
+    ctx.consume(b":");
+    ctx.consume(password_bytes);
+    format!("{:x}", ctx.compute())
 }
 
 /// Extract a named parameter from a Digest header value.
