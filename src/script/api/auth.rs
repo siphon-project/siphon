@@ -33,6 +33,28 @@ pub fn aka_key_store() -> &'static Arc<DashMap<String, AkaKeyMaterial>> {
     AKA_KEY_STORE.get_or_init(|| Arc::new(DashMap::new()))
 }
 
+/// Auth vector from the HSS MAA, cached between the 401 challenge and the
+/// verification REGISTER so that we don't send a second MAR (which would
+/// return a different XRES and always fail).
+#[derive(Debug, Clone)]
+struct ImsAuthVector {
+    /// Expected response (SIP-Authorization / XRES) from the HSS.
+    expected_response: Vec<u8>,
+    /// Confidentiality key for IPsec (AVP 625).
+    ck: Option<Vec<u8>>,
+    /// Integrity key for IPsec (AVP 626).
+    ik: Option<Vec<u8>>,
+}
+
+/// Global store for pending IMS auth vectors — keyed by nonce string.
+/// Populated on the first REGISTER (401 challenge), consumed on the second
+/// REGISTER (credential verification).
+static IMS_AUTH_STORE: OnceLock<Arc<DashMap<String, ImsAuthVector>>> = OnceLock::new();
+
+fn ims_auth_store() -> &'static Arc<DashMap<String, ImsAuthVector>> {
+    IMS_AUTH_STORE.get_or_init(|| Arc::new(DashMap::new()))
+}
+
 /// Python-visible auth namespace.
 ///
 /// Scripts use: `from siphon import auth` then `auth.require_www_digest(request, realm)`.
@@ -189,17 +211,20 @@ impl PyAuth {
             guard.headers.get("Authorization").cloned()
         };
 
-        // Check for AUTS resynchronization (TS 29.228 §6.3.18).
-        // When UE SQN is out of sync, the UE includes auts= in the Authorization
-        // header.  We detect this early and send a resync MAR before the normal flow.
+        // ── Second REGISTER (has Authorization) — verify against stored vector ──
         if let Some(ref auth_value) = existing_auth {
+            // Check for AUTS resynchronization (TS 29.228 §6.3.18).
+            // UE detected SQN out of sync → sends auts= in Authorization.
+            // We MUST send a new MAR with RAND||AUTS so the HSS can resync.
             if let Some(auts_b64) = extract_digest_param(auth_value, "auts") {
                 if let Some(auts_bytes) = base64_decode(&auts_b64) {
                     if auts_bytes.len() == 14 {
                         if let Some(nonce_str) = extract_nonce_field(auth_value) {
                             if let Some(nonce_bytes) = base64_decode(&nonce_str) {
                                 if nonce_bytes.len() >= 16 {
-                                    // RAND(16) || AUTS(14) = 30 bytes
+                                    // Clean up the stale vector for the old nonce
+                                    ims_auth_store().remove(&nonce_str);
+
                                     let mut resync_data = Vec::with_capacity(30);
                                     resync_data.extend_from_slice(&nonce_bytes[..16]);
                                     resync_data.extend_from_slice(&auts_bytes);
@@ -227,29 +252,39 @@ impl PyAuth {
                                         return Ok(false);
                                     }
 
-                                    // HSS resynced SQN — extract fresh auth vector
-                                    let fresh_data = codec::extract_grouped_avp(
-                                        &maa_resync.avps, avp::SIP_AUTH_DATA_ITEM,
+                                    // HSS resynced SQN — extract fresh auth vector and challenge again
+                                    return self.send_ims_challenge_from_maa(
+                                        request, realm, &maa_resync.avps,
                                     );
-                                    let fresh_nonce = fresh_data.as_ref()
-                                        .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHENTICATE));
-                                    let fresh_ck = fresh_data.as_ref()
-                                        .and_then(|a| codec::extract_octet_avp(a, avp::CONFIDENTIALITY_KEY));
-                                    let fresh_ik = fresh_data.as_ref()
-                                        .and_then(|a| codec::extract_octet_avp(a, avp::INTEGRITY_KEY));
-                                    self.send_ims_challenge(
-                                        request, realm, fresh_nonce.as_deref(),
-                                        fresh_ck.as_deref(), fresh_ik.as_deref(),
-                                    )?;
-                                    return Ok(false);
                                 }
                             }
                         }
                     }
                 }
             }
+
+            // Normal verification: look up the stored XRES from the first MAR
+            let nonce_str = extract_nonce_field(auth_value);
+            let stored = nonce_str.as_ref().and_then(|n| {
+                ims_auth_store().remove(n).map(|(_, v)| v)
+            });
+
+            if let Some(vector) = stored {
+                if let Some(resp) = extract_response_field(auth_value) {
+                    if resp.as_bytes() == vector.expected_response.as_slice() {
+                        if let Some(username) = extract_username(auth_value) {
+                            request.set_auth_user(username);
+                        }
+                        return Ok(true);
+                    }
+                }
+                // Response mismatch — re-challenge with a fresh vector
+            } else {
+                // No stored vector (expired or replayed nonce) — need fresh MAR
+            }
         }
 
+        // ── First REGISTER (no Authorization) or re-challenge — send MAR ──
         let maa = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(
                 client.send_mar(&public_identity, 1, "SIP Digest", None),
@@ -264,42 +299,7 @@ impl PyAuth {
             return Ok(false);
         }
 
-        let auth_data = codec::extract_grouped_avp(&maa.avps, avp::SIP_AUTH_DATA_ITEM);
-        let hss_nonce = auth_data.as_ref()
-            .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHENTICATE));
-        let hss_expected = auth_data.as_ref()
-            .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHORIZATION));
-        let hss_ck = auth_data.as_ref()
-            .and_then(|a| codec::extract_octet_avp(a, avp::CONFIDENTIALITY_KEY));
-        let hss_ik = auth_data.as_ref()
-            .and_then(|a| codec::extract_octet_avp(a, avp::INTEGRITY_KEY));
-
-        match existing_auth {
-            Some(auth_value) => {
-                if let Some(expected) = hss_expected {
-                    if let Some(resp) = extract_response_field(&auth_value) {
-                        if resp.as_bytes() == expected.as_slice() {
-                            if let Some(username) = extract_username(&auth_value) {
-                                request.set_auth_user(username);
-                            }
-                            return Ok(true);
-                        }
-                    }
-                }
-                self.send_ims_challenge(
-                    request, realm, hss_nonce.as_deref(),
-                    hss_ck.as_deref(), hss_ik.as_deref(),
-                )?;
-                Ok(false)
-            }
-            None => {
-                self.send_ims_challenge(
-                    request, realm, hss_nonce.as_deref(),
-                    hss_ck.as_deref(), hss_ik.as_deref(),
-                )?;
-                Ok(false)
-            }
-        }
+        self.send_ims_challenge_from_maa(request, realm, &maa.avps)
     }
 
     /// Local AKA digest authentication using Milenage key derivation.
@@ -633,6 +633,45 @@ impl PyAuth {
         Ok(())
     }
 
+    /// Extract auth vector from MAA AVPs, store XRES for later verification,
+    /// and send 401 challenge.  Returns `Ok(false)` (challenge sent, not yet verified).
+    fn send_ims_challenge_from_maa(
+        &self,
+        request: &mut PyRequest,
+        realm: &str,
+        maa_avps: &serde_json::Value,
+    ) -> PyResult<bool> {
+        use crate::diameter::codec;
+        use crate::diameter::dictionary::avp;
+
+        let auth_data = codec::extract_grouped_avp(maa_avps, avp::SIP_AUTH_DATA_ITEM);
+        let hss_nonce = auth_data.as_ref()
+            .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHENTICATE));
+        let hss_expected = auth_data.as_ref()
+            .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHORIZATION));
+        let hss_ck = auth_data.as_ref()
+            .and_then(|a| codec::extract_octet_avp(a, avp::CONFIDENTIALITY_KEY));
+        let hss_ik = auth_data.as_ref()
+            .and_then(|a| codec::extract_octet_avp(a, avp::INTEGRITY_KEY));
+
+        // Store the expected response (XRES) keyed by nonce so that the second
+        // REGISTER can verify without sending another MAR.
+        if let (Some(nonce_bytes), Some(expected_bytes)) = (&hss_nonce, &hss_expected) {
+            let nonce_str = base64_encode(nonce_bytes);
+            ims_auth_store().insert(nonce_str, ImsAuthVector {
+                expected_response: expected_bytes.clone(),
+                ck: hss_ck.clone(),
+                ik: hss_ik.clone(),
+            });
+        }
+
+        self.send_ims_challenge(
+            request, realm, hss_nonce.as_deref(),
+            hss_ck.as_deref(), hss_ik.as_deref(),
+        )?;
+        Ok(false)
+    }
+
     /// Send a 401 challenge using the HSS-provided nonce (or a generated one).
     fn send_ims_challenge(
         &self,
@@ -643,6 +682,7 @@ impl PyAuth {
         ik: Option<&[u8]>,
     ) -> PyResult<()> {
         request.set_reply(401, "Unauthorized".to_string());
+
 
         let nonce = match hss_nonce {
             Some(bytes) => base64_encode(bytes),
@@ -1375,6 +1415,31 @@ mod tests {
             assert_eq!(retrieved.ik, [2u8; 16]);
         } // drop Ref guard before remove — holding it causes DashMap shard deadlock
         store.remove("test-nonce-auth");
+    }
+
+    #[test]
+    fn ims_auth_store_insert_lookup_consume() {
+        let store = ims_auth_store();
+        let nonce = "test-ims-nonce-123".to_string();
+
+        store.insert(nonce.clone(), ImsAuthVector {
+            expected_response: vec![0xAA; 16],
+            ck: Some(vec![0xBB; 16]),
+            ik: Some(vec![0xCC; 16]),
+        });
+
+        // Verify it exists
+        assert!(store.get(&nonce).is_some());
+
+        // Remove consumes it (simulating verification lookup)
+        let removed = store.remove(&nonce);
+        assert!(removed.is_some());
+        let (_, vector) = removed.unwrap();
+        assert_eq!(vector.expected_response, vec![0xAA; 16]);
+        assert_eq!(vector.ck.unwrap(), vec![0xBB; 16]);
+
+        // Gone after consumption — prevents replay
+        assert!(store.get(&nonce).is_none());
     }
 
     #[test]
