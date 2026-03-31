@@ -277,17 +277,35 @@ impl PyAuth {
             });
 
             if let Some(vector) = stored {
-                if let Some(resp) = extract_response_field(auth_value) {
-                    let matches = resp.as_bytes() == vector.expected_response.as_slice();
+                // For AKAv1-MD5 (RFC 3310): the "password" is hex(XRES).
+                // Compute HA1 = MD5(username:realm:hex(XRES)) and verify the
+                // Digest response using standard RFC 2617 computation.
+                if let Some(fields) = DigestFields::parse(auth_value) {
+                    let xres_hex = crate::diameter::codec::hex::encode(
+                        &vector.expected_response,
+                    );
+                    let ha1 = md5_hex(&format!("{}:{}:{}", fields.username, realm, xres_hex));
+                    let matches = fields.verify(&ha1, "REGISTER");
                     tracing::debug!(
-                        response = %resp,
-                        expected = %crate::diameter::codec::hex::encode(&vector.expected_response),
+                        response = %fields.response,
+                        xres_hex = %xres_hex,
                         matches,
-                        "IMS auth: response comparison",
+                        "IMS auth: AKAv1-MD5 digest verification",
                     );
                     if matches {
-                        if let Some(username) = extract_username(auth_value) {
-                            request.set_auth_user(username);
+                        request.set_auth_user(fields.username);
+                        // Store CK/IK for IPsec SA creation (same as AKA local flow)
+                        if let (Some(ck_bytes), Some(ik_bytes)) = (&vector.ck, &vector.ik) {
+                            if ck_bytes.len() == 16 && ik_bytes.len() == 16 {
+                                let mut ck = [0u8; 16];
+                                let mut ik = [0u8; 16];
+                                ck.copy_from_slice(ck_bytes);
+                                ik.copy_from_slice(ik_bytes);
+                                aka_key_store().insert(
+                                    fields.nonce,
+                                    AkaKeyMaterial { ck, ik },
+                                );
+                            }
                         }
                         return Ok(true);
                     }
