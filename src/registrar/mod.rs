@@ -201,6 +201,24 @@ impl Registrar {
         source_addr: Option<SocketAddr>,
         source_transport: Option<String>,
     ) -> Result<(), RegistrarError> {
+        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, source_transport, None, None)
+    }
+
+    /// Core save with all fields including +sip.instance and reg-id.
+    #[allow(clippy::too_many_arguments)]
+    fn save_full(
+        &self,
+        aor: &str,
+        uri: SipUri,
+        expires_secs: u32,
+        q: f32,
+        call_id: String,
+        cseq: u32,
+        source_addr: Option<SocketAddr>,
+        source_transport: Option<String>,
+        sip_instance: Option<String>,
+        reg_id: Option<u32>,
+    ) -> Result<(), RegistrarError> {
         let expires_secs = std::cmp::min(expires_secs, self.config.max_expires);
 
         if expires_secs > 0 && expires_secs < self.config.min_expires {
@@ -218,8 +236,8 @@ impl Registrar {
             cseq,
             source_addr,
             source_transport,
-            sip_instance: None,
-            reg_id: None,
+            sip_instance,
+            reg_id,
             pending: false,
         };
 
@@ -249,10 +267,20 @@ impl Registrar {
             return Ok(());
         }
 
-        // Replace existing contact with same URI
-        let is_refresh = contacts.iter().any(|c| c.uri.to_string() == uri_string);
-        if let Some(existing) = contacts.iter_mut().find(|c| c.uri.to_string() == uri_string) {
-            *existing = contact;
+        // Replace existing contact with same URI, or same +sip.instance per RFC 5627 §4.2.
+        // When a UE re-registers with a different port (e.g. IPsec port rotation),
+        // the URI changes but the +sip.instance stays the same — match on instance first.
+        let instance_match = contact.sip_instance.as_ref().and_then(|inst| {
+            contacts.iter().position(|c| {
+                c.sip_instance.as_ref().is_some_and(|ci| ci == inst)
+            })
+        });
+        let uri_match = contacts.iter().position(|c| c.uri.to_string() == uri_string);
+        let replace_idx = instance_match.or(uri_match);
+
+        let is_refresh = replace_idx.is_some();
+        if let Some(idx) = replace_idx {
+            contacts[idx] = contact;
         } else {
             // Check max_contacts
             if contacts.len() >= self.config.max_contacts {
@@ -440,21 +468,7 @@ impl Registrar {
         sip_instance: Option<String>,
         reg_id: Option<u32>,
     ) -> Result<(), RegistrarError> {
-        // Delegate to save_with_source first
-        self.save_with_source(aor, uri.clone(), expires_secs, q, call_id, cseq, source_addr, None)?;
-
-        // Then patch the sip_instance and reg_id onto the saved contact
-        if sip_instance.is_some() || reg_id.is_some() {
-            if let Some(mut entry) = self.bindings.get_mut(aor) {
-                let uri_string = uri.to_string();
-                if let Some(contact) = entry.value_mut().iter_mut().find(|c| c.uri.to_string() == uri_string) {
-                    contact.sip_instance = sip_instance;
-                    contact.reg_id = reg_id;
-                }
-            }
-        }
-
-        Ok(())
+        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, None, sip_instance, reg_id)
     }
 
     /// Generate a public GRUU for a contact with a `+sip.instance`.
@@ -1046,6 +1060,47 @@ mod tests {
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].sip_instance.as_deref(), Some(instance));
         assert_eq!(contacts[0].reg_id, Some(1));
+    }
+
+    #[test]
+    fn save_with_gruu_replaces_by_instance_different_uri() {
+        // RFC 5627 §4.2: contacts with same +sip.instance should be replaced
+        // even if the Contact URI changes (e.g. IPsec port rotation).
+        let registrar = Registrar::default();
+        let instance = "<urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6>";
+
+        // First registration: port 5060
+        registrar
+            .save_with_gruu(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                None,
+                Some(instance.to_string()),
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(registrar.lookup("sip:alice@example.com").len(), 1);
+
+        // Re-registration: different URI (port 5062) but same instance
+        let mut uri2 = contact_uri("alice", "10.0.0.1");
+        uri2.port = Some(5062);
+        registrar
+            .save_with_gruu(
+                "sip:alice@example.com",
+                uri2.clone(),
+                3600, 1.0, "c2".into(), 2,
+                None,
+                Some(instance.to_string()),
+                Some(1),
+            )
+            .unwrap();
+
+        // Should still be 1 contact, not 2 — instance match replaced the old one
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts.len(), 1, "instance match should replace, not add");
+        assert_eq!(contacts[0].uri.port, Some(5062), "URI should be updated");
+        assert_eq!(contacts[0].sip_instance.as_deref(), Some(instance));
     }
 
     #[test]
