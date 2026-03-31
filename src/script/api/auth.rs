@@ -233,7 +233,14 @@ impl PyAuth {
                                     );
                                     let fresh_nonce = fresh_data.as_ref()
                                         .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHENTICATE));
-                                    self.send_ims_challenge(request, realm, fresh_nonce.as_deref())?;
+                                    let fresh_ck = fresh_data.as_ref()
+                                        .and_then(|a| codec::extract_octet_avp(a, avp::CONFIDENTIALITY_KEY));
+                                    let fresh_ik = fresh_data.as_ref()
+                                        .and_then(|a| codec::extract_octet_avp(a, avp::INTEGRITY_KEY));
+                                    self.send_ims_challenge(
+                                        request, realm, fresh_nonce.as_deref(),
+                                        fresh_ck.as_deref(), fresh_ik.as_deref(),
+                                    )?;
                                     return Ok(false);
                                 }
                             }
@@ -262,6 +269,10 @@ impl PyAuth {
             .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHENTICATE));
         let hss_expected = auth_data.as_ref()
             .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHORIZATION));
+        let hss_ck = auth_data.as_ref()
+            .and_then(|a| codec::extract_octet_avp(a, avp::CONFIDENTIALITY_KEY));
+        let hss_ik = auth_data.as_ref()
+            .and_then(|a| codec::extract_octet_avp(a, avp::INTEGRITY_KEY));
 
         match existing_auth {
             Some(auth_value) => {
@@ -275,11 +286,17 @@ impl PyAuth {
                         }
                     }
                 }
-                self.send_ims_challenge(request, realm, hss_nonce.as_deref())?;
+                self.send_ims_challenge(
+                    request, realm, hss_nonce.as_deref(),
+                    hss_ck.as_deref(), hss_ik.as_deref(),
+                )?;
                 Ok(false)
             }
             None => {
-                self.send_ims_challenge(request, realm, hss_nonce.as_deref())?;
+                self.send_ims_challenge(
+                    request, realm, hss_nonce.as_deref(),
+                    hss_ck.as_deref(), hss_ik.as_deref(),
+                )?;
                 Ok(false)
             }
         }
@@ -622,6 +639,8 @@ impl PyAuth {
         request: &mut PyRequest,
         realm: &str,
         hss_nonce: Option<&[u8]>,
+        ck: Option<&[u8]>,
+        ik: Option<&[u8]>,
     ) -> PyResult<()> {
         request.set_reply(401, "Unauthorized".to_string());
 
@@ -629,9 +648,23 @@ impl PyAuth {
             Some(bytes) => base64_encode(bytes),
             None => generate_nonce(),
         };
-        let header_value = format!(
+        // Per TS 33.203 §6.3, include CK and IK from the HSS MAA so the
+        // P-CSCF can extract them for IPsec SA setup with the UE.
+        let mut header_value = format!(
             "Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=AKAv1-MD5, qop=\"auth\""
         );
+        if let Some(ck_bytes) = ck {
+            header_value.push_str(&format!(
+                ", ck=\"{}\"",
+                crate::diameter::codec::hex::encode(ck_bytes)
+            ));
+        }
+        if let Some(ik_bytes) = ik {
+            header_value.push_str(&format!(
+                ", ik=\"{}\"",
+                crate::diameter::codec::hex::encode(ik_bytes)
+            ));
+        }
 
         let message = request.message();
         let mut message_guard = message.lock().map_err(|error| {
@@ -1246,8 +1279,8 @@ mod tests {
     #[test]
     fn extract_sip_uri_strips_angle_brackets_and_tag() {
         assert_eq!(
-            extract_sip_uri("<sip:206018802445102@ims.mnc001.mcc206.3gppnetwork.org>;tag=yfJqzFRBS1"),
-            "sip:206018802445102@ims.mnc001.mcc206.3gppnetwork.org"
+            extract_sip_uri("<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>;tag=yfJqzFRBS1"),
+            "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org"
         );
     }
 

@@ -607,6 +607,129 @@ impl SiphonServer {
             if let Some(ref nrf_url) = sbi_config.nrf_url {
                 info!(nrf_url = %nrf_url, "NRF discovery endpoint configured");
             }
+
+            // Create NpcfClient and inject as Python singleton
+            if let Some(ref npcf_url) = sbi_config.npcf_url {
+                let http_client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(sbi_config.timeout_secs))
+                    .build()
+                    .unwrap_or_default();
+                let npcf_client = std::sync::Arc::new(
+                    crate::sbi::npcf::NpcfClient::new(npcf_url, http_client)
+                );
+                pyo3::Python::attach(|python| {
+                    let py_sbi = crate::script::api::sbi::PySbi::new(npcf_client);
+                    if let Err(error) = crate::script::api::set_sbi_singleton(python, py_sbi) {
+                        error!("failed to store SBI singleton: {error}");
+                    }
+                });
+                info!(npcf_url = %npcf_url, "Npcf client initialized and exposed to Python");
+            }
+
+            // Start SBI notification listener for PCF events (N5 callback)
+            if let Some(ref notif_listen) = sbi_config.notif_listen {
+                let notif_addr: std::net::SocketAddr = notif_listen.parse().unwrap_or_else(|error| {
+                    eprintln!("Invalid sbi.notif_listen address '{}': {error}", notif_listen);
+                    std::process::exit(1);
+                });
+                let engine_for_sbi = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    use axum::{routing::post, extract::State, Json, Router};
+
+                    #[derive(Clone)]
+                    struct SbiNotifState {
+                        engine: Arc<crate::script::engine::ScriptEngine>,
+                    }
+
+                    async fn handle_pcf_notification(
+                        State(state): State<SbiNotifState>,
+                        Json(body): Json<crate::sbi::npcf::PcfEventNotification>,
+                    ) -> axum::http::StatusCode {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            pyo3::Python::attach(|python| {
+                                use pyo3::types::PyAnyMethods;
+                                let engine_state = state.engine.state();
+                                let handlers = engine_state.handlers_for(
+                                    &crate::script::engine::HandlerKind::SbiOnEvent
+                                );
+                                if handlers.is_empty() {
+                                    return;
+                                }
+
+                                // Convert PcfEventNotification to a Python dict
+                                let json_str = match serde_json::to_string(&body) {
+                                    Ok(s) => s,
+                                    Err(error) => {
+                                        tracing::error!(%error, "failed to serialize PCF event");
+                                        return;
+                                    }
+                                };
+                                let json_mod = match python.import("json") {
+                                    Ok(m) => m,
+                                    Err(error) => {
+                                        tracing::error!(%error, "failed to import json module");
+                                        return;
+                                    }
+                                };
+                                let loads_fn = match json_mod.getattr("loads") {
+                                    Ok(f) => f,
+                                    Err(error) => {
+                                        tracing::error!(%error, "failed to get json.loads");
+                                        return;
+                                    }
+                                };
+                                let py_dict = match loads_fn.call1((&json_str,)) {
+                                    Ok(d) => d,
+                                    Err(error) => {
+                                        tracing::error!(%error, "failed to parse PCF event JSON");
+                                        return;
+                                    }
+                                };
+
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((&py_dict,));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = crate::script::engine::run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async sbi.on_event handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "sbi.on_event handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        }).await;
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+
+                    let app = Router::new()
+                        .route("/sbi/events", post(handle_pcf_notification))
+                        .with_state(SbiNotifState { engine: engine_for_sbi });
+
+                    info!(addr = %notif_addr, "SBI notification listener started on /sbi/events");
+                    match tokio::net::TcpListener::bind(notif_addr).await {
+                        Ok(listener) => {
+                            if let Err(error) = axum::serve(listener, app).await {
+                                error!("SBI notification server failed: {error}");
+                            }
+                        }
+                        Err(error) => {
+                            error!(addr = %notif_addr, "failed to bind SBI notification listener: {error}");
+                        }
+                    }
+                });
+            }
         }
 
         // --- NAT keepalive ---
