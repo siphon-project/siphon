@@ -206,6 +206,53 @@ impl SiphonServer {
             }
         });
 
+        // --- Initialize ISC namespace before script load ---
+        // Must be registered before ScriptEngine::new() so that
+        // install_siphon_module() can inject the Rust-backed isc instance
+        // instead of leaving the Python stub.
+        {
+            let global_ifcs = if let Some(ref isc_config) = config.isc {
+                let xml = if let Some(ref path) = isc_config.ifc_xml_path {
+                    match std::fs::read_to_string(path) {
+                        Ok(contents) => Some(contents),
+                        Err(error) => {
+                            error!("failed to read iFC XML from {path}: {error}");
+                            None
+                        }
+                    }
+                } else {
+                    isc_config.ifc_xml.clone()
+                };
+
+                if let Some(xml) = xml {
+                    match crate::ifc::parse_service_profile(&xml) {
+                        Ok(ifcs) => {
+                            info!(count = ifcs.len(), "iFC rules loaded from config");
+                            ifcs
+                        }
+                        Err(error) => {
+                            error!("failed to parse iFC XML: {error}");
+                            vec![]
+                        }
+                    }
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            };
+
+            let ifc_store = Arc::new(crate::ifc::IfcStore::new(global_ifcs));
+            pyo3::Python::attach(|python| {
+                let py_isc = crate::script::api::isc::PyIsc::new(Arc::clone(&ifc_store));
+                if let Err(error) = crate::script::api::set_isc_singleton(python, py_isc, Arc::clone(&ifc_store)) {
+                    error!("failed to store ISC singleton: {error}");
+                } else {
+                    info!("ISC namespace registered for injection");
+                }
+            });
+        }
+
         // --- Script engine ---
         let engine = if let Some(bytecode) = self.embedded_bytecode {
             Arc::new(ScriptEngine::new_from_bytecode(bytecode).unwrap_or_else(|error| {
@@ -554,50 +601,6 @@ impl SiphonServer {
         } else {
             None
         };
-
-        // --- iFC evaluation engine ---
-        {
-            let global_ifcs = if let Some(ref isc_config) = config.isc {
-                let xml = if let Some(ref path) = isc_config.ifc_xml_path {
-                    match std::fs::read_to_string(path) {
-                        Ok(contents) => Some(contents),
-                        Err(error) => {
-                            error!("failed to read iFC XML from {path}: {error}");
-                            None
-                        }
-                    }
-                } else {
-                    isc_config.ifc_xml.clone()
-                };
-
-                if let Some(xml) = xml {
-                    match crate::ifc::parse_service_profile(&xml) {
-                        Ok(ifcs) => {
-                            info!(count = ifcs.len(), "iFC rules loaded from config");
-                            ifcs
-                        }
-                        Err(error) => {
-                            error!("failed to parse iFC XML: {error}");
-                            vec![]
-                        }
-                    }
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            };
-
-            let ifc_store = Arc::new(crate::ifc::IfcStore::new(global_ifcs));
-            pyo3::Python::attach(|python| {
-                let py_isc = crate::script::api::isc::PyIsc::new(Arc::clone(&ifc_store));
-                if let Err(error) = crate::script::api::set_isc_singleton(python, py_isc, Arc::clone(&ifc_store)) {
-                    error!("failed to store ISC singleton: {error}");
-                } else {
-                    info!("ISC namespace registered for injection");
-                }
-            });
-        }
 
         // --- SBI client ---
         if let Some(ref sbi_config) = config.sbi {
