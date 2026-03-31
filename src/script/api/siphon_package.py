@@ -18,7 +18,20 @@ import _siphon_registry as _registry
 # ---------------------------------------------------------------------------
 
 class _ProxyNamespace:
-    """Namespace for stateful/stateless proxy event handlers."""
+    """Namespace for stateful/stateless proxy event handlers.
+
+    Decorator methods (on_request, on_reply, etc.) are defined here.
+    Utility methods (send_request, rate_limit, sanity_check, etc.) live
+    on the Rust-backed ``_utils`` attribute, injected at startup.
+    ``__getattr__`` delegates unknown attributes to ``_utils`` so that
+    ``proxy.send_request(...)`` works transparently.
+    """
+
+    def __getattr__(self, name):
+        utils = object.__getattribute__(self, "__dict__").get("_utils")
+        if utils is not None:
+            return getattr(utils, name)
+        raise AttributeError(f"proxy.{name}() not available — proxy utils not initialized")
 
     def on_request(self, fn_or_filter=None):
         """
