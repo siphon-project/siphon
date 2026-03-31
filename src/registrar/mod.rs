@@ -206,7 +206,7 @@ impl Registrar {
 
     /// Core save with all fields including +sip.instance and reg-id.
     #[allow(clippy::too_many_arguments)]
-    fn save_full(
+    pub(crate) fn save_full(
         &self,
         aor: &str,
         uri: SipUri,

@@ -214,8 +214,17 @@ impl PyRegistrar {
                 let capped = std::cmp::min(expires, self.inner.config.max_expires);
                 granted_expires = std::cmp::max(granted_expires, capped);
 
+                // Extract +sip.instance and reg-id from Contact header params
+                // (RFC 5627 §3) for GRUU support and contact replacement.
+                let sip_instance = nameaddr.other_params.iter()
+                    .find(|(name, _)| name == "+sip.instance")
+                    .and_then(|(_, value)| value.clone());
+                let reg_id = nameaddr.other_params.iter()
+                    .find(|(name, _)| name == "reg-id")
+                    .and_then(|(_, value)| value.as_ref()?.parse::<u32>().ok());
+
                 self.inner
-                    .save_with_source(
+                    .save_full(
                         &aor,
                         nameaddr.uri,
                         expires,
@@ -224,6 +233,8 @@ impl PyRegistrar {
                         cseq_seq,
                         source_addr,
                         source_transport.clone(),
+                        sip_instance,
+                        reg_id,
                     )
                     .map_err(|error| match error {
                         RegistrarError::IntervalTooBrief { min_expires } => {
