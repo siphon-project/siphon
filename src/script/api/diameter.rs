@@ -361,6 +361,35 @@ impl PyDiameter {
     ///
     /// Returns:
     ///     Result code (int), or ``None`` if no Rx peer is connected.
+    /// Register a handler for incoming Registration-Termination-Request (RTR).
+    ///
+    /// The HSS sends RTR (command 304) to force deregistration. Siphon
+    /// automatically sends the RTA (result 2001) after the handler returns.
+    ///
+    /// Args:
+    ///     func: Callback ``fn(public_identity, reason_code, reason_info)``.
+    ///
+    /// Usage:
+    ///
+    /// ```python,ignore
+    /// @diameter.on_rtr
+    /// def handle_rtr(public_identity, reason_code, reason_info):
+    ///     registrar.remove(public_identity)
+    /// ```
+    #[staticmethod]
+    fn on_rtr(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let asyncio = python.import("asyncio")?;
+        let is_async = asyncio
+            .call_method1("iscoroutinefunction", (func.bind(python),))?
+            .is_truthy()?;
+        let registry = python.import("_siphon_registry")?;
+        registry.call_method1(
+            "register",
+            ("diameter.on_rtr", python.None(), func.bind(python), is_async),
+        )?;
+        Ok(func)
+    }
+
     #[pyo3(signature = (session_id,))]
     fn rx_str(&self, session_id: &str) -> PyResult<Option<u32>> {
         let client = match self.manager.any_client() {

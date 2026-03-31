@@ -363,6 +363,58 @@ pub mod deregistration_reason {
     pub const REMOVE_SCSCF: u32 = 3;
 }
 
+/// Deserialized RTR fields from an incoming Diameter request.
+pub struct RegistrationTerminationRequest {
+    pub session_id: String,
+    pub origin_host: String,
+    pub origin_realm: String,
+    pub public_identity: String,
+    pub reason_code: u32,
+    pub reason_info: Option<String>,
+}
+
+/// Parse an incoming RTR (command 304) from its decoded AVPs.
+pub fn parse_rtr(incoming: &IncomingRequest) -> Option<RegistrationTerminationRequest> {
+    let a = &incoming.avps;
+    let session_id = required_str(a, "Session-Id")?;
+    let origin_host = required_str(a, "Origin-Host")?;
+    let origin_realm = required_str(a, "Origin-Realm")?;
+    let public_identity = required_str(a, "Public-Identity")?;
+
+    // Deregistration-Reason is a grouped AVP containing Reason-Code + Reason-Info
+    let dereg_reason = a.get("Deregistration-Reason")?;
+    let reason_code = dereg_reason
+        .get("Reason-Code")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)?;
+    let reason_info = dereg_reason
+        .get("Reason-Info")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Some(RegistrationTerminationRequest {
+        session_id,
+        origin_host,
+        origin_realm,
+        public_identity,
+        reason_code,
+        reason_info,
+    })
+}
+
+/// Build an RTA (Registration-Termination-Answer) with success result code.
+pub fn build_rta(
+    origin_host: &str,
+    origin_realm: &str,
+    session_id: &str,
+    hop_by_hop: u32,
+    end_to_end: u32,
+) -> Vec<u8> {
+    CxAnswerBuilder::new(origin_host, origin_realm, session_id)
+        .experimental_result(dictionary::DIAMETER_SUCCESS)
+        .build_with_ids(dictionary::CMD_REGISTRATION_TERMINATION, hop_by_hop, end_to_end)
+}
+
 /// Encode an RTR (Registration-Termination-Request) — HSS-initiated push.
 #[allow(clippy::too_many_arguments)]
 pub fn build_rtr(
@@ -620,5 +672,92 @@ mod tests {
         let dr = decoded.avps.get("Deregistration-Reason").unwrap();
         assert_eq!(dr.get("Reason-Code").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(dr.get("Reason-Info").and_then(|v| v.as_str()), Some("Admin-initiated removal"));
+    }
+
+    #[test]
+    fn parse_rtr_extracts_fields() {
+        // Build an RTR on the wire, then parse it via parse_rtr()
+        let rtr_bytes = build_rtr(
+            "hss.ims.example.com",
+            "ims.example.com",
+            "scscf.ims.example.com",
+            "ims.example.com",
+            "cx;rtr;42",
+            "sip:alice@ims.example.com",
+            deregistration_reason::NEW_SERVER_ASSIGNED,
+            Some("HSS migration"),
+            70, 80,
+        );
+
+        let decoded = decode_diameter(&rtr_bytes).unwrap();
+        let incoming = IncomingRequest {
+            command_code: decoded.command_code,
+            application_id: decoded.application_id,
+            hop_by_hop: decoded.hop_by_hop,
+            end_to_end: decoded.end_to_end,
+            avps: decoded.avps,
+            raw: rtr_bytes,
+        };
+
+        let rtr = parse_rtr(&incoming).expect("parse_rtr failed");
+        assert_eq!(rtr.session_id, "cx;rtr;42");
+        assert_eq!(rtr.origin_host, "hss.ims.example.com");
+        assert_eq!(rtr.origin_realm, "ims.example.com");
+        assert_eq!(rtr.public_identity, "sip:alice@ims.example.com");
+        assert_eq!(rtr.reason_code, deregistration_reason::NEW_SERVER_ASSIGNED);
+        assert_eq!(rtr.reason_info.as_deref(), Some("HSS migration"));
+    }
+
+    #[test]
+    fn parse_rtr_without_reason_info() {
+        let rtr_bytes = build_rtr(
+            "hss.ims.example.com",
+            "ims.example.com",
+            "scscf.ims.example.com",
+            "ims.example.com",
+            "cx;rtr;99",
+            "sip:bob@ims.example.com",
+            deregistration_reason::PERMANENT_TERMINATION,
+            None,
+            90, 100,
+        );
+
+        let decoded = decode_diameter(&rtr_bytes).unwrap();
+        let incoming = IncomingRequest {
+            command_code: decoded.command_code,
+            application_id: decoded.application_id,
+            hop_by_hop: decoded.hop_by_hop,
+            end_to_end: decoded.end_to_end,
+            avps: decoded.avps,
+            raw: rtr_bytes,
+        };
+
+        let rtr = parse_rtr(&incoming).expect("parse_rtr failed");
+        assert_eq!(rtr.public_identity, "sip:bob@ims.example.com");
+        assert_eq!(rtr.reason_code, deregistration_reason::PERMANENT_TERMINATION);
+        assert!(rtr.reason_info.is_none());
+    }
+
+    #[test]
+    fn build_and_decode_rta() {
+        let rta = build_rta(
+            "scscf.ims.example.com",
+            "ims.example.com",
+            "cx;rtr;42",
+            70, 80,
+        );
+
+        let decoded = decode_diameter(&rta).unwrap();
+        assert!(!decoded.is_request, "RTA should not have request flag");
+        assert_eq!(decoded.command_code, dictionary::CMD_REGISTRATION_TERMINATION);
+        assert_eq!(decoded.hop_by_hop, 70);
+        assert_eq!(decoded.end_to_end, 80);
+
+        // Verify Experimental-Result contains success code
+        let er = decoded.avps.get("Experimental-Result").unwrap();
+        let rc = er.get("Experimental-Result-Code")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+        assert_eq!(rc, Some(dictionary::DIAMETER_SUCCESS));
     }
 }

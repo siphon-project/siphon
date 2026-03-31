@@ -186,9 +186,63 @@ impl PyAuth {
             guard.headers.get("Authorization").cloned()
         };
 
+        // Check for AUTS resynchronization (TS 29.228 §6.3.18).
+        // When UE SQN is out of sync, the UE includes auts= in the Authorization
+        // header.  We detect this early and send a resync MAR before the normal flow.
+        if let Some(ref auth_value) = existing_auth {
+            if let Some(auts_b64) = extract_digest_param(auth_value, "auts") {
+                if let Some(auts_bytes) = base64_decode(&auts_b64) {
+                    if auts_bytes.len() == 14 {
+                        if let Some(nonce_str) = extract_nonce_field(auth_value) {
+                            if let Some(nonce_bytes) = base64_decode(&nonce_str) {
+                                if nonce_bytes.len() >= 16 {
+                                    // RAND(16) || AUTS(14) = 30 bytes
+                                    let mut resync_data = Vec::with_capacity(30);
+                                    resync_data.extend_from_slice(&nonce_bytes[..16]);
+                                    resync_data.extend_from_slice(&auts_bytes);
+
+                                    let maa_resync = tokio::task::block_in_place(|| {
+                                        tokio::runtime::Handle::current().block_on(
+                                            client.send_mar(
+                                                &public_identity,
+                                                1,
+                                                "Digest-AKAv1-MD5",
+                                                Some(&resync_data),
+                                            ),
+                                        )
+                                    }).map_err(|error| {
+                                        pyo3::exceptions::PyRuntimeError::new_err(
+                                            format!("MAR resync failed: {error}")
+                                        )
+                                    })?;
+
+                                    let resync_result = codec::extract_u32_avp(
+                                        &maa_resync.avps, avp::RESULT_CODE,
+                                    );
+                                    if resync_result != Some(2001) {
+                                        request.set_reply(403, "Forbidden".to_string());
+                                        return Ok(false);
+                                    }
+
+                                    // HSS resynced SQN — extract fresh auth vector
+                                    let fresh_data = codec::extract_grouped_avp(
+                                        &maa_resync.avps, avp::SIP_AUTH_DATA_ITEM,
+                                    );
+                                    let fresh_nonce = fresh_data.as_ref()
+                                        .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHENTICATE));
+                                    self.send_ims_challenge(request, realm, fresh_nonce.as_deref())?;
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let maa = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(
-                client.send_mar(&public_identity, 1, "SIP Digest"),
+                client.send_mar(&public_identity, 1, "SIP Digest", None),
             )
         }).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("MAR failed: {e}"))
@@ -1234,5 +1288,51 @@ mod tests {
             assert_eq!(retrieved.ik, [2u8; 16]);
         } // drop Ref guard before remove — holding it causes DashMap shard deadlock
         store.remove("test-nonce-auth");
+    }
+
+    #[test]
+    fn extract_auts_from_authorization_header() {
+        let auth = concat!(
+            r#"Digest username="001010000000001","#,
+            r#"realm="ims.example.com","#,
+            r#"nonce="EjRW+jgAAAAJAAABgAAAAICAAIAA","#,
+            r#"uri="sip:ims.example.com","#,
+            r#"algorithm=AKAv1-MD5,"#,
+            r#"response="abc123def456abc123def456abc123de","#,
+            r#"auts="AAECAwQFBgcICQoLDA0=""#,
+        );
+        let auts = extract_digest_param(auth, "auts");
+        assert_eq!(auts.as_deref(), Some("AAECAwQFBgcICQoLDA0="));
+
+        // Decode and verify length: AUTS is 14 bytes
+        let auts_bytes = base64_decode(&auts.unwrap()).unwrap();
+        assert_eq!(auts_bytes.len(), 14);
+    }
+
+    #[test]
+    fn auts_resync_data_concatenation() {
+        // Simulate RAND(16) from nonce and AUTS(14) from Authorization header
+        let rand: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        ];
+        let auts: [u8; 14] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        ];
+
+        let mut resync_data = Vec::with_capacity(30);
+        resync_data.extend_from_slice(&rand);
+        resync_data.extend_from_slice(&auts);
+
+        assert_eq!(resync_data.len(), 30);
+        assert_eq!(&resync_data[..16], &rand);
+        assert_eq!(&resync_data[16..], &auts);
+    }
+
+    #[test]
+    fn extract_auts_missing_returns_none() {
+        let auth = r#"Digest username="alice",realm="test",nonce="abc",response="def""#;
+        assert!(extract_digest_param(auth, "auts").is_none());
     }
 }

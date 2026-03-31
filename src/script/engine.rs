@@ -65,6 +65,8 @@ pub enum HandlerKind {
         name: String,
         jitter_secs: u64,
     },
+    /// `@diameter.on_rtr` — incoming Registration-Termination-Request from HSS.
+    DiameterOnRtr,
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +668,7 @@ fn extract_handlers(
             "registration.on_change" => HandlerKind::RegistrantOnChange,
             "srs.on_invite" => HandlerKind::SrsOnInvite,
             "srs.on_session_end" => HandlerKind::SrsOnSessionEnd,
+            "diameter.on_rtr" => HandlerKind::DiameterOnRtr,
             "timer.every" => {
                 let meta = metadata.ok_or_else(|| {
                     SiphonError::Script("timer.every handler missing metadata".into())

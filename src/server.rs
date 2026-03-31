@@ -501,15 +501,32 @@ impl SiphonServer {
         }
 
         // --- Diameter peers ---
+        // Shared channel for incoming Diameter requests from all peers (RTR, etc.).
+        let (diameter_incoming_tx, diameter_incoming_rx) =
+            tokio::sync::mpsc::channel::<(
+                crate::diameter::peer::IncomingRequest,
+                std::sync::Arc<crate::diameter::peer::DiameterPeer>,
+            )>(256);
         if let Some(ref diameter_config) = config.diameter {
             if let Some(ref manager) = diameter_manager {
                 for peer_entry in &diameter_config.peers {
                     let peer_config = diameter_config.to_peer_config(peer_entry);
                     match crate::diameter::peer::connect(peer_config).await {
-                        Ok((peer, _incoming_rx)) => {
-                            let client = Arc::new(crate::diameter::DiameterClient::new(peer));
+                        Ok((peer, mut incoming_rx)) => {
+                            let client = Arc::new(crate::diameter::DiameterClient::new(Arc::clone(&peer)));
                             manager.register(peer_entry.name.clone(), client);
                             info!(peer = %peer_entry.name, "Diameter peer connected");
+
+                            // Forward incoming Diameter requests to the shared channel
+                            let tx = diameter_incoming_tx.clone();
+                            let peer_for_forward = Arc::clone(&peer);
+                            tokio::spawn(async move {
+                                while let Some(request) = incoming_rx.recv().await {
+                                    if tx.send((request, Arc::clone(&peer_for_forward))).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
                         }
                         Err(error) => {
                             warn!(peer = %peer_entry.name, %error, "failed to connect Diameter peer");
@@ -518,6 +535,7 @@ impl SiphonServer {
                 }
             }
         }
+        drop(diameter_incoming_tx); // Drop the sender so the channel closes when all peers disconnect
 
         // --- Outbound registration ---
         let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, Arc::clone(&tls_addr_map));
@@ -648,6 +666,7 @@ impl SiphonServer {
             tls_addr_map,
             crlf_pong_tracker,
             registrar_event_rx,
+            diameter_incoming_rx,
         ));
 
         // Evict connection-oriented contacts restored from the backend

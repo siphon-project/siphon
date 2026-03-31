@@ -420,6 +420,16 @@ class MockRegistrar:
         """
         self._store.pop(str(uri), None)
 
+    def remove(self, uri: Union[str, SipUri]) -> None:
+        """Remove all contacts for a URI (deregistration).
+
+        Alias for :meth:`expire` -- used from RTR handlers.
+
+        Args:
+            uri: AoR to remove.
+        """
+        self.expire(uri)
+
     def save_pending(self, request: Any) -> None:
         """Save contacts in pending state (IMS: awaiting SAR confirmation).
 
@@ -1729,6 +1739,23 @@ class MockDiameter:
             "session_id": session_id,
         }
 
+    @staticmethod
+    def on_rtr(fn: Any) -> Any:
+        """Register a handler for incoming RTR (Registration-Termination-Request).
+
+        Handler receives ``(public_identity, reason_code, reason_info)``.
+
+        Reason codes: 0=PERMANENT_TERMINATION, 1=NEW_SERVER_ASSIGNED,
+                      2=SERVER_CHANGE, 3=REMOVE_SCSCF.
+
+        Example::
+
+            @diameter.on_rtr
+            def handle_rtr(public_identity, reason_code, reason_info):
+                registrar.remove(public_identity)
+        """
+        return fn
+
     def clear(self) -> None:
         """Reset all mock peers and responses (test helper)."""
         self._peers.clear()
@@ -1774,6 +1801,7 @@ class MockPresence:
     def __init__(self) -> None:
         self._documents: dict[str, str] = {}  # entity -> pidf_xml
         self._subscriptions: dict[str, dict] = {}  # id -> {subscriber, resource, event}
+        self._notifications: list[dict[str, Any]] = []  # sent NOTIFYs
         self._next_sub_id: int = 0
 
     def publish(self, entity: str, pidf_xml: str, expires: int = 3600) -> str:
@@ -1864,10 +1892,39 @@ class MockPresence:
         """Get the total number of entities with published documents."""
         return len(self._documents)
 
+    def notify(self, subscriber: str, body: Optional[str] = None,
+               content_type: Optional[str] = None,
+               subscription_state: str = "active",
+               event: str = "reg") -> None:
+        """Send a SIP NOTIFY to a subscriber (fire-and-forget).
+
+        In the mock, this records the notification for test assertions.
+
+        Args:
+            subscriber: Target URI (e.g. ``"sip:bob@10.0.0.1:5060"``).
+            body: Optional body string (reginfo XML, PIDF XML, etc.).
+            content_type: Content-Type of the body.
+            subscription_state: Subscription-State header value (default ``"active"``).
+            event: Event header value (default ``"reg"``).
+        """
+        self._notifications.append({
+            "subscriber": subscriber,
+            "body": body,
+            "content_type": content_type,
+            "subscription_state": subscription_state,
+            "event": event,
+        })
+
+    @property
+    def notifications(self) -> list:
+        """List of NOTIFY messages sent (for test assertions)."""
+        return self._notifications
+
     def clear(self) -> None:
-        """Reset all documents and subscriptions (test helper)."""
+        """Reset all documents, subscriptions, and notifications (test helper)."""
         self._documents.clear()
         self._subscriptions.clear()
+        self._notifications.clear()
         self._next_sub_id = 0
 
 

@@ -277,6 +277,14 @@ impl PyRegistrar {
         Ok(())
     }
 
+    /// Remove all contacts for a URI (deregistration).
+    ///
+    /// Alias for `expire()` — used from RTR handlers and manual deregistration.
+    /// Accepts either a string or a SipUri object.
+    fn remove(&self, uri: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.expire(uri)
+    }
+
     /// Check if a URI has any registered contacts.
     /// Accepts either a string or a SipUri object.
     fn is_registered(&self, uri: &Bound<'_, PyAny>) -> PyResult<bool> {

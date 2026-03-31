@@ -33,6 +33,16 @@ pub fn set_uac_sender(sender: Arc<UacSender>, resolver: Arc<SipResolver>) {
     let _ = SEND_RESOLVER.set(resolver);
 }
 
+/// Get the global UAC sender (for use by other script API modules like presence).
+pub(crate) fn uac_sender() -> Option<&'static Arc<UacSender>> {
+    UAC_SENDER.get()
+}
+
+/// Get the global SIP resolver (for use by other script API modules like presence).
+pub(crate) fn send_resolver() -> Option<&'static Arc<SipResolver>> {
+    SEND_RESOLVER.get()
+}
+
 /// Rate limiter using a sliding window counter per source IP.
 pub struct RateLimiter {
     /// Map of source IP → list of request timestamps.

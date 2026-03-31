@@ -13,6 +13,9 @@
 //!
 //! for watcher in presence.subscribers("sip:alice@example.com"):
 //!     log.info(f"watcher: {watcher['subscriber']}")
+//!
+//! presence.notify("sip:bob@example.com", body=xml, content_type="application/reginfo+xml",
+//!                 subscription_state="active", event="reg")
 //! ```
 
 use std::sync::Arc;
@@ -22,6 +25,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::presence::{PresenceStore, Subscription};
+use crate::sip::builder::SipMessageBuilder;
+use crate::sip::message::Method;
+use crate::sip::parser::parse_uri_standalone;
+use crate::transport::Transport;
 
 /// Python-visible presence namespace.
 #[pyclass(name = "PresenceNamespace", skip_from_py_object)]
@@ -170,6 +177,115 @@ impl PyPresence {
     /// Remove expired subscriptions and documents.
     fn expire_stale(&self) {
         self.store.expire_stale();
+    }
+
+    /// Send a SIP NOTIFY to a subscriber (fire-and-forget).
+    ///
+    /// Constructs a NOTIFY with the given Event, Subscription-State, Content-Type
+    /// and body, then sends it via the UAC sender.  Typically used from
+    /// `@registrar.on_change` to push reg-event XML to watchers.
+    ///
+    /// Args:
+    ///     subscriber: Target URI (e.g. "sip:bob@10.0.0.1:5060").
+    ///     body: Optional body string (PIDF XML, reginfo XML, etc.).
+    ///     content_type: Content-Type of the body (e.g. "application/reginfo+xml").
+    ///     subscription_state: Subscription-State header value (default "active").
+    ///     event: Event header value (default "reg").
+    #[pyo3(signature = (subscriber, body=None, content_type=None, subscription_state="active", event="reg"))]
+    fn notify(
+        &self,
+        subscriber: &str,
+        body: Option<&str>,
+        content_type: Option<&str>,
+        subscription_state: &str,
+        event: &str,
+    ) -> PyResult<()> {
+        let uac_sender = super::proxy_utils::uac_sender().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "presence.notify() unavailable: UAC sender not initialized",
+            )
+        })?;
+        let resolver = super::proxy_utils::send_resolver().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "presence.notify() unavailable: DNS resolver not initialized",
+            )
+        })?;
+
+        let uri = parse_uri_standalone(subscriber).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid subscriber URI '{subscriber}': {error}"
+            ))
+        })?;
+
+        let transport_hint = uri.get_param("transport").map(|s: &str| s.to_string());
+        let resolver_clone = Arc::clone(resolver);
+        let host = uri.host.clone();
+        let port = uri.port;
+        let scheme = uri.scheme.clone();
+
+        let destination = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(resolver_clone.resolve(
+                &host,
+                port,
+                &scheme,
+                transport_hint.as_deref(),
+            ))
+        });
+
+        let target = destination.into_iter().next().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "cannot resolve destination for '{subscriber}'"
+            ))
+        })?;
+
+        let transport = match target
+            .transport
+            .as_deref()
+            .or(transport_hint.as_deref())
+        {
+            Some(hint) => match hint.to_lowercase().as_str() {
+                "tcp" => Transport::Tcp,
+                "tls" => Transport::Tls,
+                "ws" => Transport::WebSocket,
+                "wss" => Transport::WebSocketSecure,
+                "sctp" => Transport::Sctp,
+                _ => Transport::Udp,
+            },
+            None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
+        };
+
+        let branch = format!("z9hG4bK-py-{}", uuid::Uuid::new_v4());
+        let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
+        let call_id = format!("py-{}", uuid::Uuid::new_v4());
+        let cseq_str = "1 NOTIFY".to_string();
+
+        let mut builder = SipMessageBuilder::new()
+            .request(Method::Notify, uri)
+            .via(via)
+            .call_id(call_id)
+            .cseq(cseq_str)
+            .max_forwards(70)
+            .header("Event", event.to_string())
+            .header("Subscription-State", subscription_state.to_string());
+
+        if let Some(content_type_value) = content_type {
+            builder = builder.header("Content-Type", content_type_value.to_string());
+        }
+
+        if let Some(body_str) = body {
+            builder = builder.body_str(body_str);
+        } else {
+            builder = builder.content_length(0);
+        }
+
+        let message = builder.build().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to build NOTIFY message: {error}"
+            ))
+        })?;
+
+        uac_sender.send_request(message, target.address, transport);
+        Ok(())
     }
 }
 

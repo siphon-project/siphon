@@ -176,6 +176,7 @@ impl DiameterClient {
         public_identity: &str,
         sip_num_auth_items: u32,
         sip_auth_scheme: &str,
+        sip_authorization: Option<&[u8]>,
     ) -> Result<codec::DiameterMessage, String> {
         let config = self.peer.config();
         let hbh = self.peer.next_hbh();
@@ -188,6 +189,14 @@ impl DiameterClient {
             avp::SIP_AUTHENTICATION_SCHEME,
             sip_auth_scheme,
         ));
+        // Include SIP-Authorization AVP for AUTS resynchronization (TS 29.228 §6.3.18).
+        // Contains RAND(16) || AUTS(14) = 30 bytes when UE SQN is out of sync.
+        if let Some(auth_data) = sip_authorization {
+            auth_children.extend_from_slice(&encode_avp_octet_3gpp(
+                avp::SIP_AUTHORIZATION,
+                auth_data,
+            ));
+        }
         let sip_auth_data_item = encode_avp_grouped_3gpp(avp::SIP_AUTH_DATA_ITEM, &auth_children);
 
         let mut avp_bytes = Vec::new();
@@ -368,5 +377,74 @@ mod tests {
             manager.shutdown_all();
             assert_eq!(manager.peer_count(), 1);
         });
+    }
+
+    #[test]
+    fn mar_with_sip_authorization_encodes_resync_data() {
+        // Build the SIP-Auth-Data-Item with SIP-Authorization AVP the same way
+        // send_mar() does when sip_authorization is Some.
+        let resync_data: Vec<u8> = {
+            let rand = [0xABu8; 16];
+            let auts = [0xCDu8; 14];
+            let mut data = Vec::with_capacity(30);
+            data.extend_from_slice(&rand);
+            data.extend_from_slice(&auts);
+            data
+        };
+        assert_eq!(resync_data.len(), 30);
+
+        let mut auth_children = Vec::new();
+        auth_children.extend_from_slice(&encode_avp_utf8_3gpp(
+            avp::SIP_AUTHENTICATION_SCHEME,
+            "Digest-AKAv1-MD5",
+        ));
+        auth_children.extend_from_slice(&encode_avp_octet_3gpp(
+            avp::SIP_AUTHORIZATION,
+            &resync_data,
+        ));
+        let sip_auth_data_item = encode_avp_grouped_3gpp(avp::SIP_AUTH_DATA_ITEM, &auth_children);
+
+        let mut avp_bytes = Vec::new();
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "test;1;1"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "scscf.ims.example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, "ims.example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
+        avp_bytes.extend_from_slice(&encode_vendor_specific_app_id(
+            dictionary::VENDOR_3GPP,
+            dictionary::CX_APP_ID,
+        ));
+        avp_bytes.extend_from_slice(&encode_avp_utf8_3gpp(
+            avp::PUBLIC_IDENTITY,
+            "sip:alice@ims.example.com",
+        ));
+        avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::SIP_NUMBER_AUTH_ITEMS, 1));
+        avp_bytes.extend_from_slice(&sip_auth_data_item);
+
+        let msg = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_MULTIMEDIA_AUTH,
+            dictionary::CX_APP_ID,
+            100, 200,
+            &avp_bytes,
+        );
+
+        let decoded = codec::decode_diameter(&msg).unwrap();
+        assert!(decoded.is_request);
+        assert_eq!(decoded.command_code, dictionary::CMD_MULTIMEDIA_AUTH);
+
+        // Verify SIP-Auth-Data-Item contains SIP-Authorization
+        let auth_data = decoded.avps.get("SIP-Auth-Data-Item");
+        assert!(auth_data.is_some(), "SIP-Auth-Data-Item AVP missing");
+
+        let sip_auth = auth_data.unwrap().get("SIP-Authorization");
+        assert!(sip_auth.is_some(), "SIP-Authorization AVP missing in SIP-Auth-Data-Item");
+
+        // The codec hex-encodes OctetString AVPs, verify the decoded length
+        let hex_value = sip_auth.unwrap().as_str().unwrap();
+        let raw_bytes = codec::hex::decode(hex_value).unwrap();
+        assert_eq!(raw_bytes.len(), 30, "RAND(16) + AUTS(14) = 30 bytes");
+        assert_eq!(&raw_bytes[..16], &[0xABu8; 16]);
+        assert_eq!(&raw_bytes[16..], &[0xCDu8; 14]);
     }
 }

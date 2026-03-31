@@ -176,6 +176,9 @@ class _RegistrarNamespace:
     def is_registered(self, uri):
         raise NotImplementedError("registrar.is_registered() not yet wired to Rust backend")
 
+    def remove(self, uri):
+        raise NotImplementedError("registrar.remove() not yet wired to Rust backend")
+
     @staticmethod
     def on_change(fn):
         """Register a handler for registration state changes.
@@ -409,8 +412,46 @@ class _PresenceNamespace:
     def subscribers(self, resource):
         raise NotImplementedError("presence.subscribers() not available — presence store not initialized")
 
+    def notify(self, subscriber, body=None, content_type=None, subscription_state="active", event="reg"):
+        raise NotImplementedError("presence.notify() not available — presence store not initialized")
+
 
 presence = _PresenceNamespace()
+
+
+# ---------------------------------------------------------------------------
+# Diameter namespace (stub — replaced by Rust when diameter: is configured)
+# ---------------------------------------------------------------------------
+
+class _DiameterNamespace:
+    """Stub diameter namespace with decorator support.
+
+    When ``diameter:`` is configured, the Rust DiameterNamespace replaces this.
+    The ``@on_rtr`` decorator still needs to be available for registration even
+    before the Rust instance is injected (decorators run at import time).
+    """
+
+    @staticmethod
+    def on_rtr(fn):
+        """Register handler for incoming RTR (Registration-Termination-Request).
+
+        Handler receives (public_identity, reason_code, reason_info).
+        Siphon auto-sends RTA (result 2001) after the handler returns.
+
+        Reason codes: 0=PERMANENT_TERMINATION, 1=NEW_SERVER_ASSIGNED,
+                      2=SERVER_CHANGE, 3=REMOVE_SCSCF
+
+        Usage:
+            @diameter.on_rtr
+            def handle_rtr(public_identity, reason_code, reason_info):
+                registrar.remove(public_identity)
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("diameter.on_rtr", None, fn, is_async)
+        return fn
+
+
+diameter = _DiameterNamespace()
 
 
 # ---------------------------------------------------------------------------

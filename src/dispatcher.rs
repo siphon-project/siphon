@@ -210,6 +210,10 @@ pub async fn run(
     tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
     crlf_pong_tracker: Option<Arc<crate::transport::crlf_keepalive::CrlfPongTracker>>,
     registrar_event_rx: Option<tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>>,
+    diameter_incoming_rx: tokio::sync::mpsc::Receiver<(
+        crate::diameter::peer::IncomingRequest,
+        std::sync::Arc<crate::diameter::peer::DiameterPeer>,
+    )>,
 ) {
     // Resolve the local address for Via insertion.
     // If bound to 0.0.0.0 / [::], use advertised_address from config, or loopback.
@@ -552,6 +556,124 @@ pub async fn run(
                 })
                 .await
                 .ok();
+            }
+        });
+    }
+
+    // Spawn background task: incoming Diameter requests (RTR from HSS, etc.)
+    {
+        let mut diameter_rx = diameter_incoming_rx;
+        let state_for_diameter = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Some((incoming, peer)) = diameter_rx.recv().await {
+                let engine_state = state_for_diameter.engine.state();
+                match incoming.command_code {
+                    crate::diameter::dictionary::CMD_REGISTRATION_TERMINATION => {
+                        if engine_state
+                            .handlers_for(&HandlerKind::DiameterOnRtr)
+                            .is_empty()
+                        {
+                            // No handler registered — still send RTA to be protocol-correct
+                            let config = peer.config();
+                            let rta = crate::diameter::cx::build_rta(
+                                &config.origin_host,
+                                &config.origin_realm,
+                                &incoming.avps.get("Session-Id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(""),
+                                incoming.hop_by_hop,
+                                incoming.end_to_end,
+                            );
+                            if let Err(error) = peer.send_response(rta).await {
+                                tracing::warn!(%error, "failed to send RTA (no handler)");
+                            }
+                            continue;
+                        }
+
+                        let parsed = crate::diameter::cx::parse_rtr(&incoming);
+                        let state_ref = Arc::clone(&state_for_diameter);
+                        let peer_for_rta = Arc::clone(&peer);
+
+                        tokio::task::spawn_blocking(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state.handlers_for(&HandlerKind::DiameterOnRtr);
+
+                            let (session_id, public_identity, reason_code, reason_info) =
+                                match parsed {
+                                    Some(rtr) => (
+                                        rtr.session_id,
+                                        rtr.public_identity,
+                                        rtr.reason_code,
+                                        rtr.reason_info,
+                                    ),
+                                    None => {
+                                        tracing::warn!("failed to parse incoming RTR");
+                                        return;
+                                    }
+                                };
+
+                            pyo3::Python::attach(|python| {
+                                let py_reason_info: pyo3::Py<pyo3::PyAny> = match &reason_info {
+                                    Some(info) => info.as_str().into_pyobject(python)
+                                        .map(|s| s.into_any().into())
+                                        .unwrap_or_else(|_| python.None().into()),
+                                    None => python.None().into(),
+                                };
+
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        public_identity.as_str(),
+                                        reason_code,
+                                        py_reason_info.bind(python),
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async diameter.on_rtr handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "diameter.on_rtr handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+
+                            // Auto-send RTA after handler completes
+                            let config = peer_for_rta.config();
+                            let rta = crate::diameter::cx::build_rta(
+                                &config.origin_host,
+                                &config.origin_realm,
+                                &session_id,
+                                incoming.hop_by_hop,
+                                incoming.end_to_end,
+                            );
+                            let runtime = tokio::runtime::Handle::current();
+                            runtime.block_on(async {
+                                if let Err(error) = peer_for_rta.send_response(rta).await {
+                                    tracing::warn!(%error, "failed to send RTA");
+                                }
+                            });
+                        })
+                        .await
+                        .ok();
+                    }
+                    _ => {
+                        tracing::debug!(
+                            command_code = incoming.command_code,
+                            "unhandled incoming Diameter request"
+                        );
+                    }
+                }
             }
         });
     }
