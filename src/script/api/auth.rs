@@ -626,7 +626,7 @@ impl PyAuth {
         request.set_reply(401, "Unauthorized".to_string());
 
         let nonce = match hss_nonce {
-            Some(bytes) => crate::diameter::codec::hex::encode(bytes),
+            Some(bytes) => base64_encode(bytes),
             None => generate_nonce(),
         };
         let header_value = format!(
@@ -930,7 +930,7 @@ fn extract_nonce_field(auth_value: &str) -> Option<String> {
 }
 
 /// Base64-encode bytes (no padding, URL-safe not needed for SIP nonces).
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -955,7 +955,7 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 /// Base64-decode a string.
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
     fn decode_char(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
