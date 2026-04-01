@@ -357,6 +357,28 @@ class Request:
         """
         self._headers[name] = value
 
+    def set_reply_header(self, name: str, value: str) -> None:
+        """Set an extra header to include in the response.
+
+        Unlike :meth:`set_header` which modifies the request, this stores
+        headers that the dispatcher injects into the reply built by
+        ``request.reply()`` or ``registrar.save()``.  Multiple calls with
+        the same name append (multi-value headers like P-Associated-URI).
+
+        Args:
+            name: Header name.
+            value: Header value.
+
+        Example::
+
+            registrar.save(request)
+            request.set_reply_header("P-Associated-URI", "<sip:user@ims.net>")
+            request.set_reply_header("Service-Route", "<sip:orig@scscf:6060;lr>")
+        """
+        if not hasattr(self, "_reply_headers"):
+            self._reply_headers = []
+        self._reply_headers.append((name, value))
+
     def remove_header(self, name: str) -> None:
         """Remove a header entirely.
 

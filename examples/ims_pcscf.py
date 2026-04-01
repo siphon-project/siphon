@@ -61,7 +61,7 @@ def handle_register(request):
     # Force UE to use security agreement (IPsec): reject REGISTER without
     # Security-Client header (3GPP TS 33.203 sec 6.1, RFC 3329).
     if not request.has_header("Security-Client"):
-        request.set_header("Require", "sec-agree")
+        request.set_reply_header("Require", "sec-agree")
         request.reply(421, "Extension Required")
         log.info(f"rejected {request.from_uri}: no Security-Client (IPsec required)")
         return
@@ -90,10 +90,10 @@ def handle_register(request):
     public_id = f"sip:{request.auth_user}"
     if "@" not in public_id:
         public_id = f"{public_id}@{REALM}"
-    request.set_header("P-Associated-URI", f"<{public_id}>")
+    request.set_reply_header("P-Associated-URI", f"<{public_id}>")
 
     # Add Service-Route so subsequent requests from this UE route through us.
-    request.set_header("Service-Route", f"<{PCSCF_URI}>")
+    request.set_reply_header("Service-Route", f"<{PCSCF_URI}>")
 
     log.info(f"registered {request.from_uri}")
 

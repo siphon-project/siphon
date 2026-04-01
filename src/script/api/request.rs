@@ -63,6 +63,8 @@ pub struct PyRequest {
     on_reply_callback: Option<Py<PyAny>>,
     /// Per-relay on_failure callback (set by `relay(on_failure=...)`)
     on_failure_callback: Option<Py<PyAny>>,
+    /// Extra headers to include in the response (set by `set_reply_header`).
+    reply_headers: Vec<(String, String)>,
 }
 
 impl PyRequest {
@@ -85,6 +87,7 @@ impl PyRequest {
             via_target_override: None,
             on_reply_callback: None,
             on_failure_callback: None,
+            reply_headers: vec![],
         }
     }
 
@@ -109,6 +112,7 @@ impl PyRequest {
             via_target_override: None,
             on_reply_callback: None,
             on_failure_callback: None,
+            reply_headers: vec![],
         }
     }
 
@@ -178,6 +182,11 @@ impl PyRequest {
     /// Take the per-relay on_failure callback (consumes it).
     pub fn take_on_failure_callback(&mut self) -> Option<Py<PyAny>> {
         self.on_failure_callback.take()
+    }
+
+    /// Take the accumulated reply headers (consumed by the dispatcher).
+    pub fn take_reply_headers(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.reply_headers)
     }
 
     // --- CDR helper accessors (Rust-side, no PyResult) ---
@@ -602,11 +611,21 @@ impl PyRequest {
         self.get_header(name)
     }
 
-    /// Set (replace) a header value.
+    /// Set (replace) a header value on the request message.
     fn set_header(&self, name: &str, value: &str) -> PyResult<()> {
         let mut message = self.lock_mut()?;
         message.headers.set(name, value.to_string());
         Ok(())
+    }
+
+    /// Set an extra header to include in the response (200 OK, 401, etc.).
+    ///
+    /// Unlike ``set_header`` which modifies the request, this stores headers
+    /// that the dispatcher injects into the reply built by ``request.reply()``
+    /// or ``registrar.save()``.  Multiple calls with the same name append
+    /// (multi-value headers like P-Associated-URI, Service-Route).
+    fn set_reply_header(&mut self, name: &str, value: &str) {
+        self.reply_headers.push((name.to_string(), value.to_string()));
     }
 
     /// Remove a header entirely.

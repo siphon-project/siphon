@@ -1303,7 +1303,7 @@ fn handle_request(
     // Check BEFORE invoking scripts — if MF == 0, reject immediately.
     if message.headers.max_forwards() == Some(0) {
         debug!(method = %method, "Max-Forwards is 0, rejecting with 483");
-        let response = build_response(&message, 483, "Too Many Hops", state.server_header.as_deref());
+        let response = build_response(&message, 483, "Too Many Hops", state.server_header.as_deref(), &[]);
         send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
         return;
     }
@@ -1313,7 +1313,7 @@ fn handle_request(
 
     if handlers.is_empty() {
         warn!(method = %method, "no script handler registered");
-        let response = build_response(&message, 500, "No Script Handler", state.server_header.as_deref());
+        let response = build_response(&message, 500, "No Script Handler", state.server_header.as_deref(), &[]);
         send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
         return;
     }
@@ -1330,12 +1330,12 @@ fn handle_request(
     );
 
     // Call Python handlers
-    let (action, record_routed, on_reply_cb, on_failure_cb, send_via_transport, send_via_target) = Python::attach(|python| {
+    let (action, record_routed, on_reply_cb, on_failure_cb, send_via_transport, send_via_target, reply_headers) = Python::attach(|python| {
         let py_request = match Py::new(python, request) {
             Ok(py) => py,
             Err(error) => {
                 error!("failed to create PyRequest: {error}");
-                return (RequestAction::None, false, None, None, None, None);
+                return (RequestAction::None, false, None, None, None, None, vec![]);
             }
         };
 
@@ -1358,6 +1358,7 @@ fn handle_request(
                                 None,
                                 None,
                                 None,
+                                vec![],
                             );
                         }
                     }
@@ -1374,6 +1375,7 @@ fn handle_request(
                         None,
                         None,
                         None,
+                        vec![],
                     );
                 }
             }
@@ -1386,7 +1388,8 @@ fn handle_request(
         let on_failure = borrowed.take_on_failure_callback();
         let send_via_transport = borrowed.via_transport_override().map(|s| s.to_string());
         let send_via_target = borrowed.via_target_override().map(|s| s.to_string());
-        (action, record_routed, on_reply, on_failure, send_via_transport, send_via_target)
+        let reply_headers = borrowed.take_reply_headers();
+        (action, record_routed, on_reply, on_failure, send_via_transport, send_via_target, reply_headers)
     });
 
     // Process the action
@@ -1399,7 +1402,7 @@ fn handle_request(
             debug!("silent drop (no action from script)");
         }
         RequestAction::Reply { code, reason } => {
-            let mut response = build_response(&message_guard, *code, reason, state.server_header.as_deref());
+            let mut response = build_response(&message_guard, *code, reason, state.server_header.as_deref(), &reply_headers);
 
             // IPsec: inject Security-Server on 401 REGISTER and create SAs immediately.
             // Per 3GPP TS 33.203, the P-CSCF creates SAs right after sending the 401
@@ -1512,7 +1515,7 @@ fn handle_request(
             // RFC 3261 §16.2: a stateful proxy SHOULD send 100 Trying
             // immediately upon receiving an INVITE to stop UAC retransmissions.
             if method == "INVITE" {
-                let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref());
+                let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref(), &[]);
                 send_message(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
             }
             relay_request(
@@ -1531,11 +1534,11 @@ fn handle_request(
         RequestAction::Fork { targets, strategy } => {
             if targets.is_empty() {
                 warn!("fork with empty targets list");
-                let response = build_response(&message_guard, 500, "No Targets", state.server_header.as_deref());
+                let response = build_response(&message_guard, 500, "No Targets", state.server_header.as_deref(), &[]);
                 send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
             } else {
                 if method == "INVITE" {
-                    let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref());
+                    let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref(), &[]);
                     send_message(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
                 }
                 let fork_strategy = match strategy.as_str() {
@@ -1601,7 +1604,7 @@ fn relay_request(
         Some(t) => t,
         None => {
             warn!(target = %target_uri_string, "cannot resolve relay target");
-            let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref());
+            let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref(), &[]);
             send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
             return;
         }
@@ -1640,7 +1643,7 @@ fn relay_request(
             destination = %destination,
             "relay loop detected — destination is ourselves"
         );
-        let response = build_response(message, 482, "Loop Detected", state.server_header.as_deref());
+        let response = build_response(message, 482, "Loop Detected", state.server_header.as_deref(), &[]);
         send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
         return;
     }
@@ -1650,7 +1653,7 @@ fn relay_request(
 
     // Decrement Max-Forwards
     if core::decrement_max_forwards(&mut relayed.headers).is_err() {
-        let response = build_response(message, 483, "Too Many Hops", state.server_header.as_deref());
+        let response = build_response(message, 483, "Too Many Hops", state.server_header.as_deref(), &[]);
         send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
         return;
     }
@@ -1785,7 +1788,7 @@ fn relay_fork_request(
 
     if target_uris.is_empty() {
         warn!("fork: no valid target URIs");
-        let response = build_response(message, 500, "No Valid Targets", state.server_header.as_deref());
+        let response = build_response(message, 500, "No Valid Targets", state.server_header.as_deref(), &[]);
         send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
         return;
     }
@@ -2456,6 +2459,7 @@ fn handle_response(
                             best_code,
                             reason,
                             state.server_header.as_deref(),
+                            &[],
                         );
                         drop(session);
 
@@ -3161,6 +3165,7 @@ fn build_response(
     status_code: u16,
     reason: &str,
     server_header: Option<&str>,
+    reply_headers: &[(String, String)],
 ) -> SipMessage {
     let mut builder = SipMessageBuilder::new()
         .response(status_code, reason.to_string());
@@ -3194,6 +3199,7 @@ fn build_response(
         builder = builder.header("Proxy-Authenticate", proxy_auth.clone());
     }
 
+
     // Copy Expires header for REGISTER responses (RFC 3261 §10.3 step 8).
     // The registrar.save() method sets this on the request to communicate
     // the granted expires value to the response builder.
@@ -3208,6 +3214,12 @@ fn build_response(
 
     if let Some(server) = server_header {
         builder = builder.header("Server", server.to_string());
+    }
+
+    // Inject script-provided reply headers before Content-Length so that
+    // parsers that stop at Content-Length: 0 still see them.
+    for (name, value) in reply_headers {
+        builder = builder.header(name, value.clone());
     }
 
     builder = builder.content_length(0);
@@ -3864,7 +3876,7 @@ fn handle_cancel(
 
     // No matching session or B2BUA call
     debug!(uac_branch = %uac_branch, "CANCEL for unknown transaction");
-    let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref());
+    let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref(), &[]);
     send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
 }
 
@@ -3940,14 +3952,14 @@ fn handle_cancel_via_session(
         Ok(s) => s,
         Err(_) => {
             error!("ProxySession lock poisoned during CANCEL handling");
-            let response = build_response(&message, 500, "Internal Server Error", state.server_header.as_deref());
+            let response = build_response(&message, 500, "Internal Server Error", state.server_header.as_deref(), &[]);
             send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
             return;
         }
     };
 
     // Send 200 OK to CANCEL (RFC 3261 §9.2: always 200)
-    let cancel_response = build_response(&message, 200, "OK", state.server_header.as_deref());
+    let cancel_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
     send_message(
         cancel_response,
         inbound.transport,
@@ -3991,6 +4003,7 @@ fn handle_cancel_via_session(
         487,
         "Request Terminated",
         state.server_header.as_deref(),
+        &[],
     );
     send_message(
         response_487,
@@ -4024,7 +4037,7 @@ fn handle_b2bua_cancel(
         Some(id) => id,
         None => {
             warn!(sip_call_id = %sip_call_id, "B2BUA CANCEL: no matching call");
-            let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref());
+            let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref(), &[]);
             send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
             return;
         }
@@ -4038,14 +4051,14 @@ fn handle_b2bua_cancel(
     // Only cancel if call is still in Calling or Ringing state
     if call.state != CallState::Calling && call.state != CallState::Ringing {
         debug!(call_id = %call_id, state = ?call.state, "B2BUA CANCEL: call already answered/terminated");
-        let response = build_response(&message, 200, "OK", state.server_header.as_deref());
+        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
         send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
         drop(call);
         return;
     }
 
     // Send 200 OK to CANCEL
-    let cancel_response = build_response(&message, 200, "OK", state.server_header.as_deref());
+    let cancel_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
     send_message(
         cancel_response,
         inbound.transport,
@@ -4118,7 +4131,7 @@ fn handle_b2bua_cancel(
     let a_leg = call.a_leg.clone();
     drop(call);
 
-    let response_487 = build_response(&message, 487, "Request Terminated", state.server_header.as_deref());
+    let response_487 = build_response(&message, 487, "Request Terminated", state.server_header.as_deref(), &[]);
     send_message(
         response_487,
         a_leg.transport.transport,
@@ -4176,7 +4189,7 @@ fn handle_b2bua_invite(
 
     // Send 100 Trying immediately to suppress A-leg retransmissions
     // (RFC 3261 §8.2.6.1: SHOULD send 100 within 200ms for INVITE)
-    let trying = build_response(&message, 100, "Trying", state.server_header.as_deref());
+    let trying = build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
     send_message(
         trying,
         inbound.transport,
@@ -4322,7 +4335,7 @@ fn handle_b2bua_invite(
         }
         CallAction::Reject { code, reason } => {
             debug!(call_id = %call_id, code, "B2BUA: rejecting call");
-            let response = build_response(&message_guard, code, &reason, state.server_header.as_deref());
+            let response = build_response(&message_guard, code, &reason, state.server_header.as_deref(), &[]);
             send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
@@ -6061,7 +6074,7 @@ fn handle_b2bua_bye(
     };
 
     // Send 200 OK to the BYE sender
-    let bye_response = build_response(&message, 200, "OK", state.server_header.as_deref());
+    let bye_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
     send_message(
         bye_response,
         inbound.transport,
@@ -6565,7 +6578,7 @@ fn handle_b2bua_reinvite(
             from_a_leg = from_a_leg,
             "B2BUA: rejecting re-INVITE with 491 — target leg not yet ACKed"
         );
-        let response = build_response(&message, 491, "Request Pending", state.server_header.as_deref());
+        let response = build_response(&message, 491, "Request Pending", state.server_header.as_deref(), &[]);
         send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
         return;
     }
@@ -6577,7 +6590,7 @@ fn handle_b2bua_reinvite(
     );
 
     // Send 100 Trying to the re-INVITE sender
-    let trying = build_response(&message, 100, "Trying", state.server_header.as_deref());
+    let trying = build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
     send_message(
         trying,
         inbound.transport,
@@ -6827,7 +6840,7 @@ fn handle_srs_invite(
             Some(content_type) => content_type.clone(),
             None => {
                 warn!(call_id = %call_id, "SRS: SIPREC INVITE missing Content-Type");
-                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref());
+                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
                 send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
                 return;
             }
@@ -6835,7 +6848,7 @@ fn handle_srs_invite(
 
         if message.body.is_empty() {
             warn!(call_id = %call_id, "SRS: SIPREC INVITE has no body");
-            let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref());
+            let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
             send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
             return;
         }
@@ -6845,7 +6858,7 @@ fn handle_srs_invite(
             Ok(parts) => parts,
             Err(error) => {
                 warn!(call_id = %call_id, error = %error, "SRS: failed to parse multipart body");
-                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref());
+                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
                 send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
                 return;
             }
@@ -6859,7 +6872,7 @@ fn handle_srs_invite(
             Some(part) => String::from_utf8_lossy(&part.body).to_string(),
             None => {
                 warn!(call_id = %call_id, "SRS: no rs-metadata+xml part in SIPREC INVITE");
-                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref());
+                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
                 send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
                 return;
             }
@@ -6870,7 +6883,7 @@ fn handle_srs_invite(
             Ok(metadata) => metadata,
             Err(error) => {
                 warn!(call_id = %call_id, error = %error, "SRS: failed to parse recording metadata");
-                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref());
+                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
                 send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
                 return;
             }
@@ -6924,7 +6937,7 @@ fn handle_srs_invite(
 
         if !should_accept {
             info!(call_id = %call_id, "SRS: recording rejected by script");
-            let response = build_response(&message, 403, "Forbidden", state.server_header.as_deref());
+            let response = build_response(&message, 403, "Forbidden", state.server_header.as_deref(), &[]);
             send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
             return;
         }
@@ -6942,7 +6955,7 @@ fn handle_srs_invite(
                 }
                 None => {
                     warn!(call_id = %call_id, "SRS: re-INVITE but session not found");
-                    let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref());
+                    let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref(), &[]);
                     send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
                     return;
                 }
@@ -6953,7 +6966,7 @@ fn handle_srs_invite(
                 Some(result) => result,
                 None => {
                     warn!(call_id = %call_id, "SRS: session creation failed (max sessions?)");
-                    let response = build_response(&message, 503, "Service Unavailable", state.server_header.as_deref());
+                    let response = build_response(&message, 503, "Service Unavailable", state.server_header.as_deref(), &[]);
                     send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
                     return;
                 }
@@ -7166,7 +7179,7 @@ fn handle_srs_bye(
         let record = srs_manager.stop_session(&call_id);
 
         // Send 200 OK for the BYE.
-        let response = build_response(&message, 200, "OK", state.server_header.as_deref());
+        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
         send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
 
         // Store recording metadata via configured backend.
@@ -7225,7 +7238,7 @@ mod tests {
     #[test]
     fn build_response_copies_mandatory_headers() {
         let request = sample_invite();
-        let response = build_response(&request, 200, "OK", None);
+        let response = build_response(&request, 200, "OK", None, &[]);
 
         assert!(response.is_response());
         assert_eq!(response.status_code(), Some(200));
@@ -7248,7 +7261,7 @@ mod tests {
     #[test]
     fn build_response_sets_content_length_zero() {
         let request = sample_invite();
-        let response = build_response(&request, 404, "Not Found", None);
+        let response = build_response(&request, 404, "Not Found", None, &[]);
         assert_eq!(response.headers.get("Content-Length").unwrap(), "0");
     }
 
@@ -7260,7 +7273,7 @@ mod tests {
             "SIP/2.0/UDP proxy1.example.com;branch=z9hG4bK-proxy".to_string(),
         );
 
-        let response = build_response(&request, 200, "OK", None);
+        let response = build_response(&request, 200, "OK", None, &[]);
         let vias = response.headers.get_all("Via").unwrap();
         assert_eq!(vias.len(), 2);
     }
@@ -7268,7 +7281,7 @@ mod tests {
     #[test]
     fn build_response_serializes_to_valid_sip() {
         let request = sample_invite();
-        let response = build_response(&request, 200, "OK", None);
+        let response = build_response(&request, 200, "OK", None, &[]);
         let bytes = response.to_bytes();
         let text = String::from_utf8(bytes).unwrap();
 
@@ -7284,14 +7297,14 @@ mod tests {
     #[test]
     fn build_response_includes_server_header_when_configured() {
         let request = sample_invite();
-        let response = build_response(&request, 401, "Unauthorized", Some("SIPhon/0.1.0"));
+        let response = build_response(&request, 401, "Unauthorized", Some("SIPhon/0.1.0"), &[]);
         assert_eq!(response.headers.get("Server").unwrap(), "SIPhon/0.1.0");
     }
 
     #[test]
     fn build_response_omits_server_header_when_none() {
         let request = sample_invite();
-        let response = build_response(&request, 200, "OK", None);
+        let response = build_response(&request, 200, "OK", None, &[]);
         assert!(response.headers.get("Server").is_none());
     }
 
@@ -7299,7 +7312,7 @@ mod tests {
     fn build_response_copies_expires_header() {
         let mut request = sample_invite();
         request.headers.set("Expires", "600".to_string());
-        let response = build_response(&request, 200, "OK", None);
+        let response = build_response(&request, 200, "OK", None, &[]);
         assert_eq!(
             response.headers.get("Expires").unwrap(),
             "600",
@@ -7310,7 +7323,7 @@ mod tests {
     #[test]
     fn build_response_omits_expires_when_absent() {
         let request = sample_invite();
-        let response = build_response(&request, 200, "OK", None);
+        let response = build_response(&request, 200, "OK", None, &[]);
         assert!(
             response.headers.get("Expires").is_none(),
             "Expires should not appear in response when not set on request"
@@ -7320,7 +7333,7 @@ mod tests {
     #[test]
     fn build_ack_for_non2xx_has_correct_headers() {
         let request = sample_invite();
-        let response = build_response(&request, 480, "Temporarily Unavailable", None);
+        let response = build_response(&request, 480, "Temporarily Unavailable", None, &[]);
         let local_addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
 
         let ack = build_ack_for_non2xx(
@@ -7434,7 +7447,7 @@ mod tests {
     #[test]
     fn build_cancel_response_200() {
         let cancel = sample_cancel();
-        let response = build_response(&cancel, 200, "OK", None);
+        let response = build_response(&cancel, 200, "OK", None, &[]);
         assert_eq!(response.status_code(), Some(200));
         assert!(response.headers.cseq().unwrap().contains("CANCEL"));
     }
@@ -7442,14 +7455,14 @@ mod tests {
     #[test]
     fn build_cancel_response_481() {
         let cancel = sample_cancel();
-        let response = build_response(&cancel, 481, "Call/Transaction Does Not Exist", None);
+        let response = build_response(&cancel, 481, "Call/Transaction Does Not Exist", None, &[]);
         assert_eq!(response.status_code(), Some(481));
     }
 
     #[test]
     fn build_487_response() {
         let invite = sample_invite();
-        let response = build_response(&invite, 487, "Request Terminated", None);
+        let response = build_response(&invite, 487, "Request Terminated", None, &[]);
         assert_eq!(response.status_code(), Some(487));
         assert!(response.headers.cseq().unwrap().contains("INVITE"));
     }
