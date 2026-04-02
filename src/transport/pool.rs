@@ -168,24 +168,23 @@ impl ConnectionPool {
             self.connections.remove(&key);
         }
 
-        // Create new connection, binding to the local listening address so
-        // outbound connections originate from the well-known SIP port (e.g. :5060)
-        // rather than a random ephemeral port. TCP identifies connections by the
-        // full 4-tuple so multiple outbound connections from the same local port
-        // to different destinations are fine.
+        // Create new connection, binding to the local IP (so outbound traffic
+        // uses the correct interface) but with port 0 (OS picks an ephemeral
+        // port).  Binding to the exact listen port (e.g. :5060) causes
+        // EADDRNOTAVAIL when a pooled connection to the same destination already
+        // exists in TIME_WAIT — the 4-tuple (local:5060 → remote:6060) collides.
         let socket = if destination.is_ipv6() {
             tokio::net::TcpSocket::new_v6()?
         } else {
             tokio::net::TcpSocket::new_v4()?
         };
         socket.set_reuseaddr(true)?;
-        #[cfg(unix)]
-        socket.set_reuseport(true)?;
         if let Some(tos) = self.tos {
             let sock_ref = socket2::SockRef::from(&socket);
             sock_ref.set_tos_v4(tos)?;
         }
-        socket.bind(self.local_addr)?;
+        let bind_addr = SocketAddr::new(self.local_addr.ip(), 0);
+        socket.bind(bind_addr)?;
         let stream = socket.connect(destination).await?;
         configure_tcp_socket(&stream, self.tos);
 
