@@ -158,11 +158,35 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
     let (input, scheme) = alt((tag("sip:"), tag("sips:"))).parse(input)?;
     let scheme = scheme.trim_end_matches(':').to_string();
 
-    // Parse user part (optional)
-    let (input, user) = opt(terminated(
-        take_while1(|c: char| !matches!(c, '@' | ':' | ';' | '?' | ' ' | '\r' | '\n')),
-        char('@')
-    )).parse(input)?;
+    // Parse user part (optional).
+    // Per RFC 3261 §19.1.1, userinfo includes user-params (e.g. ;phone-context=)
+    // before the @ delimiter. We must find @ first to correctly split user from host,
+    // because ; within user-params (RFC 3966 phone-context) is NOT a URI param separator.
+    // Only scan up to the first whitespace/> to avoid matching @ in a different context.
+    let uri_end = input.find(|c: char| matches!(c, ' ' | '\r' | '\n' | '>')).unwrap_or(input.len());
+    let uri_portion = &input[..uri_end];
+    let (input, user, user_params) = if let Some(at_pos) = uri_portion.rfind('@') {
+        let user_part = &input[..at_pos];
+        let rest = &input[at_pos + 1..]; // skip @
+        // Split user from user-params at first ';' (RFC 3966 phone-context etc.)
+        if let Some(semi_pos) = user_part.find(';') {
+            let bare_user = &user_part[..semi_pos];
+            let params_str = &user_part[semi_pos..]; // ";phone-context=..."
+            let mut user_params = Vec::new();
+            for param in params_str.split(';').filter(|s| !s.is_empty()) {
+                let (name, value) = match param.split_once('=') {
+                    Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                    None => (param.to_string(), None),
+                };
+                user_params.push((name, value));
+            }
+            (rest, Some(bare_user), user_params)
+        } else {
+            (rest, Some(user_part), Vec::new())
+        }
+    } else {
+        (input, None, Vec::new())
+    };
 
     // Parse host (stop before port separator or URI parameters)
     // Host can be domain name, IPv4, or IPv6 in brackets
@@ -206,6 +230,7 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
         port,
         params,
         headers,
+        user_params,
     }))
 }
 
@@ -237,6 +262,7 @@ fn parse_tel_uri(input: &str) -> IResult<&str, SipUri> {
         port: None,
         params,
         headers: Vec::new(),
+        user_params: Vec::new(),
     }))
 }
 
@@ -506,5 +532,38 @@ mod tests {
         );
         let message = parse_sip_message_bytes(raw.as_bytes()).expect("should parse");
         assert!(message.body.is_empty());
+    }
+
+    #[test]
+    fn parse_uri_with_phone_context_user_param() {
+        // RFC 3966 phone-context in SIP URI: ;phone-context= is a user param, not a URI param.
+        // The @ delimiter comes after user params.
+        let input = "sip:0017;phone-context=ims.mnc001.mcc206.3gppnetwork.org@ims.mnc090.mcc208.3gppnetwork.org;user=phone";
+        let uri = parse_uri_standalone(input).expect("should parse phone-context URI");
+        assert_eq!(uri.user.as_deref(), Some("0017"));
+        assert_eq!(uri.host, "ims.mnc090.mcc208.3gppnetwork.org");
+        assert_eq!(
+            uri.user_params,
+            vec![("phone-context".to_string(), Some("ims.mnc001.mcc206.3gppnetwork.org".to_string()))],
+        );
+        assert!(uri.params.iter().any(|(n, _)| n == "user"), "URI params should contain user=phone");
+    }
+
+    #[test]
+    fn parse_uri_phone_context_roundtrip() {
+        let input = "sip:0017;phone-context=ims.mnc001.mcc206.3gppnetwork.org@ims.mnc090.mcc208.3gppnetwork.org;user=phone";
+        let uri = parse_uri_standalone(input).expect("should parse");
+        assert_eq!(uri.to_string(), input);
+    }
+
+    #[test]
+    fn parse_uri_no_user_params_unchanged() {
+        // Normal URI without user params should parse identically to before.
+        let input = "sip:alice@example.com;transport=tcp";
+        let uri = parse_uri_standalone(input).expect("should parse");
+        assert_eq!(uri.user.as_deref(), Some("alice"));
+        assert_eq!(uri.host, "example.com");
+        assert!(uri.user_params.is_empty());
+        assert!(uri.params.iter().any(|(n, _)| n == "transport"));
     }
 }

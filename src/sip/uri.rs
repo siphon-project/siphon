@@ -24,8 +24,10 @@ pub struct SipUri {
     pub user: Option<String>,
     pub host: String,
     pub port: Option<u16>,
-    pub params: Vec<(String, Option<String>)>, // URI parameters
+    pub params: Vec<(String, Option<String>)>, // URI parameters (after hostport)
     pub headers: Vec<(String, Option<String>)>, // URI headers (after ?)
+    /// User parameters (between user and @), e.g. ;phone-context=... (RFC 3966).
+    pub user_params: Vec<(String, Option<String>)>,
 }
 
 impl SipUri {
@@ -37,6 +39,7 @@ impl SipUri {
             port: None,
             params: Vec::new(),
             headers: Vec::new(),
+            user_params: Vec::new(),
         }
     }
 
@@ -74,9 +77,16 @@ impl fmt::Display for SipUri {
                 write!(f, "{user}")?;
             }
         } else {
-            // sip:/sips: URI: scheme:user@host:port
+            // sip:/sips: URI: scheme:user[;user-params]@host:port
             if let Some(ref user) = self.user {
-                write!(f, "{user}@")?;
+                write!(f, "{user}")?;
+                for (name, value) in &self.user_params {
+                    write!(f, ";{name}")?;
+                    if let Some(ref v) = value {
+                        write!(f, "={v}")?;
+                    }
+                }
+                write!(f, "@")?;
             }
 
             write!(f, "{}", format_sip_host(&self.host))?;
@@ -198,6 +208,7 @@ mod tests {
             port: None,
             params: Vec::new(),
             headers: Vec::new(),
+            user_params: Vec::new(),
         };
         assert_eq!(uri.to_string(), "tel:+15551234567");
     }
@@ -211,6 +222,7 @@ mod tests {
             port: None,
             params: vec![("phone-context".to_string(), Some("ims.mnc001.mcc001.3gppnetwork.org".to_string()))],
             headers: Vec::new(),
+            user_params: Vec::new(),
         };
         assert_eq!(uri.to_string(), "tel:8367;phone-context=ims.mnc001.mcc001.3gppnetwork.org");
     }

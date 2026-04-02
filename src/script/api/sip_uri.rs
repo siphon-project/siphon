@@ -226,6 +226,7 @@ mod tests {
             port: None,
             params: Vec::new(),
             headers: Vec::new(),
+            user_params: Vec::new(),
         };
         let py_uri = PySipUri::new(uri);
         assert!(py_uri.is_tel());

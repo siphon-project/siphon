@@ -248,6 +248,7 @@ mod tests {
             port: None,
             params: Vec::new(),
             headers: Vec::new(),
+            user_params: Vec::new(),
         }
     }
 
