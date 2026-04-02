@@ -31,6 +31,60 @@ pub fn parse_sip_message(input: &str) -> IResult<&str, SipMessage> {
     }))
 }
 
+/// Parse a SIP message from raw bytes, supporting binary bodies.
+///
+/// Headers are ASCII/UTF-8 per RFC 3261. The body after the blank line
+/// (`\r\n\r\n`) is treated as opaque bytes — not validated as UTF-8.
+/// This supports binary content types like `application/vnd.3gpp.sms`.
+pub fn parse_sip_message_bytes(input: &[u8]) -> Result<SipMessage, String> {
+    // Find the header/body boundary
+    let boundary = find_header_boundary(input)
+        .ok_or_else(|| "no header/body boundary (\\r\\n\\r\\n) found".to_string())?;
+
+    // Headers portion including the terminating \r\n\r\n must be valid UTF-8
+    let header_end = boundary + 4; // include \r\n\r\n
+    let header_bytes = &input[..header_end.min(input.len())];
+    let header_str = std::str::from_utf8(header_bytes)
+        .map_err(|error| format!("non-UTF8 in SIP headers: {error}"))?;
+
+    // Parse start line + headers using the existing text-based parser.
+    // The text parser handles start line → headers → body in one pass.
+    // We feed it the header portion only; it will see no body (Content-Length
+    // references bytes beyond what we pass, so parse_body returns "").
+    let trimmed = header_str.trim_start_matches("\r\n");
+    let (_, start_line) = parse_start_line(trimmed)
+        .map_err(|error| format!("start line parse error: {error}"))?;
+    // Skip past start line to parse headers
+    let after_start_line = trimmed.find("\r\n")
+        .map(|pos| &trimmed[pos + 2..])
+        .unwrap_or("");
+    let (_, headers) = parse_headers(after_start_line)
+        .map_err(|error| format!("header parse error: {error}"))?;
+
+    // Body is raw bytes after the \r\n\r\n boundary
+    let body_start = boundary + 4;
+    let content_length = headers.content_length().unwrap_or(0);
+    let body = if content_length > 0 && input.len() >= body_start + content_length {
+        input[body_start..body_start + content_length].to_vec()
+    } else if content_length == 0 {
+        Vec::new()
+    } else {
+        input[body_start..].to_vec()
+    };
+
+    Ok(SipMessage {
+        start_line,
+        headers,
+        body,
+    })
+}
+
+/// Find the position of the first `\r\n\r\n` in raw bytes (header/body boundary).
+/// Returns the index of the first `\r` in the `\r\n\r\n` sequence.
+fn find_header_boundary(input: &[u8]) -> Option<usize> {
+    input.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
 /// Parse start line (request or response)
 fn parse_start_line(input: &str) -> IResult<&str, StartLine> {
     alt((
@@ -407,5 +461,50 @@ mod tests {
             }
             _ => panic!("expected response"),
         }
+    }
+
+    #[test]
+    fn parse_bytes_with_binary_body() {
+        // Simulate a SIP MESSAGE with binary SMS TPDU body
+        let headers = concat!(
+            "MESSAGE sip:+31612345678@ims.example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK-sms-1\r\n",
+            "From: <sip:+31687654321@ims.example.com>;tag=abc\r\n",
+            "To: <sip:+31612345678@ims.example.com>\r\n",
+            "Call-ID: sms-001@ims.example.com\r\n",
+            "CSeq: 1 MESSAGE\r\n",
+            "Content-Type: application/vnd.3gpp.sms\r\n",
+            "Content-Length: 8\r\n",
+            "\r\n",
+        );
+        // Binary body: 8 bytes including non-UTF8
+        let body_bytes: [u8; 8] = [0x00, 0x01, 0xFF, 0xFE, 0x80, 0x90, 0xA0, 0xB0];
+        let mut raw = Vec::from(headers.as_bytes());
+        raw.extend_from_slice(&body_bytes);
+
+        let message = parse_sip_message_bytes(&raw).expect("should parse binary body");
+        assert!(matches!(message.start_line, StartLine::Request(_)));
+        assert_eq!(message.body.len(), 8);
+        assert_eq!(message.body, body_bytes);
+        assert_eq!(
+            message.headers.get("Content-Type").unwrap(),
+            "application/vnd.3gpp.sms"
+        );
+    }
+
+    #[test]
+    fn parse_bytes_empty_body() {
+        let raw = concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-1\r\n",
+            "From: <sip:alice@example.com>;tag=a\r\n",
+            "To: <sip:bob@example.com>;tag=b\r\n",
+            "Call-ID: test@example.com\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let message = parse_sip_message_bytes(raw.as_bytes()).expect("should parse");
+        assert!(message.body.is_empty());
     }
 }

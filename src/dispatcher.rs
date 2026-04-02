@@ -30,7 +30,7 @@ use crate::sip::headers::via::Via;
 use crate::sip::message::{Method, RequestLine, SipMessage, StartLine, StatusLine, Version};
 use crate::sip::headers::SipHeaders;
 use crate::sip::uri::SipUri;
-use crate::sip::parser::{parse_sip_message, parse_uri_standalone};
+use crate::sip::parser::{parse_sip_message, parse_sip_message_bytes, parse_uri_standalone};
 use crate::sip::uri::format_sip_host;
 use crate::transaction::key::TransactionKey;
 use crate::transaction::state::{
@@ -1018,17 +1018,9 @@ fn sweep_stale_entries(state: &DispatcherState) {
 
 /// Handle a single inbound SIP message (request or response).
 fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
-    // Parse bytes to string
-    let raw = match std::str::from_utf8(&inbound.data) {
-        Ok(s) => s,
-        Err(error) => {
-            warn!(remote = %inbound.remote_addr, "non-UTF8 SIP message: {error}");
-            return;
-        }
-    };
-
-    // RFC 5626 §3.5.1 / §4.4.1: CRLF keep-alive
-    if raw.trim().is_empty() {
+    // RFC 5626 §3.5.1 / §4.4.1: CRLF keep-alive (check raw bytes before parsing)
+    let trimmed = inbound.data.iter().filter(|b| !matches!(b, b'\r' | b'\n' | b' ')).count();
+    if trimmed == 0 {
         // Record pong for CRLF keepalive tracker (TCP/TLS only).
         if matches!(inbound.transport, Transport::Tcp | Transport::Tls) {
             if let Some(ref tracker) = state.crlf_pong_tracker {
@@ -1038,9 +1030,9 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
         return;
     }
 
-    // Parse SIP message
-    let message = match parse_sip_message(raw) {
-        Ok((_, message)) => message,
+    // Parse SIP message — supports binary bodies (e.g. SMS TPDU)
+    let message = match parse_sip_message_bytes(&inbound.data) {
+        Ok(message) => message,
         Err(error) => {
             warn!(remote = %inbound.remote_addr, "SIP parse error: {error}");
             return;
