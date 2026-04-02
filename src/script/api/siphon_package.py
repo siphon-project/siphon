@@ -419,13 +419,16 @@ class _PresenceNamespace:
     def subscribe(self, subscriber, resource, event="presence", expires=3600):
         raise NotImplementedError("presence.subscribe() not available — presence store not initialized")
 
+    def subscribe_dialog(self, subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None):
+        raise NotImplementedError("presence.subscribe_dialog() not available — presence store not initialized")
+
     def unsubscribe(self, subscription_id):
         raise NotImplementedError("presence.unsubscribe() not available — presence store not initialized")
 
     def subscribers(self, resource):
         raise NotImplementedError("presence.subscribers() not available — presence store not initialized")
 
-    def notify(self, subscriber, body=None, content_type=None, subscription_state="active", event="reg"):
+    def notify(self, subscription_id, body=None, content_type=None, subscription_state="active"):
         raise NotImplementedError("presence.notify() not available — presence store not initialized")
 
 

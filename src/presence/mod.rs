@@ -62,6 +62,17 @@ pub struct Subscription {
     pub dialog_id: Option<String>,
     /// Accepted content types for NOTIFY bodies.
     pub accept: Vec<String>,
+    // ── Dialog state for in-dialog NOTIFY (RFC 3265 §3.2.2) ──
+    /// Call-ID from the SUBSCRIBE dialog.
+    pub call_id: Option<String>,
+    /// From-tag (the subscriber's tag — becomes To-tag in NOTIFY).
+    pub from_tag: Option<String>,
+    /// To-tag (the notifier's tag — becomes From-tag in NOTIFY).
+    pub to_tag: Option<String>,
+    /// Route set from Record-Route headers in the SUBSCRIBE dialog.
+    pub route_set: Vec<String>,
+    /// CSeq counter for NOTIFYs sent within this dialog.
+    pub local_cseq: u32,
 }
 
 impl Subscription {
@@ -85,6 +96,44 @@ impl Subscription {
             created_at: Instant::now(),
             dialog_id,
             accept,
+            call_id: None,
+            from_tag: None,
+            to_tag: None,
+            route_set: vec![],
+            local_cseq: 0,
+        }
+    }
+
+    /// Create a subscription with full dialog state from a SUBSCRIBE request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_dialog(
+        id: String,
+        subscriber: String,
+        resource: String,
+        event: String,
+        expires: Duration,
+        accept: Vec<String>,
+        call_id: String,
+        from_tag: String,
+        to_tag: String,
+        route_set: Vec<String>,
+    ) -> Self {
+        let dialog_id = Some(format!("{}:{}:{}", call_id, from_tag, to_tag));
+        Self {
+            id,
+            subscriber,
+            resource,
+            event,
+            state: SubscriptionState::Active,
+            expires,
+            created_at: Instant::now(),
+            dialog_id,
+            accept,
+            call_id: Some(call_id),
+            from_tag: Some(from_tag),
+            to_tag: Some(to_tag),
+            route_set,
+            local_cseq: 0,
         }
     }
 
@@ -116,6 +165,12 @@ impl Subscription {
     pub fn terminate(&mut self) {
         debug!(subscription_id = %self.id, "subscription terminated");
         self.state = SubscriptionState::Terminated;
+    }
+
+    /// Increment and return the next CSeq for an in-dialog NOTIFY.
+    pub fn next_cseq(&mut self) -> u32 {
+        self.local_cseq += 1;
+        self.local_cseq
     }
 
     /// Refresh the subscription with a new expiry duration, resetting the timer.
@@ -219,6 +274,26 @@ impl PresenceStore {
     /// Look up a subscription by ID, returning a clone.
     pub fn get_subscription(&self, id: &str) -> Option<Subscription> {
         self.subscriptions.get(id).map(|entry| entry.clone())
+    }
+
+    /// Prepare dialog state for an in-dialog NOTIFY, incrementing CSeq atomically.
+    ///
+    /// Returns `(subscriber, event, call_id, from_tag, to_tag, route_set, cseq)`
+    /// or `None` if the subscription doesn't exist or has no dialog state.
+    pub fn prepare_notify(&self, id: &str) -> Option<(String, String, String, String, String, Vec<String>, u32)> {
+        let mut entry = self.subscriptions.get_mut(id)?;
+        let subscription = entry.value_mut();
+        let call_id = subscription.call_id.clone()?;
+        let cseq = subscription.next_cseq();
+        Some((
+            subscription.subscriber.clone(),
+            subscription.event.clone(),
+            call_id,
+            subscription.from_tag.clone().unwrap_or_default(),
+            subscription.to_tag.clone().unwrap_or_default(),
+            subscription.route_set.clone(),
+            cseq,
+        ))
     }
 
     /// Remove a subscription entirely (from both subscriptions and watchers maps).

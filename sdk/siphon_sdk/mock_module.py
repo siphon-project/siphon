@@ -1916,6 +1916,38 @@ class MockPresence:
         }
         return sub_id
 
+    def subscribe_dialog(self, subscriber: str, resource: str,
+                         event: str = "reg", expires: int = 3600,
+                         call_id: str = "", from_tag: str = "",
+                         to_tag: str = "", route_set: Optional[list] = None) -> str:
+        """Create a subscription with dialog state for in-dialog NOTIFY.
+
+        Args:
+            subscriber: Watcher URI (Contact from the SUBSCRIBE).
+            resource: Presentity URI being watched.
+            event: Event package name.
+            expires: Subscription duration in seconds.
+            call_id: Call-ID from the SUBSCRIBE dialog.
+            from_tag: From-tag from the SUBSCRIBE.
+            to_tag: To-tag from the SUBSCRIBE.
+            route_set: Route headers from Record-Route.
+
+        Returns:
+            Subscription ID string.
+        """
+        sub_id = f"sub-{self._next_sub_id}"
+        self._next_sub_id += 1
+        self._subscriptions[sub_id] = {
+            "subscriber": subscriber,
+            "resource": resource,
+            "event": event,
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "to_tag": to_tag,
+            "route_set": route_set or [],
+        }
+        return sub_id
+
     def unsubscribe(self, subscription_id: str) -> bool:
         """Unsubscribe by subscription ID.
 
@@ -1950,27 +1982,24 @@ class MockPresence:
         """Get the total number of entities with published documents."""
         return len(self._documents)
 
-    def notify(self, subscriber: str, body: Optional[str] = None,
+    def notify(self, subscription_id: str, body: Optional[str] = None,
                content_type: Optional[str] = None,
-               subscription_state: str = "active",
-               event: str = "reg") -> None:
-        """Send a SIP NOTIFY to a subscriber (fire-and-forget).
+               subscription_state: str = "active") -> None:
+        """Send an in-dialog NOTIFY for a subscription.
 
         In the mock, this records the notification for test assertions.
 
         Args:
-            subscriber: Target URI (e.g. ``"sip:bob@10.0.0.1:5060"``).
+            subscription_id: The subscription ID from ``subscribe_dialog()``.
             body: Optional body string (reginfo XML, PIDF XML, etc.).
             content_type: Content-Type of the body.
             subscription_state: Subscription-State header value (default ``"active"``).
-            event: Event header value (default ``"reg"``).
         """
         self._notifications.append({
-            "subscriber": subscriber,
+            "subscription_id": subscription_id,
             "body": body,
             "content_type": content_type,
             "subscription_state": subscription_state,
-            "event": event,
         })
 
     @property

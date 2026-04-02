@@ -119,6 +119,52 @@ impl PyPresence {
         subscription_id
     }
 
+    /// Create a subscription with full dialog state from a SUBSCRIBE request.
+    ///
+    /// Stores the dialog's Call-ID, From/To tags, and Route set so that
+    /// ``notify()`` can send in-dialog NOTIFYs per RFC 3265 §3.2.2.
+    ///
+    /// Args:
+    ///     subscriber: Watcher URI (Contact from the SUBSCRIBE).
+    ///     resource: Presentity URI being watched.
+    ///     event: Event package name (e.g. ``"reg"``).
+    ///     expires: Subscription duration in seconds.
+    ///     call_id: Call-ID from the SUBSCRIBE dialog.
+    ///     from_tag: From-tag from the SUBSCRIBE (subscriber's tag).
+    ///     to_tag: To-tag from the SUBSCRIBE (notifier's tag, set by S-CSCF).
+    ///     route_set: Route headers from Record-Route of the SUBSCRIBE dialog.
+    ///
+    /// Returns:
+    ///     Subscription ID string.
+    #[pyo3(signature = (subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None))]
+    fn subscribe_dialog(
+        &self,
+        subscriber: &str,
+        resource: &str,
+        event: &str,
+        expires: u64,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+        route_set: Option<Vec<String>>,
+    ) -> String {
+        let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
+        let subscription = Subscription::with_dialog(
+            subscription_id.clone(),
+            subscriber.to_string(),
+            resource.to_string(),
+            event.to_string(),
+            Duration::from_secs(expires),
+            vec![],
+            call_id.to_string(),
+            from_tag.to_string(),
+            to_tag.to_string(),
+            route_set.unwrap_or_default(),
+        );
+        self.store.add_subscription(subscription);
+        subscription_id
+    }
+
     /// Unsubscribe by subscription ID.
     ///
     /// Removes the subscription from the store entirely.
@@ -179,26 +225,24 @@ impl PyPresence {
         self.store.expire_stale();
     }
 
-    /// Send a SIP NOTIFY to a subscriber (fire-and-forget).
+    /// Send an in-dialog NOTIFY for a subscription (RFC 3265 §3.2.2).
     ///
-    /// Constructs a NOTIFY with the given Event, Subscription-State, Content-Type
-    /// and body, then sends it via the UAC sender.  Typically used from
-    /// `@registrar.on_change` to push reg-event XML to watchers.
+    /// Uses the stored dialog state (Call-ID, From/To tags, Route set, CSeq)
+    /// from the SUBSCRIBE to construct a proper in-dialog NOTIFY.  The message
+    /// is routed through the dialog's Route set (typically via the P-CSCF).
     ///
     /// Args:
-    ///     subscriber: Target URI (e.g. "sip:bob@10.0.0.1:5060").
-    ///     body: Optional body string (PIDF XML, reginfo XML, etc.).
-    ///     content_type: Content-Type of the body (e.g. "application/reginfo+xml").
-    ///     subscription_state: Subscription-State header value (default "active").
-    ///     event: Event header value (default "reg").
-    #[pyo3(signature = (subscriber, body=None, content_type=None, subscription_state="active", event="reg"))]
+    ///     subscription_id: The subscription ID returned by ``subscribe()``.
+    ///     body: Optional body string (reginfo XML, PIDF XML, etc.).
+    ///     content_type: Content-Type of the body (e.g. ``"application/reginfo+xml"``).
+    ///     subscription_state: Subscription-State header value (default ``"active"``).
+    #[pyo3(signature = (subscription_id, body=None, content_type=None, subscription_state="active"))]
     fn notify(
         &self,
-        subscriber: &str,
+        subscription_id: &str,
         body: Option<&str>,
         content_type: Option<&str>,
         subscription_state: &str,
-        event: &str,
     ) -> PyResult<()> {
         let uac_sender = super::proxy_utils::uac_sender().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
@@ -211,17 +255,41 @@ impl PyPresence {
             )
         })?;
 
-        let uri = parse_uri_standalone(subscriber).map_err(|error| {
+        // Look up subscription and extract + increment CSeq atomically
+        let (subscriber, event, call_id, from_tag, to_tag, route_set, cseq) =
+            self.store.prepare_notify(subscription_id).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "subscription '{subscription_id}' not found or has no dialog state \
+                     — use subscribe_dialog() to create subscriptions with dialog fields"
+                ))
+            })?;
+
+        // Determine transport destination: first Route header, or subscriber URI
+        let resolve_target: String = route_set.first()
+            .map(|route: &String| {
+                // Strip angle brackets from Route value: <sip:pcscf:5060;lr> → sip:pcscf:5060;lr
+                route.trim().trim_start_matches('<').trim_end_matches('>').to_string()
+            })
+            .unwrap_or_else(|| subscriber.clone());
+
+        let resolve_uri = parse_uri_standalone(&resolve_target).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid route/subscriber URI '{resolve_target}': {error}"
+            ))
+        })?;
+
+        // R-URI: subscriber URI (the watcher's Contact from SUBSCRIBE)
+        let ruri = parse_uri_standalone(&subscriber).map_err(|error| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "invalid subscriber URI '{subscriber}': {error}"
             ))
         })?;
 
-        let transport_hint = uri.get_param("transport").map(|s: &str| s.to_string());
+        let transport_hint = resolve_uri.get_param("transport").map(|s: &str| s.to_string());
         let resolver_clone = Arc::clone(resolver);
-        let host = uri.host.clone();
-        let port = uri.port;
-        let scheme = uri.scheme.clone();
+        let host = resolve_uri.host.clone();
+        let port = resolve_uri.port;
+        let scheme = resolve_uri.scheme.clone();
 
         let destination = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(resolver_clone.resolve(
@@ -234,7 +302,7 @@ impl PyPresence {
 
         let target = destination.into_iter().next().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "cannot resolve destination for '{subscriber}'"
+                "cannot resolve destination for '{resolve_target}'"
             ))
         })?;
 
@@ -254,19 +322,38 @@ impl PyPresence {
             None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
         };
 
+        // Build in-dialog NOTIFY: same Call-ID, swapped From/To tags, Route set
         let branch = format!("z9hG4bK-py-{}", uuid::Uuid::new_v4());
         let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
-        let call_id = format!("py-{}", uuid::Uuid::new_v4());
-        let cseq_str = "1 NOTIFY".to_string();
+        let cseq_str = format!("{} NOTIFY", cseq);
+        // In NOTIFY: From = notifier (our tag = to_tag from SUBSCRIBE),
+        //            To = subscriber (their tag = from_tag from SUBSCRIBE)
+        let from_header = if to_tag.is_empty() {
+            format!("<{}>;tag={}", ruri, uuid::Uuid::new_v4())
+        } else {
+            format!("<{}>;tag={}", ruri, to_tag)
+        };
+        let to_header = if from_tag.is_empty() {
+            format!("<{}>", subscriber)
+        } else {
+            format!("<{}>;tag={}", subscriber, from_tag)
+        };
 
         let mut builder = SipMessageBuilder::new()
-            .request(Method::Notify, uri)
+            .request(Method::Notify, ruri)
             .via(via)
             .call_id(call_id)
             .cseq(cseq_str)
             .max_forwards(70)
-            .header("Event", event.to_string())
+            .from(from_header)
+            .to(to_header)
+            .header("Event", event)
             .header("Subscription-State", subscription_state.to_string());
+
+        // Add Route headers from the dialog's route set
+        for route in &route_set {
+            builder = builder.header("Route", route.clone());
+        }
 
         if let Some(content_type_value) = content_type {
             builder = builder.header("Content-Type", content_type_value.to_string());
