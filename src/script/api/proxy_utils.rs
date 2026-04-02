@@ -184,13 +184,14 @@ impl PyProxyUtils {
     ///     ruri: Request-URI string (e.g. "sip:alice@10.0.0.1:5060")
     ///     headers: Optional dict of header name → value to add
     ///     body: Optional body string
-    #[pyo3(signature = (method, ruri, headers=None, body=None))]
+    #[pyo3(signature = (method, ruri, headers=None, body=None, next_hop=None))]
     fn send_request(
         &self,
         method: &str,
         ruri: &str,
         headers: Option<&Bound<'_, PyDict>>,
         body: Option<&str>,
+        next_hop: Option<&str>,
     ) -> PyResult<()> {
         let uac_sender = UAC_SENDER.get().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
@@ -203,17 +204,30 @@ impl PyProxyUtils {
             )
         })?;
 
-        // Parse the request URI
+        // Parse the request URI (used in the Request-Line)
         let uri = parse_uri_standalone(ruri).map_err(|error| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid request URI '{ruri}': {error}"))
         })?;
 
-        // Resolve destination via DNS (RFC 3263)
-        let transport_hint = uri.get_param("transport").map(|s| s.to_string());
+        // Resolve the transport destination.
+        // When next_hop is provided (e.g. Path from registrar), resolve that
+        // instead of the R-URI. The R-URI stays in the Request-Line but the
+        // message is sent to next_hop (like Route-based forwarding).
+        let resolve_uri = if let Some(hop) = next_hop {
+            parse_uri_standalone(hop).map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid next_hop URI '{hop}': {error}"
+                ))
+            })?
+        } else {
+            uri.clone()
+        };
+
+        let transport_hint = resolve_uri.get_param("transport").map(|s: &str| s.to_string());
         let resolver_clone = Arc::clone(resolver);
-        let host = uri.host.clone();
-        let port = uri.port;
-        let scheme = uri.scheme.clone();
+        let host = resolve_uri.host.clone();
+        let port = resolve_uri.port;
+        let scheme = resolve_uri.scheme.clone();
 
         let destination = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(resolver_clone.resolve(
@@ -225,8 +239,9 @@ impl PyProxyUtils {
         });
 
         let target = destination.into_iter().next().ok_or_else(|| {
+            let resolve_target = next_hop.unwrap_or(ruri);
             pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "cannot resolve destination for '{ruri}'"
+                "cannot resolve destination for '{resolve_target}'"
             ))
         })?;
 
