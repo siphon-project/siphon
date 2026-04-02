@@ -236,17 +236,19 @@ pub fn parse_service_profile(xml: &str) -> Result<Vec<InitialFilterCriteria>, If
                         }
                     }
                     "Header" => {
-                        // <Header> is a container element inside <SPT> with
-                        // sub-elements, but in some implementations it is a
-                        // leaf text node. We handle it as a leaf in the
-                        // "header_name" flow below.
-                        if current_spt.is_some() && header_name.is_some() {
-                            // Close of the <Header> container — assemble.
-                            if let Some(ref mut spt) = current_spt {
-                                spt.header = Some((
-                                    header_name.take().unwrap_or_default(),
-                                    header_content.take(),
-                                ));
+                        if current_spt.is_some() {
+                            if header_name.is_some() {
+                                // Close of the <Header> container with <HeaderName> child.
+                                if let Some(ref mut spt) = current_spt {
+                                    spt.header = Some((
+                                        header_name.take().unwrap_or_default(),
+                                        header_content.take(),
+                                    ));
+                                }
+                            } else if !text.is_empty() {
+                                // <Header> used as leaf node: text is the header name.
+                                // Common in 3GPP iFC XML: <SIPHeader><Header>X-Foo</Header></SIPHeader>
+                                header_name = Some(text);
                             }
                         }
                     }
@@ -1323,6 +1325,65 @@ mod tests {
             &ifcs,
         );
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn evaluate_negated_header_prevents_loop() {
+        // TAS scenario: match INVITE only when X-TAS-Handled header is NOT present.
+        // CNF with two SPTs in separate groups: Method=INVITE (group 0) AND
+        // NOT Header=X-TAS-Handled (group 1).  CNF = AND of OR groups, so
+        // both groups must pass.
+        let xml = concat!(
+            "<ServiceProfile>\n",
+            "  <InitialFilterCriteria>\n",
+            "    <Priority>0</Priority>\n",
+            "    <TriggerPoint>\n",
+            "      <ConditionTypeCNF>1</ConditionTypeCNF>\n",
+            "      <SPT>\n",
+            "        <ConditionNegated>0</ConditionNegated>\n",
+            "        <Group>0</Group>\n",
+            "        <Method>INVITE</Method>\n",
+            "      </SPT>\n",
+            "      <SPT>\n",
+            "        <ConditionNegated>1</ConditionNegated>\n",
+            "        <Group>1</Group>\n",
+            "        <SIPHeader>\n",
+            "          <Header>X-TAS-Handled</Header>\n",
+            "        </SIPHeader>\n",
+            "      </SPT>\n",
+            "    </TriggerPoint>\n",
+            "    <ApplicationServer>\n",
+            "      <ServerName>sip:tas@example.com</ServerName>\n",
+            "      <DefaultHandling>0</DefaultHandling>\n",
+            "    </ApplicationServer>\n",
+            "  </InitialFilterCriteria>\n",
+            "</ServiceProfile>\n",
+        );
+
+        let ifcs = parse_service_profile(xml).unwrap();
+
+        // First evaluation: INVITE without X-TAS-Handled → should match
+        let results = evaluate(
+            "INVITE",
+            "sip:bob@example.com",
+            &[("From".into(), "sip:alice@example.com".into())],
+            SessionCase::Originating,
+            &ifcs,
+        );
+        assert_eq!(results.len(), 1, "should match: INVITE without X-TAS-Handled");
+
+        // Second evaluation: INVITE with X-TAS-Handled → must NOT match (loop prevention)
+        let results = evaluate(
+            "INVITE",
+            "sip:bob@example.com",
+            &[
+                ("From".into(), "sip:alice@example.com".into()),
+                ("X-TAS-Handled".into(), "1".into()),
+            ],
+            SessionCase::Originating,
+            &ifcs,
+        );
+        assert!(results.is_empty(), "must not match: X-TAS-Handled present, negated condition should block");
     }
 
     #[test]
