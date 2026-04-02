@@ -1339,6 +1339,10 @@ fn handle_request(
             }
         };
 
+        // Enable deferred sends so presence.notify() etc. queue messages
+        // until after the reply is sent (RFC 3265 §3.1.6.2).
+        crate::script::api::proxy_utils::enable_deferred_sends();
+
         for handler in &handlers {
             let callable = handler.callable.bind(python);
             let result = callable.call1((py_request.bind(python),));
@@ -1510,6 +1514,7 @@ fn handle_request(
             if !sent_by_transaction {
                 send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
             }
+
         }
         RequestAction::Relay { next_hop } => {
             // RFC 3261 §16.2: a stateful proxy SHOULD send 100 Trying
@@ -1557,6 +1562,10 @@ fn handle_request(
             }
         }
     }
+
+    // Flush deferred messages (e.g. in-dialog NOTIFY) after the reply/relay
+    // has been dispatched, per RFC 3265 §3.1.6.2 (200 OK before NOTIFY).
+    flush_deferred_sends(state);
 }
 
 /// Relay a SIP request to its destination.
@@ -3598,6 +3607,23 @@ fn send_message(
     );
 
     send_outbound(data, transport, destination, connection_id, state);
+}
+
+/// Drain deferred messages queued by presence.notify() etc. during the handler
+/// and send each one via the UacSender.  Called after the reply/relay has been
+/// dispatched so ordering is preserved (RFC 3265 §3.1.6.2).
+fn flush_deferred_sends(state: &DispatcherState) {
+    let deferred = crate::script::api::proxy_utils::drain_deferred_sends();
+    if deferred.is_empty() {
+        return;
+    }
+    if let Some(uac_sender) = crate::script::api::proxy_utils::uac_sender() {
+        for msg in deferred {
+            uac_sender.send_request(msg.message, msg.destination, msg.transport);
+        }
+    } else {
+        warn!("deferred sends queued but UAC sender not available");
+    }
 }
 
 /// Send a SIP message to the B-leg, using the TCP connection pool for TCP/TLS

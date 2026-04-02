@@ -371,7 +371,11 @@ impl PyPresence {
             ))
         })?;
 
-        uac_sender.send_request(message, target.address, transport);
+        // If called within a request handler, defer until after the reply is
+        // sent (RFC 3265 §3.1.6.2: 200 OK to SUBSCRIBE before initial NOTIFY).
+        if !super::proxy_utils::try_defer_send(message.clone(), target.address, transport) {
+            uac_sender.send_request(message, target.address, transport);
+        }
         Ok(())
     }
 }

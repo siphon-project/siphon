@@ -23,6 +23,57 @@ use super::request::PyRequest;
 /// Global UacSender — set once from main.rs after transport channels are ready.
 static UAC_SENDER: OnceLock<Arc<UacSender>> = OnceLock::new();
 
+// ---------------------------------------------------------------------------
+// Deferred message queue — ensures NOTIFY is sent after the reply (RFC 3265)
+// ---------------------------------------------------------------------------
+
+use crate::sip::message::SipMessage;
+
+/// A message waiting to be sent after the current reply is dispatched.
+pub struct DeferredMessage {
+    pub message: SipMessage,
+    pub destination: std::net::SocketAddr,
+    pub transport: Transport,
+}
+
+thread_local! {
+    /// When a request handler is active, deferred messages are queued here
+    /// and flushed by the dispatcher after the reply is sent.
+    static DEFERRED_SENDS: std::cell::RefCell<Option<Vec<DeferredMessage>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Enable deferred sending mode for the current thread.
+/// Call before invoking Python handlers.
+pub fn enable_deferred_sends() {
+    DEFERRED_SENDS.with(|cell| {
+        *cell.borrow_mut() = Some(Vec::new());
+    });
+}
+
+/// Drain and return all deferred messages, disabling deferred mode.
+/// Call after the reply has been sent to wire.
+pub fn drain_deferred_sends() -> Vec<DeferredMessage> {
+    DEFERRED_SENDS.with(|cell| {
+        cell.borrow_mut().take().unwrap_or_default()
+    })
+}
+
+/// Try to queue a message for deferred sending.  Returns `true` if deferred
+/// mode is active and the message was queued; `false` if no request handler
+/// is active (caller should send immediately).
+pub(crate) fn try_defer_send(message: SipMessage, destination: std::net::SocketAddr, transport: Transport) -> bool {
+    DEFERRED_SENDS.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(ref mut queue) = *guard {
+            queue.push(DeferredMessage { message, destination, transport });
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Global DNS resolver for send_request — set alongside the UAC sender.
 static SEND_RESOLVER: OnceLock<Arc<SipResolver>> = OnceLock::new();
 
