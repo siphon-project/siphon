@@ -932,6 +932,9 @@ async fn init_registrar_backend(config: &Config) {
                 Ok(redis_backend) => {
                     match backend::restore_from_backend(&redis_backend, registrar).await {
                         Ok((aors, contacts)) => {
+                            if let Some(metrics) = crate::metrics::try_metrics() {
+                                metrics.registrations_active.set(aors as i64);
+                            }
                             info!(aors, contacts, "restored contacts from Redis backend");
                         }
                         Err(err) => {
@@ -965,6 +968,9 @@ async fn init_registrar_backend(config: &Config) {
                 Ok(pg_backend) => {
                     match backend::restore_from_backend(&pg_backend, registrar).await {
                         Ok((aors, contacts)) => {
+                            if let Some(metrics) = crate::metrics::try_metrics() {
+                                metrics.registrations_active.set(aors as i64);
+                            }
                             info!(aors, contacts, "restored contacts from Postgres backend");
                         }
                         Err(err) => {

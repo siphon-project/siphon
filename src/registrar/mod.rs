@@ -260,13 +260,19 @@ impl Registrar {
                 .iter()
                 .map(backend::StoredContact::from_contact)
                 .collect();
-            if contacts.is_empty() {
+            let aor_empty = contacts.is_empty();
+            if aor_empty {
                 drop(entry);
                 self.bindings.remove(aor);
             } else {
                 drop(entry);
             }
             self.persist_aor(aor, remaining);
+            if aor_empty {
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.registrations_active.dec();
+                }
+            }
             self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
             return Ok(());
         }
@@ -309,6 +315,9 @@ impl Registrar {
         if is_refresh {
             self.emit_event(RegistrationEvent::Refreshed { aor: aor_owned });
         } else {
+            if let Some(metrics) = crate::metrics::try_metrics() {
+                metrics.registrations_active.inc();
+            }
             self.emit_event(RegistrationEvent::Registered { aor: aor_owned });
         }
 
@@ -317,11 +326,16 @@ impl Registrar {
 
     /// Remove all contacts for an AoR (wildcard deregister, Contact: *).
     pub fn remove_all(&self, aor: &str) {
-        self.bindings.remove(aor);
+        let had_bindings = self.bindings.remove(aor).is_some();
         self.service_routes.remove(aor);
         self.associated_uris.remove(aor);
         if let Some(writer) = self.backend_writer.get() {
             writer.remove(aor);
+        }
+        if had_bindings {
+            if let Some(metrics) = crate::metrics::try_metrics() {
+                metrics.registrations_active.dec();
+            }
         }
         self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
     }
@@ -378,6 +392,9 @@ impl Registrar {
                 self.bindings.remove(&aor);
                 if let Some(writer) = self.backend_writer.get() {
                     writer.remove(&aor);
+                }
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.registrations_active.dec();
                 }
                 self.emit_event(RegistrationEvent::Deregistered { aor });
             } else {
@@ -448,11 +465,17 @@ impl Registrar {
             let before = entry.value().len();
             entry.value_mut().retain(|c| c.uri.to_string() != contact_uri);
             let removed = entry.value().len() < before;
-            if entry.value().is_empty() {
+            let aor_empty = entry.value().is_empty();
+            if aor_empty {
                 drop(entry);
                 self.bindings.remove(aor);
             }
             if removed {
+                if aor_empty {
+                    if let Some(metrics) = crate::metrics::try_metrics() {
+                        metrics.registrations_active.dec();
+                    }
+                }
                 self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
             }
         }
@@ -659,6 +682,11 @@ impl Registrar {
             entry.value_mut().retain(|c| !c.is_expired());
             if entry.value().is_empty() && before > 0 {
                 empty_aors.push(entry.key().clone());
+            }
+        }
+        if !empty_aors.is_empty() {
+            if let Some(metrics) = crate::metrics::try_metrics() {
+                metrics.registrations_active.sub(empty_aors.len() as i64);
             }
         }
         for aor in &empty_aors {
