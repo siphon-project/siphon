@@ -891,11 +891,12 @@ impl IfcStore {
         request_uri: &str,
         headers: &[(String, String)],
         session_case: SessionCase,
+        start_after_priority: Option<i32>,
     ) -> Vec<MatchedApplicationServer> {
         if let Some(user_ifcs) = self.profiles.get(aor) {
-            Self::evaluate_ifcs(&user_ifcs, method, request_uri, headers, session_case)
+            Self::evaluate_ifcs(&user_ifcs, method, request_uri, headers, session_case, start_after_priority)
         } else {
-            Self::evaluate_ifcs(&self.global, method, request_uri, headers, session_case)
+            Self::evaluate_ifcs(&self.global, method, request_uri, headers, session_case, start_after_priority)
         }
     }
 
@@ -910,13 +911,22 @@ impl IfcStore {
         request_uri: &str,
         headers: &[(String, String)],
         session_case: SessionCase,
+        start_after_priority: Option<i32>,
     ) -> Vec<MatchedApplicationServer> {
         let mut sorted: Vec<&InitialFilterCriteria> = ifcs.iter().collect();
         sorted.sort_by_key(|ifc| ifc.priority);
 
         sorted
             .into_iter()
-            .filter(|ifc| matches_ifc(ifc, method, request_uri, headers, session_case))
+            .filter(|ifc| {
+                // Skip iFCs at or below the already-processed priority.
+                if let Some(min) = start_after_priority {
+                    if ifc.priority <= min {
+                        return false;
+                    }
+                }
+                matches_ifc(ifc, method, request_uri, headers, session_case)
+            })
             .map(MatchedApplicationServer::from)
             .collect()
     }
@@ -1730,6 +1740,7 @@ mod tests {
             "sip:bob@example.com",
             &[],
             SessionCase::Originating,
+            None,
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].server_name, "sip:mmtel@example.com");
@@ -1749,6 +1760,7 @@ mod tests {
             "sip:bob@example.com",
             &[],
             SessionCase::Originating,
+            None,
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].server_name, "sip:mmtel@example.com");
@@ -1787,6 +1799,7 @@ mod tests {
             "sip:bob@example.com",
             &[],
             SessionCase::Originating,
+            None,
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].server_name, "sip:custom-as@alice.com");
@@ -1841,6 +1854,7 @@ mod tests {
             "sip:bob@example.com",
             &[],
             SessionCase::Originating,
+            None,
         );
         assert!(results.is_empty());
     }
@@ -1863,6 +1877,7 @@ mod tests {
                     "sip:bob@example.com",
                     &[],
                     SessionCase::Originating,
+                    None,
                 );
                 assert_eq!(results.len(), 1);
             }));
@@ -1898,5 +1913,72 @@ mod tests {
         assert_eq!(matched.priority, 3);
         assert!(matched.include_register_request);
         assert!(!matched.include_register_response);
+    }
+
+    #[test]
+    fn evaluate_start_after_priority_skips_processed() {
+        // Simulate ISC chain: three ASes at priorities 10, 20, 30.
+        // After AS at priority 10 processes and returns, re-evaluate
+        // with start_after_priority=10 → only priorities 20 and 30.
+        let xml = concat!(
+            "<ServiceProfile>\n",
+            "  <InitialFilterCriteria>\n",
+            "    <Priority>10</Priority>\n",
+            "    <ApplicationServer>\n",
+            "      <ServerName>sip:as1@example.com</ServerName>\n",
+            "      <DefaultHandling>0</DefaultHandling>\n",
+            "    </ApplicationServer>\n",
+            "  </InitialFilterCriteria>\n",
+            "  <InitialFilterCriteria>\n",
+            "    <Priority>20</Priority>\n",
+            "    <ApplicationServer>\n",
+            "      <ServerName>sip:as2@example.com</ServerName>\n",
+            "      <DefaultHandling>0</DefaultHandling>\n",
+            "    </ApplicationServer>\n",
+            "  </InitialFilterCriteria>\n",
+            "  <InitialFilterCriteria>\n",
+            "    <Priority>30</Priority>\n",
+            "    <ApplicationServer>\n",
+            "      <ServerName>sip:as3@example.com</ServerName>\n",
+            "      <DefaultHandling>0</DefaultHandling>\n",
+            "    </ApplicationServer>\n",
+            "  </InitialFilterCriteria>\n",
+            "</ServiceProfile>\n",
+        );
+
+        let store = IfcStore::new(vec![]);
+        store.store_profile_xml("sip:alice@example.com", xml).unwrap();
+
+        // Full evaluation: all three match
+        let all = store.evaluate(
+            "sip:alice@example.com", "INVITE", "sip:bob@example.com",
+            &[], SessionCase::Originating, None,
+        );
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].server_name, "sip:as1@example.com");
+
+        // After AS1 (priority 10) returns: skip priority <= 10
+        let remaining = store.evaluate(
+            "sip:alice@example.com", "INVITE", "sip:bob@example.com",
+            &[], SessionCase::Originating, Some(10),
+        );
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].server_name, "sip:as2@example.com");
+        assert_eq!(remaining[1].server_name, "sip:as3@example.com");
+
+        // After AS2 (priority 20) returns: skip priority <= 20
+        let remaining = store.evaluate(
+            "sip:alice@example.com", "INVITE", "sip:bob@example.com",
+            &[], SessionCase::Originating, Some(20),
+        );
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].server_name, "sip:as3@example.com");
+
+        // After AS3 (priority 30) returns: nothing left
+        let remaining = store.evaluate(
+            "sip:alice@example.com", "INVITE", "sip:bob@example.com",
+            &[], SessionCase::Originating, Some(30),
+        );
+        assert!(remaining.is_empty());
     }
 }

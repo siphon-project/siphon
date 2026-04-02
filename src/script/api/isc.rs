@@ -98,7 +98,7 @@ impl PyIsc {
     ///     ``default_handling`` (int: 0=SESSION_CONTINUED, 1=SESSION_TERMINATED),
     ///     ``service_info`` (str or None), ``priority`` (int).
     ///     Ordered by priority ascending (lowest first).
-    #[pyo3(signature = (aor, method, ruri, headers, session_case="originating"))]
+    #[pyo3(signature = (aor, method, ruri, headers, session_case="originating", start_after_priority=None))]
     fn evaluate<'py>(
         &self,
         python: Python<'py>,
@@ -107,6 +107,7 @@ impl PyIsc {
         ruri: &str,
         headers: Vec<(String, String)>,
         session_case: &str,
+        start_after_priority: Option<i32>,
     ) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let case = parse_session_case(session_case).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -115,7 +116,7 @@ impl PyIsc {
             ))
         })?;
 
-        let matches = self.store.evaluate(aor, method, ruri, &headers, case);
+        let matches = self.store.evaluate(aor, method, ruri, &headers, case, start_after_priority);
 
         let mut results = Vec::with_capacity(matches.len());
         for matched in &matches {
