@@ -40,6 +40,9 @@ pub struct StoredContact {
     pub sip_instance: Option<String>,
     /// RFC 5626 reg-id.
     pub reg_id: Option<u32>,
+    /// RFC 3327 Path headers (for routing terminating requests via proxies).
+    #[serde(default)]
+    pub path: Vec<String>,
 }
 
 impl StoredContact {
@@ -62,6 +65,7 @@ impl StoredContact {
             source_transport: contact.source_transport.clone(),
             sip_instance: contact.sip_instance.clone(),
             reg_id: contact.reg_id,
+            path: contact.path.clone(),
         }
     }
 
@@ -112,6 +116,7 @@ impl StoredContact {
             source_transport: self.source_transport.clone(),
             sip_instance: self.sip_instance.clone(),
             reg_id: self.reg_id,
+            path: self.path.clone(),
             pending: false,
         })
     }
@@ -955,6 +960,7 @@ mod tests {
             source_transport: None,
             sip_instance: None,
             reg_id: None,
+            path: vec![],
         }
     }
 
@@ -1166,6 +1172,7 @@ mod tests {
                 source_transport: None,
                 sip_instance: None,
                 reg_id: None,
+                path: vec![],
             }])
             .await
             .unwrap();
@@ -1182,6 +1189,7 @@ mod tests {
                     source_transport: None,
                     sip_instance: None,
                     reg_id: None,
+                    path: vec![],
                 },
                 StoredContact {
                     uri: "sip:bob@10.0.0.3".to_string(),
@@ -1194,6 +1202,7 @@ mod tests {
                     source_transport: None,
                     sip_instance: None,
                     reg_id: None,
+                    path: vec![],
                 },
             ])
             .await
@@ -1226,6 +1235,7 @@ mod tests {
                 source_transport: None,
                 sip_instance: None,
                 reg_id: None,
+                path: vec![],
             }])
             .await
             .unwrap();
@@ -1259,6 +1269,7 @@ mod tests {
                 source_transport: None,
                 sip_instance: None,
                 reg_id: None,
+                path: vec![],
             }])
             .await
             .unwrap();

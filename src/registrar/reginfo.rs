@@ -286,6 +286,7 @@ mod tests {
             source_transport: None,
             sip_instance: None,
             reg_id: None,
+            path: vec![],
             pending: false,
         }
     }

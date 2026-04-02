@@ -90,6 +90,10 @@ class Contact:
     expires: int = 3600
     """Seconds remaining until this contact binding expires."""
 
+    path: list = field(default_factory=list)
+    """RFC 3327 Path headers stored with this binding.
+    Use as Route headers when routing terminating requests to this contact."""
+
 
 @dataclass
 class Action:

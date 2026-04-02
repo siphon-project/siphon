@@ -26,6 +26,8 @@ pub struct PyContact {
     /// Source address of the REGISTER (for NAT traversal routing).
     /// Format: "sip:ip:port;transport=proto" — like OpenSIPS received_avp.
     received_string: Option<String>,
+    /// RFC 3327 Path headers stored with this binding.
+    path_headers: Vec<String>,
 }
 
 #[pymethods]
@@ -59,6 +61,15 @@ impl PyContact {
         self.received_string.as_deref()
     }
 
+    /// RFC 3327 Path headers stored with this contact binding.
+    ///
+    /// Returns the Path values from the REGISTER that created this binding.
+    /// Use these as Route headers when routing terminating requests to this contact.
+    #[getter]
+    fn path(&self) -> Vec<String> {
+        self.path_headers.clone()
+    }
+
     fn __str__(&self) -> &str {
         &self.uri_string
     }
@@ -84,6 +95,7 @@ impl PyContact {
             q_value: contact.q,
             expires_remaining: contact.remaining_seconds(),
             received_string,
+            path_headers: contact.path.clone(),
         }
     }
 }
@@ -188,6 +200,14 @@ impl PyRegistrar {
             .cloned()
             .unwrap_or_default();
 
+        // Extract Path headers (RFC 3327) — stored per-contact binding so
+        // terminating requests can be routed through the proxy chain.
+        let path: Vec<String> = message
+            .headers
+            .get_all("Path")
+            .cloned()
+            .unwrap_or_default();
+
         // Parse Contact headers
         let contact_values = message
             .headers
@@ -235,6 +255,7 @@ impl PyRegistrar {
                         source_transport.clone(),
                         sip_instance,
                         reg_id,
+                        path.clone(),
                     )
                     .map_err(|error| match error {
                         RegistrarError::IntervalTooBrief { min_expires } => {
@@ -728,6 +749,7 @@ mod tests {
             q_value: 1.0,
             expires_remaining: 3600,
             received_string: None,
+            path_headers: vec![],
         };
         assert_eq!(contact.__str__(), "sip:alice@10.0.0.1");
         assert!(contact.__repr__().contains("q=1"));

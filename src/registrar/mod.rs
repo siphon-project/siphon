@@ -58,6 +58,8 @@ pub struct Contact {
     pub sip_instance: Option<String>,
     /// RFC 5626 Outbound: `reg-id` parameter.
     pub reg_id: Option<u32>,
+    /// RFC 3327 Path headers from the REGISTER (for terminating request routing).
+    pub path: Vec<String>,
     /// IMS registration state: pending (awaiting SAR) vs active.
     pub pending: bool,
 }
@@ -201,7 +203,7 @@ impl Registrar {
         source_addr: Option<SocketAddr>,
         source_transport: Option<String>,
     ) -> Result<(), RegistrarError> {
-        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, source_transport, None, None)
+        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, source_transport, None, None, vec![])
     }
 
     /// Core save with all fields including +sip.instance and reg-id.
@@ -218,6 +220,7 @@ impl Registrar {
         source_transport: Option<String>,
         sip_instance: Option<String>,
         reg_id: Option<u32>,
+        path: Vec<String>,
     ) -> Result<(), RegistrarError> {
         let expires_secs = std::cmp::min(expires_secs, self.config.max_expires);
 
@@ -238,6 +241,7 @@ impl Registrar {
             source_transport,
             sip_instance,
             reg_id,
+            path,
             pending: false,
         };
 
@@ -468,7 +472,7 @@ impl Registrar {
         sip_instance: Option<String>,
         reg_id: Option<u32>,
     ) -> Result<(), RegistrarError> {
-        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, None, sip_instance, reg_id)
+        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, None, sip_instance, reg_id, vec![])
     }
 
     /// Generate a public GRUU for a contact with a `+sip.instance`.
@@ -610,6 +614,7 @@ impl Registrar {
             source_transport: None,
             sip_instance: None,
             reg_id: None,
+            path: vec![],
             pending: true,
         };
 
@@ -875,6 +880,7 @@ mod tests {
             source_transport: None,
             sip_instance: None,
             reg_id: None,
+            path: vec![],
             pending: false,
         };
         // Just registered — remaining should be very close to 3600
@@ -898,6 +904,7 @@ mod tests {
                 source_transport: None,
                 sip_instance: None,
                 reg_id: None,
+                path: vec![],
                 pending: false,
             };
             registrar.bindings.entry("sip:alice@example.com".to_string()).or_default().push(contact);
@@ -905,6 +912,73 @@ mod tests {
         assert_eq!(registrar.aor_count(), 0); // expired contacts don't count
         registrar.expire_stale();
         assert_eq!(registrar.bindings.len(), 0); // cleaned up
+    }
+
+    #[test]
+    fn path_stored_and_returned_on_lookup() {
+        // RFC 3327: Path headers from the REGISTER must be stored per-contact
+        // and returned on lookup so the registrar user can route terminating
+        // requests through the proxy chain.
+        let registrar = Registrar::default();
+        let path = vec![
+            "<sip:pcscf.ims.example.com;lr>".to_string(),
+            "<sip:icscf.ims.example.com;lr>".to_string(),
+        ];
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                None, None, None, None,
+                path.clone(),
+            )
+            .unwrap();
+
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].path, path);
+    }
+
+    #[test]
+    fn path_updated_on_re_register() {
+        // On re-REGISTER the Path may change (e.g. failover to a different P-CSCF).
+        let registrar = Registrar::default();
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                None, None, None, None,
+                vec!["<sip:old-pcscf.example.com;lr>".to_string()],
+            )
+            .unwrap();
+
+        // Re-register with new Path
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c2".into(), 2,
+                None, None, None, None,
+                vec!["<sip:new-pcscf.example.com;lr>".to_string()],
+            )
+            .unwrap();
+
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].path, vec!["<sip:new-pcscf.example.com;lr>"]);
+    }
+
+    #[test]
+    fn path_empty_when_not_provided() {
+        let registrar = Registrar::default();
+        registrar
+            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts.len(), 1);
+        assert!(contacts[0].path.is_empty());
     }
 
     #[test]
