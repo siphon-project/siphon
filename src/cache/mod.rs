@@ -145,7 +145,7 @@ impl NamedCache {
     }
 
     /// Store a value: write to local LRU and Redis.
-    async fn store(&self, key: &str, value: &str) {
+    async fn store(&self, key: &str, value: &str, ttl_secs: Option<u64>) {
         // Write to local LRU
         if let Some(local) = &self.local {
             if let Ok(mut lru) = local.lock() {
@@ -156,7 +156,35 @@ impl NamedCache {
         // Write to Redis
         #[cfg(feature = "redis-backend")]
         {
-            self.redis_store(key, value).await;
+            self.redis_store(key, value, ttl_secs).await;
+        }
+    }
+
+    async fn delete(&self, key: &str) {
+        // Remove from local LRU
+        if let Some(local) = &self.local {
+            if let Ok(mut lru) = local.lock() {
+                lru.entries.remove(key);
+            }
+        }
+
+        // Remove from Redis
+        #[cfg(feature = "redis-backend")]
+        {
+            self.redis_delete(key).await;
+        }
+    }
+
+    #[cfg(feature = "redis-backend")]
+    async fn redis_delete(&self, key: &str) {
+        if let Some(mut connection) = self.get_redis_connection().await {
+            if let Err(error) = redis::cmd("DEL")
+                .arg(key)
+                .query_async::<()>(&mut connection)
+                .await
+            {
+                warn!(key = key, "Redis DEL failed: {error}");
+            }
         }
     }
 
@@ -196,14 +224,23 @@ impl NamedCache {
     }
 
     #[cfg(feature = "redis-backend")]
-    async fn redis_store(&self, key: &str, value: &str) {
+    async fn redis_store(&self, key: &str, value: &str, ttl_secs: Option<u64>) {
         if let Some(mut connection) = self.get_redis_connection().await {
-            if let Err(error) = redis::cmd("SET")
-                .arg(key)
-                .arg(value)
-                .query_async::<()>(&mut connection)
-                .await
-            {
+            let result = if let Some(ttl) = ttl_secs {
+                redis::cmd("SETEX")
+                    .arg(key)
+                    .arg(ttl)
+                    .arg(value)
+                    .query_async::<()>(&mut connection)
+                    .await
+            } else {
+                redis::cmd("SET")
+                    .arg(key)
+                    .arg(value)
+                    .query_async::<()>(&mut connection)
+                    .await
+            };
+            if let Err(error) = result {
                 warn!(key = key, "Redis SET failed: {error}");
             }
         }
@@ -238,10 +275,20 @@ impl CacheManager {
         cache.fetch(key).await
     }
 
-    /// Store a value in a named cache.
-    pub async fn store(&self, name: &str, key: &str, value: &str) -> bool {
+    /// Store a value in a named cache with optional TTL.
+    pub async fn store(&self, name: &str, key: &str, value: &str, ttl_secs: Option<u64>) -> bool {
         if let Some(cache) = self.caches.get(name) {
-            cache.store(key, value).await;
+            cache.store(key, value, ttl_secs).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete a key from a named cache.
+    pub async fn delete(&self, name: &str, key: &str) -> bool {
+        if let Some(cache) = self.caches.get(name) {
+            cache.delete(key).await;
             true
         } else {
             false
@@ -279,7 +326,7 @@ mod tests {
         assert!(manager.fetch("test", "key1").await.is_none());
 
         // Store and hit
-        manager.store("test", "key1", "value1").await;
+        manager.store("test", "key1", "value1", None).await;
         assert_eq!(manager.fetch("test", "key1").await.unwrap(), "value1");
     }
 
@@ -293,7 +340,7 @@ mod tests {
         }];
         let manager = CacheManager::new(&configs);
 
-        manager.store("ttl_test", "key1", "value1").await;
+        manager.store("ttl_test", "key1", "value1", None).await;
         // With 0s TTL, entry should be expired immediately
         std::thread::sleep(Duration::from_millis(10));
         assert!(manager.fetch("ttl_test", "key1").await.is_none());
@@ -303,9 +350,9 @@ mod tests {
     async fn local_lru_max_entries_eviction() {
         let manager = CacheManager::new(&[make_config("small", Some(60), Some(2))]);
 
-        manager.store("small", "key1", "v1").await;
-        manager.store("small", "key2", "v2").await;
-        manager.store("small", "key3", "v3").await; // Should evict oldest
+        manager.store("small", "key1", "v1", None).await;
+        manager.store("small", "key2", "v2", None).await;
+        manager.store("small", "key3", "v3", None).await; // Should evict oldest
 
         // key3 and key2 should be present, key1 evicted
         assert!(manager.fetch("small", "key3").await.is_some());
@@ -328,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn store_returns_false_for_unknown_cache() {
         let manager = CacheManager::empty();
-        assert!(!manager.store("nope", "key", "value").await);
+        assert!(!manager.store("nope", "key", "value", None).await);
     }
 
     #[test]

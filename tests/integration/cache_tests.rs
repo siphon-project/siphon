@@ -24,7 +24,7 @@ async fn fetch_miss_then_store_then_hit() {
     assert!(manager.fetch("cnam", "msisdn:1234").await.is_none());
 
     // Store
-    assert!(manager.store("cnam", "msisdn:1234", "Alice").await);
+    assert!(manager.store("cnam", "msisdn:1234", "Alice", None).await);
 
     // Hit
     assert_eq!(
@@ -37,7 +37,7 @@ async fn fetch_miss_then_store_then_hit() {
 async fn ttl_expiry() {
     let manager = CacheManager::new(&[make_config("short", 0, 1000)]);
 
-    manager.store("short", "key1", "value1").await;
+    manager.store("short", "key1", "value1", None).await;
 
     // With 0s TTL, entries expire immediately
     std::thread::sleep(Duration::from_millis(10));
@@ -48,9 +48,9 @@ async fn ttl_expiry() {
 async fn max_entries_eviction() {
     let manager = CacheManager::new(&[make_config("tiny", 60, 3)]);
 
-    manager.store("tiny", "k1", "v1").await;
-    manager.store("tiny", "k2", "v2").await;
-    manager.store("tiny", "k3", "v3").await;
+    manager.store("tiny", "k1", "v1", None).await;
+    manager.store("tiny", "k2", "v2", None).await;
+    manager.store("tiny", "k3", "v3", None).await;
 
     // All 3 should be present
     assert!(manager.fetch("tiny", "k1").await.is_some());
@@ -58,7 +58,7 @@ async fn max_entries_eviction() {
     assert!(manager.fetch("tiny", "k3").await.is_some());
 
     // Adding a 4th should evict the oldest (k1)
-    manager.store("tiny", "k4", "v4").await;
+    manager.store("tiny", "k4", "v4", None).await;
     assert!(manager.fetch("tiny", "k4").await.is_some());
     // k1 was the oldest insert, so it should be evicted
     assert!(manager.fetch("tiny", "k1").await.is_none());
@@ -68,7 +68,7 @@ async fn max_entries_eviction() {
 async fn unknown_cache_name() {
     let manager = CacheManager::new(&[make_config("existing", 60, 100)]);
     assert!(manager.fetch("nonexistent", "key").await.is_none());
-    assert!(!manager.store("nonexistent", "key", "value").await);
+    assert!(!manager.store("nonexistent", "key", "value", None).await);
 }
 
 #[tokio::test]
@@ -78,8 +78,8 @@ async fn multiple_named_caches() {
         make_config("cache_b", 60, 100),
     ]);
 
-    manager.store("cache_a", "key", "value_a").await;
-    manager.store("cache_b", "key", "value_b").await;
+    manager.store("cache_a", "key", "value_a", None).await;
+    manager.store("cache_b", "key", "value_b", None).await;
 
     // Same key, different caches, different values
     assert_eq!(manager.fetch("cache_a", "key").await.unwrap(), "value_a");
@@ -90,10 +90,10 @@ async fn multiple_named_caches() {
 async fn overwrite_existing_key() {
     let manager = CacheManager::new(&[make_config("overwrite", 60, 100)]);
 
-    manager.store("overwrite", "key", "old_value").await;
+    manager.store("overwrite", "key", "old_value", None).await;
     assert_eq!(manager.fetch("overwrite", "key").await.unwrap(), "old_value");
 
-    manager.store("overwrite", "key", "new_value").await;
+    manager.store("overwrite", "key", "new_value", None).await;
     assert_eq!(manager.fetch("overwrite", "key").await.unwrap(), "new_value");
 }
 
