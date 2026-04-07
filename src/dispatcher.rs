@@ -3657,11 +3657,20 @@ fn build_b2bua_bye(
     );
 
     // From: our local tag, To: remote tag (RFC 3261 §12.2.1.1)
-    let b2bua_host = state.via_host(&leg.transport.transport);
-    let local_contact = dialog.local_contact.as_deref().unwrap_or("sip:invalid");
-    let from_header = format!("<{}>;tag={}", local_contact, dialog.local_tag);
-    let to_uri = dialog.remote_contact.as_deref()
-        .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"));
+    // Strip angle brackets from stored Contact values — they may already
+    // contain <>, and we need bare URIs for the name-addr format.
+    fn strip_angles(s: &str) -> String {
+        let trimmed = s.trim();
+        trimmed.strip_prefix('<').unwrap_or(trimmed)
+            .strip_suffix('>').unwrap_or(trimmed)
+            .to_string()
+    }
+    let local_contact_uri = strip_angles(dialog.local_contact.as_deref().unwrap_or("sip:invalid"));
+    let from_header = format!("<{}>;tag={}", local_contact_uri, dialog.local_tag);
+    let to_uri = strip_angles(
+        dialog.remote_contact.as_deref()
+            .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"))
+    );
     let to_header = match &dialog.remote_tag {
         Some(tag) => format!("<{}>;tag={}", to_uri, tag),
         None => format!("<{}>", to_uri),
@@ -6499,56 +6508,12 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
         None => return,
     };
 
-    // Build a BYE message for each leg
-    let bye_branch_a = TransactionKey::generate_branch();
-    let a_bye_uri = a_leg.dialog.remote_contact.as_deref()
-        .and_then(|u| parse_uri_standalone(u).ok())
-        .unwrap_or_else(|| crate::sip::uri::SipUri::new(a_leg.transport.remote_addr.ip().to_string())
-            .with_port(a_leg.transport.remote_addr.port()));
-    let bye_a = SipMessageBuilder::new()
-        .request(crate::sip::message::Method::Bye, a_bye_uri)
-        .via(format!(
-            "SIP/2.0/{} {}:{};branch={}",
-            format!("{}", a_leg.transport.transport).to_uppercase(),
-            format_sip_host(&state.local_addr.ip().to_string()),
-            state.listen_addrs.get(&a_leg.transport.transport).map(|a| a.port()).unwrap_or(state.local_addr.port()),
-            bye_branch_a,
-        ))
-        .call_id(sip_call_id.clone())
-        .from(format!("<sip:siphon@{}>;tag=session-timer", state.local_addr))
-        .to(format!("<sip:endpoint@{}>;tag={}", a_leg.transport.remote_addr, a_leg.dialog.remote_tag.as_deref().unwrap_or("")))
-        .cseq("1 BYE".to_string())
-        .content_length(0)
-        .build();
-
-    if let Ok(bye_msg) = bye_a {
+    // Build BYE for each leg using the shared build_b2bua_bye helper.
+    if let Some(bye_msg) = build_b2bua_bye(&a_leg, state) {
         send_message(bye_msg, a_leg.transport.transport, a_leg.transport.remote_addr, a_leg.transport.connection_id, state);
     }
-
-    // BYE to B-leg (use B-leg Call-ID and From-tag)
     if let Some(b_leg) = &winner_b_leg {
-        let bye_branch_b = TransactionKey::generate_branch();
-        let b_bye_uri = b_leg.dialog.remote_contact.as_deref()
-            .and_then(|u| parse_uri_standalone(u).ok())
-            .unwrap_or_else(|| crate::sip::uri::SipUri::new(b_leg.transport.remote_addr.ip().to_string())
-                .with_port(b_leg.transport.remote_addr.port()));
-        let bye_b = SipMessageBuilder::new()
-            .request(crate::sip::message::Method::Bye, b_bye_uri)
-            .via(format!(
-                "SIP/2.0/{} {}:{};branch={}",
-                format!("{}", b_leg.transport.transport).to_uppercase(),
-                format_sip_host(&state.local_addr.ip().to_string()),
-                state.listen_addrs.get(&b_leg.transport.transport).map(|a| a.port()).unwrap_or(state.local_addr.port()),
-                bye_branch_b,
-            ))
-            .call_id(b_leg.dialog.call_id.clone())
-            .from(format!("<sip:siphon@{}>;tag={}", state.local_addr, b_leg.dialog.local_tag))
-            .to(format!("<sip:endpoint@{}>", b_leg.transport.remote_addr))
-            .cseq("1 BYE".to_string())
-            .content_length(0)
-            .build();
-
-        if let Ok(bye_msg) = bye_b {
+        if let Some(bye_msg) = build_b2bua_bye(b_leg, state) {
             send_b2bua_to_bleg(bye_msg, b_leg.transport.transport, b_leg.transport.remote_addr, state);
         }
     }
