@@ -4697,6 +4697,12 @@ fn b2bua_send_b_leg_invite(
     // These must match the dialog-creating INVITE's From/To exactly.
     b_leg.dialog.local_from_uri = b_leg_invite.headers.from().cloned();
     b_leg.dialog.remote_to_uri = b_leg_invite.headers.to().cloned();
+    debug!(
+        call_id = %call_id,
+        b_leg_from = ?b_leg.dialog.local_from_uri,
+        b_leg_to = ?b_leg.dialog.remote_to_uri,
+        "B2BUA: stored B-leg dialog From/To",
+    );
     // Store the B-leg's remote AoR host (from dial target) for in-dialog To headers.
     // In-dialog To uses the original AoR, NOT the remote Contact (which is for RURI).
     if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
@@ -5503,6 +5509,57 @@ fn handle_b2bua_response(
             }
         }
 
+        // Persist dialog route sets for in-dialog requests (BYE, re-INVITE).
+        // Must happen before we consume the Record-Routes for ACK building.
+        {
+            // B-leg route set from B-leg 200 OK Record-Route (reversed per RFC 3261 §12.1.1)
+            let mut b_routes = Vec::new();
+            for rr in b_leg_record_routes.iter().rev() {
+                for entry in rr.split(',') {
+                    let trimmed = entry.trim();
+                    if !trimmed.is_empty() {
+                        b_routes.push(trimmed.to_string());
+                    }
+                }
+            }
+            // A-leg route set from stored INVITE's Record-Route (in order for UAS)
+            let a_routes = a_leg_invite.as_ref()
+                .and_then(|arc| arc.lock().ok())
+                .and_then(|invite| invite.headers.get_all("Record-Route").cloned())
+                .map(|rrs| {
+                    let mut routes = Vec::new();
+                    for rr in &rrs {
+                        for entry in rr.split(',') {
+                            let trimmed = entry.trim();
+                            if !trimmed.is_empty() {
+                                routes.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                    routes
+                })
+                .unwrap_or_default();
+
+            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                if let Some(winner) = call.winner {
+                    if let Some(b_leg) = call.b_legs.get_mut(winner) {
+                        debug!(
+                            call_id = %call_id,
+                            b_routes_count = b_routes.len(),
+                            "B2BUA: stored B-leg dialog route set",
+                        );
+                        b_leg.dialog.route_set = b_routes.clone();
+                    }
+                }
+                debug!(
+                    call_id = %call_id,
+                    a_routes_count = a_routes.len(),
+                    "B2BUA: stored A-leg dialog route set",
+                );
+                call.a_leg.dialog.route_set = a_routes;
+            }
+        }
+
         // Late ACK pattern (RFC 3261 §14.1 compliant): do NOT ACK the B-leg
         // immediately. Instead, forward the 200 OK to A-leg and wait for A-leg's
         // ACK before ACKing B-leg. This keeps the B-leg INVITE transaction alive,
@@ -5563,38 +5620,9 @@ fn handle_b2bua_response(
                     .content_length(0)
                     .build()
                 {
-                    // Store the pre-built ACK and B-leg dialog route set.
+                    // Store the pre-built ACK (route sets already persisted above).
                     if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
                         call.pending_b_leg_ack = Some((ack, b_transport, b_dest));
-
-                        // Persist B-leg route set (reversed Record-Route from 200 OK)
-                        // for subsequent in-dialog requests (BYE, re-INVITE, etc.).
-                        if let Some(winner) = call.winner {
-                            if let Some(b_leg) = call.b_legs.get_mut(winner) {
-                                b_leg.dialog.route_set = b_leg_routes.clone();
-                            }
-                        }
-
-                        // Persist A-leg route set from the stored INVITE's Record-Route.
-                        // For A-leg (UAS side) the route set is NOT reversed — RFC 3261
-                        // §12.1.1 says the UAS uses Record-Route in order (top to bottom).
-                        let a_routes = call.a_leg_invite.as_ref()
-                            .and_then(|arc| arc.lock().ok())
-                            .and_then(|invite| invite.headers.get_all("Record-Route").cloned())
-                            .map(|rrs| {
-                                let mut routes = Vec::new();
-                                for rr in &rrs {
-                                    for entry in rr.split(',') {
-                                        let trimmed = entry.trim();
-                                        if !trimmed.is_empty() {
-                                            routes.push(trimmed.to_string());
-                                        }
-                                    }
-                                }
-                                routes
-                            })
-                            .unwrap_or_default();
-                        call.a_leg.dialog.route_set = a_routes;
                     }
                     debug!(call_id = %call_id, "B2BUA: deferred B-leg ACK until A-leg ACKs");
                 }
