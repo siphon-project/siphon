@@ -3625,6 +3625,77 @@ fn flush_deferred_sends(state: &DispatcherState) {
 /// Send a SIP message to the B-leg, using the TCP connection pool for TCP/TLS
 /// or the direct outbound channel for UDP. This ensures in-dialog messages
 /// (ACK, BYE) reach the B-leg over the correct transport.
+/// Build a clean in-dialog BYE for a B2BUA leg from stored dialog state.
+///
+/// A B2BUA generates new requests — it does NOT forward the other leg's BYE.
+/// The BYE uses only the target leg's dialog identifiers (Call-ID, From/To
+/// tags), route set, Contact, and CSeq. No headers from the originating leg
+/// are included.
+fn build_b2bua_bye(
+    leg: &crate::b2bua::actor::Leg,
+    state: &DispatcherState,
+) -> Option<SipMessage> {
+    let dialog = &leg.dialog;
+
+    // R-URI: remote Contact (RFC 3261 §12.2.1.1)
+    let ruri = dialog.remote_contact.as_deref()
+        .and_then(|uri_str| parse_uri_standalone(uri_str).ok())
+        .unwrap_or_else(|| {
+            dialog.target_uri.as_deref()
+                .and_then(|uri_str| parse_uri_standalone(uri_str).ok())
+                .unwrap_or_else(|| SipUri::new("invalid".to_string()))
+        });
+
+    let transport_str = format!("{}", leg.transport.transport).to_uppercase();
+    let branch = TransactionKey::generate_branch();
+    let via = format!(
+        "SIP/2.0/{} {}:{};branch={}",
+        transport_str,
+        state.via_host(&leg.transport.transport),
+        state.via_port(&leg.transport.transport),
+        branch,
+    );
+
+    // From: our local tag, To: remote tag (RFC 3261 §12.2.1.1)
+    let b2bua_host = state.via_host(&leg.transport.transport);
+    let local_contact = dialog.local_contact.as_deref().unwrap_or("sip:invalid");
+    let from_header = format!("<{}>;tag={}", local_contact, dialog.local_tag);
+    let to_uri = dialog.remote_contact.as_deref()
+        .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"));
+    let to_header = match &dialog.remote_tag {
+        Some(tag) => format!("<{}>;tag={}", to_uri, tag),
+        None => format!("<{}>", to_uri),
+    };
+
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Bye, ruri)
+        .via(via)
+        .from(from_header)
+        .to(to_header)
+        .call_id(dialog.call_id.clone())
+        .cseq(format!("{} BYE", dialog.local_cseq))
+        .header("Max-Forwards", "70".to_string());
+
+    // Contact: what we advertised to this leg
+    if let Some(ref contact) = dialog.local_contact {
+        builder = builder.header("Contact", contact.clone());
+    }
+
+    // User-Agent / Server header (topology hiding)
+    if let Some(ref ua) = state.user_agent_header {
+        builder = builder.header("User-Agent", ua.clone());
+    } else if let Some(ref srv) = state.server_header {
+        builder = builder.header("User-Agent", srv.clone());
+    }
+
+    // Route headers from stored dialog route set (RFC 3261 §12.2.1.1)
+    for route in &dialog.route_set {
+        builder = builder.header("Route", route.clone());
+    }
+
+    builder.content_length(0).build().ok()
+}
+
 fn send_b2bua_to_bleg(
     message: SipMessage,
     transport: Transport,
@@ -6177,152 +6248,27 @@ fn handle_b2bua_bye(
     // - CSeq (independent per dialog, RFC 3261)
     // - Max-Forwards (decrement per RFC 7332)
     if from_a_leg {
-        // BYE from A → forward to B-leg(s)
+        // BYE from A → generate new B-leg BYE from stored dialog state.
+        // A B2BUA MUST NOT forward the A-leg BYE — it generates a fresh request
+        // using only B-leg dialog identifiers, route set, and Contact.
         if let Some(winner_index) = call.winner {
             if let Some(b_leg) = call.b_legs.get(winner_index) {
-                let branch = TransactionKey::generate_branch();
-                let transport_str = format!("{}", b_leg.transport.transport).to_uppercase();
-                let via_value = format!(
-                    "SIP/2.0/{} {}:{};branch={}",
-                    transport_str,
-                    state.via_host(&b_leg.transport.transport),
-                    state.via_port(&b_leg.transport.transport),
-                    branch,
-                );
-                let mut bye = message.clone();
-                bye.headers.set("Via", via_value);
-                // Sanitize: strip headers that leak the other leg's identity
-                if let Some(ref ua) = state.user_agent_header {
-                    bye.headers.set("User-Agent", ua.clone());
-                } else {
-                    bye.headers.remove("User-Agent");
+                if let Some(bye) = build_b2bua_bye(b_leg, state) {
+                    send_b2bua_to_bleg(bye, b_leg.transport.transport, b_leg.transport.remote_addr, state);
                 }
-                bye.headers.remove("Server");
-                bye.headers.remove("Allow");
-                bye.headers.remove("Allow-Events");
-                bye.headers.remove("Supported");
-                bye.headers.remove("P-Asserted-Identity");
-                // Strip A-leg Record-Route — BYE is a mid-dialog request (RFC 3261 §12.2.1.1)
-                bye.headers.remove("Record-Route");
-                // Strip A-leg Route headers — will be replaced with B-leg route set
-                bye.headers.remove("Route");
-                // Rewrite A-leg dialog headers → B-leg dialog headers
-                crate::b2bua::actor::Dialog::rewrite_headers(
-                    &mut bye, &b_leg.dialog.call_id, call.a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &b_leg.dialog.local_tag,
-                );
-                // Rewrite From URI host to our advertised address (topology hiding)
-                let b2bua_host = state.via_host(&b_leg.transport.transport);
-                if let Some(from) = bye.headers.get("From").or_else(|| bye.headers.get("f")) {
-                    bye.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
-                }
-                // Rewrite To URI host to B-leg's original AoR (topology hiding)
-                if let Some(ref aor_host) = b_leg.dialog.remote_aor_host {
-                    if let Some(to) = bye.headers.get("To").or_else(|| bye.headers.get("t")) {
-                        bye.headers.set("To", crate::b2bua::actor::rewrite_uri_host(&to, aor_host));
-                    }
-                }
-                // Regenerate CSeq for B-leg dialog
-                let b_leg_cseq = b_leg.dialog.local_cseq;
-                bye.headers.set("CSeq", format!("{} BYE", b_leg_cseq));
-                // Decrement Max-Forwards (RFC 7332)
-                let _ = crate::proxy::core::decrement_max_forwards(&mut bye.headers);
-                // Rewrite RURI to B-leg's remote Contact (RFC 3261 §12.2.1.1)
-                if let Some(ref uri_str) = b_leg.dialog.remote_contact {
-                    if let Ok(parsed) = parse_uri_standalone(uri_str) {
-                        bye.start_line = StartLine::Request(crate::sip::message::RequestLine {
-                            method: Method::Bye,
-                            request_uri: parsed,
-                            version: crate::sip::message::Version::sip_2_0(),
-                        });
-                    }
-                }
-                // Rewrite Contact to what we advertised to B-leg
-                if let Some(ref contact) = b_leg.dialog.local_contact {
-                    bye.headers.set("Contact", contact.clone());
-                }
-                // Add B-leg dialog route set as Route headers (RFC 3261 §12.2.1.1)
-                for route in &b_leg.dialog.route_set {
-                    bye.headers.add("Route", route.clone());
-                }
-                send_b2bua_to_bleg(bye, b_leg.transport.transport, b_leg.transport.remote_addr, state);
             }
         }
     } else {
-        // BYE from B → forward to A-leg
-        let mut bye = message.clone();
-        // Sanitize: strip headers that leak the other leg's identity
-        if let Some(ref ua) = state.user_agent_header {
-            bye.headers.set("User-Agent", ua.clone());
-        } else {
-            bye.headers.remove("User-Agent");
+        // BYE from B → generate new A-leg BYE from stored dialog state.
+        if let Some(bye) = build_b2bua_bye(&call.a_leg, state) {
+            send_message(
+                bye,
+                call.a_leg.transport.transport,
+                call.a_leg.transport.remote_addr,
+                call.a_leg.transport.connection_id,
+                state,
+            );
         }
-        bye.headers.remove("Server");
-        bye.headers.remove("Allow");
-        bye.headers.remove("Allow-Events");
-        bye.headers.remove("Supported");
-        bye.headers.remove("P-Asserted-Identity");
-        // Strip B-leg Record-Route and Route — will be replaced with A-leg route set
-        bye.headers.remove("Record-Route");
-        bye.headers.remove("Route");
-        // Rewrite B-leg dialog headers → A-leg dialog headers
-        if let Some(winner_index) = call.winner {
-            if let Some(b_leg) = call.b_legs.get(winner_index) {
-                crate::b2bua::actor::Dialog::rewrite_headers(
-                    &mut bye, &call.a_leg.dialog.call_id, &b_leg.dialog.local_tag, call.a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
-                );
-                // Rewrite From URI host to our advertised address (topology hiding)
-                let b2bua_host = state.via_host(&call.a_leg.transport.transport);
-                if let Some(from) = bye.headers.get("From").or_else(|| bye.headers.get("f")) {
-                    bye.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
-                }
-                // Rewrite To URI host to A-leg's original AoR (topology hiding)
-                if let Some(ref aor_host) = call.a_leg.dialog.remote_aor_host {
-                    if let Some(to) = bye.headers.get("To").or_else(|| bye.headers.get("t")) {
-                        bye.headers.set("To", crate::b2bua::actor::rewrite_uri_host(&to, aor_host));
-                    }
-                }
-            }
-        }
-        // Regenerate CSeq for A-leg dialog
-        let a_leg_cseq = call.a_leg.dialog.local_cseq;
-        bye.headers.set("CSeq", format!("{} BYE", a_leg_cseq));
-        // New Via for A-leg direction
-        let transport_str = format!("{}", call.a_leg.transport.transport).to_uppercase();
-        let branch = TransactionKey::generate_branch();
-        bye.headers.set("Via", format!(
-            "SIP/2.0/{} {}:{};branch={}",
-            transport_str,
-            state.via_host(&call.a_leg.transport.transport),
-            state.via_port(&call.a_leg.transport.transport),
-            branch,
-        ));
-        // Decrement Max-Forwards (RFC 7332)
-        let _ = crate::proxy::core::decrement_max_forwards(&mut bye.headers);
-        // Rewrite RURI to A-leg's remote Contact (RFC 3261 §12.2.1.1)
-        if let Some(ref uri_str) = call.a_leg.dialog.remote_contact {
-            if let Ok(parsed) = parse_uri_standalone(uri_str) {
-                bye.start_line = StartLine::Request(crate::sip::message::RequestLine {
-                    method: Method::Bye,
-                    request_uri: parsed,
-                    version: crate::sip::message::Version::sip_2_0(),
-                });
-            }
-        }
-        // Rewrite Contact to what we advertised to A-leg
-        if let Some(ref contact) = call.a_leg.dialog.local_contact {
-            bye.headers.set("Contact", contact.clone());
-        }
-        // Add A-leg dialog route set as Route headers (RFC 3261 §12.2.1.1)
-        for route in &call.a_leg.dialog.route_set {
-            bye.headers.add("Route", route.clone());
-        }
-        send_message(
-            bye,
-            call.a_leg.transport.transport,
-            call.a_leg.transport.remote_addr,
-            call.a_leg.transport.connection_id,
-            state,
-        );
     }
 
     drop(call);
