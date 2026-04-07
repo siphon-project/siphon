@@ -573,31 +573,51 @@ impl PyRequest {
         self.record_routed = true;
     }
 
-    /// Process loose routing per RFC 3261 §16.12.
+    /// Process loose routing per RFC 3261 §16.4 / §16.12.
     ///
-    /// If the top Route header has the `lr` parameter (loose-routing),
-    /// strip it and return `True`. The request can then be relayed to
-    /// its Request-URI (which is the remote party's Contact URI for
-    /// in-dialog requests).
+    /// Checks whether the top Route header points to **this** server
+    /// (matches a configured domain/address) and has the `lr` parameter.
+    /// If so, removes it (and any subsequent Routes that also match us)
+    /// and returns `True`.  Otherwise returns `False` with Routes intact.
     ///
-    /// When double Record-Route is in effect (transport bridging, e.g.
-    /// TLS↔TCP), two consecutive Route entries may point to this proxy.
-    /// Both are consumed so that the relay path sees the first *external*
-    /// Route or falls back to the Request-URI.
+    /// Per RFC 3261 §16.4, a proxy MUST only consume Route entries that
+    /// identify itself.  A Route addressed to another server (e.g. the
+    /// S-CSCF Route seen by a TAS) must be left for relay().
     fn loose_route(&self) -> PyResult<bool> {
         let mut message = self.lock_mut()?;
-        let is_lr = crate::proxy::core::check_loose_route(&message.headers);
-        if is_lr {
-            // Pop the first (topmost) Route — it was addressed to us.
-            crate::proxy::core::pop_top_route(&mut message.headers);
 
-            // Pop any additional Routes that also point to us (double
-            // Record-Route from transport bridging).
-            if let Some(ref domains) = self.local_domains {
-                crate::proxy::core::pop_local_routes(&mut message.headers, domains);
+        // No Route header at all — nothing to consume, relay to R-URI.
+        if message.headers.get("Route").is_none() {
+            return Ok(true);
+        }
+
+        // Check if top Route has ;lr
+        let is_lr = crate::proxy::core::check_loose_route(&message.headers);
+        if !is_lr {
+            return Ok(false);
+        }
+
+        // Per RFC 3261 §16.4: only consume Route entries that identify *this*
+        // server.  If the top Route host doesn't match our local domains,
+        // leave it intact — relay() will forward to it.
+        if let Some(ref domains) = self.local_domains {
+            let top_is_local = crate::proxy::core::top_route_is_local(
+                &message.headers, domains,
+            );
+            if !top_is_local {
+                return Ok(false);
             }
         }
-        Ok(is_lr)
+
+        // Pop the first (topmost) Route — it was addressed to us.
+        crate::proxy::core::pop_top_route(&mut message.headers);
+
+        // Pop any additional Routes that also point to us (double
+        // Record-Route from transport bridging).
+        if let Some(ref domains) = self.local_domains {
+            crate::proxy::core::pop_local_routes(&mut message.headers, domains);
+        }
+        Ok(true)
     }
 
     /// Get the first value of a header, or None.
@@ -909,7 +929,8 @@ fn parse_nameaddr_tag(raw: Option<&String>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::sip::builder::SipMessageBuilder;
-    use crate::sip::message::Method;
+    use crate::sip::headers::SipHeaders;
+    use crate::sip::message::{Method, RequestLine, StartLine, Version};
     use crate::sip::uri::SipUri;
 
     fn invite_request_message() -> SipMessage {
@@ -1106,6 +1127,78 @@ mod tests {
     fn loose_route_no_route_header() {
         let request = make_request();
         assert!(request.loose_route().unwrap());
+    }
+
+    #[test]
+    fn loose_route_non_local_route_not_consumed() {
+        // RFC 3261 §16.4: a proxy must only consume Routes that match itself.
+        // A TAS (domain 172.16.0.152) receiving a Route to scscf.example.com
+        // must NOT consume it — relay() should follow the Route to the S-CSCF.
+        let message = SipMessage {
+            start_line: StartLine::Request(RequestLine {
+                method: Method::Invite,
+                request_uri: crate::sip::uri::SipUri::new("example.com".to_string()),
+                version: Version::sip_2_0(),
+            }),
+            headers: {
+                let mut headers = SipHeaders::new();
+                headers.add("Via", "SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK-1".into());
+                headers.add("Route", "<sip:orig@scscf.example.com;lr>".into());
+                headers
+            },
+            body: vec![],
+        };
+        let local_domains = Arc::new(vec!["172.16.0.152".to_string()]);
+        let request = PyRequest::with_local_domains(
+            Arc::new(Mutex::new(message)),
+            "tcp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+            local_domains,
+        );
+
+        // loose_route() should return false — Route doesn't match us
+        assert!(!request.loose_route().unwrap());
+
+        // Route header must still be intact
+        let msg_arc = request.message();
+        let msg = msg_arc.lock().unwrap();
+        assert!(msg.headers.get("Route").is_some());
+    }
+
+    #[test]
+    fn loose_route_local_route_consumed() {
+        // When the Route DOES match our domain, consume it normally.
+        let message = SipMessage {
+            start_line: StartLine::Request(RequestLine {
+                method: Method::Invite,
+                request_uri: crate::sip::uri::SipUri::new("bob.example.com".to_string()),
+                version: Version::sip_2_0(),
+            }),
+            headers: {
+                let mut headers = SipHeaders::new();
+                headers.add("Via", "SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK-1".into());
+                headers.add("Route", "<sip:orig@scscf.example.com;lr>".into());
+                headers
+            },
+            body: vec![],
+        };
+        let local_domains = Arc::new(vec!["scscf.example.com".to_string()]);
+        let request = PyRequest::with_local_domains(
+            Arc::new(Mutex::new(message)),
+            "tcp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+            local_domains,
+        );
+
+        // loose_route() should return true and consume the Route
+        assert!(request.loose_route().unwrap());
+
+        // Route header should be gone
+        let msg_arc = request.message();
+        let msg = msg_arc.lock().unwrap();
+        assert!(msg.headers.get("Route").is_none());
     }
 
     #[test]

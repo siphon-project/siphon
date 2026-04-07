@@ -183,6 +183,26 @@ pub fn pop_top_route(headers: &mut SipHeaders) -> Option<RouteEntry> {
     Some(removed)
 }
 
+/// Check if the top Route header's host matches one of the local domains.
+///
+/// Per RFC 3261 §16.4, a proxy must only consume Route entries that identify
+/// itself.  Returns `false` if there's no Route, no local domains, or the
+/// top Route host doesn't match.
+pub fn top_route_is_local(headers: &SipHeaders, local_domains: &[String]) -> bool {
+    let route_raw = match headers.get("Route") {
+        Some(raw) => raw,
+        None => return false,
+    };
+    let entries = match RouteEntry::parse_multi(route_raw) {
+        Ok(entries) if !entries.is_empty() => entries,
+        _ => return false,
+    };
+    let host = &entries[0].uri.host;
+    local_domains
+        .iter()
+        .any(|domain| domain.eq_ignore_ascii_case(host))
+}
+
 /// Pop all leading Route entries whose URI host matches one of the local domains.
 ///
 /// After double Record-Route (transport bridging), an in-dialog request may
