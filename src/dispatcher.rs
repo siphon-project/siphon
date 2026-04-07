@@ -5393,8 +5393,25 @@ fn handle_b2bua_response(
             }
         }
 
+        // Extract B-leg Record-Route BEFORE sanitization — needed for B-leg ACK Route set.
+        // Per RFC 3261 §12.1.1, the ACK route set is the Record-Route from the 200 OK reversed.
+        let b_leg_record_routes = response.headers.get_all("Record-Route")
+            .cloned()
+            .unwrap_or_default();
+
         // Sanitize B-leg headers before forwarding to A-leg
         sanitize_b2bua_response(&mut response, state, a_leg.transport.transport);
+
+        // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).
+        // sanitize_b2bua_response strips all Record-Route (B-leg path). The A-leg
+        // 200 OK must contain the A-leg Record-Route so the UAC can build its route set.
+        if let Some(ref invite_arc) = a_leg_invite {
+            if let Ok(invite) = invite_arc.lock() {
+                if let Some(rrs) = invite.headers.get_all("Record-Route") {
+                    response.headers.set_all("Record-Route", rrs.clone());
+                }
+            }
+        }
 
         // Late ACK pattern (RFC 3261 §14.1 compliant): do NOT ACK the B-leg
         // immediately. Instead, forward the 200 OK to A-leg and wait for A-leg's
@@ -5419,7 +5436,20 @@ fn handle_b2bua_response(
                     .unwrap_or_else(|| "1".to_string());
                 let from = message.headers.from().cloned().unwrap_or_default();
                 let to = message.headers.to().cloned().unwrap_or_default();
-                if let Ok(ack) = SipMessageBuilder::new()
+
+                // Build B-leg Route set from Record-Route (reversed per RFC 3261 §12.2.1.1).
+                let mut b_leg_routes: Vec<String> = Vec::new();
+                for rr_value in b_leg_record_routes.iter().rev() {
+                    // Each Record-Route value can contain multiple comma-separated entries
+                    for entry in rr_value.split(',') {
+                        let trimmed = entry.trim();
+                        if !trimmed.is_empty() {
+                            b_leg_routes.push(trimmed.to_string());
+                        }
+                    }
+                }
+
+                let mut ack_builder = SipMessageBuilder::new()
                     .request(Method::Ack, ack_uri)
                     .via(format!(
                         "SIP/2.0/{} {}:{};branch={}",
@@ -5432,7 +5462,14 @@ fn handle_b2bua_response(
                     .to(to.to_string())
                     .call_id(b_cid.clone())
                     .cseq(format!("{} ACK", cseq_num))
-                    .header("Max-Forwards", "70".to_string())
+                    .header("Max-Forwards", "70".to_string());
+
+                // Add Route headers from reversed B-leg Record-Route
+                for route in &b_leg_routes {
+                    ack_builder = ack_builder.header("Route", route.clone());
+                }
+
+                if let Ok(ack) = ack_builder
                     .content_length(0)
                     .build()
                 {
