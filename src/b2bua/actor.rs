@@ -109,6 +109,10 @@ pub struct Dialog {
     /// initial INVITE. Used in in-dialog To headers (not the Contact/RURI
     /// which changes per RFC 3261 §12.2.1.1).
     pub remote_aor_host: Option<String>,
+    /// Dialog route set (RFC 3261 §12.1.2): Record-Route from the dialog-
+    /// creating transaction, reversed for the UAC side. Used as Route
+    /// headers in subsequent in-dialog requests (BYE, re-INVITE, etc.).
+    pub route_set: Vec<String>,
 }
 
 impl Dialog {
@@ -124,6 +128,7 @@ impl Dialog {
             local_contact: None,
             remote_contact: None,
             remote_aor_host: None,
+            route_set: vec![],
         }
     }
 
@@ -140,6 +145,7 @@ impl Dialog {
             local_contact: None,
             remote_contact: None,
             remote_aor_host: None,
+            route_set: vec![],
         }
     }
 

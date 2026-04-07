@@ -5473,9 +5473,38 @@ fn handle_b2bua_response(
                     .content_length(0)
                     .build()
                 {
-                    // Store the pre-built ACK — will be sent when A-leg ACKs
+                    // Store the pre-built ACK and B-leg dialog route set.
                     if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
                         call.pending_b_leg_ack = Some((ack, b_transport, b_dest));
+
+                        // Persist B-leg route set (reversed Record-Route from 200 OK)
+                        // for subsequent in-dialog requests (BYE, re-INVITE, etc.).
+                        if let Some(winner) = call.winner {
+                            if let Some(b_leg) = call.b_legs.get_mut(winner) {
+                                b_leg.dialog.route_set = b_leg_routes.clone();
+                            }
+                        }
+
+                        // Persist A-leg route set from the stored INVITE's Record-Route.
+                        // For A-leg (UAS side) the route set is NOT reversed — RFC 3261
+                        // §12.1.1 says the UAS uses Record-Route in order (top to bottom).
+                        let a_routes = call.a_leg_invite.as_ref()
+                            .and_then(|arc| arc.lock().ok())
+                            .and_then(|invite| invite.headers.get_all("Record-Route").cloned())
+                            .map(|rrs| {
+                                let mut routes = Vec::new();
+                                for rr in &rrs {
+                                    for entry in rr.split(',') {
+                                        let trimmed = entry.trim();
+                                        if !trimmed.is_empty() {
+                                            routes.push(trimmed.to_string());
+                                        }
+                                    }
+                                }
+                                routes
+                            })
+                            .unwrap_or_default();
+                        call.a_leg.dialog.route_set = a_routes;
                     }
                     debug!(call_id = %call_id, "B2BUA: deferred B-leg ACK until A-leg ACKs");
                 }
@@ -6173,6 +6202,10 @@ fn handle_b2bua_bye(
                 bye.headers.remove("Allow-Events");
                 bye.headers.remove("Supported");
                 bye.headers.remove("P-Asserted-Identity");
+                // Strip A-leg Record-Route — BYE is a mid-dialog request (RFC 3261 §12.2.1.1)
+                bye.headers.remove("Record-Route");
+                // Strip A-leg Route headers — will be replaced with B-leg route set
+                bye.headers.remove("Route");
                 // Rewrite A-leg dialog headers → B-leg dialog headers
                 crate::b2bua::actor::Dialog::rewrite_headers(
                     &mut bye, &b_leg.dialog.call_id, call.a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &b_leg.dialog.local_tag,
@@ -6207,6 +6240,10 @@ fn handle_b2bua_bye(
                 if let Some(ref contact) = b_leg.dialog.local_contact {
                     bye.headers.set("Contact", contact.clone());
                 }
+                // Add B-leg dialog route set as Route headers (RFC 3261 §12.2.1.1)
+                for route in &b_leg.dialog.route_set {
+                    bye.headers.add("Route", route.clone());
+                }
                 send_b2bua_to_bleg(bye, b_leg.transport.transport, b_leg.transport.remote_addr, state);
             }
         }
@@ -6224,6 +6261,9 @@ fn handle_b2bua_bye(
         bye.headers.remove("Allow-Events");
         bye.headers.remove("Supported");
         bye.headers.remove("P-Asserted-Identity");
+        // Strip B-leg Record-Route and Route — will be replaced with A-leg route set
+        bye.headers.remove("Record-Route");
+        bye.headers.remove("Route");
         // Rewrite B-leg dialog headers → A-leg dialog headers
         if let Some(winner_index) = call.winner {
             if let Some(b_leg) = call.b_legs.get(winner_index) {
@@ -6271,6 +6311,10 @@ fn handle_b2bua_bye(
         // Rewrite Contact to what we advertised to A-leg
         if let Some(ref contact) = call.a_leg.dialog.local_contact {
             bye.headers.set("Contact", contact.clone());
+        }
+        // Add A-leg dialog route set as Route headers (RFC 3261 §12.2.1.1)
+        for route in &call.a_leg.dialog.route_set {
+            bye.headers.add("Route", route.clone());
         }
         send_message(
             bye,
