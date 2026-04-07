@@ -132,9 +132,6 @@ impl SiphonServer {
         dispatcher::inject_python_singletons(&config);
         let pre_rtpengine = dispatcher::init_rtpengine(&config);
 
-        // --- Restore registrar contacts from backend (if configured) ---
-        init_registrar_backend(&config).await;
-
         // --- Gateway dispatcher ---
         let gateway_manager = init_gateway(&config);
 
@@ -252,6 +249,11 @@ impl SiphonServer {
                 }
             });
         }
+
+        // --- Restore registrar contacts + iFC profiles from backend ---
+        // Must run after ISC singleton init so ifc_store_arc() is available
+        // for the iFC Redis restore in init_ifc_redis_backend().
+        init_registrar_backend(&config).await;
 
         // --- Script engine ---
         let engine = if let Some(bytecode) = self.embedded_bytecode {
