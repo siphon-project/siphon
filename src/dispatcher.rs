@@ -3697,7 +3697,13 @@ fn build_b2bua_bye(
         builder = builder.header("Route", route.clone());
     }
 
-    builder.content_length(0).build().ok()
+    match builder.content_length(0).build() {
+        Ok(msg) => Some(msg),
+        Err(error) => {
+            warn!("B2BUA: failed to build BYE: {error}");
+            None
+        }
+    }
 }
 
 fn send_b2bua_to_bleg(
@@ -6301,9 +6307,16 @@ fn handle_b2bua_bye(
         if let Some(winner_index) = call.winner {
             if let Some(b_leg) = call.b_legs.get(winner_index) {
                 if let Some(bye) = build_b2bua_bye(b_leg, state) {
+                    debug!(call_id = %call_id, destination = %b_leg.transport.remote_addr, "B2BUA: sending BYE to B-leg");
                     send_b2bua_to_bleg(bye, b_leg.transport.transport, b_leg.transport.remote_addr, state);
+                } else {
+                    warn!(call_id = %call_id, "B2BUA: failed to build B-leg BYE");
                 }
+            } else {
+                warn!(call_id = %call_id, "B2BUA: no winning B-leg for BYE");
             }
+        } else {
+            warn!(call_id = %call_id, "B2BUA: no winner set for BYE");
         }
     } else {
         // BYE from B → generate new A-leg BYE from stored dialog state.
