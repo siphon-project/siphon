@@ -3368,6 +3368,10 @@ fn sanitize_b2bua_response(
     // Per RFC 3325 / RFC 3455, these are trust-domain headers that B2BUAs
     // within the trust domain SHOULD forward. Keep them.
 
+    // Record-Route from the B-leg path must never leak to the A-leg.
+    // Each leg has its own independent dialog and route set (RFC 3261 §16).
+    response.headers.remove("Record-Route");
+
     // Strip B-leg capability headers — siphon terminates the dialog.
     // These reveal the remote endpoint's feature set and break topology hiding.
     response.headers.remove("Allow");
