@@ -3656,25 +3656,20 @@ fn build_b2bua_bye(
         branch,
     );
 
-    // From: our local tag, To: remote tag (RFC 3261 §12.2.1.1)
-    // Strip angle brackets from stored Contact values — they may already
-    // contain <>, and we need bare URIs for the name-addr format.
-    fn strip_angles(s: &str) -> String {
-        let trimmed = s.trim();
-        trimmed.strip_prefix('<').unwrap_or(trimmed)
-            .strip_suffix('>').unwrap_or(trimmed)
-            .to_string()
-    }
-    let local_contact_uri = strip_angles(dialog.local_contact.as_deref().unwrap_or("sip:invalid"));
-    let from_header = format!("<{}>;tag={}", local_contact_uri, dialog.local_tag);
-    let to_uri = strip_angles(
-        dialog.remote_contact.as_deref()
-            .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"))
-    );
-    let to_header = match &dialog.remote_tag {
-        Some(tag) => format!("<{}>;tag={}", to_uri, tag),
-        None => format!("<{}>", to_uri),
-    };
+    // From/To: use stored values from the dialog-creating INVITE.
+    // These must match exactly (same URI, same tags) for the remote
+    // endpoint to match the BYE to the dialog (RFC 3261 §12.2.1.1).
+    let from_header = dialog.local_from_uri.clone()
+        .unwrap_or_else(|| format!("<{}>;tag={}", dialog.local_contact.as_deref().unwrap_or("sip:invalid"), dialog.local_tag));
+    let to_header = dialog.remote_to_uri.clone()
+        .unwrap_or_else(|| {
+            let to_uri = dialog.remote_contact.as_deref()
+                .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"));
+            match &dialog.remote_tag {
+                Some(tag) => format!("<{}>;tag={}", to_uri, tag),
+                None => format!("<{}>", to_uri),
+            }
+        });
 
     let mut builder = SipMessageBuilder::new()
         .request(Method::Bye, ruri)
@@ -4342,6 +4337,17 @@ fn handle_b2bua_invite(
         }
     }
 
+    // Store A-leg From/To for mid-dialog requests. As UAS, our From in BYE
+    // is the INVITE's To (with our local_tag), our To is the INVITE's From.
+    if let Some(to) = message.headers.to() {
+        // Replace/add our tag (the INVITE's To may not have a tag yet)
+        let tag_stripped = to.split(";tag=").next().unwrap_or(to);
+        a_leg.dialog.local_from_uri = Some(format!("{};tag={}", tag_stripped, a_leg.dialog.local_tag));
+    }
+    if let Some(from) = message.headers.from() {
+        a_leg.dialog.remote_to_uri = Some(from.clone());
+    }
+
     let call_id = state.call_actors.create_call(a_leg);
 
     // Create the event channel for B-leg actors → dispatcher.
@@ -4687,6 +4693,10 @@ fn b2bua_send_b_leg_invite(
         },
     );
     b_leg.dialog.local_contact = Some(b_contact_value);
+    // Store From/To URIs for mid-dialog requests (BYE, re-INVITE).
+    // These must match the dialog-creating INVITE's From/To exactly.
+    b_leg.dialog.local_from_uri = b_leg_invite.headers.from().cloned();
+    b_leg.dialog.remote_to_uri = b_leg_invite.headers.to().cloned();
     // Store the B-leg's remote AoR host (from dial target) for in-dialog To headers.
     // In-dialog To uses the original AoR, NOT the remote Contact (which is for RURI).
     if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
@@ -6652,7 +6662,7 @@ fn handle_b2bua_reinvite(
         forwarded.headers.set("Via", via_value);
 
         // Sanitize: strip headers that leak the other leg's identity/capabilities.
-        // SIPhon is UAC on the forwarded re-INVITE, so set our own User-Agent.
+        // A B2BUA terminates the dialog — no cross-leg headers should pass through.
         if let Some(ref ua) = state.user_agent_header {
             forwarded.headers.set("User-Agent", ua.clone());
         } else {
@@ -6663,22 +6673,42 @@ fn handle_b2bua_reinvite(
         forwarded.headers.remove("Allow-Events");
         forwarded.headers.remove("Supported");
         forwarded.headers.remove("Require");
-        // P-Asserted-Identity from the other leg must not cross the B2BUA boundary.
+        forwarded.headers.remove("Proxy-Require");
         forwarded.headers.remove("P-Asserted-Identity");
+        forwarded.headers.remove("P-Access-Network-Info");
+        forwarded.headers.remove("Security-Verify");
+        forwarded.headers.remove("Security-Client");
+        forwarded.headers.remove("Authorization");
+        forwarded.headers.remove("Proxy-Authorization");
+        // Strip cross-leg Record-Route and Route — replace with target leg's route set
+        forwarded.headers.remove("Record-Route");
+        forwarded.headers.remove("Route");
 
-        // Rewrite From URI host to our advertised address (topology hiding)
-        let b2bua_host = state.via_host(&transport);
-        if let Some(from) = forwarded.headers.get("From").or_else(|| forwarded.headers.get("f")) {
-            forwarded.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
+        // Add target leg's dialog route set as Route headers
+        let target_route_set = if from_a_leg {
+            winner_b_leg.as_ref().map(|b| b.dialog.route_set.clone()).unwrap_or_default()
+        } else {
+            a_leg.dialog.route_set.clone()
+        };
+        for route in &target_route_set {
+            forwarded.headers.add("Route", route.clone());
         }
 
-        // Rewrite To URI host to the target leg's original AoR (topology hiding).
-        // In-dialog To headers use the AoR from dialog establishment — NOT the
-        // remote Contact (which is for RURI only, per RFC 3261 §12.2.1.1).
-        if let Some(ref aor_host) = target_remote_aor_host {
-            if let Some(to) = forwarded.headers.get("To").or_else(|| forwarded.headers.get("t")) {
-                forwarded.headers.set("To", crate::b2bua::actor::rewrite_uri_host(&to, aor_host));
-            }
+        // Set From/To from stored dialog state (must match the dialog-creating INVITE).
+        let (target_from, target_to) = if from_a_leg {
+            let b = winner_b_leg.as_ref();
+            (
+                b.and_then(|b| b.dialog.local_from_uri.clone()),
+                b.and_then(|b| b.dialog.remote_to_uri.clone()),
+            )
+        } else {
+            (a_leg.dialog.local_from_uri.clone(), a_leg.dialog.remote_to_uri.clone())
+        };
+        if let Some(from) = target_from {
+            forwarded.headers.set("From", from);
+        }
+        if let Some(to) = target_to {
+            forwarded.headers.set("To", to);
         }
 
         // Regenerate CSeq for the target leg's dialog (RFC 3261 — independent CSeq per dialog)

@@ -113,6 +113,11 @@ pub struct Dialog {
     /// creating transaction, reversed for the UAC side. Used as Route
     /// headers in subsequent in-dialog requests (BYE, re-INVITE, etc.).
     pub route_set: Vec<String>,
+    /// Our From URI for this dialog (for mid-dialog requests like BYE).
+    /// Must match the From used in the dialog-creating request.
+    pub local_from_uri: Option<String>,
+    /// Remote To URI for this dialog (for mid-dialog requests like BYE).
+    pub remote_to_uri: Option<String>,
 }
 
 impl Dialog {
@@ -129,6 +134,8 @@ impl Dialog {
             remote_contact: None,
             remote_aor_host: None,
             route_set: vec![],
+            local_from_uri: None,
+            remote_to_uri: None,
         }
     }
 
@@ -146,6 +153,8 @@ impl Dialog {
             remote_contact: None,
             remote_aor_host: None,
             route_set: vec![],
+            local_from_uri: None,
+            remote_to_uri: None,
         }
     }
 
