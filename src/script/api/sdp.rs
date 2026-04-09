@@ -141,6 +141,21 @@ impl PySdp {
         Ok(self.lock()?.session_get_attr(name).map(|s| s.to_string()))
     }
 
+    /// Get all session-level attribute values matching ``name``.
+    fn get_attrs_by_name(&self, name: &str) -> PyResult<Vec<String>> {
+        Ok(self.lock()?.session_get_attrs_by_name(name)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect())
+    }
+
+    /// Replace all session-level attributes matching ``name`` with new values.
+    fn set_attrs_by_name(&self, name: &str, values: Vec<String>) -> PyResult<()> {
+        let str_values: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
+        self.lock()?.session_set_attrs_by_name(name, &str_values);
+        Ok(())
+    }
+
     /// Set (replace or append) a session-level attribute.
     ///
     /// `set_attr("group", "BUNDLE audio")` → `a=group:BUNDLE audio`.
@@ -358,6 +373,39 @@ impl PyMediaSection {
         Ok(sdp.media_sections[self.index]
             .get_attr(name)
             .map(|s| s.to_string()))
+    }
+
+    /// Get all values of ``a=`` attributes matching ``name``, preserving order.
+    ///
+    /// ```python,ignore
+    /// vals = m.get_attrs_by_name("des")
+    /// # ["qos optional local sendrecv", "qos mandatory remote sendrecv"]
+    /// ```
+    fn get_attrs_by_name(&self, name: &str) -> PyResult<Vec<String>> {
+        let sdp = self.lock()?;
+        self.check_index(&sdp)?;
+        Ok(sdp.media_sections[self.index]
+            .get_attrs_by_name(name)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect())
+    }
+
+    /// Replace all ``a=`` attributes matching ``name`` with new values.
+    ///
+    /// Preserves position of the first original match. If no match existed, appends.
+    ///
+    /// ```python,ignore
+    /// vals = m.get_attrs_by_name("des")
+    /// vals = [v.replace("mandatory", "optional") for v in vals]
+    /// m.set_attrs_by_name("des", vals)
+    /// ```
+    fn set_attrs_by_name(&self, name: &str, values: Vec<String>) -> PyResult<()> {
+        let str_values: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
+        let mut sdp = self.lock()?;
+        self.check_index(&sdp)?;
+        sdp.media_sections[self.index].set_attrs_by_name(name, &str_values);
+        Ok(())
     }
 
     /// Set (replace first or append) a media-level attribute.
