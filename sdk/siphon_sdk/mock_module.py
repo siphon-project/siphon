@@ -1733,8 +1733,13 @@ class MockDiameter:
         self._sar_responses: dict[str, dict] = {}
         self._lir_responses: dict[str, dict] = {}
         self._aar_responses: dict[str, dict] = {}  # session_id -> response
+        # Sh (AS → HSS) responses, keyed by public_identity
+        self._udr_responses: dict[str, dict] = {}
+        self._pur_responses: dict[str, dict] = {}
+        self._snr_responses: dict[str, dict] = {}
         self._default_server_name: Optional[str] = None
         self._default_rx_result_code: int = 2001
+        self._default_sh_result_code: int = 2001
 
     def is_connected(self, peer_name: str) -> bool:
         """Check if a Diameter peer is connected.
@@ -1842,6 +1847,59 @@ class MockDiameter:
             Result code (int), or ``None``.
         """
         return self._default_rx_result_code
+
+    # -- Sh: HSS integration (Application Server role) --
+
+    def sh_udr(self, public_identity: str,
+               data_reference,
+               service_indication: Optional[str] = None) -> Optional[dict]:
+        """Send a Sh User-Data-Request to fetch user profile data from the HSS.
+
+        Args:
+            public_identity: Target user's public identity.
+            data_reference: Data-Reference int or list[int] (TS 29.328 §7.6).
+            service_indication: e.g. ``"simservs"`` for Repository-Data.
+
+        Returns:
+            Dict with ``result_code`` and ``user_data`` (XML), or ``None``.
+        """
+        if public_identity in self._udr_responses:
+            return dict(self._udr_responses[public_identity])
+        return {"result_code": self._default_sh_result_code, "user_data": None}
+
+    def sh_pur(self, public_identity: str,
+               data_reference: int,
+               xml: str) -> Optional[dict]:
+        """Send a Sh Profile-Update-Request to push user profile data to the HSS.
+
+        Args:
+            public_identity: Target user's public identity.
+            data_reference: Data-Reference (e.g. ``0`` = Repository-Data).
+            xml: UTF-8 XML payload.
+
+        Returns:
+            Dict with ``result_code``, or ``None``.
+        """
+        if public_identity in self._pur_responses:
+            return dict(self._pur_responses[public_identity])
+        return {"result_code": self._default_sh_result_code}
+
+    def sh_snr(self, public_identity: str,
+               data_reference,
+               subs_req_type: int) -> Optional[dict]:
+        """Send a Sh Subscribe-Notifications-Request to the HSS.
+
+        Args:
+            public_identity: Target user's public identity.
+            data_reference: Data-Reference int or list[int] to subscribe to.
+            subs_req_type: ``0`` = SUBSCRIBE, ``1`` = UNSUBSCRIBE.
+
+        Returns:
+            Dict with ``result_code``, or ``None``.
+        """
+        if public_identity in self._snr_responses:
+            return dict(self._snr_responses[public_identity])
+        return {"result_code": self._default_sh_result_code}
 
     # -- Test helpers --
 
@@ -1967,6 +2025,40 @@ class MockDiameter:
         """
         return fn
 
+    @staticmethod
+    def on_pnr(fn: Any) -> Any:
+        """Register a handler for incoming Sh PNR (Push-Notification-Request).
+
+        Handler receives ``(public_identity, user_data_xml)``. Siphon auto-sends
+        PNA (result 2001) after the handler returns.
+
+        Example::
+
+            @diameter.on_pnr
+            def handle_pnr(public_identity, user_data_xml):
+                cache.put("simservs", public_identity, user_data_xml)
+        """
+        return fn
+
+    def set_udr_response(self, public_identity: str,
+                         result_code: int = 2001,
+                         user_data: Optional[str] = None) -> None:
+        """Configure a mock UDA response for a specific user (test helper)."""
+        self._udr_responses[public_identity] = {
+            "result_code": result_code,
+            "user_data": user_data,
+        }
+
+    def set_pur_response(self, public_identity: str,
+                         result_code: int = 2001) -> None:
+        """Configure a mock PUA response for a specific user (test helper)."""
+        self._pur_responses[public_identity] = {"result_code": result_code}
+
+    def set_snr_response(self, public_identity: str,
+                         result_code: int = 2001) -> None:
+        """Configure a mock SNA response for a specific user (test helper)."""
+        self._snr_responses[public_identity] = {"result_code": result_code}
+
     def clear(self) -> None:
         """Reset all mock peers and responses (test helper)."""
         self._peers.clear()
@@ -1974,8 +2066,12 @@ class MockDiameter:
         self._sar_responses.clear()
         self._lir_responses.clear()
         self._aar_responses.clear()
+        self._udr_responses.clear()
+        self._pur_responses.clear()
+        self._snr_responses.clear()
         self._default_server_name = None
         self._default_rx_result_code = 2001
+        self._default_sh_result_code = 2001
 
 
 # ---------------------------------------------------------------------------

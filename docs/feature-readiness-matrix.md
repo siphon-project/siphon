@@ -247,7 +247,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
 | Diameter Cx (HSS auth) | Implemented | `auth.backend: diameter_cx` | MAR/SAA, SAR/SAA, UAR/UAA, LIR/LIA |
-| Diameter Sh (HSS user data) | Implemented | `diameter` | UDR/UDA, PUR/PUA, SNR/SNA |
+| Diameter Sh (HSS user data) | Implemented | `diameter` | UDR/UDA, PUR/PUA, SNR/SNA, PNR/PNA — both HSS and AS roles (`sh_udr`/`sh_pur`/`sh_snr`, `@on_pnr`) |
 | Diameter Ro (online charging) | Implemented | `diameter` | CCR/CCA |
 | Diameter Rf (offline charging) | Implemented | `diameter` | ACR/ACA |
 | Diameter Rx (policy/QoS) | Implemented | `diameter` | AAR/AAA, STR/STA, RAR/RAA |

@@ -228,6 +228,68 @@ impl DiameterClient {
         self.peer.send_request(msg).await
     }
 
+    /// Send a Sh User-Data-Request (AS → HSS) and return the UDA.
+    pub async fn send_udr(
+        &self,
+        public_identity: &str,
+        data_references: &[u32],
+        service_indication: Option<&str>,
+    ) -> Result<codec::DiameterMessage, String> {
+        let session_id = self.peer.new_session_id();
+        let wire = sh::build_user_data_request(
+            self.peer.config(),
+            &session_id,
+            public_identity,
+            data_references,
+            service_indication,
+            self.peer.next_hbh(),
+            self.peer.next_e2e(),
+        );
+        self.peer.send_request(wire).await
+    }
+
+    /// Send a Sh Profile-Update-Request (AS → HSS) and return the PUA.
+    pub async fn send_pur(
+        &self,
+        public_identity: &str,
+        data_reference: u32,
+        xml_payload: &str,
+    ) -> Result<codec::DiameterMessage, String> {
+        let session_id = self.peer.new_session_id();
+        let wire = sh::build_profile_update_request(
+            self.peer.config(),
+            &session_id,
+            public_identity,
+            data_reference,
+            xml_payload,
+            self.peer.next_hbh(),
+            self.peer.next_e2e(),
+        );
+        self.peer.send_request(wire).await
+    }
+
+    /// Send a Sh Subscribe-Notifications-Request (AS → HSS) and return the SNA.
+    pub async fn send_snr(
+        &self,
+        public_identity: &str,
+        data_references: &[u32],
+        subs_req_type: u32,
+        service_indication: Option<&str>,
+    ) -> Result<codec::DiameterMessage, String> {
+        let session_id = self.peer.new_session_id();
+        let wire = sh::build_subscribe_notifications_request(
+            self.peer.config(),
+            &session_id,
+            public_identity,
+            data_references,
+            subs_req_type,
+            service_indication,
+            self.peer.next_hbh(),
+            self.peer.next_e2e(),
+        );
+        self.peer.send_request(wire).await
+    }
+
     /// Shutdown the underlying peer connection.
     pub fn shutdown(&self) {
         self.peer.shutdown();

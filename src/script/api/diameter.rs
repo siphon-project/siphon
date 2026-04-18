@@ -41,6 +41,14 @@ use crate::diameter::cx::{octet_string_as_utf8, required_str};
 use crate::diameter::rx::extract_result_code;
 use crate::diameter::DiameterManager;
 
+/// Extract Sh Data-Reference(s) from a Python object that may be ``int`` or ``list[int]``.
+fn extract_references(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+    if let Ok(single) = obj.extract::<u32>() {
+        return Ok(vec![single]);
+    }
+    obj.extract::<Vec<u32>>()
+}
+
 /// Python-visible Diameter namespace.
 #[pyclass(name = "DiameterNamespace", skip_from_py_object)]
 pub struct PyDiameter {
@@ -450,6 +458,201 @@ impl PyDiameter {
         Ok(func)
     }
 
+    /// Register a handler for incoming Sh Push-Notification-Request (PNR) from the HSS.
+    ///
+    /// The HSS sends PNR (command 309, Sh) when a subscribed user's profile
+    /// changes (MMTEL config edit via XCAP, CFU activation, etc.). Siphon
+    /// automatically sends PNA (result 2001) after the handler returns.
+    ///
+    /// Args:
+    ///     func: Callback ``fn(public_identity, user_data_xml)``. ``user_data_xml``
+    ///         is the Sh-Data XML payload, or ``None`` if the PNR had no payload.
+    ///
+    /// Usage:
+    ///
+    /// ```python,ignore
+    /// @diameter.on_pnr
+    /// def handle_pnr(public_identity, user_data_xml):
+    ///     cache.put("simservs", public_identity, user_data_xml)
+    /// ```
+    #[staticmethod]
+    fn on_pnr(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let asyncio = python.import("asyncio")?;
+        let is_async = asyncio
+            .call_method1("iscoroutinefunction", (func.bind(python),))?
+            .is_truthy()?;
+        let registry = python.import("_siphon_registry")?;
+        registry.call_method1(
+            "register",
+            ("diameter.on_pnr", python.None(), func.bind(python), is_async),
+        )?;
+        Ok(func)
+    }
+
+    /// Send a Sh User-Data-Request to the HSS (AS role).
+    ///
+    /// Used by an Application Server (e.g. MMTEL-AS) to fetch user profile
+    /// data (simservs XML, iFC, public identities, etc.).
+    ///
+    /// Args:
+    ///     public_identity: Target user's public identity.
+    ///     data_reference: One of the TS 29.328 §7.6 Data-Reference values
+    ///         (e.g. ``0`` = Repository-Data, ``11`` = IMS-User-State,
+    ///         ``13`` = Initial-Filter-Criteria).  Accepts an ``int`` or a
+    ///         ``list[int]`` for multiple references.
+    ///     service_indication: Service indication (e.g. ``"simservs"``),
+    ///         required when Data-Reference is Repository-Data.
+    ///
+    /// Returns:
+    ///     Dict with ``result_code`` (int) and ``user_data`` (str or None,
+    ///     the Sh-Data XML payload), or ``None`` if no Diameter peer is connected.
+    #[pyo3(signature = (public_identity, data_reference, service_indication=None))]
+    fn sh_udr<'py>(
+        &self,
+        python: Python<'py>,
+        public_identity: &str,
+        data_reference: &Bound<'_, PyAny>,
+        service_indication: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.manager.any_client() {
+            Some(client) => client,
+            None => {
+                warn!("sh_udr: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+
+        let references = extract_references(data_reference)?;
+
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.send_udr(
+                public_identity,
+                &references,
+                service_indication,
+            ))
+        });
+
+        match answer {
+            Ok(message) => {
+                let result_code = extract_result_code(&message.avps);
+                let user_data = octet_string_as_utf8(&message.avps, "User-Data-Sh");
+
+                let dict = PyDict::new(python);
+                dict.set_item("result_code", result_code)?;
+                dict.set_item("user_data", user_data)?;
+                Ok(Some(dict))
+            }
+            Err(error) => {
+                warn!(error = %error, "sh_udr failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send a Sh Profile-Update-Request to the HSS (AS role).
+    ///
+    /// Used by an Application Server to upload updated user profile data
+    /// (e.g. simservs XML after XCAP PUT).
+    ///
+    /// Args:
+    ///     public_identity: Target user's public identity.
+    ///     data_reference: Data-Reference value (usually ``0`` for Repository-Data).
+    ///     xml: UTF-8 XML payload for the User-Data-Sh AVP.
+    ///
+    /// Returns:
+    ///     Dict with ``result_code`` (int), or ``None`` if no peer is connected.
+    #[pyo3(signature = (public_identity, data_reference, xml))]
+    fn sh_pur<'py>(
+        &self,
+        python: Python<'py>,
+        public_identity: &str,
+        data_reference: u32,
+        xml: &str,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.manager.any_client() {
+            Some(client) => client,
+            None => {
+                warn!("sh_pur: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.send_pur(
+                public_identity,
+                data_reference,
+                xml,
+            ))
+        });
+
+        match answer {
+            Ok(message) => {
+                let result_code = extract_result_code(&message.avps);
+                let dict = PyDict::new(python);
+                dict.set_item("result_code", result_code)?;
+                Ok(Some(dict))
+            }
+            Err(error) => {
+                warn!(error = %error, "sh_pur failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send a Sh Subscribe-Notifications-Request to the HSS (AS role).
+    ///
+    /// Used by an Application Server to subscribe (or unsubscribe) for
+    /// notifications about a user's profile changes. The HSS will later push
+    /// updates via PNR — register a handler via ``@diameter.on_pnr``.
+    ///
+    /// Args:
+    ///     public_identity: Target user's public identity.
+    ///     data_reference: Data-Reference (int) or list of references to subscribe to.
+    ///     subs_req_type: ``0`` = SUBSCRIBE, ``1`` = UNSUBSCRIBE.
+    ///
+    /// Returns:
+    ///     Dict with ``result_code`` (int), or ``None`` if no peer is connected.
+    #[pyo3(signature = (public_identity, data_reference, subs_req_type))]
+    fn sh_snr<'py>(
+        &self,
+        python: Python<'py>,
+        public_identity: &str,
+        data_reference: &Bound<'_, PyAny>,
+        subs_req_type: u32,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.manager.any_client() {
+            Some(client) => client,
+            None => {
+                warn!("sh_snr: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+
+        let references = extract_references(data_reference)?;
+
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.send_snr(
+                public_identity,
+                &references,
+                subs_req_type,
+                None,
+            ))
+        });
+
+        match answer {
+            Ok(message) => {
+                let result_code = extract_result_code(&message.avps);
+                let dict = PyDict::new(python);
+                dict.set_item("result_code", result_code)?;
+                Ok(Some(dict))
+            }
+            Err(error) => {
+                warn!(error = %error, "sh_snr failed");
+                Ok(None)
+            }
+        }
+    }
+
     #[pyo3(signature = (session_id,))]
     fn rx_str(&self, session_id: &str) -> PyResult<Option<u32>> {
         let client = match self.manager.any_client() {
@@ -604,5 +807,73 @@ mod tests {
         let py_diameter = PyDiameter::new(manager);
         let result = py_diameter.rx_str("rx-session-1").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn sh_udr_returns_none_without_peer() {
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        let py_diameter = PyDiameter::new(manager);
+        pyo3::Python::attach(|python| {
+            let data_reference = 0u32.into_pyobject(python).unwrap();
+            let result = py_diameter
+                .sh_udr(
+                    python,
+                    "sip:alice@ims.example.com",
+                    data_reference.as_any(),
+                    Some("simservs"),
+                )
+                .unwrap();
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn sh_pur_returns_none_without_peer() {
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        let py_diameter = PyDiameter::new(manager);
+        pyo3::Python::attach(|python| {
+            let result = py_diameter
+                .sh_pur(
+                    python,
+                    "sip:alice@ims.example.com",
+                    0,
+                    "<simservs/>",
+                )
+                .unwrap();
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn sh_snr_returns_none_without_peer() {
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        let py_diameter = PyDiameter::new(manager);
+        pyo3::Python::attach(|python| {
+            let data_reference = vec![0u32, 17u32].into_pyobject(python).unwrap();
+            let result = py_diameter
+                .sh_snr(
+                    python,
+                    "sip:alice@ims.example.com",
+                    data_reference.as_any(),
+                    0,
+                )
+                .unwrap();
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn extract_references_accepts_int_and_list() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let single = 17u32.into_pyobject(python).unwrap();
+            assert_eq!(extract_references(single.as_any()).unwrap(), vec![17]);
+
+            let list = vec![0u32, 11u32].into_pyobject(python).unwrap();
+            assert_eq!(extract_references(list.as_any()).unwrap(), vec![0, 11]);
+        });
     }
 }

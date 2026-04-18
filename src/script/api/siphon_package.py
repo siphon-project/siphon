@@ -512,6 +512,25 @@ class _DiameterNamespace:
         _registry.register("diameter.on_asr", None, fn, is_async)
         return fn
 
+    @staticmethod
+    def on_pnr(fn):
+        """Register handler for incoming Sh PNR (Push-Notification-Request) from HSS.
+
+        Handler receives (public_identity, user_data_xml).
+        Siphon auto-sends PNA (result 2001) after the handler returns.
+
+        The HSS sends PNR when a user's profile changes (simservs edit,
+        iFC update, etc.) after the AS subscribed via ``diameter.sh_snr``.
+
+        Usage:
+            @diameter.on_pnr
+            def handle_pnr(public_identity, user_data_xml):
+                cache.put("simservs", public_identity, user_data_xml)
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("diameter.on_pnr", None, fn, is_async)
+        return fn
+
 
 diameter = _DiameterNamespace()
 

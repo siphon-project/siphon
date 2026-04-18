@@ -71,6 +71,8 @@ pub enum HandlerKind {
     DiameterOnRar,
     /// `@diameter.on_asr` — incoming Abort-Session-Request from PCRF.
     DiameterOnAsr,
+    /// `@diameter.on_pnr` — incoming Sh Push-Notification-Request from HSS.
+    DiameterOnPnr,
     /// `@sbi.on_event` — incoming PCF event notification (N5).
     SbiOnEvent,
 }
@@ -677,6 +679,7 @@ fn extract_handlers(
             "diameter.on_rtr" => HandlerKind::DiameterOnRtr,
             "diameter.on_rar" => HandlerKind::DiameterOnRar,
             "diameter.on_asr" => HandlerKind::DiameterOnAsr,
+            "diameter.on_pnr" => HandlerKind::DiameterOnPnr,
             "sbi.on_event" => HandlerKind::SbiOnEvent,
             "timer.every" => {
                 let meta = metadata.ok_or_else(|| {

@@ -857,6 +857,107 @@ pub async fn run(
                         .await
                         .ok();
                     }
+                    crate::diameter::dictionary::CMD_SH_PUSH_NOTIFICATION => {
+                        // PNR from HSS — Sh push notification (TS 29.328 §6.1.7)
+                        let parsed = crate::diameter::sh::parse_push_notification(&incoming);
+                        let config = peer.config();
+
+                        if engine_state
+                            .handlers_for(&HandlerKind::DiameterOnPnr)
+                            .is_empty()
+                        {
+                            let session_id = incoming
+                                .avps
+                                .get("Session-Id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let pna = crate::diameter::sh::build_push_notification_answer(
+                                &config.origin_host,
+                                &config.origin_realm,
+                                session_id,
+                                crate::diameter::dictionary::DIAMETER_SUCCESS,
+                                incoming.hop_by_hop,
+                                incoming.end_to_end,
+                            );
+                            if let Err(error) = peer.send_response(pna).await {
+                                tracing::warn!(%error, "failed to send PNA (no handler)");
+                            }
+                            continue;
+                        }
+
+                        let state_ref = Arc::clone(&state_for_diameter);
+                        let peer_for_pna = Arc::clone(&peer);
+
+                        tokio::task::spawn_blocking(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state.handlers_for(&HandlerKind::DiameterOnPnr);
+
+                            let (session_id, public_identity, user_data_xml) = match parsed {
+                                Some(pnr) => {
+                                    (pnr.session_id, pnr.public_identity, pnr.user_data_xml)
+                                }
+                                None => {
+                                    tracing::warn!("failed to parse incoming Sh PNR");
+                                    return;
+                                }
+                            };
+
+                            pyo3::Python::attach(|python| {
+                                let py_user_data: pyo3::Py<pyo3::PyAny> = match &user_data_xml {
+                                    Some(xml) => xml
+                                        .as_str()
+                                        .into_pyobject(python)
+                                        .map(|s| s.into_any().into())
+                                        .unwrap_or_else(|_| python.None().into()),
+                                    None => python.None().into(),
+                                };
+
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        public_identity.as_str(),
+                                        py_user_data.bind(python),
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async diameter.on_pnr handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "diameter.on_pnr handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+
+                            let config = peer_for_pna.config();
+                            let pna = crate::diameter::sh::build_push_notification_answer(
+                                &config.origin_host,
+                                &config.origin_realm,
+                                &session_id,
+                                crate::diameter::dictionary::DIAMETER_SUCCESS,
+                                incoming.hop_by_hop,
+                                incoming.end_to_end,
+                            );
+                            let runtime = tokio::runtime::Handle::current();
+                            runtime.block_on(async {
+                                if let Err(error) = peer_for_pna.send_response(pna).await {
+                                    tracing::warn!(%error, "failed to send PNA");
+                                }
+                            });
+                        })
+                        .await
+                        .ok();
+                    }
                     _ => {
                         tracing::debug!(
                             command_code = incoming.command_code,

@@ -9,7 +9,7 @@
 
 use crate::diameter::codec::*;
 use crate::diameter::dictionary::{self, avp};
-use crate::diameter::peer::IncomingRequest;
+use crate::diameter::peer::{IncomingRequest, PeerConfig};
 
 /// Data-Reference values per TS 29.328 section 7.6.
 pub mod data_reference {
@@ -355,6 +355,175 @@ pub fn build_push_notification(
         .encode()
 }
 
+/// Parsed Push-Notification-Request (HSS → AS).
+#[derive(Debug, Clone)]
+pub struct PushNotificationData {
+    pub session_id: String,
+    pub origin_host: String,
+    pub origin_realm: String,
+    pub public_identity: String,
+    pub user_data_xml: Option<String>,
+}
+
+/// Parse an incoming Push-Notification-Request.
+pub fn parse_push_notification(incoming: &IncomingRequest) -> Option<PushNotificationData> {
+    let avps = &incoming.avps;
+    Some(PushNotificationData {
+        session_id: mandatory_string(avps, "Session-Id")?,
+        origin_host: mandatory_string(avps, "Origin-Host")?,
+        origin_realm: mandatory_string(avps, "Origin-Realm")?,
+        public_identity: extract_public_identity(avps)?,
+        user_data_xml: decode_octet_string_xml(avps, "User-Data-Sh"),
+    })
+}
+
+/// Build a Push-Notification-Answer (AS → HSS response to PNR).
+pub fn build_push_notification_answer(
+    origin_host: &str,
+    origin_realm: &str,
+    session_id: &str,
+    result_code: u32,
+    hbh: u32,
+    e2e: u32,
+) -> Vec<u8> {
+    ShAnswerBuilder::new(dictionary::CMD_SH_PUSH_NOTIFICATION, hbh, e2e)
+        .session(session_id)
+        .result_code(result_code)
+        .origin(origin_host, origin_realm)
+        .no_state()
+        .sh_app()
+        .encode()
+}
+
+// ── AS-side outbound request builders (AS → HSS) ───────────────────────────
+
+fn append_common_request_headers(
+    avp_bytes: &mut Vec<u8>,
+    config: &PeerConfig,
+    session_id: &str,
+) {
+    avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
+    avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
+    avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
+    avp_bytes.extend_from_slice(&encode_avp_utf8(
+        avp::DESTINATION_REALM,
+        &config.destination_realm,
+    ));
+    if let Some(dest_host) = &config.destination_host {
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, dest_host));
+    }
+    avp_bytes.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
+    avp_bytes.extend_from_slice(&encode_vendor_specific_app_id(
+        dictionary::VENDOR_3GPP,
+        dictionary::SH_APP_ID,
+    ));
+}
+
+fn encode_user_identity(public_identity: &str) -> Vec<u8> {
+    let inner = encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, public_identity);
+    encode_avp_grouped_3gpp(avp::USER_IDENTITY, &inner)
+}
+
+/// Build a User-Data-Request (AS → HSS) per TS 29.328 §6.1.1.
+#[allow(clippy::too_many_arguments)]
+pub fn build_user_data_request(
+    config: &PeerConfig,
+    session_id: &str,
+    public_identity: &str,
+    data_references: &[u32],
+    service_indication: Option<&str>,
+    hbh: u32,
+    e2e: u32,
+) -> Vec<u8> {
+    let mut avp_bytes = Vec::with_capacity(256);
+    append_common_request_headers(&mut avp_bytes, config, session_id);
+    avp_bytes.extend_from_slice(&encode_user_identity(public_identity));
+    for reference in data_references {
+        avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::DATA_REFERENCE, *reference));
+    }
+    if let Some(indication) = service_indication {
+        avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
+            avp::SERVICE_INDICATION,
+            indication.as_bytes(),
+        ));
+    }
+
+    encode_diameter_message(
+        FLAG_REQUEST | FLAG_PROXIABLE,
+        dictionary::CMD_SH_USER_DATA,
+        dictionary::SH_APP_ID,
+        hbh,
+        e2e,
+        &avp_bytes,
+    )
+}
+
+/// Build a Profile-Update-Request (AS → HSS) per TS 29.328 §6.1.3.
+#[allow(clippy::too_many_arguments)]
+pub fn build_profile_update_request(
+    config: &PeerConfig,
+    session_id: &str,
+    public_identity: &str,
+    data_reference: u32,
+    xml_payload: &str,
+    hbh: u32,
+    e2e: u32,
+) -> Vec<u8> {
+    let mut avp_bytes = Vec::with_capacity(512);
+    append_common_request_headers(&mut avp_bytes, config, session_id);
+    avp_bytes.extend_from_slice(&encode_user_identity(public_identity));
+    avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::DATA_REFERENCE, data_reference));
+    avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
+        avp::USER_DATA_SH,
+        xml_payload.as_bytes(),
+    ));
+
+    encode_diameter_message(
+        FLAG_REQUEST | FLAG_PROXIABLE,
+        dictionary::CMD_SH_PROFILE_UPDATE,
+        dictionary::SH_APP_ID,
+        hbh,
+        e2e,
+        &avp_bytes,
+    )
+}
+
+/// Build a Subscribe-Notifications-Request (AS → HSS) per TS 29.328 §6.1.5.
+#[allow(clippy::too_many_arguments)]
+pub fn build_subscribe_notifications_request(
+    config: &PeerConfig,
+    session_id: &str,
+    public_identity: &str,
+    data_references: &[u32],
+    subs_req_type: u32,
+    service_indication: Option<&str>,
+    hbh: u32,
+    e2e: u32,
+) -> Vec<u8> {
+    let mut avp_bytes = Vec::with_capacity(256);
+    append_common_request_headers(&mut avp_bytes, config, session_id);
+    avp_bytes.extend_from_slice(&encode_user_identity(public_identity));
+    for reference in data_references {
+        avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::DATA_REFERENCE, *reference));
+    }
+    avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::SUBS_REQ_TYPE, subs_req_type));
+    if let Some(indication) = service_indication {
+        avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
+            avp::SERVICE_INDICATION,
+            indication.as_bytes(),
+        ));
+    }
+
+    encode_diameter_message(
+        FLAG_REQUEST | FLAG_PROXIABLE,
+        dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS,
+        dictionary::SH_APP_ID,
+        hbh,
+        e2e,
+        &avp_bytes,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +665,163 @@ mod tests {
         assert!(!decoded.is_request);
         assert_eq!(decoded.command_code, dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS);
         assert_eq!(decoded.avps.get("Result-Code").and_then(|v| v.as_u64()), Some(2001));
+    }
+
+    fn as_peer_config() -> PeerConfig {
+        PeerConfig {
+            host: "hss.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            port: 3868,
+            origin_host: "telephony-as.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            origin_realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            destination_host: Some("hss.ims.mnc001.mcc001.3gppnetwork.org".to_string()),
+            destination_realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            local_ip: "10.0.0.1".parse().unwrap(),
+            application_ids: vec![],
+            watchdog_interval: 30,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 100,
+        }
+    }
+
+    #[test]
+    fn user_data_request_contains_references_and_identity() {
+        let config = as_peer_config();
+        let wire = build_user_data_request(
+            &config,
+            "sh;udr;1",
+            "sip:alice@ims.example.com",
+            &[data_reference::REPOSITORY_DATA],
+            Some("simservs"),
+            101,
+            202,
+        );
+
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(decoded.is_request);
+        assert_eq!(decoded.command_code, dictionary::CMD_SH_USER_DATA);
+        assert_eq!(decoded.application_id, dictionary::SH_APP_ID);
+
+        let identity = decoded
+            .avps
+            .get("User-Identity")
+            .and_then(|ui| ui.get("Public-Identity"))
+            .and_then(|v| v.as_str());
+        assert_eq!(identity, Some("sip:alice@ims.example.com"));
+
+        let dr = decoded.avps.get("Data-Reference").and_then(|v| v.as_u64());
+        assert_eq!(dr, Some(u64::from(data_reference::REPOSITORY_DATA)));
+
+        let service_indication_hex = decoded
+            .avps
+            .get("Service-Indication")
+            .and_then(|v| v.as_str())
+            .expect("Service-Indication present");
+        let decoded_bytes = crate::diameter::codec::hex::decode(service_indication_hex).unwrap();
+        assert_eq!(String::from_utf8(decoded_bytes).unwrap(), "simservs");
+    }
+
+    #[test]
+    fn profile_update_request_carries_xml_and_reference() {
+        let config = as_peer_config();
+        let xml = "<simservs><communication-diversion active=\"true\"/></simservs>";
+        let wire = build_profile_update_request(
+            &config,
+            "sh;pur;1",
+            "sip:alice@ims.example.com",
+            data_reference::REPOSITORY_DATA,
+            xml,
+            301,
+            402,
+        );
+
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(decoded.is_request);
+        assert_eq!(decoded.command_code, dictionary::CMD_SH_PROFILE_UPDATE);
+
+        let dr = decoded.avps.get("Data-Reference").and_then(|v| v.as_u64());
+        assert_eq!(dr, Some(u64::from(data_reference::REPOSITORY_DATA)));
+
+        let xml_hex = decoded
+            .avps
+            .get("User-Data-Sh")
+            .and_then(|v| v.as_str())
+            .expect("User-Data-Sh present");
+        let xml_bytes = crate::diameter::codec::hex::decode(xml_hex).unwrap();
+        assert_eq!(String::from_utf8(xml_bytes).unwrap(), xml);
+    }
+
+    #[test]
+    fn subscribe_notifications_request_contains_subs_type() {
+        let config = as_peer_config();
+        let wire = build_subscribe_notifications_request(
+            &config,
+            "sh;snr;1",
+            "sip:alice@ims.example.com",
+            &[data_reference::REPOSITORY_DATA],
+            subscription_type::SUBSCRIBE,
+            Some("simservs"),
+            501,
+            602,
+        );
+
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(decoded.is_request);
+        assert_eq!(decoded.command_code, dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS);
+
+        let subs = decoded.avps.get("Subs-Req-Type").and_then(|v| v.as_u64());
+        assert_eq!(subs, Some(u64::from(subscription_type::SUBSCRIBE)));
+    }
+
+    #[test]
+    fn parse_push_notification_roundtrip() {
+        let xml = "<simservs><incoming-communication-barring/></simservs>";
+        let wire = build_push_notification(
+            "hss.ims.example.net",
+            "ims.example.net",
+            "telephony-as.ims.example.net",
+            "ims.example.net",
+            "sh;pnr;88",
+            "sip:alice@ims.example.net",
+            xml,
+            50,
+            60,
+        );
+
+        let decoded = decode_diameter(&wire).unwrap();
+        let incoming = IncomingRequest {
+            command_code: decoded.command_code,
+            application_id: decoded.application_id,
+            hop_by_hop: decoded.hop_by_hop,
+            end_to_end: decoded.end_to_end,
+            avps: decoded.avps,
+            raw: wire,
+        };
+
+        let parsed = parse_push_notification(&incoming).expect("PNR parses");
+        assert_eq!(parsed.session_id, "sh;pnr;88");
+        assert_eq!(parsed.origin_host, "hss.ims.example.net");
+        assert_eq!(parsed.public_identity, "sip:alice@ims.example.net");
+        assert_eq!(parsed.user_data_xml.as_deref(), Some(xml));
+    }
+
+    #[test]
+    fn push_notification_answer_carries_result_code() {
+        let wire = build_push_notification_answer(
+            "telephony-as.ims.example.net",
+            "ims.example.net",
+            "sh;pnr;88",
+            dictionary::DIAMETER_SUCCESS,
+            50,
+            60,
+        );
+
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(!decoded.is_request);
+        assert_eq!(decoded.command_code, dictionary::CMD_SH_PUSH_NOTIFICATION);
+        assert_eq!(
+            decoded.avps.get("Result-Code").and_then(|v| v.as_u64()),
+            Some(u64::from(dictionary::DIAMETER_SUCCESS))
+        );
     }
 }
