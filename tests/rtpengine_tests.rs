@@ -11,7 +11,7 @@ use bytes::BytesMut;
 use tokio::net::UdpSocket;
 
 use siphon::rtpengine::bencode::{self, BencodeValue};
-use siphon::rtpengine::client::{RtpEngineClient, RtpEngineSet};
+use siphon::rtpengine::client::{PlayMediaSource, RtpEngineClient, RtpEngineSet};
 use siphon::rtpengine::profile::{NgFlags, ProfileRegistry};
 use siphon::rtpengine::session::{MediaSession, MediaSessionStore};
 use siphon::sip::parser::parse_sip_message;
@@ -67,6 +67,15 @@ async fn spawn_mock_rtpengine() -> SocketAddr {
                                     ("bytes", BencodeValue::from_integer(160000)),
                                 ])),
                             ])),
+                        ]),
+                        "play media" => BencodeValue::dict(vec![
+                            ("result", BencodeValue::string("ok")),
+                            ("duration", BencodeValue::from_integer(3500)),
+                        ]),
+                        "stop media" | "play DTMF"
+                        | "silence media" | "unsilence media"
+                        | "block media" | "unblock media" => BencodeValue::dict(vec![
+                            ("result", BencodeValue::string("ok")),
                         ]),
                         _ => BencodeValue::dict(vec![
                             ("result", BencodeValue::string("error")),
@@ -314,6 +323,144 @@ async fn profile_flags_produce_valid_bencode() {
         let decoded = bencode::decode_full_dict(&encoded).unwrap();
         assert_eq!(decoded.dict_get_str("command"), Some("answer"));
     }
+}
+
+/// Full MMTEL-style announcement flow: offer → answer → play_media → stop_media → delete.
+///
+/// Simulates the TAS announcement pattern — a B2BUA leg anchored via RTPEngine
+/// plays a prompt via the audio player, then cleans up.
+#[tokio::test]
+async fn announcement_flow_play_stop_delete() {
+    let mock_addr = spawn_mock_rtpengine().await;
+    let client = RtpEngineClient::new(mock_addr, 2000).await.unwrap();
+
+    let invite_raw = make_invite_with_sdp();
+    let invite = parse_sip_message(&invite_raw).unwrap().1;
+    let registry = ProfileRegistry::new();
+    let offer_flags = &registry.get("srtp_to_rtp").unwrap().offer;
+
+    // 1. Anchor media via offer
+    let rewritten_offer = client
+        .offer(
+            "call-announce-1",
+            "caller-tag",
+            &invite.body,
+            offer_flags,
+        )
+        .await
+        .unwrap();
+    assert!(std::str::from_utf8(&rewritten_offer).unwrap().contains("30000"));
+
+    // 2. Complete 200 OK via answer
+    let ok_raw = make_200ok_with_sdp();
+    let ok_msg = parse_sip_message(&ok_raw).unwrap().1;
+    let answer_flags = &registry.get("srtp_to_rtp").unwrap().answer;
+    client
+        .answer(
+            "call-announce-1",
+            "caller-tag",
+            "announce-tag",
+            &ok_msg.body,
+            answer_flags,
+        )
+        .await
+        .unwrap();
+
+    // 3. Play announcement — caller's from-tag selects monologue;
+    //    per rtpengine semantics the peer (announcement player) is unused
+    //    and the caller hears the prompt replacing their own outgoing stream.
+    let duration = client
+        .play_media(
+            "call-announce-1",
+            "caller-tag",
+            &PlayMediaSource::File("/var/lib/siphon/prompts/welcome.wav".to_string()),
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(duration, Some(3500));
+
+    // 4. Stop announcement (e.g. caller pressed a key, or we're swapping prompts)
+    client.stop_media("call-announce-1", "caller-tag").await.unwrap();
+
+    // 5. Tear down
+    client.delete("call-announce-1", "caller-tag").await.unwrap();
+}
+
+/// Silence / block gating flow — the hold-music / LI-warning pattern.
+#[tokio::test]
+async fn gating_silence_block_cycle() {
+    let mock_addr = spawn_mock_rtpengine().await;
+    let client = RtpEngineClient::new(mock_addr, 2000).await.unwrap();
+
+    client.silence_media("call-gate-1", "tag-a").await.unwrap();
+    client.unsilence_media("call-gate-1", "tag-a").await.unwrap();
+    client.block_media("call-gate-1", "tag-a").await.unwrap();
+    client.unblock_media("call-gate-1", "tag-a").await.unwrap();
+}
+
+/// DTMF injection — CCBS tones and IVR.
+#[tokio::test]
+async fn dtmf_injection_with_sequence() {
+    let mock_addr = spawn_mock_rtpengine().await;
+    let client = RtpEngineClient::new(mock_addr, 2000).await.unwrap();
+
+    client
+        .play_dtmf(
+            "call-dtmf-1",
+            "tag-a",
+            "*21*1234#",
+            Some(100),
+            Some(-8),
+            Some(60),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+/// Multi-instance affinity for media commands: once a call-id is bound via
+/// offer, all media-injection commands for that call-id go to the same
+/// instance.
+#[tokio::test]
+async fn media_commands_honor_affinity() {
+    let addr1 = spawn_mock_rtpengine().await;
+    let addr2 = spawn_mock_rtpengine().await;
+    let set = RtpEngineSet::new(vec![
+        (addr1, 2000, 1),
+        (addr2, 2000, 1),
+    ])
+    .await
+    .unwrap();
+
+    let flags = NgFlags::default();
+    set.offer("call-mm-1", "tag-a", b"v=0\r\n", &flags).await.unwrap();
+
+    // These all succeed via the affinity-bound instance.
+    set.play_media(
+        "call-mm-1",
+        "tag-a",
+        &PlayMediaSource::File("/a.wav".to_string()),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    set.stop_media("call-mm-1", "tag-a").await.unwrap();
+    set.play_dtmf("call-mm-1", "tag-a", "5", None, None, None, None)
+        .await
+        .unwrap();
+    set.silence_media("call-mm-1", "tag-a").await.unwrap();
+    set.unsilence_media("call-mm-1", "tag-a").await.unwrap();
+    set.block_media("call-mm-1", "tag-a").await.unwrap();
+    set.unblock_media("call-mm-1", "tag-a").await.unwrap();
+    set.delete("call-mm-1", "tag-a").await.unwrap();
+    assert_eq!(set.active_sessions(), 0);
 }
 
 #[tokio::test]

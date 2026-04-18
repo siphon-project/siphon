@@ -864,14 +864,23 @@ class MockRtpEngine:
         # After running handler:
         assert rtpengine.operations == [("offer", "srtp_to_rtp")]
 
+    Media-injection operations (``play_media``, ``stop_media``, ``play_dtmf``,
+    ``silence_media``, ``unsilence_media``, ``block_media``, ``unblock_media``)
+    are also captured in ``operations`` as ``(name, detail_string)`` tuples so
+    downstream apps can unit-test MMTEL announcement flows without a live
+    rtpengine. Full parameter dicts are available on ``media_calls``.
+
     Valid profiles: ``"srtp_to_rtp"``, ``"ws_to_rtp"``, ``"wss_to_rtp"``,
     ``"rtp_passthrough"``.
     """
 
     def __init__(self) -> None:
         self.operations: list[tuple[str, Optional[str]]] = []
-        """List of ``(operation, profile)`` tuples recorded."""
+        """List of ``(operation, profile_or_detail)`` tuples recorded."""
+        self.media_calls: list[dict[str, Any]] = []
+        """Full parameter dicts for each media-injection call."""
         self._healthy = True
+        self._play_media_duration_ms: Optional[int] = None
 
     @property
     def active_sessions(self) -> int:
@@ -936,9 +945,153 @@ class MockRtpEngine:
         """
         return self._healthy
 
+    async def play_media(
+        self,
+        target: Any,
+        file: Optional[str] = None,
+        blob: Optional[bytes] = None,
+        db_id: Optional[int] = None,
+        repeat: Optional[int] = None,
+        start_ms: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+        to_tag: Optional[str] = None,
+    ) -> Optional[int]:
+        """Inject an audio prompt into the call.
+
+        Exactly one of ``file``/``blob``/``db_id`` must be supplied. Per
+        rtpengine semantics, ``from-tag`` (derived from ``target``) selects
+        the monologue whose outgoing audio is replaced by the prompt — the
+        **peer** of that monologue hears it. Pass ``to_tag`` to scope to a
+        specific peer in MPTY scenarios.
+
+        Requires rtpengine built with ``--with-transcoding`` and launched
+        with ``--audio-player=on-demand``. AMR-NB/WB prompts need licensed
+        codec plugins; G.711 and Opus prompts work without them.
+
+        Args:
+            target: Request, Reply, or Call object.
+            file: Absolute path to an audio file on the rtpengine host.
+            blob: Raw audio bytes to play (e.g. TTS output).
+            db_id: Reference to a prompt stored in rtpengine's prompt DB.
+            repeat: Number of times to repeat the prompt.
+            start_ms: Offset into the file at which to start (ms).
+            duration_ms: Cap on playback length (ms).
+            to_tag: Optional peer tag for MPTY scoping.
+
+        Returns:
+            Prompt duration in ms if rtpengine reports one (mock returns
+            the value set via :meth:`set_play_media_duration`, else ``None``).
+
+        Example::
+
+            dur = await rtpengine.play_media(call, file="/var/lib/siphon/prompts/cfu.wav")
+            await rtpengine.play_media(call, blob=tts_bytes, to_tag=peer_tag)
+        """
+        count = sum(1 for x in (file, blob, db_id) if x is not None)
+        if count != 1:
+            raise ValueError(
+                "play_media requires exactly one of file=, blob=, or db_id="
+            )
+        source = "file" if file is not None else "blob" if blob is not None else "db-id"
+        self.operations.append(("play_media", source))
+        self.media_calls.append({
+            "op": "play_media",
+            "file": file,
+            "blob": blob,
+            "db_id": db_id,
+            "repeat": repeat,
+            "start_ms": start_ms,
+            "duration_ms": duration_ms,
+            "to_tag": to_tag,
+        })
+        return self._play_media_duration_ms
+
+    async def stop_media(self, target: Any) -> bool:
+        """Stop any prompt currently playing on the selected monologue.
+
+        Args:
+            target: Request, Reply, or Call object.
+
+        Returns:
+            ``True`` on success.
+        """
+        self.operations.append(("stop_media", None))
+        self.media_calls.append({"op": "stop_media"})
+        return True
+
+    async def play_dtmf(
+        self,
+        target: Any,
+        code: str,
+        duration_ms: Optional[int] = None,
+        volume_dbm0: Optional[int] = None,
+        pause_ms: Optional[int] = None,
+        to_tag: Optional[str] = None,
+    ) -> bool:
+        """Inject DTMF tone(s) into the call.
+
+        Args:
+            target: Request, Reply, or Call object.
+            code: A single digit (``"0"``–``"9"``, ``"*"``, ``"#"``,
+                ``"A"``–``"D"``) or a string sequence of digits.
+            duration_ms: Tone duration per digit.
+            volume_dbm0: Tone volume in dBm0 (typically ``-8``).
+            pause_ms: Inter-tone gap when ``code`` is a sequence.
+            to_tag: Optional peer tag for MPTY scoping.
+
+        Example::
+
+            await rtpengine.play_dtmf(call, "123#", duration_ms=100)
+        """
+        self.operations.append(("play_dtmf", code))
+        self.media_calls.append({
+            "op": "play_dtmf",
+            "code": code,
+            "duration_ms": duration_ms,
+            "volume_dbm0": volume_dbm0,
+            "pause_ms": pause_ms,
+            "to_tag": to_tag,
+        })
+        return True
+
+    async def silence_media(self, target: Any) -> bool:
+        """Replace outgoing audio on the selected monologue with silence.
+
+        Pair with :meth:`unsilence_media` to restore the original stream.
+        """
+        self.operations.append(("silence_media", None))
+        self.media_calls.append({"op": "silence_media"})
+        return True
+
+    async def unsilence_media(self, target: Any) -> bool:
+        """Stop replacing outgoing audio with silence (undo :meth:`silence_media`)."""
+        self.operations.append(("unsilence_media", None))
+        self.media_calls.append({"op": "unsilence_media"})
+        return True
+
+    async def block_media(self, target: Any) -> bool:
+        """Drop outgoing packets on the selected monologue entirely.
+
+        Pair with :meth:`unblock_media` to resume.
+        """
+        self.operations.append(("block_media", None))
+        self.media_calls.append({"op": "block_media"})
+        return True
+
+    async def unblock_media(self, target: Any) -> bool:
+        """Resume forwarding the selected monologue's packets."""
+        self.operations.append(("unblock_media", None))
+        self.media_calls.append({"op": "unblock_media"})
+        return True
+
+    def set_play_media_duration(self, duration_ms: Optional[int]) -> None:
+        """Configure the duration returned by :meth:`play_media` (test helper)."""
+        self._play_media_duration_ms = duration_ms
+
     def clear(self) -> None:
         """Clear recorded operations (test helper)."""
         self.operations.clear()
+        self.media_calls.clear()
 
 
 # ---------------------------------------------------------------------------

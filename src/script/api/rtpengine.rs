@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::prelude::*;
 use tracing::{debug, warn};
 
-use crate::rtpengine::client::RtpEngineSet;
+use crate::rtpengine::client::{PlayMediaSource, RtpEngineSet};
 use crate::rtpengine::profile::ProfileRegistry;
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
 use crate::sip::message::SipMessage;
@@ -41,6 +41,67 @@ impl PyRtpEngine {
     ) -> Self {
         Self { client, sessions, registry }
     }
+
+    /// Shared body for `silence_media`/`unsilence_media`/`block_media`/`unblock_media`.
+    fn simple_media_command<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        method: &'static str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let message = extract_message(target)?;
+        let (call_id, from_tag) = extract_delete_params(&message)?;
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let result = match method {
+                "silence_media" => client.silence_media(&call_id, &from_tag).await,
+                "unsilence_media" => client.unsilence_media(&call_id, &from_tag).await,
+                "block_media" => client.block_media(&call_id, &from_tag).await,
+                "unblock_media" => client.unblock_media(&call_id, &from_tag).await,
+                other => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "unknown simple media command: {other}"
+                    )))
+                }
+            };
+            result.map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "rtpengine.{method} failed: {error}"
+                ))
+            })?;
+            debug!(call_id = %call_id, method = %method, "rtpengine simple media command");
+            Ok(true)
+        })
+    }
+}
+
+/// Validate exactly-one of ``file``/``blob``/``db_id`` and build a [`PlayMediaSource`].
+fn resolve_play_media_source(
+    file: Option<String>,
+    blob: Option<Vec<u8>>,
+    db_id: Option<u64>,
+) -> PyResult<PlayMediaSource> {
+    let count = [file.is_some(), blob.is_some(), db_id.is_some()]
+        .iter()
+        .filter(|present| **present)
+        .count();
+    if count != 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "play_media requires exactly one of file=, blob=, or db_id="
+                .to_string(),
+        ));
+    }
+    if let Some(path) = file {
+        return Ok(PlayMediaSource::File(path));
+    }
+    if let Some(bytes) = blob {
+        return Ok(PlayMediaSource::Blob(bytes));
+    }
+    if let Some(id) = db_id {
+        return Ok(PlayMediaSource::DbId(id));
+    }
+    unreachable!("count == 1 guaranteed one branch above")
 }
 
 /// Default profile name when none is specified.
@@ -256,6 +317,194 @@ impl PyRtpEngine {
                 }
             }
         })
+    }
+
+    /// Send a `play media` command — inject an audio prompt into the call.
+    ///
+    /// Exactly one of ``file``, ``blob``, or ``db_id`` must be supplied.
+    ///
+    /// Per rtpengine semantics, ``from-tag`` selects the monologue whose
+    /// outgoing audio is replaced by the prompt — the peer of that monologue
+    /// hears it. By default the from-tag is extracted from the SIP object.
+    /// Supply ``to_tag`` to scope the prompt to a specific peer when the
+    /// monologue has multiple subscribers (MPTY).
+    ///
+    /// Requires rtpengine built with ``--with-transcoding`` and launched with
+    /// ``--audio-player=on-demand``. VoLTE prompts (AMR-NB/WB) need licensed
+    /// codec plugins; G.711 and Opus prompts work without them.
+    ///
+    /// Args:
+    ///     target: Request, Reply, or Call object — used to derive Call-ID
+    ///             and From-tag.
+    ///     file: Absolute path to an audio file on the rtpengine host.
+    ///     blob: Raw audio bytes to play (e.g. TTS output).
+    ///     db_id: Reference to a prompt stored in rtpengine's prompt DB.
+    ///     repeat: Number of times to repeat the prompt (default: 1).
+    ///     start_ms: Offset into the file at which to start (milliseconds).
+    ///     duration_ms: Cap on playback length (milliseconds).
+    ///     to_tag: Optional peer tag for MPTY scoping.
+    ///
+    /// Returns:
+    ///     The prompt duration in milliseconds if rtpengine reports one,
+    ///     else ``None``.
+    #[pyo3(signature = (target, file=None, blob=None, db_id=None, repeat=None, start_ms=None, duration_ms=None, to_tag=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn play_media<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        file: Option<String>,
+        blob: Option<Vec<u8>>,
+        db_id: Option<u64>,
+        repeat: Option<u64>,
+        start_ms: Option<u64>,
+        duration_ms: Option<u64>,
+        to_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let source = resolve_play_media_source(file, blob, db_id)?;
+
+        let message = extract_message(target)?;
+        let (call_id, from_tag) = extract_delete_params(&message)?;
+
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let duration = client
+                .play_media(
+                    &call_id,
+                    &from_tag,
+                    &source,
+                    repeat,
+                    start_ms,
+                    duration_ms,
+                    to_tag.as_deref(),
+                )
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.play_media failed: {error}"
+                    ))
+                })?;
+            debug!(call_id = %call_id, duration_ms = ?duration, "rtpengine play_media");
+            Ok(duration)
+        })
+    }
+
+    /// Send a `stop media` command — stop any prompt currently playing on the
+    /// monologue selected by the SIP object's From-tag.
+    #[pyo3(signature = (target,))]
+    fn stop_media<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let message = extract_message(target)?;
+        let (call_id, from_tag) = extract_delete_params(&message)?;
+
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client.stop_media(&call_id, &from_tag).await.map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "rtpengine.stop_media failed: {error}"
+                ))
+            })?;
+            debug!(call_id = %call_id, "rtpengine stop_media");
+            Ok(true)
+        })
+    }
+
+    /// Send a `play DTMF` command — inject DTMF tone(s) into the call.
+    ///
+    /// Args:
+    ///     target: Request, Reply, or Call object.
+    ///     code: A single digit (``"0"``–``"9"``, ``"*"``, ``"#"``, ``"A"``–``"D"``)
+    ///           or a string sequence of digits.
+    ///     duration_ms: Tone duration per digit (default: 250ms per rtpengine).
+    ///     volume_dbm0: Tone volume in dBm0 (typically ``-8``).
+    ///     pause_ms: Inter-tone gap when ``code`` is a sequence.
+    ///     to_tag: Optional peer tag for MPTY scoping.
+    #[pyo3(signature = (target, code, duration_ms=None, volume_dbm0=None, pause_ms=None, to_tag=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn play_dtmf<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        code: String,
+        duration_ms: Option<u64>,
+        volume_dbm0: Option<i64>,
+        pause_ms: Option<u64>,
+        to_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let message = extract_message(target)?;
+        let (call_id, from_tag) = extract_delete_params(&message)?;
+
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client
+                .play_dtmf(
+                    &call_id,
+                    &from_tag,
+                    &code,
+                    duration_ms,
+                    volume_dbm0,
+                    pause_ms,
+                    to_tag.as_deref(),
+                )
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.play_dtmf failed: {error}"
+                    ))
+                })?;
+            debug!(call_id = %call_id, code = %code, "rtpengine play_dtmf");
+            Ok(true)
+        })
+    }
+
+    /// Send a `silence media` command — replace outgoing audio on the selected
+    /// monologue with silence. Pair with :meth:`unsilence_media` to restore.
+    #[pyo3(signature = (target,))]
+    fn silence_media<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.simple_media_command(python, target, "silence_media")
+    }
+
+    /// Send an `unsilence media` command — pass the original stream through
+    /// again after a prior :meth:`silence_media`.
+    #[pyo3(signature = (target,))]
+    fn unsilence_media<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.simple_media_command(python, target, "unsilence_media")
+    }
+
+    /// Send a `block media` command — drop outgoing packets on the selected
+    /// monologue (peer hears no audio at all, not even comfort silence).
+    #[pyo3(signature = (target,))]
+    fn block_media<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.simple_media_command(python, target, "block_media")
+    }
+
+    /// Send an `unblock media` command — resume forwarding the selected
+    /// monologue's packets after a prior :meth:`block_media`.
+    #[pyo3(signature = (target,))]
+    fn unblock_media<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.simple_media_command(python, target, "unblock_media")
     }
 
     /// Number of active media sessions being tracked.
@@ -577,6 +826,67 @@ mod tests {
     fn extract_sdp_body_empty() {
         let message = test_message(None, b"");
         assert!(extract_sdp_body(&message).is_err());
+    }
+
+    #[test]
+    fn resolve_play_media_source_file() {
+        pyo3::Python::initialize();
+        let source = resolve_play_media_source(
+            Some("/tmp/a.wav".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(source, PlayMediaSource::File(ref path) if path == "/tmp/a.wav"));
+    }
+
+    #[test]
+    fn resolve_play_media_source_blob() {
+        pyo3::Python::initialize();
+        let source = resolve_play_media_source(
+            None,
+            Some(vec![0x00, 0xff]),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(source, PlayMediaSource::Blob(ref bytes) if bytes == &[0x00, 0xff]));
+    }
+
+    #[test]
+    fn resolve_play_media_source_db_id() {
+        pyo3::Python::initialize();
+        let source = resolve_play_media_source(None, None, Some(7)).unwrap();
+        assert!(matches!(source, PlayMediaSource::DbId(7)));
+    }
+
+    #[test]
+    fn resolve_play_media_source_none_rejected() {
+        pyo3::Python::initialize();
+        let error = resolve_play_media_source(None, None, None).unwrap_err();
+        Python::attach(|py| {
+            assert!(error.value(py).to_string().contains("exactly one"));
+        });
+    }
+
+    #[test]
+    fn resolve_play_media_source_multiple_rejected() {
+        pyo3::Python::initialize();
+        let error_file_and_blob = resolve_play_media_source(
+            Some("/tmp/a.wav".to_string()),
+            Some(vec![0x00]),
+            None,
+        )
+        .unwrap_err();
+        let error_file_and_db = resolve_play_media_source(
+            Some("/tmp/a.wav".to_string()),
+            None,
+            Some(1),
+        )
+        .unwrap_err();
+        Python::attach(|py| {
+            assert!(error_file_and_blob.value(py).to_string().contains("exactly one"));
+            assert!(error_file_and_db.value(py).to_string().contains("exactly one"));
+        });
     }
 
     #[test]

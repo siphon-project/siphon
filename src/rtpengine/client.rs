@@ -17,6 +17,19 @@ use super::bencode::{self, BencodeValue};
 use super::error::RtpEngineError;
 use super::profile::NgFlags;
 
+/// Source for the `play media` command.
+///
+/// Exactly one variant is sent per command:
+/// - `File` — absolute path on the rtpengine host
+/// - `Blob` — raw audio bytes embedded in the ng command (binary-safe via bencode)
+/// - `DbId` — reference to a prompt stored in rtpengine's internal database
+#[derive(Debug, Clone)]
+pub enum PlayMediaSource {
+    File(String),
+    Blob(Vec<u8>),
+    DbId(u64),
+}
+
 /// Async client for the RTPEngine NG control protocol.
 pub struct RtpEngineClient {
     /// Local UDP socket bound to an ephemeral port.
@@ -127,6 +140,180 @@ impl RtpEngineClient {
         ];
 
         self.send_command(BencodeValue::dict(pairs)).await
+    }
+
+    /// Send a `play media` command — play an audio file/blob/db-id into a call.
+    ///
+    /// The `from-tag` selects the monologue whose outgoing audio is replaced by
+    /// the prompt. Per rtpengine semantics, the **peer** of that monologue hears
+    /// the prompt. Optional `to_tag` scopes the injection to a specific peer
+    /// when the monologue has multiple subscribers (relevant for MPTY).
+    ///
+    /// Requires rtpengine built with `--with-transcoding` and launched with
+    /// `--audio-player=on-demand`. VoLTE prompts (AMR-NB/WB) need licensed codec
+    /// plugins; G.711 and Opus prompts work without them.
+    ///
+    /// Returns the prompt duration in milliseconds, if the engine reports one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn play_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        source: &PlayMediaSource,
+        repeat_times: Option<u64>,
+        start_pos_ms: Option<u64>,
+        duration_ms: Option<u64>,
+        to_tag: Option<&str>,
+    ) -> Result<Option<u64>, RtpEngineError> {
+        let mut pairs: Vec<(&str, BencodeValue)> = vec![
+            ("command", BencodeValue::string("play media")),
+            ("call-id", BencodeValue::string(call_id)),
+            ("from-tag", BencodeValue::string(from_tag)),
+        ];
+        if let Some(tag) = to_tag {
+            pairs.push(("to-tag", BencodeValue::string(tag)));
+        }
+        match source {
+            PlayMediaSource::File(path) => {
+                pairs.push(("file", BencodeValue::string(path)));
+            }
+            PlayMediaSource::Blob(bytes) => {
+                pairs.push(("blob", BencodeValue::String(bytes.clone())));
+            }
+            PlayMediaSource::DbId(id) => {
+                pairs.push(("db-id", BencodeValue::Integer(*id as i64)));
+            }
+        }
+        if let Some(repeat) = repeat_times {
+            pairs.push(("repeat-times", BencodeValue::Integer(repeat as i64)));
+        }
+        if let Some(start) = start_pos_ms {
+            pairs.push(("start-pos", BencodeValue::Integer(start as i64)));
+        }
+        if let Some(duration) = duration_ms {
+            pairs.push(("duration", BencodeValue::Integer(duration as i64)));
+        }
+
+        let response = self.send_command(BencodeValue::dict(pairs)).await?;
+        self.check_result(&response)?;
+        Ok(response
+            .dict_get("duration")
+            .and_then(|value| value.as_integer())
+            .map(|number| number as u64))
+    }
+
+    /// Send a `stop media` command — stop any prompt currently playing on the
+    /// monologue selected by `from-tag`.
+    pub async fn stop_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        let pairs: Vec<(&str, BencodeValue)> = vec![
+            ("command", BencodeValue::string("stop media")),
+            ("call-id", BencodeValue::string(call_id)),
+            ("from-tag", BencodeValue::string(from_tag)),
+        ];
+        let response = self.send_command(BencodeValue::dict(pairs)).await?;
+        self.check_result(&response)?;
+        Ok(())
+    }
+
+    /// Send a `play DTMF` command — inject DTMF tone(s) into the call.
+    ///
+    /// `code` is a single digit (`"0"`–`"9"`, `"*"`, `"#"`, `"A"`–`"D"`) or a
+    /// string sequence. `volume_dbm0` is typically `-8` (the default used by
+    /// rtpengine). `pause_ms` is the inter-tone gap when `code` is a sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn play_dtmf(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        code: &str,
+        duration_ms: Option<u64>,
+        volume_dbm0: Option<i64>,
+        pause_ms: Option<u64>,
+        to_tag: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        let mut pairs: Vec<(&str, BencodeValue)> = vec![
+            ("command", BencodeValue::string("play DTMF")),
+            ("call-id", BencodeValue::string(call_id)),
+            ("from-tag", BencodeValue::string(from_tag)),
+            ("code", BencodeValue::string(code)),
+        ];
+        if let Some(tag) = to_tag {
+            pairs.push(("to-tag", BencodeValue::string(tag)));
+        }
+        if let Some(duration) = duration_ms {
+            pairs.push(("duration", BencodeValue::Integer(duration as i64)));
+        }
+        if let Some(volume) = volume_dbm0 {
+            pairs.push(("volume", BencodeValue::Integer(volume)));
+        }
+        if let Some(pause) = pause_ms {
+            pairs.push(("pause", BencodeValue::Integer(pause as i64)));
+        }
+        let response = self.send_command(BencodeValue::dict(pairs)).await?;
+        self.check_result(&response)?;
+        Ok(())
+    }
+
+    /// Send a `silence media` command — replace the selected monologue's
+    /// outgoing audio with silence. Use for hold-music gating and LI warnings.
+    pub async fn silence_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.simple_tag_command("silence media", call_id, from_tag).await
+    }
+
+    /// Send an `unsilence media` command — stop replacing outgoing audio with
+    /// silence; pass the original stream through again.
+    pub async fn unsilence_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.simple_tag_command("unsilence media", call_id, from_tag).await
+    }
+
+    /// Send a `block media` command — drop the selected monologue's outgoing
+    /// packets entirely (peer hears nothing, not even comfort silence).
+    pub async fn block_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.simple_tag_command("block media", call_id, from_tag).await
+    }
+
+    /// Send an `unblock media` command — resume forwarding the selected
+    /// monologue's packets after a prior `block media`.
+    pub async fn unblock_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.simple_tag_command("unblock media", call_id, from_tag).await
+    }
+
+    /// Shared shape for `silence`/`unsilence`/`block`/`unblock media`:
+    /// `{command, call-id, from-tag}` → `{result: ok}`.
+    async fn simple_tag_command(
+        &self,
+        command: &str,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        let pairs: Vec<(&str, BencodeValue)> = vec![
+            ("command", BencodeValue::string(command)),
+            ("call-id", BencodeValue::string(call_id)),
+            ("from-tag", BencodeValue::string(from_tag)),
+        ];
+        let response = self.send_command(BencodeValue::dict(pairs)).await?;
+        self.check_result(&response)?;
+        Ok(())
     }
 
     /// Send a `subscribe request` command for SIPREC media forking.
@@ -577,6 +764,92 @@ impl RtpEngineSet {
     ) -> Result<BencodeValue, RtpEngineError> {
         let client = self.select(call_id);
         client.query(call_id, from_tag).await
+    }
+
+    /// Send a `play media` command to the affinity-bound instance.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn play_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        source: &PlayMediaSource,
+        repeat_times: Option<u64>,
+        start_pos_ms: Option<u64>,
+        duration_ms: Option<u64>,
+        to_tag: Option<&str>,
+    ) -> Result<Option<u64>, RtpEngineError> {
+        let client = self.select(call_id);
+        client
+            .play_media(call_id, from_tag, source, repeat_times, start_pos_ms, duration_ms, to_tag)
+            .await
+    }
+
+    /// Send a `stop media` command to the affinity-bound instance.
+    pub async fn stop_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        let client = self.select(call_id);
+        client.stop_media(call_id, from_tag).await
+    }
+
+    /// Send a `play DTMF` command to the affinity-bound instance.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn play_dtmf(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        code: &str,
+        duration_ms: Option<u64>,
+        volume_dbm0: Option<i64>,
+        pause_ms: Option<u64>,
+        to_tag: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        let client = self.select(call_id);
+        client
+            .play_dtmf(call_id, from_tag, code, duration_ms, volume_dbm0, pause_ms, to_tag)
+            .await
+    }
+
+    /// Send a `silence media` command to the affinity-bound instance.
+    pub async fn silence_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        let client = self.select(call_id);
+        client.silence_media(call_id, from_tag).await
+    }
+
+    /// Send an `unsilence media` command to the affinity-bound instance.
+    pub async fn unsilence_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        let client = self.select(call_id);
+        client.unsilence_media(call_id, from_tag).await
+    }
+
+    /// Send a `block media` command to the affinity-bound instance.
+    pub async fn block_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        let client = self.select(call_id);
+        client.block_media(call_id, from_tag).await
+    }
+
+    /// Send an `unblock media` command to the affinity-bound instance.
+    pub async fn unblock_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        let client = self.select(call_id);
+        client.unblock_media(call_id, from_tag).await
     }
 
     /// Send a `subscribe request` command to the affinity-bound instance.
@@ -1081,5 +1354,285 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_empty());
+    }
+
+    // -- play_media / stop_media / play_dtmf / silence / block --
+
+    /// Spawn a mock that captures each request's decoded bencode dict in a
+    /// shared Vec and responds with `{result: ok, duration: N}` for play_media.
+    async fn spawn_capturing_mock() -> (SocketAddr, Arc<tokio::sync::Mutex<Vec<BencodeValue>>>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let captured: Arc<tokio::sync::Mutex<Vec<BencodeValue>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+
+        tokio::spawn(async move {
+            let mut buffer = BytesMut::zeroed(65535);
+            loop {
+                match socket.recv_from(&mut buffer).await {
+                    Ok((size, source)) => {
+                        let data = &buffer[..size];
+                        let space = data.iter().position(|&b| b == b' ').unwrap();
+                        let cookie = std::str::from_utf8(&data[..space]).unwrap().to_string();
+
+                        let payload = &data[space + 1..];
+                        let command = bencode::decode_full_dict(payload).unwrap();
+                        let cmd_name = command.dict_get_str("command").unwrap_or("").to_string();
+                        captured_clone.lock().await.push(command);
+
+                        let response = if cmd_name == "play media" {
+                            BencodeValue::dict(vec![
+                                ("result", BencodeValue::string("ok")),
+                                ("duration", BencodeValue::from_integer(12345)),
+                            ])
+                        } else {
+                            BencodeValue::dict(vec![
+                                ("result", BencodeValue::string("ok")),
+                            ])
+                        };
+                        let encoded = bencode::encode(&response);
+                        let mut reply = Vec::new();
+                        reply.extend_from_slice(cookie.as_bytes());
+                        reply.push(b' ');
+                        reply.extend_from_slice(&encoded);
+                        let _ = socket.send_to(&reply, source).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (addr, captured)
+    }
+
+    #[tokio::test]
+    async fn play_media_file_bencode_shape() {
+        let (addr, captured) = spawn_capturing_mock().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+
+        let duration = client
+            .play_media(
+                "call-1",
+                "tag-a",
+                &PlayMediaSource::File("/var/lib/siphon/prompts/announcement.wav".to_string()),
+                Some(2),
+                Some(500),
+                Some(10_000),
+                Some("tag-b"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(duration, Some(12345));
+
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 1);
+        let command = &captured[0];
+        assert_eq!(command.dict_get_str("command"), Some("play media"));
+        assert_eq!(command.dict_get_str("call-id"), Some("call-1"));
+        assert_eq!(command.dict_get_str("from-tag"), Some("tag-a"));
+        assert_eq!(command.dict_get_str("to-tag"), Some("tag-b"));
+        assert_eq!(
+            command.dict_get_str("file"),
+            Some("/var/lib/siphon/prompts/announcement.wav")
+        );
+        assert_eq!(command.dict_get("repeat-times").and_then(|v| v.as_integer()), Some(2));
+        assert_eq!(command.dict_get("start-pos").and_then(|v| v.as_integer()), Some(500));
+        assert_eq!(command.dict_get("duration").and_then(|v| v.as_integer()), Some(10_000));
+    }
+
+    #[tokio::test]
+    async fn play_media_blob_is_binary_safe() {
+        let (addr, captured) = spawn_capturing_mock().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+
+        // Include NUL + high bytes to prove binary safety through bencode.
+        let blob_bytes = vec![0x00, 0xff, 0x52, 0x49, 0x46, 0x46, 0xde, 0xad, 0xbe, 0xef];
+        client
+            .play_media(
+                "call-blob",
+                "tag-a",
+                &PlayMediaSource::Blob(blob_bytes.clone()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let captured = captured.lock().await;
+        let command = &captured[0];
+        assert_eq!(command.dict_get_str("command"), Some("play media"));
+        assert_eq!(command.dict_get_bytes("blob"), Some(blob_bytes.as_slice()));
+        assert!(command.dict_get("file").is_none());
+        assert!(command.dict_get("db-id").is_none());
+        assert!(command.dict_get("to-tag").is_none());
+    }
+
+    #[tokio::test]
+    async fn play_media_db_id_shape() {
+        let (addr, captured) = spawn_capturing_mock().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+
+        client
+            .play_media("call-db", "tag-a", &PlayMediaSource::DbId(42), None, None, None, None)
+            .await
+            .unwrap();
+
+        let captured = captured.lock().await;
+        let command = &captured[0];
+        assert_eq!(command.dict_get("db-id").and_then(|v| v.as_integer()), Some(42));
+        assert!(command.dict_get("file").is_none());
+        assert!(command.dict_get("blob").is_none());
+    }
+
+    #[tokio::test]
+    async fn play_media_omits_optionals_when_none() {
+        let (addr, captured) = spawn_capturing_mock().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+        client
+            .play_media(
+                "call-min",
+                "tag-a",
+                &PlayMediaSource::File("/tmp/x.wav".to_string()),
+                None, None, None, None,
+            )
+            .await
+            .unwrap();
+        let captured = captured.lock().await;
+        let command = &captured[0];
+        assert!(command.dict_get("repeat-times").is_none());
+        assert!(command.dict_get("start-pos").is_none());
+        assert!(command.dict_get("duration").is_none());
+        assert!(command.dict_get("to-tag").is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_media_shape() {
+        let (addr, captured) = spawn_capturing_mock().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+        client.stop_media("call-stop", "tag-a").await.unwrap();
+        let captured = captured.lock().await;
+        let command = &captured[0];
+        assert_eq!(command.dict_get_str("command"), Some("stop media"));
+        assert_eq!(command.dict_get_str("call-id"), Some("call-stop"));
+        assert_eq!(command.dict_get_str("from-tag"), Some("tag-a"));
+    }
+
+    #[tokio::test]
+    async fn play_dtmf_shape_full() {
+        let (addr, captured) = spawn_capturing_mock().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+        client
+            .play_dtmf("call-dtmf", "tag-a", "123#", Some(100), Some(-8), Some(60), None)
+            .await
+            .unwrap();
+        let captured = captured.lock().await;
+        let command = &captured[0];
+        assert_eq!(command.dict_get_str("command"), Some("play DTMF"));
+        assert_eq!(command.dict_get_str("code"), Some("123#"));
+        assert_eq!(command.dict_get("duration").and_then(|v| v.as_integer()), Some(100));
+        assert_eq!(command.dict_get("volume").and_then(|v| v.as_integer()), Some(-8));
+        assert_eq!(command.dict_get("pause").and_then(|v| v.as_integer()), Some(60));
+    }
+
+    #[tokio::test]
+    async fn play_dtmf_shape_minimal() {
+        let (addr, captured) = spawn_capturing_mock().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+        client
+            .play_dtmf("call-dtmf2", "tag-a", "5", None, None, None, None)
+            .await
+            .unwrap();
+        let captured = captured.lock().await;
+        let command = &captured[0];
+        assert_eq!(command.dict_get_str("code"), Some("5"));
+        assert!(command.dict_get("duration").is_none());
+        assert!(command.dict_get("volume").is_none());
+        assert!(command.dict_get("pause").is_none());
+    }
+
+    #[tokio::test]
+    async fn silence_and_unsilence_shape() {
+        let (addr, captured) = spawn_capturing_mock().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+        client.silence_media("call-s", "tag-a").await.unwrap();
+        client.unsilence_media("call-s", "tag-a").await.unwrap();
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].dict_get_str("command"), Some("silence media"));
+        assert_eq!(captured[1].dict_get_str("command"), Some("unsilence media"));
+    }
+
+    #[tokio::test]
+    async fn block_and_unblock_shape() {
+        let (addr, captured) = spawn_capturing_mock().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+        client.block_media("call-b", "tag-a").await.unwrap();
+        client.unblock_media("call-b", "tag-a").await.unwrap();
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].dict_get_str("command"), Some("block media"));
+        assert_eq!(captured[1].dict_get_str("command"), Some("unblock media"));
+    }
+
+    #[tokio::test]
+    async fn play_media_engine_error_propagates() {
+        let mock_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buffer = BytesMut::zeroed(65535);
+            if let Ok((size, source)) = mock_socket.recv_from(&mut buffer).await {
+                let data = &buffer[..size];
+                let space = data.iter().position(|&b| b == b' ').unwrap();
+                let cookie = std::str::from_utf8(&data[..space]).unwrap();
+                let response = BencodeValue::dict(vec![
+                    ("result", BencodeValue::string("error")),
+                    ("error-reason", BencodeValue::string("audio player not enabled")),
+                ]);
+                let encoded = bencode::encode(&response);
+                let mut reply = Vec::new();
+                reply.extend_from_slice(cookie.as_bytes());
+                reply.push(b' ');
+                reply.extend_from_slice(&encoded);
+                mock_socket.send_to(&reply, source).await.unwrap();
+            }
+        });
+
+        let client = RtpEngineClient::new(mock_addr, 2000).await.unwrap();
+        let result = client
+            .play_media(
+                "call-err",
+                "tag-a",
+                &PlayMediaSource::File("/nope.wav".to_string()),
+                None, None, None, None,
+            )
+            .await;
+        assert!(matches!(result, Err(RtpEngineError::EngineError(_))));
+        assert!(result.unwrap_err().to_string().contains("audio player"));
+    }
+
+    #[tokio::test]
+    async fn set_play_media_uses_affinity() {
+        let addr = spawn_mock_rtpengine().await;
+        let set = RtpEngineSet::new(vec![(addr, 2000, 1)]).await.unwrap();
+        let flags = NgFlags::default();
+        set.offer("call-play-aff", "tag-a", b"v=0\r\n", &flags).await.unwrap();
+        // `spawn_mock_rtpengine` returns `result: ok` for unknown commands,
+        // so play_media succeeds with no duration. Success alone proves the
+        // set routed to the affinity-bound instance without timing out.
+        let result = set
+            .play_media(
+                "call-play-aff",
+                "tag-a",
+                &PlayMediaSource::File("/a.wav".to_string()),
+                None, None, None, None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, None);
     }
 }
