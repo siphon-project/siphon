@@ -42,7 +42,7 @@ class TestPcscf:
             from_uri=f"sip:alice@{REALM}",
         )
         assert result.status_code == 421
-        require = result.request.get_header("Require")
+        require = result.request.get_reply_header("Require")
         assert require == "sec-agree"
 
     def test_register_sets_service_route(self):
@@ -53,8 +53,8 @@ class TestPcscf:
             headers={"Security-Client": "ipsec-3gpp;alg=hmac-sha-1-96"},
         )
         assert result.status_code == 200
-        # Verify Service-Route header was set
-        service_route = result.request.get_header("Service-Route")
+        # Verify Service-Route was set for the outgoing 200 OK response.
+        service_route = result.request.get_reply_header("Service-Route")
         assert service_route is not None
         assert REALM in service_route
 
@@ -66,7 +66,7 @@ class TestPcscf:
             headers={"Security-Client": "ipsec-3gpp;alg=hmac-sha-1-96"},
         )
         assert result.status_code == 200
-        pai = result.request.get_header("P-Associated-URI")
+        pai = result.request.get_reply_header("P-Associated-URI")
         assert pai is not None
         assert "alice" in pai
 
@@ -206,7 +206,7 @@ class TestScscf:
             auth_user="alice",
         )
         assert result.status_code == 200
-        service_route = result.request.get_header("Service-Route")
+        service_route = result.request.get_reply_header("Service-Route")
         assert service_route is not None
         assert "orig" in service_route
 
@@ -217,7 +217,7 @@ class TestScscf:
             auth_user="alice",
         )
         assert result.status_code == 200
-        pai = result.request.get_header("P-Associated-URI")
+        pai = result.request.get_reply_header("P-Associated-URI")
         assert pai is not None
         assert "alice" in pai
 

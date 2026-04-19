@@ -211,6 +211,9 @@ class SipTestHarness:
                            ``request.ruri.is_local``).  Default: ``["example.com"]``.
         """
         self._local_domains = local_domains or ["example.com"]
+        # Start from a clean slate so handlers from a previous harness /
+        # previous test don't accumulate across ``load_script`` calls.
+        mock_module.reset()
         self._module = mock_module.install()
         self._loop = asyncio.new_event_loop()
         self._hss: Optional[MockHss] = None
@@ -344,11 +347,16 @@ class SipTestHarness:
         if parsed_ruri.host in self._local_domains:
             parsed_ruri._is_local = True
 
+        # For REGISTER, the To header is the AoR being registered — by
+        # convention the same as From (RFC 3261 §10.2).  For other methods
+        # the default is the R-URI (the callee).
+        default_to_uri = from_uri if method == "REGISTER" else ruri
+
         request = Request(
             method=method,
             ruri=parsed_ruri,
             from_uri=from_uri,
-            to_uri=to_uri or ruri,
+            to_uri=to_uri or default_to_uri,
             from_tag=from_tag,
             to_tag=to_tag,
             call_id=call_id,

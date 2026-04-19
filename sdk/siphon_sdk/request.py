@@ -379,6 +379,22 @@ class Request:
             self._reply_headers = []
         self._reply_headers.append((name, value))
 
+    def get_reply_header(self, name: str) -> Optional[str]:
+        """Return the reply header value set by :meth:`set_reply_header`, or
+        ``None`` if not set.  Joins multi-value headers with ``, ``.
+
+        Test-only convenience — matches what the dispatcher would inject
+        into the outgoing response.
+        """
+        reply_headers = getattr(self, "_reply_headers", [])
+        values = [v for (n, v) in reply_headers if n.lower() == name.lower()]
+        return ", ".join(values) if values else None
+
+    @property
+    def reply_headers(self) -> list[tuple[str, str]]:
+        """All ``(name, value)`` pairs set via :meth:`set_reply_header`."""
+        return list(getattr(self, "_reply_headers", []))
+
     def set_body(self, body, content_type: str | None = None) -> None:
         """Replace the body of the incoming request message.
 

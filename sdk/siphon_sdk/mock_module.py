@@ -520,6 +520,11 @@ class MockRegistrar:
         # Fire on_change callbacks
         event_type = "refreshed" if already_exists else "registered"
         self._fire_on_change(aor, event_type)
+        # Automatically reply 200 OK on behalf of the script — matches the
+        # real Rust registrar.save() behaviour (the script must NOT also
+        # call request.reply()).
+        if hasattr(request, "reply"):
+            request.reply(200, "OK")
         return True
 
     def lookup(self, uri: Union[str, SipUri]) -> list[Contact]:
