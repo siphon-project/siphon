@@ -14,7 +14,7 @@
 //! threads can call into Python concurrently.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use pyo3::prelude::*;
@@ -23,6 +23,14 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{ReloadMode, ScriptConfig};
 use crate::error::{Result, SiphonError};
+
+/// Serializes the `clear → exec → extract` sequence against the global
+/// `_siphon_registry` Python module. Free-threaded Python 3.14t no longer
+/// serializes via the GIL, so concurrent compilers would otherwise see each
+/// other's handler registrations leak through the shared registry list.
+/// Compilation only happens at startup and on hot-reload, so a single mutex
+/// is fine — the request hot path never touches it.
+static REGISTRY_COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // Handler kind — each decorator type maps to one variant
@@ -380,6 +388,9 @@ impl ScriptEngine {
             SiphonError::Script(format!("cannot read {}: {error}", path.display()))
         })?;
 
+        let _registry_guard = REGISTRY_COMPILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Python::attach(|python| {
             Self::compile_source(python, path, &source)
         })
@@ -396,6 +407,10 @@ impl ScriptEngine {
         }
 
         let bytecode_payload = &pyc[16..];
+
+        let _registry_guard = REGISTRY_COMPILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         Python::attach(|python| {
             let registry_module = get_or_create_registry(python)?;
@@ -455,6 +470,9 @@ impl ScriptEngine {
 
     /// Compile an already-loaded source string. Used for embedded scripts.
     fn compile_source_standalone(path: &Path, source: &str) -> Result<ScriptState> {
+        let _registry_guard = REGISTRY_COMPILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Python::attach(|python| {
             Self::compile_source(python, path, source)
         })
