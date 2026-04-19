@@ -308,7 +308,7 @@ impl Ist {
             }
             (IstState::Completed, IstEvent::TimerH) => {
                 // ACK timeout — inform TU, terminate
-                self.state = NistState::Terminated.into();
+                self.state = IstState::Terminated;
                 vec![
                     Action::CancelTimer(TimerName::G),
                     Action::Timeout,
@@ -344,16 +344,6 @@ impl Ist {
             // -- Accepted / Terminated / invalid --
             (IstState::Accepted, _) | (IstState::Terminated, _) => vec![],
             _ => vec![],
-        }
-    }
-}
-
-// Conversion helper for the Timer H handler
-impl From<NistState> for IstState {
-    fn from(state: NistState) -> Self {
-        match state {
-            NistState::Terminated => IstState::Terminated,
-            _ => IstState::Terminated, // only used for terminated
         }
     }
 }
