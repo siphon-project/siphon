@@ -112,6 +112,31 @@ pub struct Config {
 
     /// Session Recording Server (SRS) — receive SIPREC INVITEs and record calls.
     pub srs: Option<SrsConfig>,
+
+    /// Generic SUBSCRIBE dialog state (``proxy.subscribe_state``).  When
+    /// ``cache`` references a configured named cache, dialogs are
+    /// persisted through it so they survive restarts and are visible to
+    /// other replicas.
+    pub subscribe_state: Option<SubscribeStateConfig>,
+}
+
+/// Configuration for ``proxy.subscribe_state`` — generic SUBSCRIBE
+/// dialog state with optional Redis-backed write-through.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SubscribeStateConfig {
+    /// Name of a cache defined in the top-level ``cache:`` list that
+    /// should be used as L2 write-through storage.  When unset, the
+    /// store is in-process only (no cross-replica visibility).
+    pub cache: Option<String>,
+    /// Default expiry (seconds) when the SUBSCRIBE carries no
+    /// ``Expires`` header and the script doesn't override.  Defaults to
+    /// 3600.
+    #[serde(default = "default_subscribe_state_expires")]
+    pub default_expires_secs: u64,
+}
+
+fn default_subscribe_state_expires() -> u64 {
+    3600
 }
 
 // ---------------------------------------------------------------------------

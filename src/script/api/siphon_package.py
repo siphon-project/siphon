@@ -27,6 +27,12 @@ class _ProxyNamespace:
     ``proxy.send_request(...)`` works transparently.
     """
 
+    def __init__(self):
+        # Placeholder for proxy.subscribe_state — replaced at startup by the
+        # Rust-backed SubscribeStateNamespace.  Keeps decorator-time access
+        # from AttributeError-ing before the Rust namespace is installed.
+        self.subscribe_state = _SubscribeStateStub()
+
     def __getattr__(self, name):
         utils = object.__getattribute__(self, "__dict__").get("_utils")
         if utils is not None:
@@ -415,6 +421,22 @@ class _RegistrationNamespace:
         is_async = _asyncio.iscoroutinefunction(fn)
         _registry.register("registration.on_change", None, fn, is_async)
         return fn
+
+
+class _SubscribeStateStub:
+    """Pre-startup stub for ``proxy.subscribe_state``.  Replaced by the
+    Rust-backed namespace before any user handler runs."""
+
+    def create(self, request, expires=None):
+        raise NotImplementedError(
+            "proxy.subscribe_state.create() not available yet — "
+            "called before the Rust namespace was installed"
+        )
+
+    def get(self, id):
+        raise NotImplementedError(
+            "proxy.subscribe_state.get() not available yet"
+        )
 
 
 # ---------------------------------------------------------------------------

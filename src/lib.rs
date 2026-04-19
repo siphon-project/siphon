@@ -35,5 +35,6 @@ pub mod sbi;
 pub mod server;
 pub mod siprec;
 pub mod srs;
+pub mod subscribe_state;
 
 pub use server::SiphonServer;

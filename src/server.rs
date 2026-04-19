@@ -535,8 +535,46 @@ impl SiphonServer {
             });
             crate::script::api::proxy_utils::set_uac_sender(
                 Arc::clone(&uac_sender),
-                dns_resolver,
+                Arc::clone(&dns_resolver),
             );
+            crate::script::api::subscribe_state::set_uac_sender(Arc::clone(&uac_sender));
+            crate::script::api::subscribe_state::set_resolver(Arc::clone(&dns_resolver));
+        }
+
+        // --- Subscribe-state namespace (proxy.subscribe_state) ---
+        {
+            let cache_manager = std::sync::Arc::new(
+                crate::cache::CacheManager::new(config.cache.as_deref().unwrap_or(&[])),
+            );
+            let mut store = crate::subscribe_state::SubscribeStore::new();
+            if let Some(ref cfg) = config.subscribe_state {
+                if let Some(ref cache_name) = cfg.cache {
+                    if cache_manager.has_cache(cache_name) {
+                        store = store.with_cache(
+                            Arc::clone(&cache_manager),
+                            cache_name.clone(),
+                        );
+                        info!(cache = %cache_name, "subscribe_state: L2 persistence enabled");
+                    } else {
+                        error!(
+                            cache = %cache_name,
+                            "subscribe_state: configured cache not found in cache: list"
+                        );
+                    }
+                }
+            }
+            let store_arc = Arc::new(store);
+            pyo3::Python::attach(|python| {
+                let namespace =
+                    crate::script::api::subscribe_state::PySubscribeState::new(
+                        Arc::clone(&store_arc),
+                    );
+                if let Err(error) =
+                    crate::script::api::set_subscribe_state_singleton(python, namespace)
+                {
+                    error!("failed to store subscribe_state singleton: {error}");
+                }
+            });
         }
 
         // --- Gateway health probers ---

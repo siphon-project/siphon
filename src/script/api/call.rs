@@ -42,6 +42,16 @@ pub enum CallAction {
     AcceptRefer,
     /// Reject a REFER with a status code.
     RejectRefer { code: u16, reason: String },
+    /// UAS-mode answer — siphon sends the final response to the A-leg
+    /// INVITE directly instead of bridging to a B-leg.  ``code`` must
+    /// be 2xx.  ``body`` is an optional answer body (SDP for audio,
+    /// could also be XML for future simservs-Ut responses).
+    Answer {
+        code: u16,
+        reason: String,
+        body: Option<Vec<u8>>,
+        content_type: Option<String>,
+    },
 }
 
 /// Which side initiated a BYE.
@@ -458,6 +468,43 @@ impl PyCall {
             code,
             reason: reason.to_string(),
         };
+    }
+
+    /// UAS-mode answer — send a final 2xx response to the A-leg INVITE
+    /// directly instead of bridging to a B-leg.  Useful for MRF /
+    /// announcement servers that own the dialog themselves.
+    ///
+    /// Args:
+    ///     code: Final response status (must be 2xx).
+    ///     reason: Reason phrase (e.g. ``"OK"``).
+    ///     body: Optional response body (``bytes`` or ``str``) — typically SDP.
+    ///     content_type: Content-Type for the body (e.g. ``"application/sdp"``).
+    #[pyo3(signature = (code, reason, body=None, content_type=None))]
+    fn answer(
+        &mut self,
+        code: u16,
+        reason: &str,
+        body: Option<&Bound<'_, PyAny>>,
+        content_type: Option<&str>,
+    ) -> PyResult<()> {
+        if !(200..300).contains(&code) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "call.answer() requires a 2xx status code; use call.reject() for failure responses (got {code})"
+            )));
+        }
+
+        let body_bytes = match body {
+            Some(obj) => Some(super::request::extract_body_bytes(obj)?),
+            None => None,
+        };
+
+        self.action = CallAction::Answer {
+            code,
+            reason: reason.to_string(),
+            body: body_bytes,
+            content_type: content_type.map(|s| s.to_string()),
+        };
+        Ok(())
     }
 
     /// Dial a single target (simple B-leg).

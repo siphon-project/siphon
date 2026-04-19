@@ -198,6 +198,109 @@ class MockProxy:
         self._utils = MockProxyUtils()
         self._sent_requests: list[dict] = []
         self._send_request_responses: dict[tuple[str, str], Any] = {}
+        self.subscribe_state = MockSubscribeState()
+
+
+# ---------------------------------------------------------------------------
+# proxy.subscribe_state (managed SUBSCRIBE dialog API)
+# ---------------------------------------------------------------------------
+
+class MockSubscribeHandle:
+    """Mock of the Rust ``SubscribeHandle``.
+
+    In the mock, NOTIFY / terminate calls are recorded on the parent
+    ``MockSubscribeState`` for test assertions.  No real SIP message is
+    produced.
+    """
+
+    def __init__(self, parent: "MockSubscribeState", id_: str, dialog: dict) -> None:
+        self._parent = parent
+        self._id = id_
+        self._dialog = dialog
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    @property
+    def event(self) -> str:
+        return self._dialog.get("event", "")
+
+    @property
+    def expires(self) -> int:
+        return int(self._dialog.get("expires_secs", 0))
+
+    def notify(self, body=None, content_type: Optional[str] = None,
+               state: Optional[str] = None) -> bool:
+        if self._id not in self._parent._dialogs:
+            return False
+        entry = {
+            "id": self._id,
+            "body": body,
+            "content_type": content_type,
+            "state": state or f"active;expires={self.expires}",
+        }
+        self._parent.notifies.append(entry)
+        return True
+
+    def terminate(self, reason: Optional[str] = None,
+                  body=None, content_type: Optional[str] = None) -> bool:
+        reason_str = reason or "noresource"
+        self._parent.terminates.append({
+            "id": self._id,
+            "reason": reason_str,
+            "body": body,
+            "content_type": content_type,
+        })
+        self._parent._dialogs.pop(self._id, None)
+        return True
+
+    def __repr__(self) -> str:
+        return f"MockSubscribeHandle(id={self._id!r})"
+
+
+class MockSubscribeState:
+    """Mock of the Rust ``proxy.subscribe_state`` namespace.
+
+    Used from scripts under test as ``proxy.subscribe_state.create(request)``.
+    Records NOTIFY and terminate invocations on ``notifies`` /
+    ``terminates`` lists for test assertions.
+    """
+
+    def __init__(self) -> None:
+        self._dialogs: dict[str, dict] = {}
+        self.notifies: list[dict] = []
+        self.terminates: list[dict] = []
+
+    def create(self, request: Any, expires: Optional[int] = None) -> MockSubscribeHandle:
+        import uuid
+        event = getattr(request, "event", None) or "presence"
+        expires_secs = expires if expires is not None else 3600
+        handle_id = uuid.uuid4().hex
+        dialog = {
+            "id": handle_id,
+            "event": event,
+            "expires_secs": expires_secs,
+            "call_id": getattr(request, "call_id", ""),
+            "remote_tag": getattr(request, "from_tag", ""),
+        }
+        self._dialogs[handle_id] = dialog
+        return MockSubscribeHandle(self, handle_id, dialog)
+
+    def get(self, id: str) -> Optional[MockSubscribeHandle]:
+        dialog = self._dialogs.get(id)
+        if dialog is None:
+            return None
+        return MockSubscribeHandle(self, id, dialog)
+
+    @property
+    def local_count(self) -> int:
+        return len(self._dialogs)
+
+    def clear(self) -> None:
+        self._dialogs.clear()
+        self.notifies.clear()
+        self.terminates.clear()
 
 
 # ---------------------------------------------------------------------------

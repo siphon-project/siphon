@@ -27,6 +27,7 @@ pub mod sbi;
 pub mod sdp;
 pub mod sip_uri;
 pub mod srs;
+pub mod subscribe_state;
 pub mod timer;
 
 use std::ffi::CString;
@@ -77,6 +78,8 @@ static ISC_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 static SBI_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 static TIMER_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+static SUBSCRIBE_STATE_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// The IfcStore Arc — stored so the backend can wire Redis persistence.
 static IFC_STORE_ARC: OnceLock<std::sync::Arc<crate::ifc::IfcStore>> = OnceLock::new();
@@ -300,6 +303,20 @@ pub fn set_timer_singleton(python: Python<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Store the ``proxy.subscribe_state`` singleton for injection into the
+/// siphon module.  Injected onto ``proxy`` as ``subscribe_state``
+/// (alongside ``_utils``).
+pub fn set_subscribe_state_singleton(
+    python: Python<'_>,
+    py_namespace: subscribe_state::PySubscribeState,
+) -> Result<()> {
+    let ns_py: Py<PyAny> = Py::new(python, py_namespace)
+        .map_err(|error| SiphonError::Script(format!("Py::new(subscribe_state): {error}")))?
+        .into_any();
+    let _ = SUBSCRIBE_STATE_SINGLETON.set(ns_py);
+    Ok(())
+}
+
 /// Store the ISC singleton for injection into the siphon module.
 ///
 /// Always called at startup — the iFC store is always available (even if
@@ -394,6 +411,14 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         proxy_ns
             .setattr("_utils", proxy_utils_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr proxy._utils: {error}")))?;
+
+        if let Some(subscribe_state_py) = SUBSCRIBE_STATE_SINGLETON.get() {
+            proxy_ns
+                .setattr("subscribe_state", subscribe_state_py.bind(python))
+                .map_err(|error| {
+                    SiphonError::Script(format!("setattr proxy.subscribe_state: {error}"))
+                })?;
+        }
     }
 
     // Inject optional RTPEngine singleton (only when media.rtpengine is configured).

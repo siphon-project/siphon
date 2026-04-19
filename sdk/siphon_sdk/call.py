@@ -167,6 +167,36 @@ class Call:
         self._state = "terminated"
         self._actions.append(Action(kind="reject", status_code=code, reason=reason))
 
+    def answer(self, code: int, reason: str,
+               body=None, content_type: str | None = None) -> None:
+        """UAS-mode answer — send a final 2xx response to the inbound
+        INVITE directly, without bridging to a B-leg.
+
+        Args:
+            code: Final 2xx status code (200, 202, etc.).
+            reason: Reason phrase.
+            body: Optional response body (``bytes`` or ``str``) — typically SDP.
+            content_type: Content-Type for the body (e.g. ``"application/sdp"``).
+
+        Example::
+
+            call.answer(200, "OK", body=sdp_bytes, content_type="application/sdp")
+        """
+        if not 200 <= code < 300:
+            raise ValueError(
+                f"call.answer() requires a 2xx status code; "
+                f"use call.reject() for failures (got {code})"
+            )
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self._state = "answered"
+        self._actions.append(Action(
+            kind="answer",
+            status_code=code,
+            reason=reason,
+            extras={"body": body, "content_type": content_type},
+        ))
+
     def dial(self, uri: str, timeout: int = 30) -> None:
         """Dial a single B-leg target.
 

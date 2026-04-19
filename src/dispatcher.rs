@@ -4652,6 +4652,22 @@ fn handle_b2bua_invite(
         CallAction::RejectRefer { code, reason } => {
             debug!(call_id = %call_id, code, reason = %reason, "B2BUA: RejectRefer during INVITE (no-op)");
         }
+        CallAction::Answer { code, reason, body, content_type } => {
+            debug!(call_id = %call_id, code, "B2BUA: UAS-mode answer");
+            let mut response = build_response(
+                &message_guard, code, &reason, state.server_header.as_deref(), &[],
+            );
+            if let Some(body_bytes) = body {
+                if let Some(ct) = content_type {
+                    response.headers.set("Content-Type", ct);
+                }
+                response.headers.set("Content-Length", body_bytes.len().to_string());
+                response.body = body_bytes;
+            }
+            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            // Actor stays alive — the A-leg dialog is now confirmed and the
+            // @b2bua.on_bye handler takes over when the UAC BYEs.
+        }
     }
 }
 
