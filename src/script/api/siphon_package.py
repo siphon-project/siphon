@@ -282,6 +282,15 @@ class _RtpEngineNamespace:
     async def ping(self):
         raise NotImplementedError("rtpengine.ping() not available — no media.rtpengine in config")
 
+    async def subscribe_request(self, call_id, from_tag, to_tag, sdp=None, profile=None):
+        raise NotImplementedError("rtpengine.subscribe_request() not available — no media.rtpengine in config")
+
+    async def subscribe_answer(self, call_id, from_tag, to_tag, sdp, profile=None):
+        raise NotImplementedError("rtpengine.subscribe_answer() not available — no media.rtpengine in config")
+
+    async def unsubscribe(self, call_id, from_tag, to_tag):
+        raise NotImplementedError("rtpengine.unsubscribe() not available — no media.rtpengine in config")
+
 
 # ---------------------------------------------------------------------------
 # Gateway namespace (stub — replaced by Rust when gateway is configured)

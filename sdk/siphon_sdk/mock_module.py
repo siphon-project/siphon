@@ -144,23 +144,50 @@ class MockProxy:
 
     def send_request(self, method: str, ruri: str,
                      headers: Optional[dict[str, str]] = None,
-                     body: Optional[str] = None) -> None:
-        """Originate an outbound SIP request (fire-and-forget).
+                     body: Optional[Any] = None,
+                     next_hop: Optional[str] = None,
+                     wait_for_response: bool = False,
+                     timeout_ms: int = 2000) -> Any:
+        """Originate an outbound SIP request.
 
-        Used to send NOTIFY, MESSAGE, and other requests from Python scripts.
+        Fire-and-forget by default; when ``wait_for_response=True``, blocks
+        until a response is configured for the destination and returns a
+        mock ``Reply`` (or ``None`` on timeout).
 
         Args:
-            method: SIP method name (e.g. "NOTIFY", "MESSAGE").
+            method: SIP method name (e.g. "NOTIFY", "OPTIONS", "MESSAGE").
             ruri: Request-URI string (e.g. "sip:alice@10.0.0.1:5060").
             headers: Optional dict of header name → value to add.
-            body: Optional body string.
+            body: Optional body — ``str`` or ``bytes``.
+            next_hop: Optional next-hop URI override.
+            wait_for_response: When ``True``, return the configured mock reply.
+            timeout_ms: Response timeout (not meaningfully enforced in the mock).
         """
-        self._sent_requests.append({
+        record = {
             "method": method,
             "ruri": ruri,
             "headers": headers or {},
             "body": body,
-        })
+            "next_hop": next_hop,
+            "wait_for_response": wait_for_response,
+            "timeout_ms": timeout_ms,
+        }
+        self._sent_requests.append(record)
+        if not wait_for_response:
+            return None
+        key = (method, ruri)
+        return self._send_request_responses.get(key)
+
+    def set_response_for(self, method: str, ruri: str, reply: Any) -> None:
+        """Test helper: configure the mock reply returned by
+        ``send_request(wait_for_response=True)`` for a given (method, ruri).
+
+        Args:
+            method: SIP method (e.g. "OPTIONS").
+            ruri: Request-URI the script will pass.
+            reply: Any object (often a ``MockReply``) — returned to the script.
+        """
+        self._send_request_responses[(method, ruri)] = reply
 
     @property
     def sent_requests(self) -> list[dict]:
@@ -170,6 +197,7 @@ class MockProxy:
     def __init__(self) -> None:
         self._utils = MockProxyUtils()
         self._sent_requests: list[dict] = []
+        self._send_request_responses: dict[tuple[str, str], Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -881,6 +909,8 @@ class MockRtpEngine:
         """Full parameter dicts for each media-injection call."""
         self._healthy = True
         self._play_media_duration_ms: Optional[int] = None
+        self._subscribe_request_sdp: bytes = b""
+        self._subscribe_answer_sdp: bytes = b""
 
     @property
     def active_sessions(self) -> int:
@@ -1083,6 +1113,87 @@ class MockRtpEngine:
         self.operations.append(("unblock_media", None))
         self.media_calls.append({"op": "unblock_media"})
         return True
+
+    async def subscribe_request(
+        self,
+        call_id: str,
+        from_tag: str,
+        to_tag: str,
+        sdp: Optional[bytes] = None,
+        profile: Optional[str] = None,
+    ) -> bytes:
+        """Create a new subscription to an existing call's media (MPTY / MRF
+        conference focus).
+
+        Args:
+            call_id: rtpengine call-id of the source session.
+            from_tag: source monologue tag whose outgoing audio is subscribed.
+            to_tag: subscriber tag to create.
+            sdp: Optional inbound SDP for the subscriber.
+            profile: RTP profile name (defaults to ``"rtp_passthrough"``).
+
+        Returns:
+            The subscriber SDP as ``bytes``.
+        """
+        self.operations.append(("subscribe_request", to_tag))
+        self.media_calls.append({
+            "op": "subscribe_request",
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "to_tag": to_tag,
+            "sdp": sdp,
+            "profile": profile,
+        })
+        return self._subscribe_request_sdp
+
+    async def subscribe_answer(
+        self,
+        call_id: str,
+        from_tag: str,
+        to_tag: str,
+        sdp: bytes,
+        profile: Optional[str] = None,
+    ) -> bytes:
+        """Complete the SDP negotiation for a subscription created via
+        :meth:`subscribe_request`.
+
+        Returns:
+            The rewritten SDP as ``bytes`` (may be empty).
+        """
+        self.operations.append(("subscribe_answer", to_tag))
+        self.media_calls.append({
+            "op": "subscribe_answer",
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "to_tag": to_tag,
+            "sdp": sdp,
+            "profile": profile,
+        })
+        return self._subscribe_answer_sdp
+
+    async def unsubscribe(
+        self,
+        call_id: str,
+        from_tag: str,
+        to_tag: str,
+    ) -> bool:
+        """Tear down a subscription created via :meth:`subscribe_request`."""
+        self.operations.append(("unsubscribe", to_tag))
+        self.media_calls.append({
+            "op": "unsubscribe",
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "to_tag": to_tag,
+        })
+        return True
+
+    def set_subscribe_request_sdp(self, sdp: bytes) -> None:
+        """Configure the SDP returned by :meth:`subscribe_request` (test helper)."""
+        self._subscribe_request_sdp = sdp
+
+    def set_subscribe_answer_sdp(self, sdp: bytes) -> None:
+        """Configure the SDP returned by :meth:`subscribe_answer` (test helper)."""
+        self._subscribe_answer_sdp = sdp
 
     def set_play_media_duration(self, duration_ms: Optional[int]) -> None:
         """Configure the duration returned by :meth:`play_media` (test helper)."""

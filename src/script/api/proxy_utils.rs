@@ -18,6 +18,7 @@ use crate::sip::parser::parse_uri_standalone;
 use crate::transport::Transport;
 use crate::uac::UacSender;
 
+use super::reply::PyReply;
 use super::request::PyRequest;
 
 /// Global UacSender — set once from main.rs after transport channels are ready.
@@ -228,22 +229,41 @@ impl PyProxyUtils {
 
     /// Originate an outbound SIP request (fire-and-forget).
     ///
-    /// Used to send NOTIFY, MESSAGE, and other requests from Python scripts.
+    /// Used to send NOTIFY, MESSAGE, OPTIONS, and other requests from Python
+    /// scripts.  Fire-and-forget by default; pass ``wait_for_response=True``
+    /// to block until the peer responds (or ``timeout_ms`` elapses).
     ///
     /// Args:
-    ///     method: SIP method name (e.g. "NOTIFY", "MESSAGE")
-    ///     ruri: Request-URI string (e.g. "sip:alice@10.0.0.1:5060")
-    ///     headers: Optional dict of header name → value to add
-    ///     body: Optional body string
-    #[pyo3(signature = (method, ruri, headers=None, body=None, next_hop=None))]
+    ///     method: SIP method name (e.g. "NOTIFY", "OPTIONS", "MESSAGE").
+    ///     ruri: Request-URI string (e.g. "sip:alice@10.0.0.1:5060").
+    ///     headers: Optional dict of header name → value to add.
+    ///     body: Optional body — ``str`` or ``bytes``.
+    ///     next_hop: Optional next-hop URI (e.g. Path from registrar).  The
+    ///               R-URI stays in the Request-Line; the message is routed
+    ///               to next_hop.
+    ///     wait_for_response: When ``True``, block until the peer responds
+    ///               or ``timeout_ms`` elapses, and return the :class:`Reply`.
+    ///               When ``False`` (default), fire-and-forget and return
+    ///               ``None``.
+    ///     timeout_ms: Response timeout in milliseconds (default 2000).
+    ///               Ignored when ``wait_for_response=False``.
+    ///
+    /// Returns:
+    ///     ``None`` when ``wait_for_response=False``; a :class:`Reply` (or
+    ///     ``None`` on timeout) when ``wait_for_response=True``.
+    #[pyo3(signature = (method, ruri, headers=None, body=None, next_hop=None, wait_for_response=false, timeout_ms=2000))]
+    #[allow(clippy::too_many_arguments)]
     fn send_request(
         &self,
+        python: Python<'_>,
         method: &str,
         ruri: &str,
         headers: Option<&Bound<'_, PyDict>>,
-        body: Option<&str>,
+        body: Option<&Bound<'_, PyAny>>,
         next_hop: Option<&str>,
-    ) -> PyResult<()> {
+        wait_for_response: bool,
+        timeout_ms: u64,
+    ) -> PyResult<Option<Py<PyReply>>> {
         let uac_sender = UAC_SENDER.get().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "proxy.send_request() unavailable: UAC sender not initialized",
@@ -315,7 +335,10 @@ impl PyProxyUtils {
 
         // Build the SIP message
         let sip_method = Method::from_str(method);
-        let branch = format!("z9hG4bK-py-{}", uuid::Uuid::new_v4());
+        // Always use the z9hG4bK-uac- prefix — harmless for fire-and-forget
+        // (no pending entry is registered), required for wait_for_response
+        // so UacSender::match_response picks it up.
+        let branch = format!("z9hG4bK-uac-py-{}", uuid::Uuid::new_v4());
         let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
         let call_id = format!("py-{}", uuid::Uuid::new_v4());
         let cseq_str = format!("1 {}", sip_method.as_str());
@@ -344,9 +367,17 @@ impl PyProxyUtils {
             }
         }
 
-        // Set body if provided
-        if let Some(body_str) = body {
-            builder = builder.body_str(body_str);
+        // Set body if provided — accept str or bytes.
+        if let Some(body_obj) = body {
+            if let Ok(body_str) = body_obj.extract::<&str>() {
+                builder = builder.body_str(body_str);
+            } else if let Ok(body_bytes) = body_obj.extract::<Vec<u8>>() {
+                builder = builder.body(body_bytes);
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "body must be str or bytes",
+                ));
+            }
         } else {
             builder = builder.content_length(0);
         }
@@ -357,8 +388,32 @@ impl PyProxyUtils {
             ))
         })?;
 
-        uac_sender.send_request(message, target.address, transport);
-        Ok(())
+        if !wait_for_response {
+            uac_sender.send_request(message, target.address, transport);
+            return Ok(None);
+        }
+
+        let receiver = uac_sender.send_request_with_response(
+            message,
+            target.address,
+            transport,
+        );
+
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                tokio::time::timeout(timeout, receiver).await
+            })
+        });
+
+        match result {
+            Ok(Ok(crate::uac::UacResult::Response(message))) => {
+                let py_reply = PyReply::new(Arc::new(std::sync::Mutex::new(*message)));
+                Ok(Some(Py::new(python, py_reply)?))
+            }
+            // Timeout or channel closed or explicit UacResult::Timeout
+            _ => Ok(None),
+        }
     }
 
     /// Return approximate RSS memory usage as a percentage (0-100).

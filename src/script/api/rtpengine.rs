@@ -507,6 +507,154 @@ impl PyRtpEngine {
         self.simple_media_command(python, target, "unblock_media")
     }
 
+    /// Send a `subscribe request` — create a new subscription to an existing
+    /// call's media.
+    ///
+    /// Low-level primitive for building MPTY / conference topologies (MRF
+    /// focus, monitoring, call recording). The caller is responsible for
+    /// deciding how to compose pair-wise or N-way subscriptions.
+    ///
+    /// Args:
+    ///     call_id: rtpengine call-id of the source session.
+    ///     from_tag: source monologue tag (whose outgoing audio the new
+    ///               subscription receives).
+    ///     to_tag: subscriber tag to create.
+    ///     sdp: Optional inbound SDP for the subscriber. Usually ``None`` —
+    ///          rtpengine generates one.
+    ///     profile: RTP profile name for flag composition (default
+    ///              ``"rtp_passthrough"``).
+    ///
+    /// Returns:
+    ///     The subscriber SDP as ``bytes``.
+    #[pyo3(signature = (call_id, from_tag, to_tag, sdp=None, profile=None))]
+    fn subscribe_request<'py>(
+        &self,
+        python: Python<'py>,
+        call_id: String,
+        from_tag: String,
+        to_tag: String,
+        sdp: Option<Vec<u8>>,
+        profile: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
+        let entry = self.registry.get(profile_name).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown RTP profile '{profile_name}'; valid profiles: {}",
+                self.registry.profile_names().join(", ")
+            ))
+        })?;
+        let flags = entry.offer.clone();
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let rewritten_sdp = client
+                .subscribe_request(&call_id, &from_tag, &to_tag, sdp.as_deref(), &flags)
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.subscribe_request failed: {error}"
+                    ))
+                })?;
+            debug!(
+                call_id = %call_id,
+                from_tag = %from_tag,
+                to_tag = %to_tag,
+                sdp_len = rewritten_sdp.len(),
+                "rtpengine subscribe_request"
+            );
+            Ok(rewritten_sdp)
+        })
+    }
+
+    /// Send a `subscribe answer` — complete the SDP negotiation for a
+    /// subscription created via :meth:`subscribe_request`.
+    ///
+    /// Args:
+    ///     call_id: rtpengine call-id of the source session.
+    ///     from_tag: source monologue tag (same value used in subscribe_request).
+    ///     to_tag: subscriber tag (same value used in subscribe_request).
+    ///     sdp: Answer SDP for the subscription.
+    ///     profile: RTP profile name (default ``"rtp_passthrough"``).
+    ///
+    /// Returns:
+    ///     The rewritten SDP as ``bytes`` (may be empty — rtpengine does
+    ///     not always echo SDP on subscribe answer).
+    #[pyo3(signature = (call_id, from_tag, to_tag, sdp, profile=None))]
+    fn subscribe_answer<'py>(
+        &self,
+        python: Python<'py>,
+        call_id: String,
+        from_tag: String,
+        to_tag: String,
+        sdp: Vec<u8>,
+        profile: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
+        let entry = self.registry.get(profile_name).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown RTP profile '{profile_name}'; valid profiles: {}",
+                self.registry.profile_names().join(", ")
+            ))
+        })?;
+        let flags = entry.answer.clone();
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let rewritten_sdp = client
+                .subscribe_answer(&call_id, &from_tag, &to_tag, &sdp, &flags)
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.subscribe_answer failed: {error}"
+                    ))
+                })?;
+            debug!(
+                call_id = %call_id,
+                from_tag = %from_tag,
+                to_tag = %to_tag,
+                sdp_len = rewritten_sdp.len(),
+                "rtpengine subscribe_answer"
+            );
+            Ok(rewritten_sdp)
+        })
+    }
+
+    /// Send an `unsubscribe` command — tear down a subscription created via
+    /// :meth:`subscribe_request`.
+    ///
+    /// Args:
+    ///     call_id: rtpengine call-id of the source session.
+    ///     from_tag: source monologue tag.
+    ///     to_tag: subscriber tag to remove.
+    #[pyo3(signature = (call_id, from_tag, to_tag))]
+    fn unsubscribe<'py>(
+        &self,
+        python: Python<'py>,
+        call_id: String,
+        from_tag: String,
+        to_tag: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client
+                .unsubscribe(&call_id, &from_tag, &to_tag)
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.unsubscribe failed: {error}"
+                    ))
+                })?;
+            debug!(
+                call_id = %call_id,
+                from_tag = %from_tag,
+                to_tag = %to_tag,
+                "rtpengine unsubscribe"
+            );
+            Ok(true)
+        })
+    }
+
     /// Number of active media sessions being tracked.
     #[getter]
     fn active_sessions(&self) -> usize {

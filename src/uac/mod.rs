@@ -288,6 +288,74 @@ impl UacSender {
         }
     }
 
+    /// Send a pre-built SIP message and register a pending entry so that the
+    /// eventual response is delivered via the returned `oneshot::Receiver`.
+    ///
+    /// The caller MUST ensure the topmost Via branch starts with
+    /// `z9hG4bK-uac-` — this is what [`match_response`] keys on.
+    pub fn send_request_with_response(
+        &self,
+        message: SipMessage,
+        destination: SocketAddr,
+        transport: Transport,
+    ) -> oneshot::Receiver<UacResult> {
+        let (sender, receiver) = oneshot::channel();
+
+        // Extract branch from the topmost Via.  If absent or not UAC-shaped,
+        // we can't correlate — signal timeout immediately.
+        let branch = message
+            .headers
+            .get("Via")
+            .or_else(|| message.headers.get("v"))
+            .and_then(|via_raw| {
+                crate::sip::headers::via::Via::parse_multi(via_raw)
+                    .ok()
+                    .and_then(|vias| vias.into_iter().next())
+                    .and_then(|v| v.branch)
+            });
+
+        let branch = match branch {
+            Some(b) if b.starts_with("z9hG4bK-uac-") => b,
+            _ => {
+                warn!("send_request_with_response: message has no z9hG4bK-uac- branch");
+                let _ = sender.send(UacResult::Timeout);
+                return receiver;
+            }
+        };
+
+        let data = Bytes::from(message.to_bytes());
+
+        if let Some(ref hep) = self.hep_sender {
+            let addr = self.addr_for(&transport);
+            hep.capture_outbound(addr, destination, transport, &data);
+        }
+
+        let outbound_message = OutboundMessage {
+            connection_id: ConnectionId::default(),
+            transport,
+            destination,
+            data,
+        };
+
+        self.pending.insert(branch.clone(), PendingRequest { sender });
+
+        debug!(
+            destination = %destination,
+            transport = %transport,
+            branch = %branch,
+            "UAC send_request_with_response"
+        );
+
+        if let Err(error) = self.outbound.send(outbound_message) {
+            warn!("UAC send_request_with_response failed: {error}");
+            if let Some((_, pending)) = self.pending.remove(&branch) {
+                let _ = pending.sender.send(UacResult::Timeout);
+            }
+        }
+
+        receiver
+    }
+
     /// Fire-and-forget: send a pre-built SIP message with no response tracking.
     ///
     /// Used for NOTIFY, MESSAGE, and other outbound requests where the caller
@@ -503,6 +571,69 @@ mod tests {
         let outbound = udp_rx.try_recv().unwrap();
         assert_eq!(outbound.destination, "10.0.0.5:5060".parse().unwrap());
         assert!(!outbound.data.is_empty());
+    }
+
+    #[test]
+    fn send_request_with_response_registers_pending() {
+        let (sender, receivers) = make_uac_sender();
+
+        let branch = format!("z9hG4bK-uac-{}", uuid::Uuid::new_v4());
+        let message = SipMessageBuilder::new()
+            .request(
+                crate::sip::message::Method::Options,
+                SipUri::new("10.0.0.5".to_string()),
+            )
+            .via(format!("SIP/2.0/UDP 127.0.0.1:5060;branch={branch}"))
+            .to("<sip:as@10.0.0.5>".to_string())
+            .from("<sip:siphon@127.0.0.1>;tag=py-1".to_string())
+            .call_id("py-test-1".to_string())
+            .cseq("1 OPTIONS".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let _receiver = sender.send_request_with_response(
+            message,
+            "10.0.0.5:5060".parse().unwrap(),
+            Transport::Udp,
+        );
+
+        assert_eq!(sender.pending_count(), 1);
+
+        // Message was routed to UDP.
+        let udp_rx = &receivers[0];
+        let outbound = udp_rx.try_recv().unwrap();
+        assert_eq!(outbound.destination, "10.0.0.5:5060".parse().unwrap());
+    }
+
+    #[test]
+    fn send_request_with_response_rejects_non_uac_branch() {
+        let (sender, _receivers) = make_uac_sender();
+
+        let message = SipMessageBuilder::new()
+            .request(
+                crate::sip::message::Method::Options,
+                SipUri::new("10.0.0.5".to_string()),
+            )
+            .via("SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-py-xyz".to_string())
+            .to("<sip:as@10.0.0.5>".to_string())
+            .from("<sip:siphon@127.0.0.1>;tag=py-1".to_string())
+            .call_id("py-test-2".to_string())
+            .cseq("1 OPTIONS".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let receiver = sender.send_request_with_response(
+            message,
+            "10.0.0.5:5060".parse().unwrap(),
+            Transport::Udp,
+        );
+
+        // No pending entry was registered; the receiver gets an immediate Timeout.
+        assert_eq!(sender.pending_count(), 0);
+        let result = receiver.blocking_recv().unwrap();
+        assert!(matches!(result, UacResult::Timeout));
     }
 
     // --- resolve_via_addr tests ---
