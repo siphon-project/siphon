@@ -998,6 +998,18 @@ pub struct MediaConfig {
     /// Hides the remote endpoint's identity (e.g. "FreeSWITCH") from the other leg.
     /// Defaults to "SIPhon" if not set.
     pub sdp_name: Option<String>,
+    /// Optional inbound event listener for rtpengine async notifications
+    /// (DTMF, etc.).  Configure rtpengine with `dtmf-log-ng-tcp-uri=tcp://<this>`
+    /// to make it deliver bencode-framed events here.
+    pub events: Option<RtpEngineEventsConfig>,
+}
+
+/// Configuration for siphon's inbound listener that accepts rtpengine's
+/// async event notifications (DTMF, etc.) over NG-protocol TCP.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RtpEngineEventsConfig {
+    /// Socket address to listen on (e.g. ``"0.0.0.0:22226"``).
+    pub listen_addr: String,
 }
 
 /// A user-defined RTPEngine media profile with separate offer/answer NG flags.

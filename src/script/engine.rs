@@ -75,6 +75,14 @@ pub enum HandlerKind {
     DiameterOnPnr,
     /// `@sbi.on_event` — incoming PCF event notification (N5).
     SbiOnEvent,
+    /// `@rtpengine.on_dtmf` — inbound DTMF event from rtpengine.
+    ///
+    /// ``call_id`` and ``from_tag`` are optional filters: when set, only
+    /// matching DTMF events invoke the handler.
+    RtpEngineOnDtmf {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +128,25 @@ impl ScriptState {
                 HandlerKind::ProxyRequest(None) => true,
                 HandlerKind::ProxyRequest(Some(filter)) => {
                     filter.split('|').any(|m| m == method)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Return all `RtpEngineOnDtmf` handlers whose optional call-id/from-tag
+    /// filters match the event.  `None` filters match everything.
+    pub fn dtmf_handlers(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnDtmf { call_id: filter_cid, from_tag: filter_ftag } => {
+                    filter_cid.as_deref().map_or(true, |v| v == call_id)
+                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
                 _ => false,
             })
@@ -700,6 +727,17 @@ fn extract_handlers(
                     .and_then(|v| v.extract())
                     .unwrap_or(0);
                 HandlerKind::TimerEvery { interval_secs, name, jitter_secs }
+            }
+            "rtpengine.on_dtmf" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnDtmf { call_id, from_tag }
             }
             other => {
                 warn!(kind = other, "unknown handler kind, skipping");

@@ -379,6 +379,43 @@ class Request:
             self._reply_headers = []
         self._reply_headers.append((name, value))
 
+    def set_body(self, body, content_type: str | None = None) -> None:
+        """Replace the body of the incoming request message.
+
+        Args:
+            body: ``str`` or ``bytes`` — the new body.
+            content_type: Optional Content-Type to set alongside the body.
+
+        Example::
+
+            request.set_body(pidf_lo_xml, "application/pidf+xml")
+        """
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self._body = body
+        if content_type is not None:
+            self._headers["Content-Type"] = content_type
+        self._headers["Content-Length"] = str(len(body))
+
+    def set_reply_body(self, body, content_type: str) -> None:
+        """Attach a body to the response built by :meth:`reply`.
+
+        The dispatcher copies this body and sets ``Content-Type`` /
+        ``Content-Length`` on the outgoing response.
+
+        Args:
+            body: ``str`` or ``bytes`` — the response body.
+            content_type: ``Content-Type`` header value.
+
+        Example::
+
+            request.set_reply_body(pidf_lo_xml, "application/pidf+xml")
+            request.reply(200, "OK")
+        """
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self._reply_body = (body, content_type)
+
     def remove_header(self, name: str) -> None:
         """Remove a header entirely.
 

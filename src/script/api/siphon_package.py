@@ -291,6 +291,27 @@ class _RtpEngineNamespace:
     async def unsubscribe(self, call_id, from_tag, to_tag):
         raise NotImplementedError("rtpengine.unsubscribe() not available — no media.rtpengine in config")
 
+    def on_dtmf(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for inbound DTMF events from rtpengine.
+
+        Usage:
+            @rtpengine.on_dtmf
+            def handle_any(call_id, from_tag, digit, duration_ms, volume):
+                ...
+
+            @rtpengine.on_dtmf(call_id="abc")
+            def handle_specific(call_id, from_tag, digit, duration_ms, volume):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_dtmf", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
 
 # ---------------------------------------------------------------------------
 # Gateway namespace (stub — replaced by Rust when gateway is configured)

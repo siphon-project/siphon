@@ -65,6 +65,9 @@ pub struct PyRequest {
     on_failure_callback: Option<Py<PyAny>>,
     /// Extra headers to include in the response (set by `set_reply_header`).
     reply_headers: Vec<(String, String)>,
+    /// Optional body to attach to the response built by `reply()` — set by
+    /// `set_reply_body()`.  Carries ``(body, content_type)``.
+    reply_body: Option<(Vec<u8>, String)>,
 }
 
 impl PyRequest {
@@ -88,6 +91,7 @@ impl PyRequest {
             on_reply_callback: None,
             on_failure_callback: None,
             reply_headers: vec![],
+            reply_body: None,
         }
     }
 
@@ -113,6 +117,7 @@ impl PyRequest {
             on_reply_callback: None,
             on_failure_callback: None,
             reply_headers: vec![],
+            reply_body: None,
         }
     }
 
@@ -187,6 +192,11 @@ impl PyRequest {
     /// Take the accumulated reply headers (consumed by the dispatcher).
     pub fn take_reply_headers(&mut self) -> Vec<(String, String)> {
         std::mem::take(&mut self.reply_headers)
+    }
+
+    /// Take the response body set by `set_reply_body()` (consumed by the dispatcher).
+    pub fn take_reply_body(&mut self) -> Option<(Vec<u8>, String)> {
+        self.reply_body.take()
     }
 
     // --- CDR helper accessors (Rust-side, no PyResult) ---
@@ -648,6 +658,44 @@ impl PyRequest {
         self.reply_headers.push((name.to_string(), value.to_string()));
     }
 
+    /// Replace the body of the incoming request message.
+    ///
+    /// Updates ``Content-Type`` and ``Content-Length`` to match.  ``body``
+    /// accepts ``str`` or ``bytes``.  Useful for PIDF-LO synthesis,
+    /// SDP rewrite, XCAP/Ut document manipulation.
+    #[pyo3(signature = (body, content_type=None))]
+    fn set_body(
+        &self,
+        body: &Bound<'_, PyAny>,
+        content_type: Option<&str>,
+    ) -> PyResult<()> {
+        let bytes = extract_body_bytes(body)?;
+        let mut message = self.lock_mut()?;
+        if let Some(ct) = content_type {
+            message.headers.set("Content-Type", ct.to_string());
+        }
+        message.headers.set("Content-Length", bytes.len().to_string());
+        message.body = bytes;
+        Ok(())
+    }
+
+    /// Attach a body to the response built by ``request.reply()``.
+    ///
+    /// The dispatcher copies this body and sets ``Content-Type`` and
+    /// ``Content-Length`` on the outgoing response.  ``body`` accepts
+    /// ``str`` or ``bytes``.  Typical uses: PIDF-LO attachment on LIR/LRF
+    /// 200 OK, XCAP/Ut responses, custom failure body.
+    #[pyo3(signature = (body, content_type))]
+    fn set_reply_body(
+        &mut self,
+        body: &Bound<'_, PyAny>,
+        content_type: &str,
+    ) -> PyResult<()> {
+        let bytes = extract_body_bytes(body)?;
+        self.reply_body = Some((bytes, content_type.to_string()));
+        Ok(())
+    }
+
     /// Remove a header entirely.
     fn remove_header(&self, name: &str) -> PyResult<()> {
         let mut message = self.lock_mut()?;
@@ -892,6 +940,19 @@ impl PyRequest {
     fn lock_mut(&self) -> PyResult<std::sync::MutexGuard<'_, SipMessage>> {
         self.lock()
     }
+}
+
+/// Coerce a Python body argument (``str`` or ``bytes``) into raw bytes.
+pub(super) fn extract_body_bytes(body: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(text) = body.extract::<&str>() {
+        return Ok(text.as_bytes().to_vec());
+    }
+    if let Ok(bytes) = body.extract::<Vec<u8>>() {
+        return Ok(bytes);
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "body must be str or bytes",
+    ))
 }
 
 /// Rewrite the display name in a From or To header.

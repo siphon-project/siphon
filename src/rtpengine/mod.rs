@@ -12,6 +12,7 @@
 pub mod bencode;
 pub mod client;
 pub mod error;
+pub mod events;
 pub mod profile;
 pub mod session;
 

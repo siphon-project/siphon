@@ -27,6 +27,7 @@ pub mod sbi;
 pub mod sdp;
 pub mod sip_uri;
 pub mod srs;
+pub mod timer;
 
 use std::ffi::CString;
 use std::sync::OnceLock;
@@ -74,6 +75,8 @@ static ISC_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Optional SBI singleton — set only when `sbi` is configured.
 static SBI_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+static TIMER_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// The IfcStore Arc — stored so the backend can wire Redis persistence.
 static IFC_STORE_ARC: OnceLock<std::sync::Arc<crate::ifc::IfcStore>> = OnceLock::new();
@@ -286,6 +289,17 @@ pub fn set_sdp_singleton(python: Python<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Store the timer namespace singleton for injection into the siphon module.
+///
+/// Always called at startup — timers are always available, no config needed.
+pub fn set_timer_singleton(python: Python<'_>) -> Result<()> {
+    let timer_py: Py<PyAny> = Py::new(python, timer::PyTimerNamespace::new())
+        .map_err(|error| SiphonError::Script(format!("Py::new(timer): {error}")))?
+        .into_any();
+    let _ = TIMER_SINGLETON.set(timer_py);
+    Ok(())
+}
+
 /// Store the ISC singleton for injection into the siphon module.
 ///
 /// Always called at startup — the iFC store is always available (even if
@@ -443,6 +457,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("sdp", sdp_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr sdp: {error}")))?;
+    }
+
+    // Inject timer namespace singleton (always available — runtime scheduler).
+    if let Some(timer_py) = TIMER_SINGLETON.get() {
+        module
+            .setattr("timer", timer_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr timer: {error}")))?;
     }
 
     // Inject ISC singleton (always available — iFC store).

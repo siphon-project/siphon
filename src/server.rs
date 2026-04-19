@@ -203,6 +203,14 @@ impl SiphonServer {
             }
         });
 
+        // --- Initialize timer namespace for Python scripts ---
+        // Runtime scheduler for timer.set / timer.cancel — always available.
+        pyo3::Python::attach(|python| {
+            if let Err(error) = crate::script::api::set_timer_singleton(python) {
+                error!("failed to store timer singleton: {error}");
+            }
+        });
+
         // --- Initialize ISC namespace before script load ---
         // Must be registered before ScriptEngine::new() so that
         // install_siphon_module() can inject the Rust-backed isc instance
@@ -549,6 +557,33 @@ impl SiphonServer {
             }
         }
 
+        // --- RTPEngine event listener (DTMF, etc.) ---
+        let (rtpengine_events_tx, rtpengine_events_rx) =
+            tokio::sync::mpsc::channel::<crate::rtpengine::events::RtpEngineEvent>(256);
+        if let Some(ref media_config) = config.media {
+            if let Some(ref events_config) = media_config.events {
+                match events_config.listen_addr.parse() {
+                    Ok(addr) => {
+                        if let Err(error) = crate::rtpengine::events::spawn_event_listener(
+                            addr,
+                            rtpengine_events_tx.clone(),
+                        )
+                        .await
+                        {
+                            error!(%error, "rtpengine event listener failed to start");
+                        }
+                    }
+                    Err(error) => {
+                        error!(
+                            listen_addr = %events_config.listen_addr,
+                            %error,
+                            "rtpengine events: invalid listen_addr"
+                        );
+                    }
+                }
+            }
+        }
+
         // --- Diameter peers ---
         // Shared channel for incoming Diameter requests from all peers (RTR, etc.).
         let (diameter_incoming_tx, diameter_incoming_rx) =
@@ -810,7 +845,12 @@ impl SiphonServer {
             crlf_pong_tracker,
             registrar_event_rx,
             diameter_incoming_rx,
+            rtpengine_events_rx,
         ));
+
+        // Keep the sender alive for the lifetime of the server so the listener
+        // task never sees a "channel closed" error when no DTMF activity happens.
+        let _rtpengine_events_keepalive = rtpengine_events_tx;
 
         // Evict connection-oriented contacts restored from the backend
         if let Some(registrar) = crate::script::api::registrar_arc() {

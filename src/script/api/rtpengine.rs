@@ -12,6 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use tracing::{debug, warn};
 
 use crate::rtpengine::client::{PlayMediaSource, RtpEngineSet};
@@ -653,6 +654,64 @@ impl PyRtpEngine {
             );
             Ok(true)
         })
+    }
+
+    /// Register a handler for inbound DTMF events from rtpengine.
+    ///
+    /// rtpengine must be configured with ``dtmf-log-ng-tcp-uri=tcp://<siphon>``
+    /// and siphon must have ``media.events.listen_addr`` set so it accepts
+    /// the inbound TCP connection.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_dtmf(call_id="abc", from_tag="ftag1")
+    /// def handle_digit(call_id, from_tag, digit, duration_ms, volume):
+    ///     ...
+    ///
+    /// # Catch-all - no filters
+    /// @rtpengine.on_dtmf
+    /// def handle_any(call_id, from_tag, digit, duration_ms, volume):
+    ///     ...
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_dtmf``) this
+    ///         is the function.  When called with keyword filters the return
+    ///         value is a decorator.
+    ///     call_id: Optional rtpengine call-id filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_dtmf<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Compose a Python-side decorator that registers via _siphon_registry
+        // with metadata describing the filters.
+        let code = r#"
+def make_decorator(call_id, from_tag):
+    import asyncio
+    import _siphon_registry
+    def decorator(fn):
+        is_async = asyncio.iscoroutinefunction(fn)
+        metadata = {"call_id": call_id, "from_tag": from_tag}
+        _siphon_registry.register("rtpengine.on_dtmf", None, fn, is_async, metadata)
+        return fn
+    return decorator
+"#;
+        let globals = PyDict::new(python);
+        python.run(&std::ffi::CString::new(code).unwrap(), Some(&globals), None)?;
+        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_dtmf decorator")
+        })?;
+        let decorator = make_decorator.call1((call_id, from_tag))?;
+
+        // Support both `@on_dtmf` (bare) and `@on_dtmf(call_id=...)` forms.
+        match func_or_none {
+            Some(func) => decorator.call1((func.bind(python),)),
+            None => Ok(decorator),
+        }
     }
 
     /// Number of active media sessions being tracked.

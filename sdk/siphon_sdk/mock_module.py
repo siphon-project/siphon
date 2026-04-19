@@ -911,6 +911,7 @@ class MockRtpEngine:
         self._play_media_duration_ms: Optional[int] = None
         self._subscribe_request_sdp: bytes = b""
         self._subscribe_answer_sdp: bytes = b""
+        self._dtmf_handlers: list[dict[str, Any]] = []
 
     @property
     def active_sessions(self) -> int:
@@ -1186,6 +1187,46 @@ class MockRtpEngine:
             "to_tag": to_tag,
         })
         return True
+
+    def on_dtmf(self, func_or_none: Any = None, *,
+                call_id: Optional[str] = None,
+                from_tag: Optional[str] = None) -> Any:
+        """Register a handler for inbound DTMF events from rtpengine.
+
+        Usage::
+
+            @rtpengine.on_dtmf
+            def handle_any(call_id, from_tag, digit, duration_ms, volume):
+                ...
+
+            @rtpengine.on_dtmf(call_id="abc", from_tag="ftag1")
+            def handle_specific(call_id, from_tag, digit, duration_ms, volume):
+                ...
+        """
+        def decorator(fn: Any) -> Any:
+            self._dtmf_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_dtmf(self, call_id: str, from_tag: str, digit: str,
+                  duration_ms: int = 0, volume: int = 0) -> int:
+        """Test helper: fire a DTMF event.  Returns the number of handlers
+        that matched (and were invoked)."""
+        fired = 0
+        for entry in self._dtmf_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            entry["fn"](call_id, from_tag, digit, duration_ms, volume)
+            fired += 1
+        return fired
 
     def set_subscribe_request_sdp(self, sdp: bytes) -> None:
         """Configure the SDP returned by :meth:`subscribe_request` (test helper)."""
@@ -2526,6 +2567,10 @@ class MockTimer:
             log.info("pushing stats")
     """
 
+    def __init__(self) -> None:
+        # Scheduled one-shot timers: key -> (delay_ms, handler)
+        self._one_shots: dict[str, tuple[int, Callable]] = {}
+
     def every(self, seconds: int, name: str | None = None,
               jitter: int = 0) -> Callable:
         """Register a periodic timer callback.
@@ -2551,6 +2596,55 @@ class MockTimer:
             _registry.register("timer.every", None, fn, is_async, metadata)
             return fn
         return decorator
+
+    def set(self, key: str, delay_ms: int, handler: Callable) -> "MockTimerHandle":
+        """Schedule a one-shot callback under ``key`` to fire after ``delay_ms``.
+
+        Setting the same key twice cancels the previous timer and reschedules.
+
+        In the mock, no tokio runtime fires the callback — tests call
+        :meth:`fire` with the key to invoke the handler manually.
+        """
+        self._one_shots[key] = (delay_ms, handler)
+        return MockTimerHandle(self, key)
+
+    def cancel(self, key: str) -> bool:
+        """Cancel the one-shot timer registered under ``key``.  Returns
+        ``True`` if a timer was cancelled, ``False`` if no timer matched."""
+        return self._one_shots.pop(key, None) is not None
+
+    def fire(self, key: str) -> None:
+        """Test helper: fire the one-shot timer registered under ``key``.
+
+        Raises ``KeyError`` if no timer matches.  Pops the timer so a
+        subsequent fire for the same key raises.
+        """
+        delay_ms, handler = self._one_shots.pop(key)
+        _ = delay_ms  # delay is cosmetic in the mock
+        handler(key)
+
+    @property
+    def scheduled(self) -> dict[str, int]:
+        """Map of active one-shot timer keys → scheduled delay (ms)."""
+        return {key: delay for key, (delay, _) in self._one_shots.items()}
+
+
+class MockTimerHandle:
+    """Mock of the ``TimerHandle`` returned by ``timer.set()``."""
+
+    def __init__(self, timer: "MockTimer", key: str) -> None:
+        self._timer = timer
+        self._key = key
+
+    @property
+    def key(self) -> str:
+        return self._key
+
+    def cancel(self) -> bool:
+        return self._timer.cancel(self._key)
+
+    def __repr__(self) -> str:
+        return f"MockTimerHandle(key={self._key!r})"
 
 
 # ---------------------------------------------------------------------------

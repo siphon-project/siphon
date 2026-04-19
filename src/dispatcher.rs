@@ -214,6 +214,7 @@ pub async fn run(
         crate::diameter::peer::IncomingRequest,
         std::sync::Arc<crate::diameter::peer::DiameterPeer>,
     )>,
+    rtpengine_events_rx: tokio::sync::mpsc::Receiver<crate::rtpengine::events::RtpEngineEvent>,
 ) {
     // Resolve the local address for Via insertion.
     // If bound to 0.0.0.0 / [::], use advertised_address from config, or loopback.
@@ -969,6 +970,71 @@ pub async fn run(
         });
     }
 
+    // Spawn background task: rtpengine async events (DTMF, etc.)
+    {
+        let mut events_rx = rtpengine_events_rx;
+        let state_for_events = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Some(event) = events_rx.recv().await {
+                match event {
+                    crate::rtpengine::events::RtpEngineEvent::Dtmf(dtmf) => {
+                        let engine_state = state_for_events.engine.state();
+                        let handlers = engine_state.dtmf_handlers(&dtmf.call_id, &dtmf.from_tag);
+                        if handlers.is_empty() {
+                            continue;
+                        }
+                        let state_ref = Arc::clone(&state_for_events);
+                        let dtmf_clone = dtmf.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state
+                                .dtmf_handlers(&dtmf_clone.call_id, &dtmf_clone.from_tag);
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        dtmf_clone.call_id.as_str(),
+                                        dtmf_clone.from_tag.as_str(),
+                                        dtmf_clone.digit.as_str(),
+                                        dtmf_clone.duration_ms,
+                                        dtmf_clone.volume,
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async rtpengine.on_dtmf handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "rtpengine.on_dtmf handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        })
+                        .await
+                        .ok();
+                    }
+                    crate::rtpengine::events::RtpEngineEvent::Unknown { event, call_id, .. } => {
+                        tracing::debug!(
+                            %event,
+                            ?call_id,
+                            "unhandled rtpengine event"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     info!("dispatcher started");
 
     while let Ok(inbound) = inbound_rx.recv_async().await {
@@ -1423,12 +1489,12 @@ fn handle_request(
     );
 
     // Call Python handlers
-    let (action, record_routed, on_reply_cb, on_failure_cb, send_via_transport, send_via_target, reply_headers) = Python::attach(|python| {
+    let (action, record_routed, on_reply_cb, on_failure_cb, send_via_transport, send_via_target, reply_headers, reply_body) = Python::attach(|python| {
         let py_request = match Py::new(python, request) {
             Ok(py) => py,
             Err(error) => {
                 error!("failed to create PyRequest: {error}");
-                return (RequestAction::None, false, None, None, None, None, vec![]);
+                return (RequestAction::None, false, None, None, None, None, vec![], None);
             }
         };
 
@@ -1456,6 +1522,7 @@ fn handle_request(
                                 None,
                                 None,
                                 vec![],
+                                None,
                             );
                         }
                     }
@@ -1473,6 +1540,7 @@ fn handle_request(
                         None,
                         None,
                         vec![],
+                        None,
                     );
                 }
             }
@@ -1486,7 +1554,8 @@ fn handle_request(
         let send_via_transport = borrowed.via_transport_override().map(|s| s.to_string());
         let send_via_target = borrowed.via_target_override().map(|s| s.to_string());
         let reply_headers = borrowed.take_reply_headers();
-        (action, record_routed, on_reply, on_failure, send_via_transport, send_via_target, reply_headers)
+        let reply_body = borrowed.take_reply_body();
+        (action, record_routed, on_reply, on_failure, send_via_transport, send_via_target, reply_headers, reply_body)
     });
 
     // Process the action
@@ -1500,6 +1569,13 @@ fn handle_request(
         }
         RequestAction::Reply { code, reason } => {
             let mut response = build_response(&message_guard, *code, reason, state.server_header.as_deref(), &reply_headers);
+
+            // Script-provided reply body — PIDF-LO, XCAP/Ut, custom failure body, etc.
+            if let Some((body_bytes, content_type)) = &reply_body {
+                response.headers.set("Content-Type", content_type.clone());
+                response.headers.set("Content-Length", body_bytes.len().to_string());
+                response.body = body_bytes.clone();
+            }
 
             // IPsec: inject Security-Server on 401 REGISTER and create SAs immediately.
             // Per 3GPP TS 33.203, the P-CSCF creates SAs right after sending the 401
