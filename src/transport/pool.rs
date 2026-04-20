@@ -25,6 +25,7 @@ use crate::transport::{
     ConnectionId, InboundMessage, Transport,
     configure_tcp_socket, next_connection_id,
 };
+use crate::transport::tcp::extract_sip_message_length;
 
 /// Idle timeout for pooled outbound connections (shorter than inbound).
 ///
@@ -205,32 +206,56 @@ impl ConnectionPool {
             "pool: opened outbound TCP connection"
         );
 
-        // Read task — responses from the remote server come back here
+        // Read task — responses from the remote server come back here.
+        //
+        // SIP-over-TCP requires Content-Length-based message framing (RFC 3261
+        // §18.3): each TCP read may deliver a partial message, multiple
+        // messages, or any combination. Without framing, multi-message
+        // arrivals were forwarded as a single InboundMessage and the parser
+        // saw garbled headers — manifesting as missing 200 OKs and silent
+        // call failures under any sustained TCP load.
         let inbound_tx = self.inbound_tx.clone();
         let conn_map = self.connection_map.clone();
         let connections = self.connections.clone();
         let key_for_cleanup = key;
         tokio::spawn(async move {
-            let mut buffer = BytesMut::zeroed(65536);
+            let mut accumulator = BytesMut::with_capacity(65536);
+            let mut read_buf = [0u8; 8192];
             loop {
-                match tokio::time::timeout(POOL_IDLE_TIMEOUT, reader.read(&mut buffer)).await
+                match tokio::time::timeout(POOL_IDLE_TIMEOUT, reader.read(&mut read_buf)).await
                 {
                     Ok(Ok(0)) => {
                         info!("pool: TCP connection {:?} to {} closed by peer", connection_id, destination);
                         break;
                     }
                     Ok(Ok(size)) => {
-                        let response_data = Bytes::copy_from_slice(&buffer[..size]);
-                        let message = InboundMessage {
-                            connection_id,
-                            transport: Transport::Tcp,
-                            local_addr,
-                            remote_addr: destination,
-                            data: response_data,
-                        };
-                        if let Err(error) = inbound_tx.send_async(message).await {
-                            error!("pool: inbound enqueue failed: {}", error);
-                            break;
+                        accumulator.extend_from_slice(&read_buf[..size]);
+
+                        // Drain all complete messages from the accumulator.
+                        loop {
+                            // Strip leading CRLF keepalives (RFC 3261 §7.5).
+                            while accumulator.len() >= 2 && &accumulator[..2] == b"\r\n" {
+                                let _ = accumulator.split_to(2);
+                            }
+                            if accumulator.is_empty() {
+                                break;
+                            }
+                            let message_len = match extract_sip_message_length(&accumulator) {
+                                Some(len) if len <= accumulator.len() => len,
+                                _ => break, // incomplete — wait for more bytes
+                            };
+                            let data = accumulator.split_to(message_len).freeze();
+                            let message = InboundMessage {
+                                connection_id,
+                                transport: Transport::Tcp,
+                                local_addr,
+                                remote_addr: destination,
+                                data,
+                            };
+                            if let Err(error) = inbound_tx.send_async(message).await {
+                                error!("pool: inbound enqueue failed: {}", error);
+                                return;
+                            }
                         }
                     }
                     Ok(Err(error)) => {
@@ -349,25 +374,48 @@ impl ConnectionPool {
         let tls_addr_map = self.tls_addr_map.clone();
         let key_for_cleanup = key;
         tokio::spawn(async move {
-            let mut buffer = BytesMut::zeroed(65536);
+            // SIP-over-TLS framing — see the matching comment in send_tcp's
+            // read task above. A raw `reader.read()` on a TLS stream can
+            // return a partial SIP message or coalesce two messages into one
+            // chunk; both produce parser garbage and silent call drops.
+            let mut accumulator = BytesMut::with_capacity(65536);
+            let mut read_buf = [0u8; 8192];
             loop {
-                match reader.read(&mut buffer).await {
+                match reader.read(&mut read_buf).await {
                     Ok(0) => {
                         info!("pool: TLS connection {:?} to {} closed by peer", connection_id, destination);
                         break;
                     }
                     Ok(size) => {
-                        let response_data = Bytes::copy_from_slice(&buffer[..size]);
-                        let message = InboundMessage {
-                            connection_id,
-                            transport: Transport::Tls,
-                            local_addr,
-                            remote_addr: destination,
-                            data: response_data,
-                        };
-                        if let Err(error) = inbound_tx.send_async(message).await {
-                            error!("pool: TLS inbound enqueue failed: {}", error);
-                            break;
+                        accumulator.extend_from_slice(&read_buf[..size]);
+                        loop {
+                            while accumulator.len() >= 2 && &accumulator[..2] == b"\r\n" {
+                                let _ = accumulator.split_to(2);
+                            }
+                            if accumulator.is_empty() {
+                                break;
+                            }
+                            let message_len = match extract_sip_message_length(&accumulator) {
+                                Some(len) if len <= accumulator.len() => len,
+                                _ => break,
+                            };
+                            let data = accumulator.split_to(message_len).freeze();
+                            let message = InboundMessage {
+                                connection_id,
+                                transport: Transport::Tls,
+                                local_addr,
+                                remote_addr: destination,
+                                data,
+                            };
+                            if let Err(error) = inbound_tx.send_async(message).await {
+                                error!("pool: TLS inbound enqueue failed: {}", error);
+                                conn_map.remove(&connection_id);
+                                connections.remove(&key_for_cleanup);
+                                if let Some(ref addr_map) = tls_addr_map {
+                                    addr_map.remove(&destination);
+                                }
+                                return;
+                            }
                         }
                     }
                     Err(error) => {
