@@ -183,6 +183,23 @@ auth:
   users:
     alice: "secret"
     bob: "secret"
+    # bob1..bob16 — used by scripts/scale_test.sh to spread load across N UAS processes
+    bob1: "secret"
+    bob2: "secret"
+    bob3: "secret"
+    bob4: "secret"
+    bob5: "secret"
+    bob6: "secret"
+    bob7: "secret"
+    bob8: "secret"
+    bob9: "secret"
+    bob10: "secret"
+    bob11: "secret"
+    bob12: "secret"
+    bob13: "secret"
+    bob14: "secret"
+    bob15: "secret"
+    bob16: "secret"
 
   # REST credential lookup (backend: http)
   # GET {url} with {username} substituted → returns password or HA1.
