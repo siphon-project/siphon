@@ -1892,14 +1892,15 @@ fn relay_request(
         "relaying request"
     );
 
-    // Send to target — use resolved transport, with connection pool for TCP/TLS
-    let connection_id = send_to_target(data, &target, inbound.transport, inbound.connection_id, state);
-
-    // Create client transaction for retransmission and timeout handling.
-    // The state machine will schedule Timer A/E (retransmit) and Timer B/F (timeout).
-    // We've already sent the initial request above, so we only process timer actions.
+    // IMPORTANT: register the client transaction and session BEFORE sending.
+    // On low-latency transports (loopback, fast LANs), the response can arrive
+    // before this code finishes, leaving the response handler with no matching
+    // session ("response for unknown branch"). The connection_id stored here is
+    // a placeholder for UDP (where send_to_target returns the same value passed
+    // in) and is updated below for TCP/TLS once the connection is established.
     let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
-    match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
+    let placeholder_connection_id = inbound.connection_id;
+    let client_key_opt = match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
         Ok((client_key, actions)) => {
             for action in &actions {
                 if let Action::StartTimer(name, duration) = action {
@@ -1910,12 +1911,11 @@ fn relay_request(
                         fires_at: std::time::Instant::now() + *duration,
                         destination: Some(destination),
                         transport: Some(outbound_transport),
-                        connection_id: Some(connection_id),
+                        connection_id: Some(placeholder_connection_id),
                     });
                 }
             }
 
-            // Create ProxySession linking server → client transaction
             if let Some(srv_key) = server_key {
                 let mut session = ProxySession::new(
                     srv_key.clone(),
@@ -1926,19 +1926,38 @@ fn relay_request(
                     record_routed,
                 );
                 session.add_client_key(client_key.clone());
-                session.set_client_branch(client_key, ClientBranch {
+                session.set_client_branch(client_key.clone(), ClientBranch {
                     destination,
                     transport: outbound_transport,
-                    connection_id,
+                    connection_id: placeholder_connection_id,
                 });
                 session.on_reply_callback = on_reply_callback;
                 session.on_failure_callback = on_failure_callback;
                 state.session_store.insert(session);
             }
+            Some(client_key)
         }
         Err(error) => {
             debug!(branch = %branch, "failed to create client transaction: {error}");
-            // Non-fatal: relay still works without transaction layer
+            None
+        }
+    };
+
+    // Now actually send. For TCP/TLS the returned connection_id may differ from
+    // the placeholder; update the session's ClientBranch so retransmits and BYE
+    // routing use the correct connection.
+    let connection_id = send_to_target(data, &target, inbound.transport, inbound.connection_id, state);
+    if connection_id != placeholder_connection_id {
+        if let (Some(srv_key), Some(client_key)) = (server_key, client_key_opt.as_ref()) {
+            if let Some(session_arc) = state.session_store.get_by_server_key(srv_key) {
+                if let Ok(mut session) = session_arc.write() {
+                    session.set_client_branch(client_key.clone(), ClientBranch {
+                        destination,
+                        transport: outbound_transport,
+                        connection_id,
+                    });
+                }
+            }
         }
     }
 }
@@ -2003,6 +2022,12 @@ fn relay_fork_request(
         }
     };
 
+    // Insert the session into the store *before* any branch is sent so the
+    // response handler can look it up via by_client_key (after each branch
+    // pre-registers itself below). Without this, a fast peer (loopback) can
+    // deliver a response before the branch is registered, stranding the call.
+    let session_arc = state.session_store.insert_for_fork(session);
+
     for branch_index in branches_to_start {
         let target = &targets[branch_index];
         relay_fork_branch(
@@ -2012,13 +2037,11 @@ fn relay_fork_request(
             record_routed,
             inbound,
             &srv_key,
-            &mut session,
+            &session_arc,
             &aggregator,
             state,
         );
     }
-
-    state.session_store.insert(session);
 }
 
 /// Relay a single branch of a forked request.
@@ -2032,8 +2055,8 @@ fn relay_fork_branch(
     branch_index: usize,
     record_routed: bool,
     inbound: &InboundMessage,
-    _server_key: &TransactionKey,
-    session: &mut ProxySession,
+    server_key: &TransactionKey,
+    session_arc: &Arc<RwLock<ProxySession>>,
     aggregator: &Arc<std::sync::Mutex<crate::proxy::fork::ForkAggregator>>,
     state: &DispatcherState,
 ) {
@@ -2096,6 +2119,52 @@ fn relay_fork_branch(
 
     let data = Bytes::from(relayed.to_bytes());
 
+    // Mark branch as Trying in aggregator (before any send, so a synchronous
+    // response can find a branch in the right state).
+    if let Ok(mut agg) = aggregator.lock() {
+        agg.mark_trying(branch_index);
+    }
+
+    // Pre-register the client transaction and the branch in the session_store
+    // BEFORE sending. The placeholder connection_id is fine for UDP (the
+    // listener fd is shared); for TCP/TLS it's updated below once the actual
+    // connection is established.
+    let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
+    let placeholder_connection_id = inbound.connection_id;
+    let client_key_opt = match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
+        Ok((client_key, actions)) => {
+            for action in &actions {
+                if let Action::StartTimer(name, duration) = action {
+                    let timer_id = format!("{}:{:?}", client_key, name);
+                    state.timer_wheel.insert(timer_id, TimerEntry {
+                        key: client_key.clone(),
+                        name: *name,
+                        fires_at: std::time::Instant::now() + *duration,
+                        destination: Some(destination),
+                        transport: Some(outbound_transport),
+                        connection_id: Some(placeholder_connection_id),
+                    });
+                }
+            }
+            state.session_store.register_fork_branch(
+                session_arc,
+                server_key,
+                client_key.clone(),
+                ClientBranch {
+                    destination,
+                    transport: outbound_transport,
+                    connection_id: placeholder_connection_id,
+                },
+                branch_index,
+            );
+            Some(client_key)
+        }
+        Err(error) => {
+            debug!(branch = %branch, "fork: failed to create client transaction: {error}");
+            None
+        }
+    };
+
     // Send via pool for TCP/TLS, direct channel for UDP
     let connection_id = send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state);
 
@@ -2108,40 +2177,12 @@ fn relay_fork_branch(
         "fork: sent branch"
     );
 
-    // Mark branch as Trying in aggregator
-    if let Ok(mut agg) = aggregator.lock() {
-        agg.mark_trying(branch_index);
-    }
-
-    // Create client transaction
-    let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
-    match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
-        Ok((client_key, actions)) => {
-            for action in &actions {
-                if let Action::StartTimer(name, duration) = action {
-                    let timer_id = format!("{}:{:?}", client_key, name);
-                    state.timer_wheel.insert(timer_id, TimerEntry {
-                        key: client_key.clone(),
-                        name: *name,
-                        fires_at: std::time::Instant::now() + *duration,
-                        destination: Some(destination),
-                        transport: Some(outbound_transport),
-                        connection_id: Some(connection_id),
-                    });
-                }
-            }
-
-            // Register in session
-            session.add_client_key(client_key.clone());
-            session.set_client_branch(client_key.clone(), ClientBranch {
-                destination,
-                transport: outbound_transport,
-                connection_id,
-            });
-            session.branch_index_map.insert(client_key, branch_index);
-        }
-        Err(error) => {
-            debug!(branch = %branch, "fork: failed to create client transaction: {error}");
+    // For TCP/TLS the actual connection_id may differ from the placeholder
+    // — patch the session's ClientBranch so retransmits/CANCEL hit the right
+    // connection.
+    if connection_id != placeholder_connection_id {
+        if let Some(client_key) = client_key_opt.as_ref() {
+            state.session_store.update_branch_connection_id(client_key, connection_id);
         }
     }
 }
@@ -4071,10 +4112,6 @@ fn start_next_fork_branch(
             transport,
             data: Bytes::new(),
         };
-        let Ok(mut session_mut) = session_arc.write() else {
-            error!("session_arc write lock poisoned during sequential fork");
-            return;
-        };
         relay_fork_branch(
             &original_request,
             &target_str,
@@ -4082,7 +4119,7 @@ fn start_next_fork_branch(
             record_routed,
             &inbound_info,
             server_key,
-            &mut session_mut,
+            &session_arc,
             &agg,
             state,
         );

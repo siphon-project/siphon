@@ -173,6 +173,70 @@ impl ProxySessionStore {
             .or_insert(client_keys);
     }
 
+    /// Pre-insert a session for a fork *before* any branch has been registered.
+    ///
+    /// Returns the shared `Arc` that callers must pass to
+    /// [`Self::register_fork_branch`] for each branch. This split exists so
+    /// that the response handler can find the session via `by_client_key`
+    /// *before* the network bytes go out — otherwise a fast peer (loopback,
+    /// LAN) can deliver a response before the post-send registration finishes,
+    /// stranding the call as "response for unknown branch".
+    pub fn insert_for_fork(&self, session: ProxySession) -> Arc<RwLock<ProxySession>> {
+        let server_key = session.server_key.clone();
+        let dialog_key = Self::dialog_key_from_message(&session.original_request);
+        let session_arc = Arc::new(RwLock::new(session));
+        if let Some(dk) = dialog_key {
+            self.by_dialog_key.insert(dk, Arc::clone(&session_arc));
+        }
+        self.server_to_clients.entry(server_key).or_default();
+        session_arc
+    }
+
+    /// Register a fork branch's client transaction key against a pre-inserted
+    /// session arc. MUST be called before the branch's request is sent on the
+    /// wire so the response handler can locate the session via `by_client_key`.
+    pub fn register_fork_branch(
+        &self,
+        session_arc: &Arc<RwLock<ProxySession>>,
+        server_key: &TransactionKey,
+        client_key: TransactionKey,
+        branch: ClientBranch,
+        branch_index: usize,
+    ) {
+        if let Ok(mut session) = session_arc.write() {
+            session.add_client_key(client_key.clone());
+            session.set_client_branch(client_key.clone(), branch);
+            session.branch_index_map.insert(client_key.clone(), branch_index);
+        }
+        self.by_client_key
+            .insert(client_key.clone(), Arc::clone(session_arc));
+        self.server_to_clients
+            .entry(server_key.clone())
+            .and_modify(|keys| {
+                if !keys.contains(&client_key) {
+                    keys.push(client_key.clone());
+                }
+            })
+            .or_insert_with(|| vec![client_key]);
+    }
+
+    /// Update the `connection_id` recorded for a registered fork branch.
+    /// Called after `send_to_target` returns the actual connection id (may
+    /// differ from the placeholder used at pre-registration time for TCP/TLS).
+    pub fn update_branch_connection_id(
+        &self,
+        client_key: &TransactionKey,
+        connection_id: ConnectionId,
+    ) {
+        if let Some(arc) = self.by_client_key.get(client_key) {
+            if let Ok(mut session) = arc.write() {
+                if let Some(branch) = session.client_branches.get_mut(client_key) {
+                    branch.connection_id = connection_id;
+                }
+            }
+        }
+    }
+
     /// Add a client key to an existing session (for fork branches added after initial insert).
     pub fn add_client_key(
         &self,
