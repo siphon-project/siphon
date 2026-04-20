@@ -599,26 +599,36 @@ Reference machine: AMD Ryzen AI 9 HX 370 (24 logical cores), 128 GB RAM, Linux 6
 
 `TRANSPORT=tcp` switches the SIPp UAC/UAS to TCP. The proxy listens on UDP and TCP simultaneously on `:5060`.
 
-**Peak CPU%** is `pidstat -u` reported on the siphon process — 100 % = one fully-saturated logical core, so 1273 % ≈ 12.7 cores out of 24 available.
+**Peak CPU%** is `pidstat -u` on the siphon process — 100 % = one fully-saturated logical core, so 493 % ≈ 5 cores out of 24 available. **Peak RSS** is the resident-set high-water mark (`pidstat -r`) seen during the run.
 
-| Mode  | Transport | Test                  | Peak CPS | Peak CPU% |
-|-------|-----------|-----------------------|---------:|----------:|
-| Proxy | UDP       | `1000 250 1`          |      250 |       34% |
-| Proxy | UDP       | `5000 1000 4`         |    1 004 |       92% |
-| Proxy | UDP       | `20000 5000 4`        |    4 968 |      329% |
-| Proxy | UDP       | `40000 10000 8`       |    9 920 |      753% |
-| Proxy | TCP       | `1000 250 1`          |      250 |       31% |
-| Proxy | TCP       | `5000 1000 4`         |    1 004 |       91% |
-| Proxy | TCP       | `20000 5000 4`        |    4 976 |      307% |
-| Proxy | TCP       | `40000 10000 8`       |    9 928 |      726% |
-| B2BUA | UDP       | `1000 250 1`          |      250 |       34% |
-| B2BUA | UDP       | `5000 1000 4`         |    1 004 |      102% |
-| B2BUA | UDP       | `20000 5000 4`        |    4 964 |      385% |
-| B2BUA | UDP       | `40000 10000 8`       |    9 904 |      938% |
-| B2BUA | TCP       | `1000 250 1`          |      249 |       34% |
-| B2BUA | TCP       | `5000 1000 4`         |    1 004 |      101% |
-| B2BUA | TCP       | `20000 5000 4`        |    4 960 |      377% |
-| B2BUA | TCP       | `40000 10000 8`       |    9 992 |    1 273% |
+| Mode  | Transport | Test                  | Peak CPS | Peak CPU% | Peak RSS |
+|-------|-----------|-----------------------|---------:|----------:|---------:|
+| Proxy | UDP       | `1000 250 1`          |      250 |       15% |     63 MB |
+| Proxy | UDP       | `5000 1000 4`         |    1 000 |       44% |    121 MB |
+| Proxy | UDP       | `20000 5000 4`        |    4 964 |      273% |    344 MB |
+| Proxy | UDP       | `40000 10000 8`       |    9 928 |      444% |    617 MB |
+| Proxy | TCP       | `1000 250 1`          |      250 |       15% |     53 MB |
+| Proxy | TCP       | `5000 1000 4`         |    1 000 |       41% |     76 MB |
+| Proxy | TCP       | `20000 5000 4`        |    4 960 |      172% |    162 MB |
+| Proxy | TCP       | `40000 10000 8`       |    9 936 |      390% |    269 MB |
+| B2BUA | UDP       | `1000 250 1`          |      250 |       16% |     54 MB |
+| B2BUA | UDP       | `5000 1000 4`         |    1 004 |       50% |     68 MB |
+| B2BUA | UDP       | `20000 5000 4`        |    4 960 |      221% |    116 MB |
+| B2BUA | UDP       | `40000 10000 8`       |    9 920 |      493% |    185 MB |
+| B2BUA | TCP       | `1000 250 1`          |      250 |       13% |     52 MB |
+| B2BUA | TCP       | `5000 1000 4`         |    1 004 |       48% |     72 MB |
+| B2BUA | TCP       | `20000 5000 4`        |    4 964 |      196% |    119 MB |
+| B2BUA | TCP       | `40000 10000 8`       |    9 952 |      407% |    152 MB |
+
+### Headroom
+
+Above the design target of 10 000 cps, siphon stays clean well past 2× the spec:
+
+| Test (proxy UDP, free-threaded) | Peak CPS | Peak CPU% | Peak RSS |
+|---------------------------------|---------:|----------:|---------:|
+| `100000 20000 20`               |   19 840 |    1 014% |   1.4 GB |
+| `120000 24000 24`               |   23 856 |    1 224% |   1.9 GB |
+| `140000 28000 28`               |   27 944 |    1 349% |   2.4 GB |
 
 ## Roadmap
 
