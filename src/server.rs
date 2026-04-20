@@ -87,10 +87,47 @@ impl SiphonServer {
             std::process::exit(1);
         }
 
-        let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|error| {
-            eprintln!("Failed to create tokio runtime: {error}");
-            std::process::exit(1);
-        });
+        // Initialize Python interpreter on the main thread first — this also
+        // marks the main thread as "the python initial thread" so subsequent
+        // PyGILState_Ensure calls from workers create proper per-thread state.
+        pyo3::Python::initialize();
+
+        // Build the Tokio runtime with custom on_thread_start hooks that
+        // permanently attach each worker (async + blocking) to the Python
+        // interpreter. Free-threaded Python (3.14t) tears down a thread's
+        // mimalloc heap on every PyGILState_Release when the attach count
+        // returns to 0 — calling munmap and serializing all 24 worker
+        // threads on the process-wide mm_struct rwsem (clearly visible in
+        // perf flame graphs as `_PyThreadState_ClearMimallocHeaps →
+        // rwsem_down_write_slowpath`). By doing one un-paired
+        // `PyGILState_Ensure` at thread start we keep the count > 0 for
+        // the lifetime of the worker thread, turning every per-request
+        // pyo3 attach into a cheap nested no-op.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .on_thread_start(|| {
+                // SAFETY: the gstate is intentionally leaked — we want the
+                // thread state to outlive every pyo3 attach/release cycle.
+                // It will be cleaned up when the worker thread itself
+                // terminates (i.e. process shutdown).
+                unsafe {
+                    let _gstate = pyo3::ffi::PyGILState_Ensure();
+                    // Re-detach so other threads (and pyo3 attaches on this
+                    // thread) can take the per-thread state without conflict
+                    // — but the underlying PyThreadState remains cached, so
+                    // mimalloc heap teardown is avoided.
+                    let tstate = pyo3::ffi::PyEval_SaveThread();
+                    std::mem::forget(tstate);
+                    // Don't call PyGILState_Release: we want the gstate
+                    // lifetime to match the OS thread.
+                    std::mem::forget(_gstate);
+                }
+            })
+            .build()
+            .unwrap_or_else(|error| {
+                eprintln!("Failed to create tokio runtime: {error}");
+                std::process::exit(1);
+            });
 
         runtime.block_on(self.run_async());
     }
