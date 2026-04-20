@@ -597,17 +597,28 @@ Reference machine: AMD Ryzen AI 9 HX 370 (24 logical cores), 128 GB RAM, Linux 6
 
 `MODE=b2bua` swaps `scripts/proxy_default.py` for `scripts/b2bua_default.py` so the same call flow runs through the B2BUA path instead of the stateful proxy.
 
-**Peak CPU%** is `pidstat -u` reported on the siphon process — 100 % = one fully-saturated logical core, so 685 % ≈ 6.85 cores out of 24 available.
+`TRANSPORT=tcp` switches the SIPp UAC/UAS to TCP. The proxy listens on UDP and TCP simultaneously on `:5060`.
 
-| Mode  | Test                                    | Peak CPS | Peak CPU% |
-|-------|-----------------------------------------|---------:|----------:|
-| Proxy | `scale_test.sh 1000 250 1`              |      250 |       15% |
-| Proxy | `scale_test.sh 5000 1000 4`             |    1 004 |       52% |
-| Proxy | `scale_test.sh 20000 5000 4`            |    4 988 |      243% |
-| Proxy | `scale_test.sh 40000 10000 8`           |   10 000 |      685% |
-| B2BUA | `MODE=b2bua scale_test.sh 1000 250 1`   |      250 |       17% |
-| B2BUA | `MODE=b2bua scale_test.sh 20000 5000 4` |    4 980 |      248% |
-| B2BUA | `MODE=b2bua scale_test.sh 40000 10000 8`|    9 960 |      549% |
+**Peak CPU%** is `pidstat -u` reported on the siphon process — 100 % = one fully-saturated logical core, so 1273 % ≈ 12.7 cores out of 24 available.
+
+| Mode  | Transport | Test                  | Peak CPS | Peak CPU% |
+|-------|-----------|-----------------------|---------:|----------:|
+| Proxy | UDP       | `1000 250 1`          |      250 |       34% |
+| Proxy | UDP       | `5000 1000 4`         |    1 004 |       92% |
+| Proxy | UDP       | `20000 5000 4`        |    4 968 |      329% |
+| Proxy | UDP       | `40000 10000 8`       |    9 920 |      753% |
+| Proxy | TCP       | `1000 250 1`          |      250 |       31% |
+| Proxy | TCP       | `5000 1000 4`         |    1 004 |       91% |
+| Proxy | TCP       | `20000 5000 4`        |    4 976 |      307% |
+| Proxy | TCP       | `40000 10000 8`       |    9 928 |      726% |
+| B2BUA | UDP       | `1000 250 1`          |      250 |       34% |
+| B2BUA | UDP       | `5000 1000 4`         |    1 004 |      102% |
+| B2BUA | UDP       | `20000 5000 4`        |    4 964 |      385% |
+| B2BUA | UDP       | `40000 10000 8`       |    9 904 |      938% |
+| B2BUA | TCP       | `1000 250 1`          |      249 |       34% |
+| B2BUA | TCP       | `5000 1000 4`         |    1 004 |      101% |
+| B2BUA | TCP       | `20000 5000 4`        |    4 960 |      377% |
+| B2BUA | TCP       | `40000 10000 8`       |    9 992 |    1 273% |
 
 ## Roadmap
 
