@@ -41,6 +41,54 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --- Pick Python interpreter ---
+# CLAUDE.md baseline assumes free-threaded Python 3.14t. Without it we'd be
+# benchmarking a GIL-serialized build, which silently ceiling-limits throughput
+# regardless of how many cores the box has. Resolution order:
+#   1. PYO3_PYTHON env var if explicitly set
+#   2. uv-installed free-threaded build (cpython-3.14*+freethreaded)
+#   3. system `python3` (fallback — likely GIL build, prints a warning)
+if [ -z "${PYO3_PYTHON:-}" ]; then
+    UV_FT_BIN=""
+    if command -v uv > /dev/null 2>&1; then
+        UV_FT_BIN="$(uv python find 3.14 --no-managed-python 2>/dev/null || true)"
+        if [ -z "$UV_FT_BIN" ] || ! "$UV_FT_BIN" -c "import sysconfig,sys; sys.exit(0 if sysconfig.get_config_var('Py_GIL_DISABLED') else 1)" 2>/dev/null; then
+            UV_FT_BIN="$(uv python list --only-installed 2>/dev/null | awk '/freethreaded/ && /-linux-/ {for (i=1;i<=NF;i++) if ($i ~ /\/python3\.14t$/) {print $i; exit}}' || true)"
+        fi
+    fi
+    if [ -z "$UV_FT_BIN" ]; then
+        # Glob fallback: typical uv install path
+        for cand in "$HOME/.local/share/uv/python/cpython-3.14"*"+freethreaded"*"/bin/python3.14t"; do
+            [ -x "$cand" ] && { UV_FT_BIN="$cand"; break; }
+        done
+    fi
+    if [ -n "$UV_FT_BIN" ] && [ -x "$UV_FT_BIN" ]; then
+        export PYO3_PYTHON="$UV_FT_BIN"
+        echo "[*] Using free-threaded Python: $PYO3_PYTHON"
+    else
+        export PYO3_PYTHON="python3"
+        echo "[!] WARN: free-threaded Python not found — falling back to system python3."
+        echo "[!]       Throughput results will be GIL-limited and won't match the README baseline."
+        echo "[!]       Install via: uv python install 3.14+freethreaded"
+    fi
+fi
+
+# If PYO3_PYTHON points at a custom (non-system) Python, the matching libpython
+# may not be on the default loader search path — derive its lib/ dir and add it
+# to LD_LIBRARY_PATH so the siphon binary can dlopen libpythonX.Y(t).so.
+if [ -x "$PYO3_PYTHON" ] && [ -f "$PYO3_PYTHON" ]; then
+    # Resolve symlinks (uv installs a `~/.local/bin/python3.14t` shim that
+    # points at the real interpreter under `~/.local/share/uv/python/...`).
+    PYO3_PYTHON_REAL="$(readlink -f "$PYO3_PYTHON")"
+    PY_LIB_DIR="$(dirname "$(dirname "$PYO3_PYTHON_REAL")")/lib"
+    if [ -d "$PY_LIB_DIR" ]; then
+        case ":${LD_LIBRARY_PATH:-}:" in
+            *":$PY_LIB_DIR:"*) ;;
+            *) export LD_LIBRARY_PATH="${PY_LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+        esac
+    fi
+fi
+
 echo "=== SIPhon Scale Test ==="
 echo "  Total calls:  $TOTAL"
 echo "  Target rate:  $CPS cps"
@@ -49,7 +97,7 @@ echo ""
 
 # --- Build siphon release binary (no-op if already fresh) ---
 echo "[*] Building siphon (release)..."
-if ! PYO3_PYTHON=python3 cargo build --release --quiet > /tmp/siphon_scale_build.log 2>&1; then
+if ! cargo build --release --quiet > /tmp/siphon_scale_build.log 2>&1; then
     echo "FAIL: cargo build failed"
     tail -40 /tmp/siphon_scale_build.log
     exit 1
@@ -80,7 +128,9 @@ esac
 cleanup
 sleep 1
 
-RUST_LOG="${RUST_LOG:-warn}" PYO3_PYTHON=python3 ./target/release/siphon -c "$CONFIG_FILE" > /tmp/siphon_scale_proxy.log 2>&1 &
+RUST_LOG="${RUST_LOG:-warn}" PYO3_PYTHON="${PYO3_PYTHON:-python3}" \
+    LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
+    ./target/release/siphon -c "$CONFIG_FILE" > /tmp/siphon_scale_proxy.log 2>&1 &
 SIPHON_PID=$!
 sleep 2
 
@@ -99,13 +149,29 @@ echo "[+] siphon started (PID $SIPHON_PID)"
 # and lost in-dialog requests.
 UAS_PORT=5061
 UAC_PORT=5062
+
+# --- Pick transport: TRANSPORT=udp (default) | tcp ---
+# SIPp -t flag: u1=UDP single-socket, t1=TCP one socket per call,
+# tn=TCP one socket per call (new connection per call, more like real-world UAC).
+# Use t1 for TCP throughput so SIPp keeps a single TCP connection to the proxy.
+TRANSPORT="${TRANSPORT:-udp}"
+case "$TRANSPORT" in
+    udp) SIPP_T="u1"; TPORT_LABEL="UDP" ;;
+    tcp) SIPP_T="t1"; TPORT_LABEL="TCP" ;;
+    *)
+        echo "FAIL: unknown TRANSPORT='$TRANSPORT' (use 'udp' or 'tcp')"
+        exit 1
+        ;;
+esac
+echo "[*] Transport: $TPORT_LABEL"
+
 echo "[*] Registering bob1..bob${NUM_UACS} (one UAS per UAC, distinct IPs)..."
 REG_FAILED=0
 for i in $(seq 1 "$NUM_UACS"); do
     ip="127.0.0.$((1 + i))"
     user="bob${i}"
     log="/tmp/siphon_scale_register_${i}.log"
-    sipp -sf sipp/register.xml "$PROXY" -m 1 -i "$ip" -p "$UAS_PORT" \
+    sipp -sf sipp/register.xml "$PROXY" -m 1 -t "$SIPP_T" -i "$ip" -p "$UAS_PORT" \
         -s "$user" -au "$user" -ap secret > "$log" 2>&1 || true
     if ! grep -q "Successful call.*1" "$log"; then
         echo "FAIL: registration of $user from $ip failed"
@@ -119,7 +185,7 @@ echo "[+] $NUM_UACS bobs registered (127.0.0.2..127.0.0.$((1 + NUM_UACS)))"
 # --- Start one UAS per UAC, each on its own loopback IP ---
 for i in $(seq 1 "$NUM_UACS"); do
     ip="127.0.0.$((1 + i))"
-    sipp -sf sipp/invite_uas_fast.xml -i "$ip" -p "$UAS_PORT" -bg > /dev/null 2>&1 || true
+    sipp -sf sipp/invite_uas_fast.xml -t "$SIPP_T" -i "$ip" -p "$UAS_PORT" -bg > /dev/null 2>&1 || true
 done
 sleep 1
 echo "[+] $NUM_UACS UAS processes started"
@@ -136,7 +202,7 @@ for i in $(seq 1 "$NUM_UACS"); do
     ip="127.0.0.$((50 + i))"
     user="bob${i}"
     sipp -sf sipp/invite_uac_fast.xml "$PROXY" \
-        -m "$CALLS_PER_UAC" -r "$CPS_PER_UAC" \
+        -m "$CALLS_PER_UAC" -r "$CPS_PER_UAC" -t "$SIPP_T" \
         -i "$ip" -p "$UAC_PORT" -s "$user" \
         -trace_stat -stf "/tmp/sipp_uac_${i}.csv" -fd 1 \
         -trace_msg -message_file "/tmp/sipp_uac_${i}.msg.log" \
