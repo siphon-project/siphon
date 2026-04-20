@@ -27,8 +27,8 @@ CPS_PER_UAC=$((CPS / NUM_UACS))
 PROXY="127.0.0.1:5060"
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-if [ "$NUM_UACS" -gt 16 ]; then
-    echo "FAIL: NUM_UACS > 16 not supported (siphon.yaml registers bob1..bob16)"
+if [ "$NUM_UACS" -gt 32 ]; then
+    echo "FAIL: NUM_UACS > 32 not supported (siphon.yaml registers bob1..bob32)"
     exit 1
 fi
 
@@ -211,13 +211,14 @@ done
 
 echo "[+] $NUM_UACS UAC(s) launched, waiting..."
 
-# --- Sample siphon CPU% during the run via pidstat ---
-# pidstat -u  -h  -p PID 1 → 1-second samples; we keep the *peak* sample value
-# as "Peak CPU%" (the max instantaneous CPU consumption observed during the
-# test). 100% = one fully-saturated logical core.
+# --- Sample siphon CPU% + memory during the run via pidstat ---
+# `-u` = CPU, `-r` = memory (RSS in KiB, VSZ in KiB, %MEM).
+# `-h` puts everything on one line per sample so awk can parse it.
+# 1-second samples → we keep peak CPU% and peak RSS observed during the test.
+# 100 % CPU = one fully-saturated logical core.
 PIDSTAT_LOG="/tmp/siphon_scale_pidstat.log"
 > "$PIDSTAT_LOG"
-pidstat -u -h -p "$SIPHON_PID" 1 > "$PIDSTAT_LOG" 2>/dev/null &
+pidstat -u -r -h -p "$SIPHON_PID" 1 > "$PIDSTAT_LOG" 2>/dev/null &
 PIDSTAT_PID=$!
 
 # Poll until all UAC processes finish
@@ -231,9 +232,14 @@ wait "$PIDSTAT_PID" 2>/dev/null || true
 END_NS=$(date +%s%N)
 ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
 
-# pidstat -h output: header lines start with '#'; data lines have a numeric
-# %CPU column. Column layout: # Time UID PID %usr %system %guest %wait %CPU CPU Command
+# pidstat -u -r -h column layout (`-h` puts all stats on one row):
+# # Time UID PID %usr %system %guest %wait %CPU CPU minflt/s majflt/s VSZ RSS %MEM Command
+# Indices:           1   2   3    4      5      6     7    8    9     10        11   12  13   14   15
+# Note: pidstat uses locale decimal — comma in some locales — but %CPU and RSS
+# are integers/are tolerant to "$8+0".
 PEAK_CPU=$(awk '/^[ \t]*[0-9]/ {if ($8+0 > p) p=$8+0} END {printf "%.0f", p+0}' "$PIDSTAT_LOG")
+PEAK_RSS_KB=$(awk '/^[ \t]*[0-9]/ {if ($13+0 > p) p=$13+0} END {printf "%.0f", p+0}' "$PIDSTAT_LOG")
+PEAK_RSS_MB=$(awk -v kb="$PEAK_RSS_KB" 'BEGIN {printf "%.1f", kb / 1024}' | tr ',' '.')
 
 # --- Collect results from SIPp stat files ---
 # Column reference (sipp -h stat):
@@ -303,13 +309,14 @@ echo "  Peak CPS (1s):     ~${AGG_PEAK_CPS}  (per-UAC peak: ${PEAK_CPS})"
 echo "  Wall avg CPS:      ~${WALL_CPS}  (includes ramp+drain)"
 echo "  Mean INVITE→200:   ${MEAN_RT}ms"
 echo "  Peak siphon CPU:   ${PEAK_CPU}%  (100% = 1 logical core)"
+echo "  Peak siphon RSS:   ${PEAK_RSS_MB} MB  (${PEAK_RSS_KB} KiB)"
 echo "  Proxy errors:      $SIPHON_ERRORS"
 
 echo ""
 if [ "$TOTAL_FAILED" -eq 0 ] && [ "$TOTAL_SUCCESS" -ge "$TOTAL" ]; then
-    echo "=== PASS: $TOTAL_SUCCESS/$TOTAL  peak ${AGG_PEAK_CPS} cps  cpu ${PEAK_CPU}%  rt ${MEAN_RT}ms ==="
+    echo "=== PASS: $TOTAL_SUCCESS/$TOTAL  peak ${AGG_PEAK_CPS} cps  cpu ${PEAK_CPU}%  rss ${PEAK_RSS_MB}MB  rt ${MEAN_RT}ms ==="
     exit 0
 else
-    echo "=== RESULT: $TOTAL_SUCCESS/$TOTAL ($TOTAL_FAILED failed)  peak ${AGG_PEAK_CPS} cps  cpu ${PEAK_CPU}%  rt ${MEAN_RT}ms ==="
+    echo "=== RESULT: $TOTAL_SUCCESS/$TOTAL ($TOTAL_FAILED failed)  peak ${AGG_PEAK_CPS} cps  cpu ${PEAK_CPU}%  rss ${PEAK_RSS_MB}MB  rt ${MEAN_RT}ms ==="
     [ "$TOTAL_FAILED" -eq 0 ] && exit 0 || exit 1
 fi

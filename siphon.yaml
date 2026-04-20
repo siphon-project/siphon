@@ -200,6 +200,22 @@ auth:
     bob14: "secret"
     bob15: "secret"
     bob16: "secret"
+    bob17: "secret"
+    bob18: "secret"
+    bob19: "secret"
+    bob20: "secret"
+    bob21: "secret"
+    bob22: "secret"
+    bob23: "secret"
+    bob24: "secret"
+    bob25: "secret"
+    bob26: "secret"
+    bob27: "secret"
+    bob28: "secret"
+    bob29: "secret"
+    bob30: "secret"
+    bob31: "secret"
+    bob32: "secret"
 
   # REST credential lookup (backend: http)
   # GET {url} with {username} substituted → returns password or HA1.
