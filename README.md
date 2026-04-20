@@ -586,6 +586,29 @@ docker compose -f sipp/docker-compose.yaml run --rm sipp-register
 | B2BUA | 5,000 calls/sec | 8-core machine |
 | Script | 0 compiles/request | Bytecode cached at startup |
 
+### Current baseline
+
+Reference machine: AMD Ryzen AI 9 HX 370 (24 logical cores), 128 GB RAM, Linux 6.17, free-threaded Python 3.14t.
+
+`scale_test.sh` arguments are `TOTAL_CALLS TARGET_CPS NUM_UACS`:
+- **TOTAL_CALLS** — total INVITE→200→ACK→BYE→200 transactions to drive
+- **TARGET_CPS** — aggregate call-per-second rate SIPp tries to launch (split evenly across UACs)
+- **NUM_UACS** — how many parallel SIPp UAC instances; each gets its own SIPp UAS peer (one UAC ≈ ~1250 cps SIPp ceiling, so peaks ≥ 5k cps require multiple pairs). Each UAS binds a distinct loopback IP so the proxy fans load across them.
+
+`MODE=b2bua` swaps `scripts/proxy_default.py` for `scripts/b2bua_default.py` so the same call flow runs through the B2BUA path instead of the stateful proxy.
+
+**Peak CPU%** is `pidstat -u` reported on the siphon process — 100 % = one fully-saturated logical core, so 685 % ≈ 6.85 cores out of 24 available.
+
+| Mode  | Test                                    | Peak CPS | Peak CPU% |
+|-------|-----------------------------------------|---------:|----------:|
+| Proxy | `scale_test.sh 1000 250 1`              |      250 |       15% |
+| Proxy | `scale_test.sh 5000 1000 4`             |    1 004 |       52% |
+| Proxy | `scale_test.sh 20000 5000 4`            |    4 988 |      243% |
+| Proxy | `scale_test.sh 40000 10000 8`           |   10 000 |      685% |
+| B2BUA | `MODE=b2bua scale_test.sh 1000 250 1`   |      250 |       17% |
+| B2BUA | `MODE=b2bua scale_test.sh 20000 5000 4` |    4 980 |      248% |
+| B2BUA | `MODE=b2bua scale_test.sh 40000 10000 8`|    9 960 |      549% |
+
 ## Roadmap
 
 - [x] SIP parser (RFC 3261)
