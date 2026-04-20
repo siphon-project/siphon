@@ -1185,16 +1185,23 @@ fn sweep_stale_entries(state: &DispatcherState) {
 
 /// Handle a single inbound SIP message (request or response).
 fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
-    // RFC 5626 §3.5.1 / §4.4.1: CRLF keep-alive (check raw bytes before parsing)
-    let trimmed = inbound.data.iter().filter(|b| !matches!(b, b'\r' | b'\n' | b' ')).count();
-    if trimmed == 0 {
-        // Record pong for CRLF keepalive tracker (TCP/TLS only).
-        if matches!(inbound.transport, Transport::Tcp | Transport::Tls) {
-            if let Some(ref tracker) = state.crlf_pong_tracker {
-                tracker.record_pong(inbound.connection_id);
+    // RFC 5626 §3.5.1 / §4.4.1: CRLF keep-alive (check raw bytes before parsing).
+    // Real SIP messages start with an uppercase ASCII letter (a method like
+    // "INVITE…" or the response start "SIP/2.0…"). Only do the all-bytes
+    // whitespace scan when the first byte LOOKS like a keepalive — at 30k+
+    // cps a per-message full-buffer scan was a measurable hot path.
+    if matches!(inbound.data.first(), Some(b'\r' | b'\n' | b' ')) {
+        let all_whitespace = inbound.data.iter()
+            .all(|b| matches!(b, b'\r' | b'\n' | b' '));
+        if all_whitespace {
+            // Record pong for CRLF keepalive tracker (TCP/TLS only).
+            if matches!(inbound.transport, Transport::Tcp | Transport::Tls) {
+                if let Some(ref tracker) = state.crlf_pong_tracker {
+                    tracker.record_pong(inbound.connection_id);
+                }
             }
+            return;
         }
-        return;
     }
 
     // Parse SIP message — supports binary bodies (e.g. SMS TPDU)
