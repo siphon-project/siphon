@@ -600,25 +600,33 @@ impl PyAuth {
                 };
                 request.set_reply(challenge_code, reason.to_string());
 
-                // In a real implementation, we'd add the WWW-Authenticate or
-                // Proxy-Authenticate header with nonce. For now, the challenge
-                // header is set on the message so the transport layer can include it.
+                // RFC 7616 §3.7: a server that supports multiple algorithms
+                // SHOULD include one challenge per algorithm, weakest first.
+                // Modern clients pick the strongest they support; legacy
+                // MD5-only clients fall back to the first/last MD5 entry.
+                // We emit MD5 + SHA-256 + SHA-512-256 so a single challenge
+                // covers RFC 2617 and RFC 7616 implementations.
                 let nonce = generate_nonce();
-                let header_value =
-                    format!("Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=MD5, qop=\"auth\"");
+                let header_name = if challenge_code == 401 {
+                    "WWW-Authenticate"
+                } else {
+                    "Proxy-Authenticate"
+                };
+                let header_values = [
+                    format!("Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=MD5, qop=\"auth\""),
+                    format!("Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=SHA-256, qop=\"auth\""),
+                    format!("Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=SHA-512-256, qop=\"auth\""),
+                ];
 
                 let message = request.message();
                 let mut message_guard = message.lock().map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
                 })?;
 
-                // Store the challenge header so the response builder can pick it up
-                let header_name = if challenge_code == 401 {
-                    "WWW-Authenticate"
-                } else {
-                    "Proxy-Authenticate"
-                };
-                message_guard.headers.set(header_name, header_value);
+                // Store the challenge headers so the response builder can pick them up.
+                for value in &header_values {
+                    message_guard.headers.add(header_name, value.clone());
+                }
 
                 Ok(false)
             }
@@ -782,8 +790,13 @@ impl PyAuth {
             None => return false,
         };
 
-        // Compute HA1 from username:realm:password
-        let ha1 = md5_hex(&format!("{}:{}:{}", fields.username, realm, password));
+        // Compute HA1 from username:realm:password using the SAME algorithm
+        // the client used in its Authorization header — RFC 7616 §3.4.3
+        // requires HA1 / HA2 / response to all use the same hash function.
+        let ha1 = crate::auth::hash_hex_public(
+            fields.algorithm,
+            format!("{}:{}:{}", fields.username, realm, password).as_bytes(),
+        );
         fields.verify(&ha1, method)
     }
 
@@ -832,11 +845,19 @@ impl PyAuth {
         };
 
         let ha1 = if http_config.ha1 {
-            // Response body is already the HA1 hex string
+            // Response body is already the HA1 hex string. NOTE: this only
+            // works when the stored HA1 was computed with the same algorithm
+            // the client advertised. For SHA-256 / SHA-512-256 deployments
+            // the HA1 backend MUST store a per-algorithm HA1 (e.g. by
+            // namespacing the URL or returning a JSON object) — we currently
+            // assume the operator has matched algorithms.
             body
         } else {
-            // Response body is a plaintext password — hash it
-            md5_hex(&format!("{}:{}:{}", fields.username, realm, body))
+            // Plaintext password — hash with the algorithm the client used.
+            crate::auth::hash_hex_public(
+                fields.algorithm,
+                format!("{}:{}:{}", fields.username, realm, body).as_bytes(),
+            )
         };
 
         let valid = fields.verify(&ha1, method);
@@ -860,11 +881,16 @@ struct DigestFields {
     qop: Option<String>,
     cnonce: Option<String>,
     nc: Option<String>,
+    /// Algorithm advertised by the client. Defaults to MD5 if absent
+    /// (RFC 2617 / RFC 7616 §3.4 — algorithm is OPTIONAL on the request).
+    algorithm: crate::auth::DigestAlgorithm,
 }
 
 impl DigestFields {
     /// Parse all relevant fields from a Digest Authorization header value.
     fn parse(auth_value: &str) -> Option<Self> {
+        let algorithm_str = extract_digest_param(auth_value, "algorithm");
+        let algorithm = parse_algorithm(algorithm_str.as_deref());
         Some(Self {
             username: extract_username(auth_value)?,
             realm: extract_digest_param(auth_value, "realm")?,
@@ -874,25 +900,53 @@ impl DigestFields {
             qop: extract_digest_param(auth_value, "qop"),
             cnonce: extract_digest_param(auth_value, "cnonce"),
             nc: extract_digest_param(auth_value, "nc"),
+            algorithm,
         })
     }
 
     /// Verify the digest response against a known HA1.
+    ///
+    /// The HA1 passed in MUST be computed with the same algorithm as
+    /// `self.algorithm`, since both `H(method:uri)` for HA2 and the final
+    /// response composition use the same hash function (RFC 7616 §3.4.3).
     fn verify(&self, ha1: &str, method: &str) -> bool {
-        // HA2 = MD5(method:uri)
-        let ha2 = md5_hex(&format!("{}:{}", method, self.uri));
+        let alg = self.algorithm;
+        let ha2 = crate::auth::hash_hex_public(alg, format!("{}:{}", method, self.uri).as_bytes());
 
         let expected = if self.qop.as_deref() == Some("auth") {
-            // response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
             let nc = self.nc.as_deref().unwrap_or("00000001");
             let cnonce = self.cnonce.as_deref().unwrap_or("");
-            md5_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, self.nonce, nc, cnonce, ha2))
+            crate::auth::hash_hex_public(
+                alg,
+                format!("{}:{}:{}:{}:auth:{}", ha1, self.nonce, nc, cnonce, ha2).as_bytes(),
+            )
         } else {
-            // response = MD5(HA1:nonce:HA2)
-            md5_hex(&format!("{}:{}:{}", ha1, self.nonce, ha2))
+            crate::auth::hash_hex_public(
+                alg,
+                format!("{}:{}:{}", ha1, self.nonce, ha2).as_bytes(),
+            )
         };
 
         expected.eq_ignore_ascii_case(&self.response)
+    }
+}
+
+/// Parse the `algorithm=` value from an Authorization header into a
+/// `DigestAlgorithm`. Falls back to MD5 (RFC 2617's default) when the
+/// parameter is missing or unrecognised — that's the safest choice for
+/// the server side because we'd rather verify with the wrong algorithm
+/// (and reject) than panic.
+fn parse_algorithm(value: Option<&str>) -> crate::auth::DigestAlgorithm {
+    use crate::auth::DigestAlgorithm;
+    let Some(raw) = value else { return DigestAlgorithm::Md5 };
+    match raw.to_uppercase().replace('_', "-").as_str() {
+        "MD5" | "" => DigestAlgorithm::Md5,
+        "MD5-SESS" => DigestAlgorithm::Md5Sess,
+        "SHA-256" | "SHA256" => DigestAlgorithm::Sha256,
+        "SHA-256-SESS" | "SHA256-SESS" => DigestAlgorithm::Sha256Sess,
+        "SHA-512-256" | "SHA512-256" => DigestAlgorithm::Sha512_256,
+        "SHA-512-256-SESS" | "SHA512-256-SESS" => DigestAlgorithm::Sha512_256Sess,
+        _ => DigestAlgorithm::Md5,
     }
 }
 

@@ -82,6 +82,7 @@ aes = "0.8"
 
 # Utilities
 md5 = "0.7"
+sha2 = "0.10"
 uuid = { version = "1.22", features = ["v4", "fast-rng"] }
 ipnet = "2"
 notify = "8"
