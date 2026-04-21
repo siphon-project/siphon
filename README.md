@@ -26,21 +26,6 @@
 
 ---
 
-> [!WARNING]
-> **TEST DEPLOYMENTS ONLY — NOT PRODUCTION READY**
->
-> SIPhon is functionally comprehensive — the core proxy, B2BUA, registrar, Diameter, lawful intercept,
-> presence, CDR, gateway routing, and media anchoring are all implemented with extensive test coverage
-> (1500+ unit and integration tests). However, **this project has not yet been validated against
-> real-world production traffic.** SIP interop quirks with vendor equipment, edge cases under
-> sustained load, and failure modes that only surface in live networks have not been exercised.
->
-> **Do not deploy SIPhon in production.** Use it in test and lab environments, run SIPp scenarios against
-> it, break it, and report what you find. Production readiness requires real-world mileage that hasn't
-> happened yet.
-
----
-
 ## Why SIPhon?
 
 SIPhon exists because of Kamailio and OpenSIPS — not in spite of them.
@@ -128,7 +113,7 @@ This isn't a replacement for Kamailio or OpenSIPS. It's what happens when someon
 | **CDR** | — | Unit + integration tests (file/syslog/http/postgres) |
 | **Lawful Intercept (X1/X2/X3)** | ETSI TS 103 221-1, ETSI TS 102 232 | Unit + integration tests |
 | **SIPREC** | RFC 7865, RFC 7866 | Unit + integration tests |
-| **Initial Filter Criteria (iFC)** | 3GPP TS 29.228 | XML parser + trigger point matching only; ISC routing to AS not wired |
+| **Initial Filter Criteria (iFC)** | 3GPP TS 29.228 | XML parser, trigger point matching, ISC routing to AS; S-CSCF production |
 | **IPsec SA Management** | 3GPP TS 33.203 | Unit tests |
 | **Milenage Key Derivation** | 3GPP TS 35.206 | Unit tests (3GPP test vectors) |
 | **5G SBI (Npcf, Nchf)** | 3GPP TS 29.512, TS 29.594 | Unit tests |
@@ -141,8 +126,6 @@ This isn't a replacement for Kamailio or OpenSIPS. It's what happens when someon
 | **Hot-Reload Python Scripting** | — | SIPp scenarios |
 | **Graceful Shutdown** | — | Unit tests |
 
-> [!NOTE]
-> **No feature has been validated in a production or real-life deployment yet.** All testing is currently limited to unit tests, integration tests, property tests, and SIPp scenarios in lab environments. Real-world validation with vendor equipment, live traffic, and production failure modes is pending.
 
 ## Installation
 
@@ -651,9 +634,10 @@ Above the design target of 10 000 cps, siphon stays clean well past 2× the spec
 - [x] Prometheus metrics + admin API
 - [x] Graceful shutdown
 - [x] IPsec SA management (P-CSCF)
-- [ ] Initial Filter Criteria (iFC) — XML parser done, ISC routing not wired
+- [x] Initial Filter Criteria (iFC) — full ISC routing to AS
 - [x] SBI interfaces (5G Npcf, Nchf)
 - [x] AKAv1-MD5 / Milenage authentication
+- [x] Full IMS core roles (P-CSCF, I-CSCF, S-CSCF) — see `examples/ims_*.{py,yaml}`
 - [ ] ESL/ARI-style external control interface for B2BUA
 - [ ] RTP-to-WebSocket streaming for AI/ML processing
 

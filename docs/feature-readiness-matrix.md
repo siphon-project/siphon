@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document tracks the maturity of every SIPhon feature across three readiness levels. The only production deployment to date is a registrar/proxy role — features validated there are marked accordingly.
+This document tracks the maturity of every SIPhon feature across three readiness levels. SIPhon runs in production today in a residential SIP registrar/proxy role and a 3GPP IMS deployment exercising Diameter Cx/Sh/Rx, iFC, IPsec, and 5G SBI policy control. Features validated on live traffic are marked Production.
 
 | Readiness | Meaning |
 |-----------|---------|
@@ -17,7 +17,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
 | Stateful proxy (RFC 3261 §16) | **Production** | `script: @proxy.on_request` | Full transaction state machines; ICT Timer A RFC-compliant (capped at T2, fires in Proceeding, cancelled on final response) |
-| B2BUA (RFC 3261 §6) | Implemented | `script: @b2bua.on_invite` | Two-leg call control, per-leg Call-ID + From-tag, topology hiding |
+| B2BUA (RFC 3261 §6) | **Production** | `script: @b2bua.on_invite` | Two-leg call control, per-leg Call-ID + From-tag, topology hiding |
 | Parallel forking | **Production** | `request.fork()` | Used for AS→subscriber delivery |
 | Sequential forking | Implemented | `request.fork(strategy="sequential")` | |
 | Record-Route / Loose Route | **Production** | `request.record_route()` | Mid-dialog routing proven |
@@ -36,7 +36,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | TLS 1.3 | **Production** | `tls.method: TLSv1_3` | |
 | TLS 1.2 | Implemented | `tls.method: TLSv1_2` | |
 | mTLS (client cert verification) | Implemented | `tls.verify_client: true` | |
-| UDP | Implemented | `listen.udp` | Not used in current deployment |
+| UDP | **Production** | `listen.udp` | |
 | WebSocket (WS) | Implemented | `listen.ws` | RFC 7118, browser/WebRTC clients |
 | Secure WebSocket (WSS) | Implemented | `listen.wss` | |
 | SCTP | Implemented | `listen.sctp` | RFC 4168, IMS inter-node |
@@ -56,9 +56,9 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Max contacts per AoR | **Production** | `registrar.max_contacts` | |
 | Redis TTL slack | **Production** | `registrar.redis.ttl_slack_secs` | Race condition buffer |
 | GRUU (RFC 5627) | Implemented | | |
-| Service-Route (RFC 3608) | Implemented | | |
+| Service-Route (RFC 3608) | **Production** | | Via `registrar.set_service_routes()` / `service_route()` |
 | Registration state change hooks | **Production** | `@registrar.on_change` | Callbacks on insert/delete/expire |
-| Outbound registration (registrant) | Implemented | `registrant:` | UAC REGISTER to upstream trunks |
+| Outbound registration (registrant) | **Production** | `registrant:` | UAC REGISTER to upstream trunks |
 
 ## Authentication
 
@@ -68,8 +68,9 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Digest auth — 407 (proxy) | **Production** | `auth.require_proxy_digest()` | INVITE challenges |
 | HTTP backend (HA1 lookup) | **Production** | `auth.backend: http` | REST credential lookup |
 | Static users backend | Implemented | `auth.backend: static` | Inline config credentials |
-| Diameter Cx backend (HSS) | Implemented | `auth.backend: diameter_cx` | 3GPP TS 29.228 |
-| AKA / AKAv1-MD5 | Implemented | `auth.aka_credentials` | 3GPP TS 33.203 + Milenage |
+| Diameter Cx backend (HSS) | **Production** | `auth.backend: diameter_cx` | 3GPP TS 29.228 |
+| AKA / AKAv1-MD5 (HSS-backed) | **Production** | `auth.require_ims_digest()` | 3GPP TS 33.203 via Cx MAR/MAA |
+| AKA / AKAv1-MD5 (local Milenage) | Implemented | `auth.aka_credentials` | 3GPP TS 35.206 — local key derivation without HSS |
 | SHA-256 digest (RFC 7616) | Implemented | | |
 | Anti-spoofing (from=auth check) | **Production** | Script logic | `auth_user == from_uri.user` |
 
@@ -102,7 +103,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| RTPEngine integration (NG protocol) | Implemented | `media.rtpengine` | Single or multi-instance |
+| RTPEngine integration (NG protocol) | **Production** | `media.rtpengine` | Single or multi-instance |
 | RTPEngine load balancing | Implemented | `media.rtpengine.instances[]` | Weighted distribution |
 | Built-in profile: SRTP↔RTP | Implemented | `srtp_to_rtp` | SRTP UE ↔ RTP core |
 | Built-in profile: WS↔RTP | Implemented | `ws_to_rtp` | WebSocket UE ↔ RTP core |
@@ -118,11 +119,11 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| Destination groups | Implemented | `gateway.groups` | |
-| Round-robin algorithm | Implemented | `algorithm: round_robin` | |
+| Destination groups | **Production** | `gateway.groups` | |
+| Round-robin algorithm | **Production** | `algorithm: round_robin` | |
 | Weighted algorithm | Implemented | `algorithm: weighted` | |
 | Hash-based algorithm | Implemented | `algorithm: hash` | |
-| SIP OPTIONS health probing | Implemented | `gateway.groups[].probe` | Configurable interval + failure threshold |
+| SIP OPTIONS health probing | **Production** | `gateway.groups[].probe` | Configurable interval + failure threshold |
 | Priority-based failover tiers | Implemented | `destinations[].priority` | |
 | Dynamic group management | Implemented | Python `gateway.add_group()` / `gateway.remove_group()` | |
 | Destination up/down marking | Implemented | Python `gateway.mark_up()` / `gateway.mark_down()` | |
@@ -182,15 +183,16 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Hot-reload via inotify | **Production** | `script.reload: auto` | |
 | Hot-reload via SIGHUP | Implemented | `script.reload: sighup` | |
 | Proxy handlers (on_request/on_reply/on_failure) | **Production** | `@proxy.*` | on_request + on_reply proven |
-| B2BUA handlers | Implemented | `@b2bua.*` | on_invite, on_answer, on_failure, on_bye, on_refer |
+| B2BUA handlers | **Production** | `@b2bua.*` | on_invite, on_early_media, on_answer, on_failure, on_bye, on_refer |
 | Registrar hooks | **Production** | `@registrar.on_change` | |
 | Auth API | **Production** | `auth.require_digest()` etc. | |
-| Gateway API | Implemented | `gateway.select()` etc. | |
-| Cache API | Implemented | `cache.fetch()` | |
-| Presence API | Implemented | `presence.*` | |
+| Gateway API | **Production** | `gateway.select()` etc. | |
+| Cache API | **Production** | `cache.fetch()` | Redis-backed |
+| Presence API | **Production** | `presence.*` | Used for reg-event SUBSCRIBE/NOTIFY |
 | Lawful intercept API | Implemented | `li.*` | |
 | Logging API | **Production** | `log.*` | |
-| Async handler support | Implemented | | Auto-detected by runtime |
+| Async handler support | **Production** | | Auto-detected by runtime |
+| Custom metrics API | **Production** | `metrics.counter/gauge/histogram` | Script-defined Prometheus metrics |
 | Timer routes | Implemented | `@timer.every()`, `timer.set()`/`cancel()` | Periodic callbacks via Tokio; one-shot cancellable timers keyed by string |
 | Mock SDK for testing | Implemented | `siphon-sdk` | Test scripts without Rust binary |
 
@@ -206,14 +208,14 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| Redis-backed cache | Implemented | `cache[].url` | |
+| Redis-backed cache | **Production** | `cache[].url` | |
 | Local LRU tier | Implemented | `cache[].local_ttl_secs` | Two-tier: local + Redis |
 
 ## Presence
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| SUBSCRIBE/NOTIFY (RFC 6665) | Implemented | Python `presence` API | |
+| SUBSCRIBE/NOTIFY (RFC 6665) | **Production** | Python `presence` API | reg-event package |
 | PIDF (RFC 3863) | Implemented | | |
 | Resource List Server (RFC 4662) | Implemented | | |
 | Watcher Info (RFC 3857/3858) | Implemented | | |
@@ -246,19 +248,20 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| Diameter Cx (HSS auth) | Implemented | `auth.backend: diameter_cx` | MAR/SAA, SAR/SAA, UAR/UAA, LIR/LIA |
-| Diameter Sh (HSS user data) | Implemented | `diameter` | UDR/UDA, PUR/PUA, SNR/SNA, PNR/PNA — both HSS and AS roles (`sh_udr`/`sh_pur`/`sh_snr`, `@on_pnr`) |
+| Diameter Cx (HSS auth) | **Production** | `auth.backend: diameter_cx` | MAR/SAA, SAR/SAA, UAR/UAA, LIR/LIA |
+| Diameter Sh (HSS user data) | **Production** | `diameter` | `sh_udr` for repository data, `@on_pnr` for profile pushes |
 | Diameter Ro (online charging) | Implemented | `diameter` | CCR/CCA |
 | Diameter Rf (offline charging) | Implemented | `diameter` | ACR/ACA |
-| Diameter Rx (policy/QoS) | Implemented | `diameter` | AAR/AAA, STR/STA, RAR/RAA |
-| Diameter peer management | Implemented | `diameter.peers` | Failover + round-robin routing |
-| AKA authentication (Milenage) | Implemented | `auth.aka_credentials` | 3GPP TS 33.203 / TS 35.206 |
-| IPsec SA management (P-CSCF) | Implemented | `ipsec` | Protected client/server ports |
-| Initial Filter Criteria (iFC) | Implemented | `isc` | XML trigger point matching |
-| IMS P-CSCF role | Implemented | Example config + script | |
-| IMS I-CSCF role | Implemented | Example config + script | |
-| IMS S-CSCF role | Implemented | Example config + script | |
-| 5G SBI — Npcf (policy) | Implemented | `sbi` | NRF discovery, OAuth2 |
+| Diameter Rx (policy/QoS) | **Production** | `diameter` | AAR/AAA, STR/STA, `@on_rar` + `@on_asr` |
+| Diameter peer management | **Production** | `diameter.peers` | Failover + round-robin across HSS/DRA peers |
+| AKA authentication (Milenage, local) | Implemented | `auth.aka_credentials` | 3GPP TS 35.206 — local key derivation without HSS |
+| AKA authentication (HSS-backed) | **Production** | `auth.require_ims_digest()` | 3GPP TS 33.203 via Cx MAR/MAA |
+| IPsec SA management (P-CSCF) | **Production** | `ipsec` | Protected client/server ports for IMS AKA |
+| Initial Filter Criteria (iFC) | **Production** | `isc` | XML trigger-point matching + per-user profile storage from Cx SAR |
+| IMS P-CSCF role | **Production** | Example `examples/ims_pcscf.{py,yaml}` | |
+| IMS I-CSCF role | **Production** | Example `examples/ims_icscf.{py,yaml}` | |
+| IMS S-CSCF role | **Production** | Example `examples/ims_scscf.{py,yaml}` | |
+| 5G SBI — Npcf (policy) | **Production** | `sbi` | N5 app-session for VoNR QoS; NRF discovery, OAuth2 |
 | 5G SBI — Nchf (charging) | Implemented | `sbi` | |
 
 ## Lawful Intercept / Recording
@@ -277,17 +280,17 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Category | Production | Implemented | Total |
 |----------|-----------|-------------|-------|
-| Transports | 3 (TCP, TLS, TLS 1.3) | 6 (UDP, WS, WSS, SCTP, mTLS, TLS 1.2) | 9 |
-| Registrar | 5 (Redis, expires, max contacts, hooks, TTL slack) | 5 (memory, PG, Python, GRUU, Service-Route) | 10 |
-| Authentication | 4 (HTTP/HA1, digest 401/407, anti-spoof) | 4 (static, Diameter Cx, AKA, SHA-256) | 8 |
+| Transports | 4 (UDP, TCP, TLS, TLS 1.3) | 5 (WS, WSS, SCTP, mTLS, TLS 1.2) | 9 |
+| Registrar | 7 (Redis, expires, max contacts, hooks, TTL slack, Service-Route, registrant) | 3 (memory, PG, Python, GRUU) | 10 |
+| Authentication | 6 (HTTP/HA1, digest 401/407, anti-spoof, Diameter Cx, IMS AKA) | 3 (static, local Milenage AKA, SHA-256) | 9 |
 | Security | 5 (rate limit, scanner, trusted CIDR, fail ban, APIBan) | 1 (IP ACLs) | 6 |
 | NAT | 5 (rport, fix contact, fix register, script fixup, stale eviction) | 3 (keepalive, CRLF keepalive, flow tokens) | 8 |
-| Media | 0 | 7 (RTPEngine, LB, 4 profiles, custom profiles) | 7 |
-| Gateway routing | 0 | 7 (groups, 3 algorithms, probes, failover, dynamic) | 7 |
+| Media | 1 (RTPEngine NG) | 6 (LB, 4 profiles, custom profiles) | 7 |
+| Gateway routing | 3 (groups, round-robin, probes) | 4 (weighted, hash, failover, dynamic) | 7 |
 | CDR | 0 | 5 (file, syslog, HTTP, register events, extra fields) | 5 |
 | Tracing | 3 (HEP v3 UDP, agent ID, error suppression) | 2 (TCP, TLS) | 5 |
 | Metrics | 8 (Prometheus, all gauges/counters/histograms) | 3 (admin health, stats, registrations) | 11 |
-| Scripting | 9 (proxy, registrar, auth, logging, header ops) | 7 (B2BUA, gateway, cache, presence, LI, async, SDK) | 16 |
-| 3GPP/IMS | 0 | 14 (Diameter 5 apps, AKA, IPsec, iFC, 3 CSCFs, 2 SBI) | 14 |
+| Scripting | 14 (proxy, B2BUA, registrar, auth, gateway, cache, presence, logging, metrics, async, ...) | 3 (LI, timer, SDK) | 17 |
+| 3GPP/IMS | 10 (Cx, Sh, Rx, peer mgmt, IMS AKA HSS-backed, IPsec, iFC, P/I/S-CSCF, Npcf) | 4 (Ro, Rf, local Milenage AKA, Nchf) | 14 |
 | LI/Recording | 0 | 5 (X1, X2, X3, SIPREC, audit) | 5 |
-| **Totals** | **~42** | **~69** | **~111** |
+| **Totals** | **~66** | **~42** | **~109** |
