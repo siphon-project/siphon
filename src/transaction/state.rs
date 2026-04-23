@@ -46,6 +46,12 @@ pub enum Action {
     Timeout,
     /// Transaction is terminated — the manager should remove it.
     Terminated,
+    /// A protocol-level anomaly the state machine detected but could not
+    /// remedy itself (e.g. couldn't construct a required ACK because the
+    /// INVITE/response headers were malformed). The caller should log
+    /// this at warn level. RFC 3261 §17.1.1.3 requires such conditions
+    /// to be reported rather than silently ignored.
+    ProtocolError(String),
 }
 
 /// Named timers used across all state machines.
@@ -577,18 +583,52 @@ impl Ict {
     ///
     /// The ACK reuses the original INVITE's From, Call-ID, Request-URI, and
     /// top Via (same branch = hop-by-hop). The To header comes from the
-    /// response (includes the remote tag).
-    fn build_ack_for_non2xx(&self, response: &SipMessage) -> Option<SipMessage> {
+    /// response (which carries the remote tag); if the response is
+    /// malformed and lacks a To header we fall back to the INVITE's To
+    /// rather than skip the ACK entirely — RFC 3261 §17.1.1.3 requires
+    /// that an ACK MUST be generated for every non-2xx final response,
+    /// and a technically-incorrect To tag is preferable to silent protocol
+    /// breakage that would leave the UAS retransmitting forever.
+    ///
+    /// Returns an error string instead of silently dropping when the
+    /// INVITE itself is malformed (missing Via/From/Call-ID) so the TU
+    /// gets a log line rather than a mysteriously missing ACK.
+    fn build_ack_for_non2xx(&self, response: &SipMessage) -> Result<SipMessage, String> {
         let request_uri = match &self.request.start_line {
             StartLine::Request(request_line) => request_line.request_uri.clone(),
-            _ => return None,
+            _ => return Err("ICT request is not a Request (never happens)".into()),
         };
-        let via = self.request.headers.via()?.to_string();
-        let from = self.request.headers.from()?.to_string();
-        // To from response (has remote tag)
-        let to = response.headers.to()?.to_string();
-        let call_id = self.request.headers.call_id()?.to_string();
-        let cseq_num = self.request.headers.cseq()
+        let via = self
+            .request
+            .headers
+            .via()
+            .ok_or_else(|| "original INVITE missing Via header".to_string())?
+            .to_string();
+        let from = self
+            .request
+            .headers
+            .from()
+            .ok_or_else(|| "original INVITE missing From header".to_string())?
+            .to_string();
+        // To from response (carries remote tag); if the response is
+        // malformed and has no To, fall back to the original INVITE's To
+        // — less correct, but still an ACK.
+        let to = response
+            .headers
+            .to()
+            .or_else(|| self.request.headers.to())
+            .ok_or_else(|| "neither response nor INVITE has a To header".to_string())?
+            .to_string();
+        let call_id = self
+            .request
+            .headers
+            .call_id()
+            .ok_or_else(|| "original INVITE missing Call-ID".to_string())?
+            .to_string();
+        let cseq_num = self
+            .request
+            .headers
+            .cseq()
             .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
             .unwrap_or_else(|| "1".to_string());
 
@@ -601,7 +641,7 @@ impl Ict {
             .cseq(format!("{} ACK", cseq_num))
             .content_length(0)
             .build()
-            .ok()
+            .map_err(|error| format!("ACK build failed: {error}"))
     }
 
     pub fn process(&mut self, event: IctEvent) -> Vec<Action> {
@@ -640,11 +680,22 @@ impl Ict {
                     Transport::Udp => self.timers.timer_d_udp(),
                     Transport::Reliable => self.timers.timer_d_tcp(),
                 };
-                // RFC 3261 §17.1.1.3: ICT MUST generate ACK for non-2xx
+                // RFC 3261 §17.1.1.3: ICT MUST generate ACK for non-2xx.
+                // Construction failures are reported via Action::ProtocolError
+                // so the caller can log the anomaly — silently skipping the
+                // ACK would leave the UAS retransmitting its final response
+                // forever.
                 let mut actions = Vec::new();
-                if let Some(ack) = self.build_ack_for_non2xx(&response) {
-                    self.cached_ack = Some(ack.clone());
-                    actions.push(Action::SendMessage(ack));
+                match self.build_ack_for_non2xx(&response) {
+                    Ok(ack) => {
+                        self.cached_ack = Some(ack.clone());
+                        actions.push(Action::SendMessage(ack));
+                    }
+                    Err(error) => {
+                        actions.push(Action::ProtocolError(format!(
+                            "could not build ACK for non-2xx: {error}"
+                        )));
+                    }
                 }
                 actions.extend([
                     Action::CancelTimer(TimerName::A),
@@ -684,11 +735,22 @@ impl Ict {
                     Transport::Udp => self.timers.timer_d_udp(),
                     Transport::Reliable => self.timers.timer_d_tcp(),
                 };
-                // RFC 3261 §17.1.1.3: ICT MUST generate ACK for non-2xx
+                // RFC 3261 §17.1.1.3: ICT MUST generate ACK for non-2xx.
+                // Construction failures are reported via Action::ProtocolError
+                // so the caller can log the anomaly — silently skipping the
+                // ACK would leave the UAS retransmitting its final response
+                // forever.
                 let mut actions = Vec::new();
-                if let Some(ack) = self.build_ack_for_non2xx(&response) {
-                    self.cached_ack = Some(ack.clone());
-                    actions.push(Action::SendMessage(ack));
+                match self.build_ack_for_non2xx(&response) {
+                    Ok(ack) => {
+                        self.cached_ack = Some(ack.clone());
+                        actions.push(Action::SendMessage(ack));
+                    }
+                    Err(error) => {
+                        actions.push(Action::ProtocolError(format!(
+                            "could not build ACK for non-2xx: {error}"
+                        )));
+                    }
                 }
                 actions.extend([
                     Action::CancelTimer(TimerName::A),
@@ -1168,6 +1230,58 @@ mod tests {
         assert!(has_send(&actions), "ICT must generate ACK for non-2xx (RFC 3261 §17.1.1.3)");
         assert!(has_pass_to_tu(&actions));
         assert!(has_terminated(&actions));
+    }
+
+    #[test]
+    /// RFC 3261 §17.1.1.3: when the ACK for a non-2xx cannot be
+    /// constructed (e.g. the response is malformed — no To header, no
+    /// fallback possible), the transaction MUST report the error
+    /// rather than silently skipping the ACK.
+    #[test]
+    fn ict_non2xx_malformed_response_emits_protocol_error() {
+        fn has_protocol_error(actions: &[Action]) -> bool {
+            has_action(actions, |a| matches!(a, Action::ProtocolError(_)))
+        }
+        // Strip the To header from a non-2xx response so build_ack_for_non2xx
+        // falls past the response.to() fallback into the request.to()
+        // fallback — then strip the INVITE's To too so both fallbacks fail.
+        let mut broken_invite = dummy_invite();
+        broken_invite.headers.remove("To");
+        let (mut ict, _) = Ict::new(broken_invite, Transport::Udp, TimerConfig::default());
+        let mut broken_response = dummy_response(486, "Busy Here");
+        broken_response.headers.remove("To");
+
+        let actions = ict.process(IctEvent::ResponseNon2xx(broken_response));
+
+        // Still transitions to Completed (per RFC, transaction state advances
+        // even if ACK send failed).
+        assert_eq!(ict.state, IctState::Completed);
+        // No ACK was sent (build failed)…
+        assert!(!has_send(&actions));
+        // …but the failure is surfaced to the TU via ProtocolError.
+        assert!(has_protocol_error(&actions));
+        // Response still reaches the TU so upper layers see the 4xx.
+        assert!(has_pass_to_tu(&actions));
+    }
+
+    /// When the response is missing its To header but the INVITE has one,
+    /// build_ack_for_non2xx falls back to the INVITE's To rather than
+    /// dropping the ACK entirely. This is "less correct" (missing remote
+    /// tag) but keeps the UAS from retransmitting forever.
+    #[test]
+    fn ict_non2xx_falls_back_to_request_to_header() {
+        fn has_protocol_error(actions: &[Action]) -> bool {
+            has_action(actions, |a| matches!(a, Action::ProtocolError(_)))
+        }
+        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let mut response = dummy_response(486, "Busy Here");
+        response.headers.remove("To");
+
+        let actions = ict.process(IctEvent::ResponseNon2xx(response));
+
+        assert_eq!(ict.state, IctState::Completed);
+        assert!(has_send(&actions), "ACK with fallback To must still be sent");
+        assert!(!has_protocol_error(&actions));
     }
 
     #[test]

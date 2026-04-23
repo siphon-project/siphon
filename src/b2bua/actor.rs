@@ -280,6 +280,12 @@ pub struct Leg {
     pub stored_cseq: Option<String>,
     /// Whether the initial INVITE on this leg has been ACKed.
     pub initial_acked: bool,
+    /// Whether a re-INVITE toward this leg is currently in flight
+    /// (awaiting a final response). Used by glare detection
+    /// (RFC 3261 §14.1): if a new re-INVITE arrives while one is
+    /// already pending toward the same leg we respond 491 Request
+    /// Pending rather than forward a second concurrent offer/answer.
+    pub pending_reinvite: bool,
 }
 
 impl Leg {
@@ -299,6 +305,7 @@ impl Leg {
             stored_vias: Vec::new(),
             stored_cseq: None,
             initial_acked: false,
+            pending_reinvite: false,
         }
     }
 
@@ -319,6 +326,7 @@ impl Leg {
             stored_vias: Vec::new(),
             stored_cseq: None,
             initial_acked: false,
+            pending_reinvite: false,
         }
     }
 }
@@ -803,6 +811,63 @@ impl CallActorStore {
             if let Some(b_leg) = call.b_legs.get_mut(index) {
                 b_leg.dialog.target_uri = Some(target_uri);
             }
+        }
+    }
+
+    /// Find any call that contains a leg matching the supplied dialog
+    /// triple. Used to validate the `Replaces` header on an incoming
+    /// INVITE (RFC 3891 §3): the referenced dialog must exist or the
+    /// INVITE MUST be rejected with 481 Call/Transaction Does Not
+    /// Exist.
+    ///
+    /// The `from_tag` in the `Replaces` header is the tag of the UA
+    /// that *sent* the original dialog request (the "remote" side from
+    /// our perspective); `to_tag` is *our* tag for that dialog.
+    pub fn find_call_by_replaces_dialog(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+    ) -> Option<String> {
+        for entry in self.calls.iter() {
+            let call = entry.value();
+            let leg_matches = |leg: &Leg| {
+                leg.dialog.call_id == call_id
+                    && leg.dialog.local_tag == to_tag
+                    && leg
+                        .dialog
+                        .remote_tag
+                        .as_deref()
+                        .map_or(false, |tag| tag == from_tag)
+            };
+            if leg_matches(&call.a_leg) || call.b_legs.iter().any(leg_matches) {
+                return Some(entry.key().clone());
+            }
+        }
+        None
+    }
+
+    /// Set the `pending_reinvite` flag on the A-leg or the winning B-leg.
+    ///
+    /// Returns the previous value so callers can implement the RFC 3261
+    /// §14.1 glare check in one step: take-and-check if there was already
+    /// a pending re-INVITE toward this leg.
+    pub fn set_pending_reinvite(&self, call_id: &str, on_a_leg: bool, pending: bool) -> bool {
+        let Some(mut call) = self.calls.get_mut(call_id) else {
+            return false;
+        };
+        let leg = if on_a_leg {
+            Some(&mut call.a_leg)
+        } else {
+            call.winner.and_then(|idx| call.b_legs.get_mut(idx))
+        };
+        match leg {
+            Some(leg) => {
+                let previous = leg.pending_reinvite;
+                leg.pending_reinvite = pending;
+                previous
+            }
+            None => false,
         }
     }
 
@@ -1352,6 +1417,81 @@ mod tests {
 
         assert!(store.add_b_leg(&call_id, b_leg));
         assert_eq!(store.call_id_for_branch(&branch), Some(call_id));
+    }
+
+    /// RFC 3261 §14.1 glare detection: take-and-set of the pending_reinvite
+    /// flag on the target leg. A second `set_pending_reinvite(_, _, true)`
+    /// against the same leg must return the previous `true` so the caller
+    /// knows another re-INVITE is already in flight and can reject with 491.
+    #[test]
+    fn pending_reinvite_flag_tracks_concurrent_reinvites() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+        store.set_winner(&call_id, 0);
+
+        // First re-INVITE toward B-leg: flag was false, is now true.
+        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true), false);
+        // Second (glare): flag was already true.
+        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true), true);
+        // Clear on completion.
+        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, false), true);
+        // Now a new re-INVITE can start.
+        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true), false);
+    }
+
+    /// RFC 3891 §3 dialog lookup: find a call where one of its legs has
+    /// the dialog identifiers (call_id, local_tag, remote_tag) referenced
+    /// by a `Replaces` header.
+    #[test]
+    fn find_call_by_replaces_matches_a_leg() {
+        let store = CallActorStore::new();
+        let a_leg = make_a_leg();
+        let dialog_call_id = a_leg.dialog.call_id.clone();
+        let our_tag = a_leg.dialog.local_tag.clone();
+        let their_tag = a_leg.dialog.remote_tag.clone().unwrap();
+        let call_id = store.create_call(a_leg);
+
+        // Replaces says: "the dialog you (siphon) have where YOU are tagged
+        // `our_tag` and the OTHER end is tagged `their_tag`".
+        let matched = store.find_call_by_replaces_dialog(&dialog_call_id, &their_tag, &our_tag);
+        assert_eq!(matched, Some(call_id));
+    }
+
+    #[test]
+    fn find_call_by_replaces_no_match_returns_none() {
+        let store = CallActorStore::new();
+        let _ = store.create_call(make_a_leg());
+
+        let matched = store.find_call_by_replaces_dialog("bogus-call", "x", "y");
+        assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn find_call_by_replaces_wrong_tag_combo() {
+        // Right call_id, wrong tag pair → no match (avoid false positives).
+        let store = CallActorStore::new();
+        let a_leg = make_a_leg();
+        let dialog_call_id = a_leg.dialog.call_id.clone();
+        let _ = store.create_call(a_leg);
+
+        let matched = store.find_call_by_replaces_dialog(&dialog_call_id, "wrong-from", "wrong-to");
+        assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn pending_reinvite_is_per_leg() {
+        // A-leg and B-leg pending flags are independent — a re-INVITE in
+        // flight toward the B-leg does NOT block a re-INVITE toward the
+        // A-leg.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+        store.set_winner(&call_id, 0);
+
+        assert_eq!(store.set_pending_reinvite(&call_id, false, true), false);
+        // The A-leg flag should still be false.
+        assert_eq!(store.set_pending_reinvite(&call_id, true, true), false);
     }
 
     #[test]

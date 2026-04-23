@@ -1160,6 +1160,9 @@ fn process_timer_actions(
                 warn!(key = %key, "transaction timeout");
                 // Session cleanup happens via sweep_stale_entries
             }
+            Action::ProtocolError(message) => {
+                warn!(key = %key, "transaction protocol error: {message}");
+            }
             Action::Terminated | Action::PassToTu(_) => {
                 // PassToTu from timer context is unusual (shouldn't happen)
                 // Terminated: transaction already auto-removed by manager
@@ -2443,6 +2446,9 @@ fn handle_response(
                                     transport: None,
                                     connection_id: None,
                                 });
+                            }
+                            Action::ProtocolError(message) => {
+                                warn!(key = %key, "client transaction protocol error: {message}");
                             }
                             _ => {}
                         }
@@ -4511,6 +4517,69 @@ fn handle_b2bua_invite(
         return;
     }
 
+    // RFC 3891: if the INVITE carries a `Replaces` header it must match an
+    // existing dialog, otherwise we MUST reject with 481 Call/Transaction
+    // Does Not Exist. Silently treating it as a fresh INVITE would defeat
+    // the attended-transfer semantics (the referrer expects the old dialog
+    // to go away once this INVITE succeeds).
+    if let Some(replaces_raw) = message.headers.get("Replaces") {
+        match crate::sip::headers::refer::parse_replaces(&replaces_raw) {
+            Ok(replaces) => {
+                match state.call_actors.find_call_by_replaces_dialog(
+                    &replaces.call_id,
+                    &replaces.from_tag,
+                    &replaces.to_tag,
+                ) {
+                    Some(matched_call_id) => {
+                        // Dialog found — full attended-transfer bridging
+                        // (terminating the matched dialog and bridging the
+                        // remote party with the new INVITE's originator) is
+                        // still TODO. For now the INVITE flows through as a
+                        // normal new call so at least the caller reaches the
+                        // UAS; a dedicated ticket tracks the bridge step.
+                        debug!(
+                            call_id = %sip_call_id,
+                            matched_call = %matched_call_id,
+                            "B2BUA: INVITE with Replaces matched an existing dialog (bridge TODO)"
+                        );
+                    }
+                    None => {
+                        debug!(
+                            call_id = %sip_call_id,
+                            replaces_call_id = %replaces.call_id,
+                            "B2BUA: rejecting INVITE with 481 — Replaces target dialog does not exist"
+                        );
+                        let response = build_response(
+                            &message,
+                            481,
+                            "Call/Transaction Does Not Exist",
+                            state.server_header.as_deref(),
+                            &[],
+                        );
+                        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                debug!(
+                    call_id = %sip_call_id,
+                    error = %error,
+                    "B2BUA: rejecting INVITE with 400 — malformed Replaces header"
+                );
+                let response = build_response(
+                    &message,
+                    400,
+                    "Bad Replaces Header",
+                    state.server_header.as_deref(),
+                    &[],
+                );
+                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+                return;
+            }
+        }
+    }
+
     // Send 100 Trying immediately to suppress A-leg retransmissions
     // (RFC 3261 §8.2.6.1: SHOULD send 100 within 200ms for INVITE)
     let trying = build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
@@ -5392,6 +5461,12 @@ fn handle_b2bua_response(
             if let Some(idx) = b_leg_index {
                 state.call_actors.set_b_leg_target_uri(call_id, idx, format!("reinvite_done:{}", direction));
             }
+            // RFC 3261 §14.1: the re-INVITE toward the target leg has
+            // completed — clear the pending flag so a subsequent re-INVITE
+            // (from either side) is allowed to start. `is_a2b` means the
+            // re-INVITE was forwarded TOWARD the B-leg, so the pending flag
+            // was set on the B-leg.
+            state.call_actors.set_pending_reinvite(call_id, /*on_a_leg=*/ !is_a2b, false);
         } else if status_code >= 300 {
             // Non-2xx: ACK is hop-by-hop — reuse the SAME branch as the
             // forwarded re-INVITE (RFC 3261 §17.1.1.3).
@@ -5408,6 +5483,8 @@ fn handle_b2bua_response(
             if let Some(idx) = b_leg_index {
                 state.call_actors.remove_b_leg(call_id, idx);
             }
+            // Clear pending-reinvite on the target leg (see comment above).
+            state.call_actors.set_pending_reinvite(call_id, /*on_a_leg=*/ !is_a2b, false);
         }
 
         // Forward response to the originator
@@ -6867,8 +6944,15 @@ fn handle_b2bua_reinvite(
         (a_leg.dialog.remote_contact.clone(), a_leg.dialog.local_contact.clone(), a_leg.dialog.remote_aor_host.clone())
     };
 
-    // Glare prevention: don't forward re-INVITE if target hasn't ACKed initial INVITE.
-    // Responding 491 tells the originator to retry after a random delay (RFC 3261 §14.1).
+    // Glare prevention (RFC 3261 §14.1):
+    //  (a) Don't forward a re-INVITE if the target hasn't ACKed the initial
+    //      INVITE yet — the offer/answer from the initial transaction is
+    //      still in flight.
+    //  (b) Don't forward a second re-INVITE while one is already pending
+    //      toward the same leg — two concurrent offer/answer exchanges
+    //      would leave the media state undefined.
+    // In either case we respond 491 Request Pending so the originator can
+    // retry after a random delay per the RFC.
     let target_acked = if from_a_leg {
         winner_b_leg.as_ref().map(|b| b.initial_acked).unwrap_or(false)
     } else {
@@ -6879,6 +6963,24 @@ fn handle_b2bua_reinvite(
             call_id = %call_id,
             from_a_leg = from_a_leg,
             "B2BUA: rejecting re-INVITE with 491 — target leg not yet ACKed"
+        );
+        let response = build_response(&message, 491, "Request Pending", state.server_header.as_deref(), &[]);
+        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+        return;
+    }
+
+    // `on_a_leg = !from_a_leg` because the "target" of the re-INVITE is the
+    // OPPOSITE side from where it arrived. A re-INVITE from the A-leg is
+    // forwarded toward the B-leg (and vice versa). Take-and-set the pending
+    // flag atomically so the glare check races against nothing.
+    let already_pending = state
+        .call_actors
+        .set_pending_reinvite(&call_id, /*on_a_leg=*/ !from_a_leg, true);
+    if already_pending {
+        debug!(
+            call_id = %call_id,
+            from_a_leg = from_a_leg,
+            "B2BUA: rejecting re-INVITE with 491 — another re-INVITE already pending toward target"
         );
         let response = build_response(&message, 491, "Request Pending", state.server_header.as_deref(), &[]);
         send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);

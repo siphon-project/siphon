@@ -170,8 +170,37 @@ pub fn parse_challenge(header_value: &str) -> Option<DigestChallenge> {
     })
 }
 
+/// Generate a cryptographically random client nonce (cnonce).
+///
+/// RFC 2617 §3.2.2 / RFC 7616 §3.4 use the cnonce to thwart chosen-plaintext
+/// replay attacks: the server's nonce alone is chosen by the server, so the
+/// client mixes in its own fresh random value. Returning a *predictable*
+/// cnonce (for example a hardcoded `"0a1b2c3d"`) makes the response hash
+/// replayable and silently defeats that protection — which is why we never
+/// fall back to a static string.
+///
+/// 16 hex chars = 64 bits of entropy, which is well above the "sufficient"
+/// guidance in RFC 7616 §5.5 and matches what most modern SIP stacks emit.
+pub fn generate_cnonce() -> String {
+    let u = uuid::Uuid::new_v4();
+    // Take the first 8 bytes of the UUID v4 — `uuid` uses `getrandom`
+    // under the hood so these bytes are drawn from the OS CSPRNG.
+    let bytes = u.as_bytes();
+    let mut output = String::with_capacity(16);
+    for byte in &bytes[..8] {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
 /// Compute the digest response per RFC 2617 (MD5) or RFC 7616 (SHA-256,
 /// SHA-512-256, and `-sess` variants).
+///
+/// The caller is responsible for passing a `cnonce` whenever the challenge
+/// has `qop=auth` or uses a `-sess` algorithm — if omitted in those cases
+/// a fresh random cnonce is generated, but callers that also build the
+/// Authorization header separately must ensure the SAME value flows into
+/// both places (see `format_authorization_header`, which handles this).
 ///
 /// Returns the hex-encoded response hash.
 pub fn compute_digest_response(
@@ -195,11 +224,21 @@ pub fn compute_digest_response(
 
     // RFC 7616 §3.4.2: -sess variants re-hash HA1 with nonce + cnonce so the
     // per-session key can't be replayed across sessions even if the raw
-    // credential hash leaks. The cnonce is required for this path; use a
-    // stable-but-explicit placeholder if the caller didn't supply one and
-    // pray they noticed (tests do supply one).
+    // credential hash leaks. A cnonce is required on this path.
+    let generated_cnonce;
+    let cnonce_value: &str = if hash.is_session() || challenge.qop.is_some() {
+        match cnonce {
+            Some(value) => value,
+            None => {
+                generated_cnonce = generate_cnonce();
+                &generated_cnonce
+            }
+        }
+    } else {
+        ""
+    };
+
     if hash.is_session() {
-        let cnonce_value = cnonce.unwrap_or("0a1b2c3d");
         ha1 = hash_hex(
             hash,
             format!("{ha1}:{}:{cnonce_value}", challenge.nonce).as_bytes(),
@@ -217,7 +256,6 @@ pub fn compute_digest_response(
     if has_qop_auth {
         let nc = nonce_count.unwrap_or(1);
         let nc_str = format!("{nc:08x}");
-        let cnonce_value = cnonce.unwrap_or("0a1b2c3d");
         hash_hex(
             hash,
             format!(
@@ -232,6 +270,11 @@ pub fn compute_digest_response(
 }
 
 /// Build the complete `Authorization` or `Proxy-Authorization` header value.
+///
+/// If the caller does not supply a `cnonce` but the challenge requires one
+/// (qop=auth or a `-sess` algorithm), a cryptographically random cnonce is
+/// generated and used consistently for both the response hash and the
+/// emitted `cnonce=` parameter in the header.
 pub fn format_authorization_header(
     challenge: &DigestChallenge,
     credentials: &DigestCredentials,
@@ -240,20 +283,34 @@ pub fn format_authorization_header(
     nonce_count: Option<u32>,
     cnonce: Option<&str>,
 ) -> String {
+    let has_qop_auth = challenge
+        .qop
+        .as_ref()
+        .map(|qop| qop.split(',').any(|token| token.trim() == "auth"))
+        .unwrap_or(false);
+
+    // Derive a single cnonce value up front so the response hash and the
+    // header's `cnonce=` parameter match. Without this, `compute_digest_response`
+    // and the header emission would each fall back to their own fresh random
+    // string, and the server's verification would fail every time.
+    let owned_cnonce;
+    let cnonce_ref: Option<&str> = if cnonce.is_some() {
+        cnonce
+    } else if has_qop_auth || challenge.algorithm.is_session() {
+        owned_cnonce = generate_cnonce();
+        Some(owned_cnonce.as_str())
+    } else {
+        None
+    };
+
     let response = compute_digest_response(
         challenge,
         credentials,
         method,
         digest_uri,
         nonce_count,
-        cnonce,
+        cnonce_ref,
     );
-
-    let has_qop_auth = challenge
-        .qop
-        .as_ref()
-        .map(|qop| qop.split(',').any(|token| token.trim() == "auth"))
-        .unwrap_or(false);
 
     let mut header = format!(
         "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", algorithm={}, response=\"{}\"",
@@ -262,7 +319,8 @@ pub fn format_authorization_header(
 
     if has_qop_auth {
         let nc = nonce_count.unwrap_or(1);
-        let cnonce_value = cnonce.unwrap_or("0a1b2c3d");
+        // cnonce_ref is always Some when qop=auth because of the derivation above.
+        let cnonce_value = cnonce_ref.unwrap_or("");
         header.push_str(&format!(
             ", qop=auth, nc={:08x}, cnonce=\"{cnonce_value}\"",
             nc
@@ -551,6 +609,73 @@ mod tests {
         let plain = compute_digest_response(&base, &creds, "INVITE", "sip:x", Some(1), Some("c"));
         let sessed = compute_digest_response(&sess, &creds, "INVITE", "sip:x", Some(1), Some("c"));
         assert_ne!(plain, sessed, "-sess must re-hash HA1 with nonce+cnonce");
+    }
+
+    /// RFC 2617 §3.2.2 / RFC 7616 §5.5: cnonce MUST be unpredictable. A
+    /// hardcoded placeholder (we used to fall back to `"0a1b2c3d"`) silently
+    /// defeats replay protection. Verify that omitting cnonce from
+    /// `format_authorization_header` injects a fresh random value and that
+    /// two back-to-back calls produce different values.
+    #[test]
+    fn format_authorization_generates_unique_cnonce_when_absent() {
+        let challenge = DigestChallenge {
+            realm: "r".to_string(),
+            nonce: "N".to_string(),
+            opaque: None,
+            qop: Some("auth".to_string()),
+            algorithm: DigestAlgorithm::Sha256,
+            stale: false,
+        };
+        let creds = DigestCredentials {
+            username: "u".to_string(),
+            password: "p".to_string(),
+        };
+
+        let extract_cnonce = |header: &str| -> String {
+            let start = header.find("cnonce=\"").unwrap() + 8;
+            let end = header[start..].find('"').unwrap() + start;
+            header[start..end].to_string()
+        };
+
+        let h1 = format_authorization_header(&challenge, &creds, "INVITE", "sip:x", Some(1), None);
+        let h2 = format_authorization_header(&challenge, &creds, "INVITE", "sip:x", Some(1), None);
+
+        let c1 = extract_cnonce(&h1);
+        let c2 = extract_cnonce(&h2);
+
+        assert_ne!(c1, "0a1b2c3d", "must not fall back to a hardcoded cnonce");
+        assert_ne!(c2, "0a1b2c3d", "must not fall back to a hardcoded cnonce");
+        assert_ne!(c1, c2, "two consecutive calls must produce different cnonces");
+        assert_eq!(c1.len(), 16, "cnonce is 16 hex chars (64 bits of entropy)");
+        assert!(c1.chars().all(|character| character.is_ascii_hexdigit()));
+    }
+
+    /// When the caller DOES supply a cnonce, format_authorization_header
+    /// must use exactly that value — not generate its own.
+    #[test]
+    fn format_authorization_honors_explicit_cnonce() {
+        let challenge = DigestChallenge {
+            realm: "r".to_string(),
+            nonce: "N".to_string(),
+            opaque: None,
+            qop: Some("auth".to_string()),
+            algorithm: DigestAlgorithm::Md5,
+            stale: false,
+        };
+        let creds = DigestCredentials {
+            username: "u".to_string(),
+            password: "p".to_string(),
+        };
+        let header = format_authorization_header(&challenge, &creds, "INVITE", "sip:x", Some(1), Some("explicitcnonce"));
+        assert!(header.contains("cnonce=\"explicitcnonce\""));
+    }
+
+    #[test]
+    fn generate_cnonce_is_random() {
+        let c1 = generate_cnonce();
+        let c2 = generate_cnonce();
+        assert_ne!(c1, c2);
+        assert_eq!(c1.len(), 16);
     }
 
     #[test]
