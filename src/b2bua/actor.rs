@@ -286,6 +286,11 @@ pub struct Leg {
     /// already pending toward the same leg we respond 491 Request
     /// Pending rather than forward a second concurrent offer/answer.
     pub pending_reinvite: bool,
+    /// Highest RSeq we've already PRACKed on this leg (RFC 3262
+    /// auto-PRACK). Reliable 1xx responses retransmit until PRACKed
+    /// — without this guard we would emit a fresh PRACK for every
+    /// retransmit, racking up CSeq numbers and confusing the peer.
+    pub prack_acked_rseq: Option<u32>,
 }
 
 impl Leg {
@@ -306,6 +311,7 @@ impl Leg {
             stored_cseq: None,
             initial_acked: false,
             pending_reinvite: false,
+            prack_acked_rseq: None,
         }
     }
 
@@ -327,6 +333,7 @@ impl Leg {
             stored_cseq: None,
             initial_acked: false,
             pending_reinvite: false,
+            prack_acked_rseq: None,
         }
     }
 }
@@ -845,6 +852,60 @@ impl CallActorStore {
             }
         }
         None
+    }
+
+    /// Atomically increment the local CSeq counter on the A-leg or the
+    /// winning B-leg and return the new value. Used when the B2BUA needs
+    /// to originate an in-dialog request (PRACK, BYE, re-INVITE) and must
+    /// allocate a CSeq number that is monotonically increasing within
+    /// the dialog (RFC 3261 §12.2.1.1).
+    pub fn next_local_cseq(&self, call_id: &str, on_a_leg: bool) -> Option<u32> {
+        let mut call = self.calls.get_mut(call_id)?;
+        let leg = if on_a_leg {
+            Some(&mut call.a_leg)
+        } else {
+            // Two-step indirection because `winner` borrows `call` immutably
+            // while `b_legs.get_mut` needs the mutable borrow exclusively.
+            let idx = call.winner?;
+            call.b_legs.get_mut(idx)
+        };
+        leg.map(|leg| {
+            leg.dialog.local_cseq = leg.dialog.local_cseq.saturating_add(1);
+            leg.dialog.local_cseq
+        })
+    }
+
+    /// Like `next_local_cseq` but addresses a specific B-leg by index —
+    /// used when the call hasn't picked a winner yet (e.g. early media on
+    /// a forked INVITE where the 1xx arrives before any 2xx).
+    pub fn next_b_leg_local_cseq(&self, call_id: &str, b_leg_index: usize) -> Option<u32> {
+        let mut call = self.calls.get_mut(call_id)?;
+        let leg = call.b_legs.get_mut(b_leg_index)?;
+        leg.dialog.local_cseq = leg.dialog.local_cseq.saturating_add(1);
+        Some(leg.dialog.local_cseq)
+    }
+
+    /// RFC 3262 auto-PRACK dedup: returns `true` exactly once for each
+    /// new RSeq value seen on the given B-leg, and `false` for retransmits
+    /// of an already-PRACKed reliable provisional. Used so the B2BUA emits
+    /// a single PRACK per RSeq instead of one per 1xx retransmit.
+    pub fn try_mark_prack_acked(
+        &self,
+        call_id: &str,
+        b_leg_index: usize,
+        rseq: u32,
+    ) -> bool {
+        let Some(mut call) = self.calls.get_mut(call_id) else {
+            return false;
+        };
+        let Some(leg) = call.b_legs.get_mut(b_leg_index) else {
+            return false;
+        };
+        if leg.prack_acked_rseq.map_or(false, |v| v >= rseq) {
+            return false;
+        }
+        leg.prack_acked_rseq = Some(rseq);
+        true
     }
 
     /// Set the `pending_reinvite` flag on the A-leg or the winning B-leg.
@@ -1477,6 +1538,37 @@ mod tests {
 
         let matched = store.find_call_by_replaces_dialog(&dialog_call_id, "wrong-from", "wrong-to");
         assert_eq!(matched, None);
+    }
+
+    /// RFC 3262 auto-PRACK dedup: each new RSeq returns true once,
+    /// retransmits return false so we don't PRACK the same provisional twice.
+    #[test]
+    fn try_mark_prack_acked_dedupes() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+
+        assert!(store.try_mark_prack_acked(&call_id, 0, 42));
+        // Same RSeq again — already PRACKed, returns false.
+        assert!(!store.try_mark_prack_acked(&call_id, 0, 42));
+        // Earlier RSeq (out-of-order retransmit) — also no PRACK.
+        assert!(!store.try_mark_prack_acked(&call_id, 0, 1));
+        // Higher RSeq (next reliable 1xx, e.g. 180 after 183) — PRACK it.
+        assert!(store.try_mark_prack_acked(&call_id, 0, 43));
+    }
+
+    #[test]
+    fn next_b_leg_local_cseq_increments_per_call() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+
+        // B-leg starts at local_cseq = 1 (the INVITE).
+        assert_eq!(store.next_b_leg_local_cseq(&call_id, 0), Some(2));
+        assert_eq!(store.next_b_leg_local_cseq(&call_id, 0), Some(3));
+        assert_eq!(store.next_b_leg_local_cseq(&call_id, 0), Some(4));
+        // Out-of-range index returns None.
+        assert_eq!(store.next_b_leg_local_cseq(&call_id, 99), None);
     }
 
     #[test]

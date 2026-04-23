@@ -3608,8 +3608,16 @@ fn sanitize_b2bua_response(
     response.headers.remove("Allow");
     response.headers.remove("Allow-Events");
     response.headers.remove("Supported");
-    response.headers.remove("Require");
     response.headers.remove("Content-Disposition");
+    // Strip RFC 3262 100rel state from forwarded responses: in "auto-PRACK"
+    // mode the B2BUA terminates the reliable provisional locally on the
+    // B-leg side (sending its own PRACK) and presents an ordinary 1xx to
+    // the A-leg. Without this the A-leg would see a Require: 100rel and
+    // think it has to PRACK back — but the dialog identifiers it would use
+    // belong to the A-leg dialog, not B-leg, so the PRACK could never reach
+    // the originating UAS.
+    response.headers.remove("Require");
+    response.headers.remove("RSeq");
 
     // Sanitize SDP: mask B-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
@@ -3932,6 +3940,86 @@ fn build_b2bua_bye(
         Ok(msg) => Some(msg),
         Err(error) => {
             warn!("B2BUA: failed to build BYE: {error}");
+            None
+        }
+    }
+}
+
+/// Build an in-dialog PRACK request toward a leg, acknowledging the
+/// reliable provisional response identified by `rseq`/`response_cseq_num`.
+/// Used by the B2BUA's "auto-PRACK" mode (RFC 3262 §4): when the B-leg
+/// sends a 1xx with `Require: 100rel`, siphon answers with a PRACK
+/// locally rather than relying on the A-leg (which lives in a different
+/// dialog) to do it.
+///
+/// `local_cseq` MUST already have been incremented for the dialog before
+/// calling this — the value passed in is used as-is.
+fn build_b2bua_prack(
+    leg: &crate::b2bua::actor::Leg,
+    state: &DispatcherState,
+    rseq: u32,
+    response_cseq_num: u32,
+    response_cseq_method: &str,
+    local_cseq: u32,
+) -> Option<SipMessage> {
+    let dialog = &leg.dialog;
+
+    let ruri = dialog.remote_contact.as_deref()
+        .and_then(|uri_str| parse_uri_standalone(uri_str).ok())
+        .unwrap_or_else(|| {
+            dialog.target_uri.as_deref()
+                .and_then(|uri_str| parse_uri_standalone(uri_str).ok())
+                .unwrap_or_else(|| SipUri::new("invalid".to_string()))
+        });
+
+    let transport_str = format!("{}", leg.transport.transport).to_uppercase();
+    let branch = TransactionKey::generate_branch();
+    let via = format!(
+        "SIP/2.0/{} {}:{};branch={}",
+        transport_str,
+        state.via_host(&leg.transport.transport),
+        state.via_port(&leg.transport.transport),
+        branch,
+    );
+
+    let from_header = dialog.local_from_uri.clone()
+        .unwrap_or_else(|| format!(
+            "<{}>;tag={}",
+            dialog.local_contact.as_deref().unwrap_or("sip:invalid"),
+            dialog.local_tag,
+        ));
+    let to_header = dialog.remote_to_uri.clone()
+        .unwrap_or_else(|| {
+            let to_uri = dialog.remote_contact.as_deref()
+                .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"));
+            match &dialog.remote_tag {
+                Some(tag) => format!("<{}>;tag={}", to_uri, tag),
+                None => format!("<{}>", to_uri),
+            }
+        });
+
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Prack, ruri)
+        .via(via)
+        .from(from_header)
+        .to(to_header)
+        .call_id(dialog.call_id.clone())
+        .cseq(format!("{} PRACK", local_cseq))
+        .header("Max-Forwards", "70".to_string())
+        // RFC 3262 §7.2: RAck = "<rseq> <cseq-num> <cseq-method>".
+        .header("RAck", format!("{rseq} {response_cseq_num} {response_cseq_method}"));
+
+    if let Some(ref contact) = dialog.local_contact {
+        builder = builder.header("Contact", contact.clone());
+    }
+    for route in &dialog.route_set {
+        builder = builder.header("Route", route.clone());
+    }
+
+    match builder.content_length(0).build() {
+        Ok(message) => Some(message),
+        Err(error) => {
+            warn!("B2BUA: failed to build PRACK: {error}");
             None
         }
     }
@@ -5202,6 +5290,91 @@ fn handle_b2bua_response(
             return;
         }
     };
+
+    // RFC 3262 auto-PRACK for the B-leg side: when the B-leg sends a
+    // reliable provisional response (`Require: 100rel` + `RSeq: <n>`),
+    // the B2BUA must answer with a PRACK. We do that locally here using
+    // the B-leg dialog state so the A-leg sees an ordinary 1xx (the
+    // `Require`/`RSeq` headers are stripped in `sanitize_b2bua_response`).
+    // We don't track a client transaction for the PRACK — the B-leg's
+    // 200 OK PRACK that comes back will hit the response handler with no
+    // matching session and be dropped, which is the correct behavior here.
+    let needs_prack = (100..200).contains(&status_code)
+        && status_code != 100
+        && crate::sip::headers::rseq::requires_100rel(&message.headers);
+    if needs_prack {
+        if let (Some(rseq), Some(idx)) = (
+            crate::sip::headers::rseq::parse_rseq(&message.headers),
+            b_leg_index,
+        ) {
+            // Skip if we've already PRACKed this RSeq — the B-leg is just
+            // retransmitting the reliable 1xx because our PRACK is in
+            // flight or got delayed; one PRACK per RSeq is correct.
+            if !state.call_actors.try_mark_prack_acked(call_id, idx, rseq.response_number) {
+                debug!(
+                    call_id = %call_id,
+                    rseq = rseq.response_number,
+                    "B2BUA: already PRACKed this RSeq, skipping"
+                );
+                // Still need to strip Require/RSeq from forwarded 1xx (done
+                // in sanitize_b2bua_response below); fall through.
+                let _ = ();
+                // We DO want to fall through to the rest of the function so
+                // the 1xx still reaches the A-leg.
+            } else {
+            // Pull CSeq num + method from the 1xx (it echoes the INVITE's).
+            let response_cseq_num: u32 = message.headers.cseq()
+                .and_then(|c| c.split_whitespace().next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(1);
+            let response_cseq_method = message.headers.cseq()
+                .and_then(|c| c.split_whitespace().nth(1))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "INVITE".to_string());
+
+            if let Some(prack_cseq) = state.call_actors.next_b_leg_local_cseq(call_id, idx) {
+                // Re-snapshot the leg now that we may have mutated it.
+                let prack = state.call_actors.get_call(call_id).and_then(|call| {
+                    let leg = call.b_legs.get(idx)?;
+                    build_b2bua_prack(
+                        leg,
+                        state,
+                        rseq.response_number,
+                        response_cseq_num,
+                        &response_cseq_method,
+                        prack_cseq,
+                    )
+                });
+                if let Some(prack) = prack {
+                    if let Some((dest, transport)) = b_leg_dest {
+                        debug!(
+                            call_id = %call_id,
+                            rseq = rseq.response_number,
+                            "B2BUA: sending auto-PRACK for reliable 1xx from B-leg"
+                        );
+                        send_b2bua_to_bleg(prack, transport, dest, state);
+                    }
+                }
+            }
+            } // close `else` (first-time-this-RSeq branch)
+        }
+    }
+
+    // Absorb the B-leg's 200 OK PRACK so it never gets forwarded to the
+    // A-leg (the A-leg never sent a PRACK — siphon did, locally). The
+    // CSeq method on the response distinguishes it from the INVITE 200.
+    if (200..300).contains(&status_code)
+        && message.headers.cseq()
+            .and_then(|c| c.split_whitespace().nth(1))
+            .map(|m| m.eq_ignore_ascii_case("PRACK"))
+            .unwrap_or(false)
+    {
+        debug!(
+            call_id = %call_id,
+            "B2BUA: absorbing B-leg 200 OK PRACK"
+        );
+        return;
+    }
 
     // Handle retransmitted 200 OK for already-completed re-INVITEs.
     // The entry was marked "reinvite_done:<dir>" after the first 200 OK was processed.
