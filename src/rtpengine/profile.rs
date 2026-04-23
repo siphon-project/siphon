@@ -549,4 +549,32 @@ mod tests {
         let pairs = flags.to_bencode_pairs();
         assert!(pairs.is_empty());
     }
+
+    /// Regression check: `record_call` and `record_path` (set in user YAML
+    /// or in the built-in `srs_recording` profile) MUST appear in the bencode
+    /// emission as the keys RTPEngine actually understands. An audit once
+    /// claimed these were dead config; if anyone inadvertently drops the
+    /// emission again this test catches it.
+    #[test]
+    fn ng_flags_emits_record_call_and_recording_dir() {
+        let flags = NgFlags {
+            record_call: true,
+            record_path: Some("/var/spool/rtpengine".into()),
+            ..NgFlags::default()
+        };
+        let pairs = flags.to_bencode_pairs();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"record call"), "missing 'record call' key");
+        assert!(keys.contains(&"recording-dir"), "missing 'recording-dir' key");
+    }
+
+    #[test]
+    fn srs_recording_builtin_emits_record_call() {
+        let registry = ProfileRegistry::new();
+        let entry = registry.get("srs_recording").expect("srs_recording profile");
+        assert!(entry.offer.record_call, "srs_recording offer must record_call");
+        let pairs = entry.offer.to_bencode_pairs();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"record call"));
+    }
 }
