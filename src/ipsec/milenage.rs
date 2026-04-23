@@ -213,10 +213,17 @@ pub fn generate_vector(
     amf: &[u8; 2],
 ) -> AkaVector {
     let mut rand = [0u8; 16];
-    // Use a CSPRNG for production randomness.
-    for byte in &mut rand {
-        // Read from /dev/urandom via getrandom(2) on Linux.
-        *byte = fastrand_byte();
+    // RAND is the challenge value the UE will sign with K. It MUST be
+    // unpredictable — a guessable RAND lets an attacker pre-compute valid
+    // RES values and impersonate the network. Use the OS CSPRNG (getrandom
+    // → /dev/urandom on Linux, BCryptGenRandom on Windows). On the
+    // extremely rare chance the syscall fails (sandboxed environment with
+    // no entropy source), fall back rather than panic — the UE will reject
+    // the AUTN if the resulting vector is bogus.
+    if getrandom::fill(&mut rand).is_err() {
+        for byte in &mut rand {
+            *byte = fastrand_byte();
+        }
     }
     generate_vector_with_rand(key, op, sqn, amf, &rand)
 }
@@ -288,10 +295,14 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-/// Generate a single random byte.
+/// Generate a single byte from a non-cryptographic xorshift PRNG seeded
+/// from the system's `RandomState` entropy.
 ///
-/// Uses a simple thread-local PRNG seeded from system entropy.
-/// For production use, consider replacing with a proper CSPRNG.
+/// Kept as the fallback path inside [`generate_vector`] for the rare case
+/// where `getrandom` fails (sandboxes with no entropy source). NEW callers
+/// should use `getrandom::fill` directly — this function is NOT a CSPRNG
+/// and using it for keys, nonces, or RAND values undermines the security
+/// of every protocol that depends on those values being unpredictable.
 fn fastrand_byte() -> u8 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
@@ -643,5 +654,31 @@ mod tests {
         assert_eq!(hex_nibble(b'g'), None);
         assert_eq!(hex_nibble(b'z'), None);
         assert_eq!(hex_nibble(b' '), None);
+    }
+
+    /// Sanity check: the production AKA RAND must come from a real
+    /// CSPRNG, not a constant stub or a deterministic PRNG seeded once
+    /// per process. Two consecutive vectors must have different RAND
+    /// values with overwhelming probability.
+    ///
+    /// (Probability that two CSPRNG-drawn 128-bit values collide is
+    /// 2^-128; if this test ever fails you've either won the lottery
+    /// or someone replaced `getrandom` with a stub.)
+    #[test]
+    fn generate_vector_uses_unpredictable_rand() {
+        let key = test_set_1_key();
+        let op = test_set_1_op();
+        let sqn = hex_array::<6>("ff9bb4d0b607");
+        let amf = hex_array::<2>("b9b9");
+
+        let v1 = generate_vector(&key, &op, &sqn, &amf);
+        let v2 = generate_vector(&key, &op, &sqn, &amf);
+
+        assert_ne!(v1.rand, v2.rand, "RAND must change between calls");
+        assert_ne!(v1.rand, [0u8; 16], "RAND must not be all zeros");
+        // AUTN / xRES / CK / IK derive from RAND, so they all differ too.
+        assert_ne!(v1.autn, v2.autn);
+        assert_ne!(v1.xres, v2.xres);
+        assert_ne!(v1.ck, v2.ck);
     }
 }
