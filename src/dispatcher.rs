@@ -224,6 +224,13 @@ pub async fn run(
             .advertised_address
             .as_deref()
             .unwrap_or(fallback);
+        if config.advertised_address.is_none() {
+            warn!(
+                bind = %local_addr,
+                "binding to unspecified address with no `advertised_address` configured — \
+                 Via/Contact will use {fallback}; remote peers will not be able to reach this instance"
+            );
+        }
         let ip: std::net::IpAddr = host
             .parse()
             .unwrap_or_else(|_| {
@@ -3573,16 +3580,12 @@ fn sanitize_b2bua_response(
 ) {
     // Contact: must point to siphon so in-dialog requests (ACK, BYE, re-INVITE)
     // route through us, not directly to the B-leg.
-    // Use advertised address (public IP) when configured, otherwise listen address.
-    let listen_addr = state.listen_addrs.get(&a_leg_transport).copied()
-        .unwrap_or(state.local_addr);
-    let contact_host = state.advertised_addrs.get(&a_leg_transport)
-        .map(|h| format_sip_host(h))
-        .unwrap_or_else(|| format_sip_host(&listen_addr.ip().to_string()));
+    // via_host()/via_port() apply advertised_address fallback and substitute the
+    // sanitized local_addr when bound to 0.0.0.0/[::] — never leak unspecified.
     let contact_value = format!(
         "<sip:{}:{};transport={}>",
-        contact_host,
-        listen_addr.port(),
+        state.via_host(&a_leg_transport),
+        state.via_port(&a_leg_transport),
         a_leg_transport.to_string().to_lowercase(),
     );
     response.headers.set("Contact", contact_value);
@@ -4691,14 +4694,13 @@ fn handle_b2bua_invite(
         },
     );
 
-    // Store our Contact for the A-leg direction (what we advertise to the caller)
-    let a_listen = state.listen_addrs.get(&inbound.transport).copied().unwrap_or(state.local_addr);
-    let a_contact_host = state.advertised_addrs.get(&inbound.transport)
-        .map(|h| format_sip_host(h))
-        .unwrap_or_else(|| format_sip_host(&a_listen.ip().to_string()));
+    // Store our Contact for the A-leg direction (what we advertise to the caller).
+    // via_host()/via_port() apply advertised_address fallback and substitute the
+    // sanitized local_addr when bound to 0.0.0.0/[::].
     a_leg.dialog.local_contact = Some(format!(
         "<sip:{}:{};transport={}>",
-        a_contact_host, a_listen.port(),
+        state.via_host(&inbound.transport),
+        state.via_port(&inbound.transport),
         inbound.transport.to_string().to_lowercase(),
     ));
 
@@ -4980,14 +4982,13 @@ fn b2bua_send_b_leg_invite(
     }
 
     // Set Contact to siphon's own address so in-dialog requests route through us.
-    // Use advertised address (public IP) when configured.
-    let b_listen = state.listen_addrs.get(&outbound_transport).copied().unwrap_or(state.local_addr);
-    let b_contact_host = state.advertised_addrs.get(&outbound_transport)
-        .map(|h| format_sip_host(h))
-        .unwrap_or_else(|| format_sip_host(&b_listen.ip().to_string()));
+    // via_host()/via_port() apply advertised_address fallback and substitute the
+    // sanitized local_addr when the bind is 0.0.0.0/[::] — never leak unspecified.
+    let b_contact_host = state.via_host(&outbound_transport);
+    let b_contact_port = state.via_port(&outbound_transport);
     b_leg_invite.headers.set("Contact", format!(
         "<sip:{}:{};transport={}>",
-        b_contact_host, b_listen.port(),
+        b_contact_host, b_contact_port,
         outbound_transport.to_string().to_lowercase(),
     ));
 
@@ -5078,7 +5079,7 @@ fn b2bua_send_b_leg_invite(
     // Register B-leg with call manager
     let b_contact_value = format!(
         "<sip:{}:{};transport={}>",
-        b_contact_host, b_listen.port(),
+        b_contact_host, b_contact_port,
         outbound_transport.to_string().to_lowercase(),
     );
     let mut b_leg = Leg::new_b_leg(

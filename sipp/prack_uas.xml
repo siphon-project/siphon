@@ -24,7 +24,6 @@
       <ereg regexp="(.*)" search_in="hdr" header="To:" assign_to="junk,invite_to" />
       <ereg regexp="(.*)" search_in="hdr" header="Call-ID:" assign_to="junk,invite_callid" />
       <ereg regexp="(.*)" search_in="hdr" header="CSeq:" assign_to="junk,invite_cseq" />
-      <ereg regexp="(.*)" search_in="hdr" header="Record-Route:" assign_to="junk,invite_rr" />
     </action>
   </recv>
 
@@ -86,14 +85,15 @@ Content-Length: 0
 ]]>
   </send>
 
-  <!-- Final 200 for the INVITE — uses the INVITE's stored header values
-       (extracted via ereg above; the captures contain just the values, so
-       we re-add the field names here). -->
+  <!-- Final 200 for the INVITE — uses the INVITE's stored header values.
+       Record-Route is intentionally omitted on this scenario; in a real
+       deployment the proxy/B2BUA already inserted it on the inbound path
+       and the response just echoes whatever the UAS chooses (typically
+       no RR). -->
   <send retrans="500">
     <![CDATA[
 SIP/2.0 200 OK
 Via:[$invite_via]
-Record-Route:[$invite_rr]
 From:[$invite_from]
 To:[$invite_to];tag=[pid]SIPpTag01[call_number]
 Call-ID:[$invite_callid]
