@@ -1445,6 +1445,20 @@ fn handle_request(
             }
         }
     }
+    if method == "PRACK" && engine_state.has_b2bua_handlers() {
+        // RFC 3262: the A-leg PRACK acknowledges our reliable provisional.
+        // In B2BUA mode siphon already PRACKed the B-leg locally (see the
+        // auto-PRACK path in the response handler), so the A-leg PRACK has
+        // no upstream peer to relay to — terminate it here with 200 OK.
+        let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
+        if let Some(ref sip_call_id) = sip_call_id {
+            if state.call_actors.find_by_sip_call_id(sip_call_id).is_some() {
+                drop(engine_state);
+                handle_b2bua_prack(inbound, message, state);
+                return;
+            }
+        }
+    }
 
     // --- Create server transaction ---
     // The server transaction handles retransmission absorption and timer management.
@@ -7075,6 +7089,35 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
     state.call_actors.remove_call(call_id);
     state.call_event_receivers.remove(call_id);
     schedule_zombie_reinvite_cleanup(&state.call_actors);
+}
+
+/// Handle an A-leg PRACK in a B2BUA call (RFC 3262).
+///
+/// The B2BUA strips Require/RSeq from forwarded reliable provisionals (see
+/// sanitize_b2bua_response) so a well-behaved A-leg never sends PRACK in
+/// the first place. This handler exists for A-legs that PRACK anyway —
+/// either because the original INVITE carried Require: 100rel, or because
+/// the UAC is configured to PRACK whenever it sent Supported: 100rel. The
+/// B-leg side is already PRACKed locally by the auto-PRACK path in the
+/// response handler, so all that's left is to terminate the A-leg PRACK
+/// transaction with 200 OK.
+fn handle_b2bua_prack(
+    inbound: InboundMessage,
+    message: SipMessage,
+    state: &DispatcherState,
+) {
+    let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+    debug!(
+        call_id = %message.headers.get("Call-ID").map(|s| s.as_str()).unwrap_or(""),
+        "B2BUA: auto-200 OK for A-leg PRACK",
+    );
+    send_message(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        state,
+    );
 }
 
 /// Handle a mid-dialog re-INVITE for a B2BUA call.
