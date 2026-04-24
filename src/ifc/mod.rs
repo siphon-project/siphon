@@ -102,6 +102,15 @@ pub struct TriggerPoint {
     pub condition_type_cnf: bool,
     /// Service point triggers (the conditions).
     pub service_point_triggers: Vec<ServicePointTrigger>,
+    /// Pre-computed method filter for the early-return fast path.
+    ///
+    /// Set at parse time when the trigger has exactly one non-negated SPT with
+    /// a method criterion — the overwhelmingly common iFC shape ("trigger on
+    /// INVITE", "trigger on REGISTER"). At evaluate time, a single
+    /// case-insensitive compare lets us skip the full SPT walk + HashMap
+    /// allocation for any request whose method doesn't match. `None` means
+    /// "no fast-path filter — fall through to the full evaluator".
+    pub method_fast_path: Option<String>,
 }
 
 /// A single condition within a trigger point.
@@ -417,11 +426,55 @@ struct TriggerPointBuilder {
 
 impl TriggerPointBuilder {
     fn build(self) -> TriggerPoint {
+        let condition_type_cnf = self.condition_type_cnf.unwrap_or(true);
+        let method_fast_path = compute_method_fast_path(condition_type_cnf, &self.spts);
         TriggerPoint {
-            condition_type_cnf: self.condition_type_cnf.unwrap_or(true),
+            condition_type_cnf,
             service_point_triggers: self.spts,
+            method_fast_path,
         }
     }
+}
+
+/// Detect the common-case method-only iFC trigger and stash the required
+/// method (lower-cased) for the eval-time fast path. Conservative: returns
+/// `Some(method)` only when the trigger UNAMBIGUOUSLY requires that method —
+/// so any iFC with negated conditions, multiple SPTs in a CNF group, or no
+/// method criterion at all, falls through to the full evaluator.
+fn compute_method_fast_path(condition_type_cnf: bool, spts: &[ServicePointTrigger]) -> Option<String> {
+    // Single-SPT triggers are by far the most common shape: "trigger on INVITE".
+    if spts.len() == 1 {
+        let spt = &spts[0];
+        if !spt.condition_negated {
+            if let Some(ref method) = spt.method {
+                return Some(method.to_ascii_lowercase());
+            }
+        }
+        return None;
+    }
+    // CNF (AND of OR groups): a non-negated method SPT alone in its own group
+    // is a hard requirement on the method. Find one and use it.
+    if condition_type_cnf {
+        for spt in spts {
+            if spt.condition_negated || spt.method.is_none() {
+                continue;
+            }
+            // Alone in its group means: explicit group [n] not shared with any
+            // other SPT, or empty group (default 0) with no other empty-group
+            // SPT alongside.
+            let group_alone = if spt.group.is_empty() {
+                spts.iter().filter(|other| other.group.is_empty()).count() == 1
+            } else {
+                spt.group.iter().all(|index| {
+                    spts.iter().filter(|other| other.group.contains(index)).count() == 1
+                })
+            };
+            if group_alone {
+                return spt.method.as_ref().map(|method| method.to_ascii_lowercase());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -520,6 +573,25 @@ fn evaluate_trigger_point(
 ) -> bool {
     if trigger.service_point_triggers.is_empty() {
         return true;
+    }
+
+    // Method-match early return — for the overwhelmingly common iFC shape
+    // ("trigger on INVITE", "trigger on REGISTER") this skips the SPT walk
+    // and the HashMap allocation below for any non-matching method.
+    if let Some(ref required) = trigger.method_fast_path {
+        if !method.eq_ignore_ascii_case(required) {
+            return false;
+        }
+    }
+
+    // Single-SPT triggers don't need group bookkeeping — most iFCs in real
+    // deployments are single-SPT method filters that survived the fast-path
+    // guard above; eval them directly.
+    if trigger.service_point_triggers.len() == 1 {
+        return evaluate_spt(
+            &trigger.service_point_triggers[0],
+            method, request_uri, headers, session_case,
+        );
     }
 
     // Group SPTs by their group indices.
@@ -981,6 +1053,59 @@ mod tests {
         assert!(!spt.condition_negated);
         assert_eq!(spt.group, vec![0]);
         assert_eq!(spt.method.as_deref(), Some("INVITE"));
+    }
+
+    #[test]
+    fn method_fast_path_set_for_simple_invite_ifc() {
+        let ifcs = parse_service_profile(simple_ifc_xml()).unwrap();
+        let trigger = ifcs[0].trigger_point.as_ref().unwrap();
+        assert_eq!(trigger.method_fast_path.as_deref(), Some("invite"));
+    }
+
+    #[test]
+    fn method_fast_path_skips_non_matching_method_without_iter() {
+        let ifcs = parse_service_profile(simple_ifc_xml()).unwrap();
+        // INVITE-only iFC: any non-INVITE request must early-return false.
+        let matched = evaluate(
+            "REGISTER", "sip:user@example.com", &[],
+            SessionCase::Originating, &ifcs,
+        );
+        assert!(matched.is_empty());
+
+        let matched = evaluate(
+            "INVITE", "sip:user@example.com", &[],
+            SessionCase::Originating, &ifcs,
+        );
+        assert_eq!(matched.len(), 1);
+    }
+
+    #[test]
+    fn method_fast_path_unset_for_negated_method() {
+        let xml = concat!(
+            "<?xml version=\"1.0\"?>\n",
+            "<ServiceProfile>\n",
+            "  <InitialFilterCriteria>\n",
+            "    <Priority>0</Priority>\n",
+            "    <TriggerPoint>\n",
+            "      <ConditionTypeCNF>1</ConditionTypeCNF>\n",
+            "      <SPT>\n",
+            "        <ConditionNegated>1</ConditionNegated>\n",
+            "        <Group>0</Group>\n",
+            "        <Method>REGISTER</Method>\n",
+            "      </SPT>\n",
+            "    </TriggerPoint>\n",
+            "    <ApplicationServer>\n",
+            "      <ServerName>sip:as@example.com</ServerName>\n",
+            "      <DefaultHandling>0</DefaultHandling>\n",
+            "    </ApplicationServer>\n",
+            "  </InitialFilterCriteria>\n",
+            "</ServiceProfile>\n",
+        );
+        let ifcs = parse_service_profile(xml).unwrap();
+        let trigger = ifcs[0].trigger_point.as_ref().unwrap();
+        // !REGISTER means "trigger on any method except REGISTER" — fast path
+        // can't filter by method, so no shortcut.
+        assert_eq!(trigger.method_fast_path, None);
     }
 
     #[test]
