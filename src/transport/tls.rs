@@ -7,8 +7,10 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,6 +22,10 @@ use crate::config::TlsServerConfig;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
 use crate::transport::pool::ConnectionPool;
+
+/// Live-swappable TLS acceptor — read by every accept loop, replaced
+/// atomically by the file watcher when the cert or key on disk changes.
+pub type SharedTlsAcceptor = Arc<ArcSwap<TlsAcceptor>>;
 
 /// Build a `TlsAcceptor` from the certificate and key paths in config.
 pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
@@ -85,6 +91,109 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
+/// Build a `SharedTlsAcceptor` and spawn a watcher that rebuilds it whenever
+/// the certificate or private-key file on disk changes (atomic rename, in-place
+/// rewrite, or directory swap — handled like the script hot-reload in
+/// [`crate::script::engine::spawn_file_watcher`]).
+///
+/// Existing connections continue using whatever acceptor accepted them — only
+/// new handshakes pick up the new cert. That matches the standard cert-renewal
+/// model: ACME/cert-manager writes the new pair, siphon picks it up, sessions
+/// transition naturally over the renewal window.
+pub fn build_hot_reload_acceptor(
+    tls_config: &TlsServerConfig,
+) -> io::Result<SharedTlsAcceptor> {
+    let initial = build_tls_acceptor(tls_config)?;
+    let shared: SharedTlsAcceptor = Arc::new(ArcSwap::from(Arc::new(initial)));
+
+    let cert_path = PathBuf::from(&tls_config.certificate);
+    let key_path = PathBuf::from(&tls_config.private_key);
+    let watch_config = tls_config.clone();
+    // Weak ref so the watcher exits when the last strong reference (the
+    // listener) is dropped. Without this, tests that build an acceptor
+    // would leak the spawned task and block runtime shutdown.
+    let weak = Arc::downgrade(&shared);
+
+    tokio::task::spawn_blocking(move || {
+        use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+        use std::sync::mpsc;
+
+        let (sender, receiver) = mpsc::channel::<notify::Result<Event>>();
+        let mut watcher = match RecommendedWatcher::new(sender, Config::default()) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                error!(%error, "TLS watcher: failed to create file watcher");
+                return;
+            }
+        };
+
+        // Watch the parent directories so atomic rename (cert-manager, certbot)
+        // is observed — they typically swap the file rather than rewrite it.
+        for path in [&cert_path, &key_path] {
+            let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            if let Err(error) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                warn!(%error, path = %dir.display(),
+                    "TLS watcher: failed to watch directory; cert hot-reload disabled");
+                return;
+            }
+        }
+        info!(
+            cert = %cert_path.display(),
+            key = %key_path.display(),
+            "TLS cert hot-reload watcher started"
+        );
+
+        let cert_name = cert_path.file_name().map(|n| n.to_owned());
+        let key_name = key_path.file_name().map(|n| n.to_owned());
+
+        loop {
+            // Poll with a 1s timeout so we can check Weak::upgrade between
+            // events — when the listener drops the SharedTlsAcceptor we exit.
+            let event = match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(event) => event,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if weak.upgrade().is_none() { break; }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            let target = match weak.upgrade() {
+                Some(target) => target,
+                None => break,
+            };
+            match event {
+                Ok(Event { kind: EventKind::Modify(_) | EventKind::Create(_), paths, .. }) => {
+                    let touched = paths.iter().any(|p| {
+                        let name = p.file_name().map(|n| n.to_owned());
+                        name == cert_name || name == key_name
+                    });
+                    if !touched {
+                        continue;
+                    }
+                    // Debounce — typical cert renewal writes the key first,
+                    // then the cert; wait for the pair to settle.
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    match build_tls_acceptor(&watch_config) {
+                        Ok(new_acceptor) => {
+                            target.store(Arc::new(new_acceptor));
+                            info!("TLS cert hot-reloaded — new handshakes use the updated cert");
+                        }
+                        Err(error) => {
+                            warn!(%error,
+                                "TLS hot-reload failed — keeping previous cert. Renewal half-written?");
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "TLS watcher: file event error"),
+            }
+        }
+        debug!("TLS watcher exiting (acceptor dropped)");
+    });
+
+    Ok(shared)
+}
+
 /// Spawn a TLS listener. Mirrors the TCP listener but wraps each accepted
 /// connection in a TLS handshake before spawning read/write tasks.
 pub async fn listen(
@@ -98,7 +207,7 @@ pub async fn listen(
     tos: Option<u32>,
     pool: Option<Arc<ConnectionPool>>,
 ) {
-    let acceptor = build_tls_acceptor(tls_config).unwrap_or_else(|error| {
+    let acceptor = build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
         std::process::exit(1);
     });
@@ -178,7 +287,9 @@ pub async fn listen(
                         debug!("TLS rejected {} by ACL", remote_addr);
                         continue;
                     }
-                    let acceptor = acceptor.clone();
+                    // Read the *current* acceptor — it may have been swapped
+                    // by the hot-reload watcher since the previous accept().
+                    let acceptor = (**acceptor.load()).clone();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
                     let addr_map = addr_map.clone();
@@ -347,6 +458,27 @@ mod tests {
         assert!(result.is_err());
         let error = result.as_ref().err().unwrap().to_string();
         assert!(error.contains("cert"), "error should mention cert: {}", error);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_acceptor_is_atomically_swappable() {
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let tls_config = write_test_cert(&directory);
+
+        // Build the SharedTlsAcceptor (this also spawns a watcher task — we don't
+        // exercise the file-change path here because it depends on inotify timing
+        // that's flaky in CI; just verify the swap mechanism itself works).
+        let shared = build_hot_reload_acceptor(&tls_config).unwrap();
+        let initial = Arc::clone(&shared.load());
+
+        // Manually rebuild + store a new acceptor.
+        let replacement = build_tls_acceptor(&tls_config).unwrap();
+        shared.store(Arc::new(replacement));
+
+        let after = Arc::clone(&shared.load());
+        assert!(!Arc::ptr_eq(&initial, &after),
+            "SharedTlsAcceptor did not swap the inner Arc after store()");
     }
 
     #[test]

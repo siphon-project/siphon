@@ -235,7 +235,7 @@ pub async fn listen_secure(
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
 ) {
-    let acceptor = crate::transport::tls::build_tls_acceptor(tls_config).unwrap_or_else(|error| {
+    let acceptor = crate::transport::tls::build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor for WSS: {error}");
         std::process::exit(1);
     });
@@ -258,7 +258,8 @@ pub async fn listen_secure(
                     if !acl.is_allowed(remote_addr.ip()) {
                         continue;
                     }
-                    let acceptor = acceptor.clone();
+                    // Hot-reloadable acceptor — read the live one each accept.
+                    let acceptor = (**acceptor.load()).clone();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
 
