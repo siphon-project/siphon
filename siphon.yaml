@@ -375,6 +375,12 @@ auth:
 # server:
 #   server_header: "SIPhon/0.1.0"    # default: "SIPhon/<cargo version>"
 #   user_agent_header: "SIPhon/0.1.0" # default: "SIPhon/<cargo version>"
+#   drain_secs: 30                    # Graceful shutdown drain (seconds).
+#                                     # On SIGTERM/SIGINT, stop accepting new INVITEs
+#                                     # (503 Service Unavailable) and wait up to this
+#                                     # many seconds for in-flight transactions and
+#                                     # B2BUA calls to finish before exiting. Default
+#                                     # 30s. Set to 0 to exit immediately on signal.
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics

@@ -933,6 +933,16 @@ fn default_metrics_path() -> String {
 pub struct ServerIdentityConfig {
     pub server_header: Option<String>,
     pub user_agent_header: Option<String>,
+    /// Graceful drain on SIGTERM/SIGINT: stop accepting new INVITEs and wait
+    /// up to this many seconds for in-flight transactions and B2BUA calls to
+    /// finish before exiting. Default: 30s. Set to 0 to disable drain (exit
+    /// immediately on signal).
+    #[serde(default = "default_drain_secs")]
+    pub drain_secs: u64,
+}
+
+fn default_drain_secs() -> u64 {
+    30
 }
 
 // ---------------------------------------------------------------------------

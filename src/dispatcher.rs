@@ -139,6 +139,11 @@ struct DispatcherState {
     /// task watches for cancellation, plus the original CSeq number for RAck
     /// validation. Removed when PRACK arrives or the retransmit deadline hits.
     reliable_provisionals: Arc<DashMap<(String, u32), Arc<ReliableProvisional>>>,
+    /// Shared drain state — the server flips `drain.is_draining` on
+    /// SIGTERM/SIGINT. While set, new INVITEs are rejected with 503 Service
+    /// Unavailable; in-dialog requests (ACK, BYE, PRACK, re-INVITE) and
+    /// responses still flow so active calls can drain.
+    pub is_draining: Arc<DrainState>,
 }
 
 /// State for one outstanding reliable provisional response (RFC 3262 §3).
@@ -150,6 +155,37 @@ pub struct ReliableProvisional {
     /// CSeq number of the INVITE the response belongs to. Used to validate
     /// the RAck — a PRACK whose RAck cseq doesn't match this is not for us.
     pub cseq_num: u32,
+}
+
+/// Shared drain state — server flips `is_draining` on signal; dispatcher fills
+/// in `transaction_manager` and `call_actors` at startup so the server can poll
+/// counts during the drain wait.
+pub struct DrainState {
+    pub is_draining: std::sync::atomic::AtomicBool,
+    transaction_manager: std::sync::OnceLock<Arc<TransactionManager>>,
+    call_actors: std::sync::OnceLock<Arc<CallActorStore>>,
+}
+
+impl DrainState {
+    pub fn new() -> Self {
+        Self {
+            is_draining: std::sync::atomic::AtomicBool::new(false),
+            transaction_manager: std::sync::OnceLock::new(),
+            call_actors: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Number of (transactions, b2bua_calls) currently active. Returns
+    /// `(0, 0)` until the dispatcher has registered its managers.
+    pub fn active_counts(&self) -> (usize, usize) {
+        let txs = self.transaction_manager.get().map(|tm| tm.count()).unwrap_or(0);
+        let calls = self.call_actors.get().map(|ca| ca.registry.call_count()).unwrap_or(0);
+        (txs, calls)
+    }
+}
+
+impl Default for DrainState {
+    fn default() -> Self { Self::new() }
 }
 
 impl DispatcherState {
@@ -231,6 +267,7 @@ pub async fn run(
         std::sync::Arc<crate::diameter::peer::DiameterPeer>,
     )>,
     rtpengine_events_rx: tokio::sync::mpsc::Receiver<crate::rtpengine::events::RtpEngineEvent>,
+    drain: Arc<DrainState>,
 ) {
     // Resolve the local address for Via insertion.
     // If bound to 0.0.0.0 / [::], use advertised_address from config, or loopback.
@@ -350,7 +387,13 @@ pub async fn run(
             .unwrap_or_else(|| "SIPhon".to_string()),
         call_event_receivers: Arc::new(DashMap::new()),
         reliable_provisionals: Arc::new(DashMap::new()),
+        is_draining: drain.clone(),
     });
+
+    // Hand the freshly-constructed manager handles to the drain coordinator
+    // so the server's drain loop can poll active counts on shutdown.
+    let _ = drain.transaction_manager.set(Arc::clone(&state.transaction_manager));
+    let _ = drain.call_actors.set(Arc::clone(&state.call_actors));
 
     // Spawn background task: fire transaction timers + sweep stale entries
     {
@@ -1423,6 +1466,26 @@ fn handle_request(
                     return;
                 }
             }
+        }
+    }
+
+    // Graceful drain — reject NEW INVITEs only (in-dialog re-INVITEs identified
+    // by To-tag must still flow so active calls can finish their renegotiation).
+    // ACK/BYE/PRACK/CANCEL and all responses are unaffected.
+    if method == "INVITE"
+        && state.is_draining.is_draining.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let to_has_tag = message.headers.get("To")
+            .map(|t| t.split(';').any(|p| p.trim().starts_with("tag=")))
+            .unwrap_or(false);
+        if !to_has_tag {
+            debug!("draining — rejecting new INVITE with 503 Service Unavailable");
+            let response = build_response(
+                &message, 503, "Service Unavailable",
+                state.server_header.as_deref(), &[],
+            );
+            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            return;
         }
     }
 
@@ -8011,6 +8074,24 @@ mod tests {
     use crate::sip::message::Method;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    #[test]
+    fn drain_state_default_counts_zero_when_managers_unset() {
+        let drain = DrainState::new();
+        assert_eq!(drain.active_counts(), (0, 0));
+        assert!(!drain.is_draining.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn drain_state_reports_counts_after_register() {
+        let drain = DrainState::new();
+        let tm = Arc::new(TransactionManager::new(crate::transaction::timer::TimerConfig::default()));
+        let ca = Arc::new(CallActorStore::new());
+        drain.transaction_manager.set(Arc::clone(&tm)).ok();
+        drain.call_actors.set(Arc::clone(&ca)).ok();
+        // Both empty initially.
+        assert_eq!(drain.active_counts(), (0, 0));
+    }
 
     fn sample_invite() -> SipMessage {
         SipMessageBuilder::new()

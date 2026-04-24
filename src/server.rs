@@ -901,6 +901,7 @@ impl SiphonServer {
             .map(|r| r.subscribe_events());
 
         // --- Start dispatcher ---
+        let drain = Arc::new(dispatcher::DrainState::new());
         let dispatcher_handle = tokio::spawn(dispatcher::run(
             inbound_rx,
             outbound_senders,
@@ -921,6 +922,7 @@ impl SiphonServer {
             registrar_event_rx,
             diameter_incoming_rx,
             rtpengine_events_rx,
+            Arc::clone(&drain),
         ));
 
         // Keep the sender alive for the lifetime of the server so the listener
@@ -940,7 +942,43 @@ impl SiphonServer {
         // Wait for shutdown signal (SIGINT or SIGTERM)
         shutdown::wait_for_signal().await;
 
-        info!("shutting down...");
+        let drain_secs = config.server.as_ref()
+            .map(|s| s.drain_secs)
+            .unwrap_or(30);
+
+        if drain_secs > 0 {
+            // Stop accepting new INVITEs; let in-flight transactions and B2BUA
+            // calls finish for up to drain_secs.
+            drain.is_draining.store(true, std::sync::atomic::Ordering::SeqCst);
+            let (initial_tx, initial_calls) = drain.active_counts();
+            info!(
+                drain_secs,
+                active_transactions = initial_tx,
+                active_calls = initial_calls,
+                "draining — refusing new INVITEs while in-flight work completes"
+            );
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+            tick.tick().await; // burn the immediate first tick
+            loop {
+                let (txs, calls) = drain.active_counts();
+                if txs == 0 && calls == 0 {
+                    info!("drain complete — all in-flight work finished");
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    warn!(
+                        active_transactions = txs,
+                        active_calls = calls,
+                        "drain timeout — exiting with in-flight work still active"
+                    );
+                    break;
+                }
+                tick.tick().await;
+            }
+        } else {
+            info!("shutting down (drain disabled)");
+        }
 
         dispatcher_handle.abort();
         let _ = dispatcher_handle.await;
