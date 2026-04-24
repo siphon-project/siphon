@@ -27,7 +27,15 @@ pub enum RequestAction {
     /// No action taken — silent drop.
     None,
     /// Send a response.
-    Reply { code: u16, reason: String },
+    Reply {
+        code: u16,
+        reason: String,
+        /// RFC 3262 — when true and code is 101..199, send as a reliable
+        /// provisional response (Require: 100rel + RSeq). The dispatcher
+        /// retransmits per RFC 3262 §3 timing until a matching PRACK arrives
+        /// or the deadline (32s) elapses.
+        reliable: bool,
+    },
     /// Relay to the Request-URI (or an explicit next-hop).
     Relay { next_hop: Option<String> },
     /// Fork to multiple targets.
@@ -143,7 +151,7 @@ impl PyRequest {
 
     /// Set a reply action from Rust code (e.g., auth challenges).
     pub fn set_reply(&mut self, code: u16, reason: String) {
-        self.action = RequestAction::Reply { code, reason };
+        self.action = RequestAction::Reply { code, reason, reliable: false };
     }
 
     /// Get the underlying SIP message.
@@ -545,10 +553,18 @@ impl PyRequest {
     // -----------------------------------------------------------------------
 
     /// Send a response with the given status code and reason phrase.
-    fn reply(&mut self, code: u16, reason: &str) {
+    ///
+    /// `reliable=True` (RFC 3262) is only meaningful for 101..199 INVITE
+    /// responses and only when the UAC advertised `100rel` in Supported or
+    /// Require. The dispatcher attaches `Require: 100rel` + a fresh `RSeq`,
+    /// retransmits the response (T1 doubling to T2, deadline 32s) until a
+    /// matching PRACK arrives, then auto-200s the PRACK.
+    #[pyo3(signature = (code, reason, reliable=false))]
+    fn reply(&mut self, code: u16, reason: &str, reliable: bool) {
         self.action = RequestAction::Reply {
             code,
             reason: reason.to_string(),
+            reliable,
         };
     }
 
@@ -1128,12 +1144,13 @@ mod tests {
     #[test]
     fn reply_sets_action() {
         let mut request = make_request();
-        request.reply(200, "OK");
+        request.reply(200, "OK", false);
         assert_eq!(
             *request.action(),
             RequestAction::Reply {
                 code: 200,
-                reason: "OK".to_string()
+                reason: "OK".to_string(),
+                reliable: false,
             }
         );
     }

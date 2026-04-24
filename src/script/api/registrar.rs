@@ -830,6 +830,7 @@ mod tests {
             RequestAction::Reply {
                 code: 200,
                 reason: "OK".to_string(),
+                reliable: false,
             }
         );
 
@@ -892,6 +893,7 @@ mod tests {
             RequestAction::Reply {
                 code: 200,
                 reason: "OK".to_string(),
+                reliable: false,
             }
         );
 

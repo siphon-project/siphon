@@ -214,17 +214,24 @@ class Request:
 
     # -- Response & forwarding -------------------------------------------------
 
-    def reply(self, code: int, reason: str) -> None:
+    def reply(self, code: int, reason: str, reliable: bool = False) -> None:
         """Send a SIP response.
 
         Args:
             code: SIP status code (e.g. 200, 401, 404, 486).
             reason: Reason phrase (e.g. ``"OK"``, ``"Not Found"``).
+            reliable: RFC 3262 — when True and ``code`` is 101..199, send as
+                a reliable provisional response (``Require: 100rel`` + ``RSeq``).
+                Only honoured for INVITE responses where the UAC advertised
+                100rel in Supported or Require. Siphon retransmits the
+                response per RFC 3262 §3 (T1 doubling to T2, deadline 32s)
+                until a matching PRACK arrives, then auto-200s the PRACK.
 
         Example::
 
             request.reply(200, "OK")
             request.reply(486, "Busy Here")
+            request.reply(183, "Session Progress", reliable=True)
         """
         self._actions.append(Action(
             kind="reply",
@@ -232,6 +239,7 @@ class Request:
             reason=reason,
             headers_set=dict(self._pending_headers()),
             headers_removed=list(self._pending_removed()),
+            reliable=reliable,
         ))
 
     def relay(

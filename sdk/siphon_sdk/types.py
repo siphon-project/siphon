@@ -134,6 +134,9 @@ class Action:
     extras: Optional[dict] = None
     """Additional action-specific data (e.g. session timer params, SRS URI)."""
 
+    reliable: bool = False
+    """For ``reply`` — RFC 3262 reliable provisional flag (``Require: 100rel``)."""
+
 
 @dataclass
 class ByeInitiator:

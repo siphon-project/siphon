@@ -73,7 +73,7 @@ fn www_digest_challenge_sets_401_reply() {
     assert!(!result, "should return false when no credentials present");
 
     match request.action() {
-        RequestAction::Reply { code, reason } => {
+        RequestAction::Reply { code, reason, .. } => {
             assert_eq!(*code, 401);
             assert_eq!(reason, "Unauthorized");
         }
@@ -121,7 +121,7 @@ fn proxy_digest_challenge_sets_407_reply() {
     assert!(!result);
 
     match request.action() {
-        RequestAction::Reply { code, reason } => {
+        RequestAction::Reply { code, reason, .. } => {
             assert_eq!(*code, 407);
             assert_eq!(reason, "Proxy Authentication Required");
         }

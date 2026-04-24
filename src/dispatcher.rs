@@ -134,6 +134,22 @@ struct DispatcherState {
     /// Keyed by internal call ID; the receiver gets [`CallEvent`]s from all
     /// B-leg actors belonging to that call.
     call_event_receivers: Arc<DashMap<String, tokio::sync::mpsc::Receiver<CallEvent>>>,
+    /// RFC 3262 — outstanding reliable provisional responses awaiting PRACK.
+    /// Keyed by (Call-ID, RSeq); the entry carries a Notify the retransmit
+    /// task watches for cancellation, plus the original CSeq number for RAck
+    /// validation. Removed when PRACK arrives or the retransmit deadline hits.
+    reliable_provisionals: Arc<DashMap<(String, u32), Arc<ReliableProvisional>>>,
+}
+
+/// State for one outstanding reliable provisional response (RFC 3262 §3).
+pub struct ReliableProvisional {
+    /// Notified by the dispatcher when a matching PRACK arrives, or when the
+    /// retransmit task itself decides to give up. The retransmit loop selects
+    /// on this; once notified it stops sending and exits.
+    pub cancel: tokio::sync::Notify,
+    /// CSeq number of the INVITE the response belongs to. Used to validate
+    /// the RAck — a PRACK whose RAck cseq doesn't match this is not for us.
+    pub cseq_num: u32,
 }
 
 impl DispatcherState {
@@ -333,6 +349,7 @@ pub async fn run(
             .and_then(|m| m.sdp_name.clone())
             .unwrap_or_else(|| "SIPhon".to_string()),
         call_event_receivers: Arc::new(DashMap::new()),
+        reliable_provisionals: Arc::new(DashMap::new()),
     });
 
     // Spawn background task: fire transaction timers + sweep stale entries
@@ -1445,17 +1462,44 @@ fn handle_request(
             }
         }
     }
-    if method == "PRACK" && engine_state.has_b2bua_handlers() {
-        // RFC 3262: the A-leg PRACK acknowledges our reliable provisional.
-        // In B2BUA mode siphon already PRACKed the B-leg locally (see the
-        // auto-PRACK path in the response handler), so the A-leg PRACK has
-        // no upstream peer to relay to — terminate it here with 200 OK.
-        let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
-        if let Some(ref sip_call_id) = sip_call_id {
-            if state.call_actors.find_by_sip_call_id(sip_call_id).is_some() {
-                drop(engine_state);
-                handle_b2bua_prack(inbound, message, state);
+    if method == "PRACK" {
+        // RFC 3262 §3 — does this PRACK acknowledge a reliable provisional we
+        // sent ourselves (script called reply(reliable=True))? If so: cancel
+        // retransmits, send 200 OK PRACK, done. Runs in both proxy and B2BUA
+        // modes; the B2BUA-specific auto-200 path below only fires when no
+        // tracked entry matches (e.g. A-leg PRACKs that originated from the
+        // UAC's own 100rel handling, not from us).
+        if let Some(rack) = crate::sip::headers::rseq::parse_rack(&message.headers) {
+            let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string()).unwrap_or_default();
+            let key = (sip_call_id.clone(), rack.response_number);
+            let matched = state.reliable_provisionals.get(&key)
+                .map(|r| Arc::clone(r.value()))
+                .filter(|entry| entry.cseq_num == rack.cseq_number);
+            if let Some(entry) = matched {
+                state.reliable_provisionals.remove(&key);
+                entry.cancel.notify_one();
+                debug!(
+                    call_id = %sip_call_id, rseq = rack.response_number,
+                    "PRACK matches our reliable 1xx — cancelling retransmits and sending 200 OK"
+                );
+                let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
                 return;
+            }
+        }
+
+        if engine_state.has_b2bua_handlers() {
+            // RFC 3262: the A-leg PRACK acknowledges our reliable provisional.
+            // In B2BUA mode siphon already PRACKed the B-leg locally (see the
+            // auto-PRACK path in the response handler), so the A-leg PRACK has
+            // no upstream peer to relay to — terminate it here with 200 OK.
+            let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
+            if let Some(ref sip_call_id) = sip_call_id {
+                if state.call_actors.find_by_sip_call_id(sip_call_id).is_some() {
+                    drop(engine_state);
+                    handle_b2bua_prack(inbound, message, state);
+                    return;
+                }
             }
         }
     }
@@ -1546,6 +1590,7 @@ fn handle_request(
                                 RequestAction::Reply {
                                     code: 500,
                                     reason: "Script Error".to_string(),
+                                    reliable: false,
                                 },
                                 false,
                                 None,
@@ -1564,6 +1609,7 @@ fn handle_request(
                         RequestAction::Reply {
                             code: 500,
                             reason: "Script Error".to_string(),
+                            reliable: false,
                         },
                         false,
                         None,
@@ -1598,7 +1644,7 @@ fn handle_request(
         RequestAction::None => {
             debug!("silent drop (no action from script)");
         }
-        RequestAction::Reply { code, reason } => {
+        RequestAction::Reply { code, reason, reliable } => {
             let mut response = build_response(&message_guard, *code, reason, state.server_header.as_deref(), &reply_headers);
 
             // Script-provided reply body — PIDF-LO, XCAP/Ut, custom failure body, etc.
@@ -1607,6 +1653,40 @@ fn handle_request(
                 response.headers.set("Content-Length", body_bytes.len().to_string());
                 response.body = body_bytes.clone();
             }
+
+            // RFC 3262 — script asked for a reliable provisional. Only valid for
+            // 101..199 INVITE responses, and only when the UAC advertised 100rel.
+            // We attach Require: 100rel + a fresh RSeq, then arm a retransmit
+            // task that fires until a matching PRACK arrives or the deadline
+            // (32s = 64×T1) elapses.
+            let mut reliable_provisional_armed = false;
+            if *reliable && (101..200).contains(code) {
+                if !crate::sip::headers::rseq::supports_100rel(&message_guard.headers) {
+                    warn!(
+                        method = %method, code = %code,
+                        "reliable=True ignored: UAC didn't advertise 100rel in Supported/Require"
+                    );
+                } else if method != "INVITE" {
+                    warn!(method = %method, code = %code,
+                        "reliable=True ignored: only valid on responses to INVITE");
+                } else {
+                    let rseq = crate::sip::headers::rseq::next_rseq();
+                    // Merge 100rel into existing Require if present, else set fresh.
+                    let new_require = match response.headers.get("Require") {
+                        Some(existing) if existing.split(',').any(|t| t.trim().eq_ignore_ascii_case("100rel")) =>
+                            existing.clone(),
+                        Some(existing) => format!("{}, 100rel", existing),
+                        None => "100rel".to_string(),
+                    };
+                    response.headers.set("Require", new_require);
+                    response.headers.set("RSeq", rseq.to_string());
+                    arm_reliable_provisional_retransmit(
+                        rseq, &message_guard, response.clone(), &inbound, state,
+                    );
+                    reliable_provisional_armed = true;
+                }
+            }
+            let _ = reliable_provisional_armed;
 
             // IPsec: inject Security-Server on 401 REGISTER and create SAs immediately.
             // Per 3GPP TS 33.203, the P-CSCF creates SAs right after sending the 401
@@ -7089,6 +7169,79 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
     state.call_actors.remove_call(call_id);
     state.call_event_receivers.remove(call_id);
     schedule_zombie_reinvite_cleanup(&state.call_actors);
+}
+
+/// Arm the RFC 3262 §3 retransmit task for a reliable provisional response.
+///
+/// Stores a [`ReliableProvisional`] entry in the dispatcher state under
+/// `(Call-ID, RSeq)` and spawns a background task that resends `response`
+/// every interval (T1 = 500 ms doubling up to T2 = 4 s, max 64×T1 = 32 s).
+/// The task watches the entry's [`tokio::sync::Notify`] and exits as soon
+/// as the inbound-PRACK handler signals a match — see the proxy PRACK
+/// short-circuit in [`run`].
+///
+/// The transport-layer write goes through `state.outbound`, the same channel
+/// the dispatcher uses, so retransmits look identical to the original send.
+fn arm_reliable_provisional_retransmit(
+    rseq: u32,
+    request: &SipMessage,
+    response: SipMessage,
+    inbound: &InboundMessage,
+    state: &DispatcherState,
+) {
+    let call_id = request.headers.call_id().cloned().unwrap_or_default();
+    let cseq_num = request.headers.cseq()
+        .and_then(|c| c.split_whitespace().next())
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(1);
+    let entry = Arc::new(ReliableProvisional {
+        cancel: tokio::sync::Notify::new(),
+        cseq_num,
+    });
+    state.reliable_provisionals.insert((call_id.clone(), rseq), Arc::clone(&entry));
+
+    let store = Arc::clone(&state.reliable_provisionals);
+    let outbound = Arc::clone(&state.outbound);
+    let destination = inbound.remote_addr;
+    let transport = inbound.transport;
+    let connection_id = inbound.connection_id;
+    let key = (call_id.clone(), rseq);
+
+    tokio::spawn(async move {
+        // RFC 3262 §3 timing: start at T1 = 500 ms, double on each retransmit
+        // up to T2 = 4 s, give up after 64 × T1 = 32 s if no PRACK.
+        let mut interval = std::time::Duration::from_millis(500);
+        let cap = std::time::Duration::from_secs(4);
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(32);
+        let bytes = bytes::Bytes::from(response.to_bytes());
+
+        loop {
+            let sleep = tokio::time::sleep(interval);
+            tokio::pin!(sleep);
+            tokio::select! {
+                _ = entry.cancel.notified() => break,
+                _ = &mut sleep => {
+                    if tokio::time::Instant::now() >= deadline {
+                        warn!(
+                            call_id = %key.0, rseq = key.1,
+                            "RFC 3262: no PRACK after 32s — giving up reliable 1xx retransmits"
+                        );
+                        store.remove(&key);
+                        break;
+                    }
+                    debug!(
+                        call_id = %key.0, rseq = key.1, interval_ms = interval.as_millis() as u64,
+                        "retransmitting reliable 1xx (RFC 3262)"
+                    );
+                    let _ = outbound.send(OutboundMessage {
+                        connection_id, transport, destination, data: bytes.clone(),
+                    });
+                    interval = (interval * 2).min(cap);
+                }
+            }
+        }
+    });
 }
 
 /// Handle an A-leg PRACK in a B2BUA call (RFC 3262).

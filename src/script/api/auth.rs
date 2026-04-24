@@ -1268,7 +1268,8 @@ mod tests {
             *request.action(),
             RequestAction::Reply {
                 code: 401,
-                reason: "Unauthorized".to_string()
+                reason: "Unauthorized".to_string(),
+                reliable: false,
             }
         );
     }
@@ -1284,7 +1285,8 @@ mod tests {
             *request.action(),
             RequestAction::Reply {
                 code: 407,
-                reason: "Proxy Authentication Required".to_string()
+                reason: "Proxy Authentication Required".to_string(),
+                reliable: false,
             }
         );
     }
@@ -1351,7 +1353,8 @@ mod tests {
             *request.action(),
             RequestAction::Reply {
                 code: 401,
-                reason: "Unauthorized".to_string()
+                reason: "Unauthorized".to_string(),
+                reliable: false,
             }
         );
     }

@@ -4,6 +4,29 @@
 //!   RSeq: <response-number>
 //!   RAck: <response-number> <cseq-number> <method>
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Allocate the next RSeq value for a reliable provisional response.
+///
+/// RFC 3262 §3 requires the initial RSeq to be chosen randomly in the range
+/// [1, 2^31 - 1] and to increase monotonically per response within a dialog.
+/// A process-wide atomic counter satisfies both — random first value, then
+/// monotonic across all dialogs (each dialog only ever sees a strictly
+/// increasing subsequence, which is what the spec actually mandates).
+pub fn next_rseq() -> u32 {
+    static COUNTER: OnceLock<AtomicU32> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        let mut buf = [0u8; 4];
+        let _ = getrandom::fill(&mut buf);
+        // Mask to 31 bits (RFC 3262 ceiling) and ensure non-zero (RSeq MUST > 0).
+        let init = u32::from_le_bytes(buf) & 0x7FFF_FFFF;
+        AtomicU32::new(init.max(1))
+    });
+    let value = counter.fetch_add(1, Ordering::Relaxed) & 0x7FFF_FFFF;
+    if value == 0 { counter.fetch_add(1, Ordering::Relaxed) & 0x7FFF_FFFF } else { value }
+}
+
 /// Parsed `RSeq` header — sequence number for a reliable provisional response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RSeq {
@@ -272,5 +295,20 @@ mod tests {
         let headers = super::super::SipHeaders::new();
         assert!(parse_rseq(&headers).is_none());
         assert!(parse_rack(&headers).is_none());
+    }
+
+    #[test]
+    fn next_rseq_is_monotonic_and_nonzero() {
+        let a = next_rseq();
+        let b = next_rseq();
+        let c = next_rseq();
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+        assert_ne!(c, 0);
+        assert!(b > a || (a == 0x7FFF_FFFF && b == 1));
+        assert!(c > b || (b == 0x7FFF_FFFF && c == 1));
+        // 31-bit ceiling
+        assert!(a <= 0x7FFF_FFFF);
+        assert!(c <= 0x7FFF_FFFF);
     }
 }

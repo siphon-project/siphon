@@ -48,7 +48,7 @@ a=fmtp:101 0-15
   <!-- Reliable 183 Session Progress carrying RSeq + Require: 100rel -->
   <recv response="183" rtd="true" crlf="true" rrs="true">
     <action>
-      <ereg regexp="RSeq:[ \t]+([0-9]+)" search_in="hdr" header="RSeq:" assign_to="rseq_value" />
+      <ereg regexp="([0-9]+)" search_in="hdr" header="RSeq:" assign_to="rseq_value" />
     </action>
   </recv>
 
