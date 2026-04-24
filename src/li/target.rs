@@ -33,6 +33,13 @@ pub enum DeliveryType {
     IriAndCc,
 }
 
+impl DeliveryType {
+    /// Whether this delivery type requires X3 content capture.
+    pub fn includes_content(self) -> bool {
+        matches!(self, Self::IriAndCc)
+    }
+}
+
 /// A single intercept target provisioned via X1.
 #[derive(Debug, Clone)]
 pub struct InterceptTarget {

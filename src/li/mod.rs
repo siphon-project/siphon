@@ -122,6 +122,12 @@ pub struct LiManager {
     audit_sender: mpsc::Sender<AuditEntry>,
     /// Configuration snapshot.
     config: Arc<LawfulInterceptConfig>,
+    /// X3 media capture manager — populated only when `lawful_intercept.x3`
+    /// is configured. Shared across `LiManager` clones (the Python singleton
+    /// gets its own clone before X3 is wired) via the `Arc<OnceLock<...>>`
+    /// pattern. Driven by `intercept()` / `stop_intercept()` for targets
+    /// whose delivery_type includes CC (Content of Communication).
+    x3: Arc<std::sync::OnceLock<x3::X3Manager>>,
 }
 
 impl LiManager {
@@ -140,6 +146,7 @@ impl LiManager {
             iri_sender,
             audit_sender,
             config: Arc::new(config),
+            x3: Arc::new(std::sync::OnceLock::new()),
         };
 
         // Log startup
@@ -213,6 +220,35 @@ impl LiManager {
     /// Whether the LI subsystem is enabled.
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// Attach the X3 media-capture manager. Called once at startup if
+    /// `lawful_intercept.x3` is configured. Idempotent — second call is
+    /// silently ignored.
+    pub fn set_x3_manager(&self, manager: x3::X3Manager) {
+        let _ = self.x3.set(manager);
+    }
+
+    /// Start media (CC) capture for an intercepted call. Called by
+    /// `intercept()` when a target's `delivery_type` includes CC. Becomes a
+    /// no-op when X3 is not configured or the target is IRI-only.
+    pub fn start_media_capture(&self, target: &InterceptTarget, call_id: &str) {
+        if !target.delivery_type.includes_content() {
+            return;
+        }
+        if let Some(x3) = self.x3.get() {
+            // RTPEngine source is filled in later by the rtpengine wiring; for
+            // now we register the session so an inbound mirrored RTP packet
+            // can be matched by Call-ID via X3Manager::get_session.
+            x3.start_capture(&target.liid, call_id, None);
+        }
+    }
+
+    /// Stop media (CC) capture for an intercepted call. Idempotent.
+    pub fn stop_media_capture(&self, call_id: &str) {
+        if let Some(x3) = self.x3.get() {
+            x3.stop_capture(call_id);
+        }
     }
 }
 
@@ -341,5 +377,92 @@ mod tests {
         let entry = audit_receiver.recv().await.unwrap();
         assert!(matches!(entry.operation, AuditOperation::TargetActivated));
         assert_eq!(entry.liid.unwrap(), "LI-001");
+    }
+
+    fn x3_test_config() -> crate::config::LiX3Config {
+        crate::config::LiX3Config {
+            listen_udp: "127.0.0.1:0".to_string(),
+            delivery_address: "127.0.0.1:19998".to_string(),
+            transport: "udp".to_string(),
+            encapsulation: "etsi".to_string(),
+        }
+    }
+
+    #[test]
+    fn start_media_capture_no_op_without_x3() {
+        let (manager, _iri_rx, _audit_rx) = LiManager::new(test_config(), 100);
+        let target = InterceptTarget {
+            liid: "LI-001".to_string(),
+            target_identity: TargetIdentity::SipUri("sip:alice@example.com".to_string()),
+            delivery_type: DeliveryType::IriAndCc,
+            active: true,
+            activated_at: SystemTime::now(),
+            warrant_ref: None,
+            mediation_id: None,
+        };
+        // X3 not configured — must not panic, must not register anything.
+        manager.start_media_capture(&target, "call-1");
+        manager.stop_media_capture("call-1");
+    }
+
+    #[test]
+    fn start_media_capture_skips_iri_only_targets() {
+        let (manager, _iri_rx, _audit_rx) = LiManager::new(test_config(), 100);
+        let x3 = x3::X3Manager::new(&x3_test_config()).unwrap();
+        manager.set_x3_manager(x3.clone());
+        let target = InterceptTarget {
+            liid: "LI-001".to_string(),
+            target_identity: TargetIdentity::SipUri("sip:alice@example.com".to_string()),
+            delivery_type: DeliveryType::IriOnly,
+            active: true,
+            activated_at: SystemTime::now(),
+            warrant_ref: None,
+            mediation_id: None,
+        };
+        manager.start_media_capture(&target, "iri-only-call");
+        assert!(!x3.is_capturing("iri-only-call"));
+    }
+
+    #[test]
+    fn start_media_capture_registers_iri_and_cc_targets() {
+        let (manager, _iri_rx, _audit_rx) = LiManager::new(test_config(), 100);
+        let x3 = x3::X3Manager::new(&x3_test_config()).unwrap();
+        manager.set_x3_manager(x3.clone());
+        let target = InterceptTarget {
+            liid: "LI-002".to_string(),
+            target_identity: TargetIdentity::SipUri("sip:bob@example.com".to_string()),
+            delivery_type: DeliveryType::IriAndCc,
+            active: true,
+            activated_at: SystemTime::now(),
+            warrant_ref: None,
+            mediation_id: None,
+        };
+        manager.start_media_capture(&target, "cc-call");
+        assert!(x3.is_capturing("cc-call"));
+        manager.stop_media_capture("cc-call");
+        assert!(!x3.is_capturing("cc-call"));
+    }
+
+    #[test]
+    fn x3_manager_is_shared_across_clones() {
+        // Python singleton clones LiManager before X3 is wired; verify the
+        // OnceLock<X3Manager> is shared so the late attach is visible to
+        // the cloned (Python-side) handle.
+        let (manager, _iri_rx, _audit_rx) = LiManager::new(test_config(), 100);
+        let cloned = manager.clone();
+        let x3 = x3::X3Manager::new(&x3_test_config()).unwrap();
+        manager.set_x3_manager(x3.clone());
+        let target = InterceptTarget {
+            liid: "LI-003".to_string(),
+            target_identity: TargetIdentity::SipUri("sip:carol@example.com".to_string()),
+            delivery_type: DeliveryType::IriAndCc,
+            active: true,
+            activated_at: SystemTime::now(),
+            warrant_ref: None,
+            mediation_id: None,
+        };
+        // Calling start on the clone must use the same X3 manager.
+        cloned.start_media_capture(&target, "shared-call");
+        assert!(x3.is_capturing("shared-call"));
     }
 }

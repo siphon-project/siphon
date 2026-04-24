@@ -1291,6 +1291,10 @@ type LiState = (
     tokio::sync::mpsc::Receiver<crate::li::AuditEntry>,
 );
 
+/// Cloned LiManager handle that survives `init_li` so `spawn_li_tasks` can
+/// hand the X3 manager into it once X3 has been constructed.
+static LI_MANAGER: std::sync::OnceLock<crate::li::LiManager> = std::sync::OnceLock::new();
+
 fn init_li(config: &Config) -> Option<LiState> {
     let li_config = config.lawful_intercept.as_ref()?;
     if !li_config.enabled {
@@ -1312,6 +1316,11 @@ fn init_li(config: &Config) -> Option<LiState> {
             info!("lawful intercept namespace registered for injection");
         }
     });
+
+    // Stash a clone for spawn_li_tasks to wire up X3 once it's built. All
+    // LiManager clones share the same `Arc<OnceLock<X3Manager>>`, so setting
+    // X3 on this clone makes it visible to the Python singleton too.
+    let _ = LI_MANAGER.set(li_manager.clone());
 
     Some((li_manager, iri_rx, audit_rx))
 }
@@ -1490,6 +1499,11 @@ fn spawn_li_tasks(
     if let Some(ref x3_config) = li_config.x3 {
         match crate::li::x3::X3Manager::new(x3_config) {
             Ok(x3_manager) => {
+                // Hand a clone to LiManager so intercept() can register and
+                // stop_intercept() can deregister capture sessions.
+                if let Some(li) = LI_MANAGER.get() {
+                    li.set_x3_manager(x3_manager.clone());
+                }
                 let listen_address = x3_config.listen_udp.clone();
                 tokio::spawn(async move {
                     if let Err(error) = crate::li::x3::receive_and_forward_task(

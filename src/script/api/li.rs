@@ -148,13 +148,19 @@ impl PyLiNamespace {
             };
             self.manager.emit_iri(event);
 
+            // Targets with IRI+CC need media capture — register the call with
+            // the X3 manager so subsequent mirrored RTP for this Call-ID is
+            // encapsulated and forwarded to the LEMF.
+            self.manager.start_media_capture(target, &request.li_call_id());
+
             self.manager.audit(
                 li::AuditOperation::InterceptMatch,
                 Some(&target.liid),
                 format!(
-                    "intercept triggered: method={} call_id={}",
+                    "intercept triggered: method={} call_id={} delivery={:?}",
                     request.li_method(),
                     request.li_call_id(),
+                    target.delivery_type,
                 ),
             );
         }
@@ -248,6 +254,8 @@ impl PyLiNamespace {
             };
             self.manager.emit_iri(event);
         }
+        // Idempotent — covers the IRI-only case and any straggling capture.
+        self.manager.stop_media_capture(&request.li_call_id());
 
         true
     }
