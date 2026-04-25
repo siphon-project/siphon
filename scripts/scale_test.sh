@@ -37,7 +37,10 @@ cd "$SCRIPT_DIR"
 cleanup() {
     pkill -f "invite_uac" 2>/dev/null || true
     pkill -f "invite_uas" 2>/dev/null || true
-    pkill -f "target/release/siphon" 2>/dev/null || true
+    # SIGKILL siphon — perf runs are independent, the graceful drain
+    # (server.drain_secs default 30) would otherwise keep the listener
+    # bound for half a minute between rows and block port :5060.
+    pkill -9 -f "target/release/siphon" 2>/dev/null || true
 }
 trap cleanup EXIT
 
