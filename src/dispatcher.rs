@@ -3385,8 +3385,20 @@ fn send_to_target(
                     connection_id
                 }
                 Err(error) => {
-                    error!(destination = %destination, "TCP pool send failed: {error}");
-                    fallback_connection_id
+                    // Pool send failed (connect refused, broken pipe, etc.).
+                    // DO NOT fall back to the inbound connection_id — for TCP
+                    // that's the UAC's connection, and routing the outbound
+                    // request to it would echo the message back to the sender.
+                    // Return the sentinel ConnectionId::default() so the
+                    // caller stores 0 on the ClientBranch; future in-dialog
+                    // sends (ACK, BYE) on that branch will miss the
+                    // connection_map lookup and be dropped — which is the
+                    // correct outcome when we never reached the upstream.
+                    error!(
+                        destination = %destination,
+                        "TCP pool send failed: {error}"
+                    );
+                    ConnectionId::default()
                 }
             }
         }
@@ -3438,8 +3450,10 @@ fn send_to_target(
                         connection_id
                     }
                     Err(error) => {
+                        // Same rationale as the TCP arm above — never echo to
+                        // the inbound connection on outbound failure.
                         error!(destination = %destination, "TLS pool send failed: {error}");
-                        fallback_connection_id
+                        ConnectionId::default()
                     }
                 }
             }
