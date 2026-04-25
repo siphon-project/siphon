@@ -20,6 +20,7 @@ fn main() {
     let cli = Cli::parse();
 
     SiphonServer::builder()
+        .product("SIPhon", env!("CARGO_PKG_VERSION"))
         .config_path(&cli.config)
         .run();
 }

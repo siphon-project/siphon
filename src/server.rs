@@ -40,6 +40,8 @@ pub struct SiphonServer {
     embedded_script: Option<&'static str>,
     embedded_bytecode: Option<&'static [u8]>,
     skip_logging_init: bool,
+    product_name: Option<&'static str>,
+    product_version: Option<&'static str>,
     user_namespaces: Vec<(String, UserNamespaceFactory)>,
 }
 
@@ -52,8 +54,22 @@ impl SiphonServer {
             embedded_script: None,
             embedded_bytecode: None,
             skip_logging_init: false,
+            product_name: None,
+            product_version: None,
             user_namespaces: Vec::new(),
         }
+    }
+
+    /// Override the product name and version used in startup logs and the
+    /// default `User-Agent` / `Server` header values for outbound requests.
+    ///
+    /// Defaults to `"SIPhon"` and `env!("CARGO_PKG_VERSION")` when unset.
+    /// Host applications that embed siphon as a library typically set this
+    /// to their own product identity.
+    pub fn product(mut self, name: &'static str, version: &'static str) -> Self {
+        self.product_name = Some(name);
+        self.product_version = Some(version);
+        self
     }
 
     /// Set the path to the YAML configuration file.
@@ -216,6 +232,9 @@ impl SiphonServer {
 
     /// Async entry point — all the real work happens here.
     async fn run_async(mut self) {
+        let product_name = self.product_name.unwrap_or("SIPhon");
+        let product_version = self.product_version.unwrap_or(env!("CARGO_PKG_VERSION"));
+
         // --- Load configuration ---
         let config = if let Some(ref yaml) = self.config_string {
             Arc::new(Config::from_str(yaml).unwrap_or_else(|error| {
@@ -244,8 +263,7 @@ impl SiphonServer {
         };
 
         info!(
-            "SIPhon v{} starting — script: {}, domain: {:?}",
-            env!("CARGO_PKG_VERSION"),
+            "{product_name} v{product_version} starting — script: {}, domain: {:?}",
             script_desc,
             config.domain.local
         );
@@ -664,7 +682,7 @@ impl SiphonServer {
         // --- UAC sender ---
         let uac_user_agent = config.server.as_ref()
             .and_then(|server| server.user_agent_header.clone())
-            .or_else(|| Some(format!("SIPhon/{}", env!("CARGO_PKG_VERSION"))));
+            .or_else(|| Some(format!("{product_name}/{product_version}")));
         let uac_sender = Arc::new(UacSender::new(
             Arc::clone(&outbound_senders),
             local_addr,
@@ -835,7 +853,7 @@ impl SiphonServer {
         // and the channel must stay open for the lifetime of the process.
 
         // --- Outbound registration ---
-        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, Arc::clone(&tls_addr_map));
+        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, Arc::clone(&tls_addr_map), product_name, product_version);
 
         // --- LI tasks ---
         spawn_li_tasks(li_state, &config);
@@ -1051,7 +1069,7 @@ impl SiphonServer {
             }
         }
 
-        info!("SIPhon ready — press Ctrl+C to stop");
+        info!("{product_name} ready — press Ctrl+C to stop");
 
         // Wait for shutdown signal (SIGINT or SIGTERM)
         shutdown::wait_for_signal().await;
@@ -1464,6 +1482,8 @@ fn init_registrant(
     advertised_addrs: &std::collections::HashMap<transport::Transport, String>,
     hep_sender: &Option<Arc<HepSender>>,
     tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>>,
+    product_name: &str,
+    product_version: &str,
 ) -> Option<Arc<crate::registrant::RegistrantManager>> {
     use crate::registrant::{RegistrantCredentials, RegistrantEntry, RegistrantManager};
 
@@ -1471,7 +1491,7 @@ fn init_registrant(
 
     let registrant_user_agent = config.server.as_ref()
         .and_then(|server| server.user_agent_header.clone())
-        .or_else(|| Some(format!("SIPhon/{}", env!("CARGO_PKG_VERSION"))));
+        .or_else(|| Some(format!("{product_name}/{product_version}")));
 
     let manager = Arc::new(RegistrantManager::new(
         registrant_config.default_interval,
