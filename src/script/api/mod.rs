@@ -31,12 +31,42 @@ pub mod subscribe_state;
 pub mod timer;
 
 use std::ffi::CString;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 use crate::error::{Result, SiphonError};
+
+/// Names reserved for built-in siphon namespaces. Registering a host
+/// namespace with one of these names is a hard error.
+pub const BUILT_IN_NAMESPACE_NAMES: &[&str] = &[
+    "proxy",
+    "registrar",
+    "auth",
+    "log",
+    "cache",
+    "metrics",
+    "sdp",
+    "timer",
+    "isc",
+    "b2bua",
+    "rtpengine",
+    "gateway",
+    "cdr",
+    "registration",
+    "li",
+    "diameter",
+    "presence",
+    "sbi",
+    "srs",
+    "subscribe_state",
+];
+
+/// Host-registered Python namespaces. Populated by `SiphonServer` at
+/// startup, before the script engine is created. Read every time
+/// `install_siphon_module()` runs (i.e. on each script load / reload).
+static USER_NAMESPACES: Mutex<Vec<(String, Py<PyAny>)>> = Mutex::new(Vec::new());
 
 /// Tuple of (auth, registrar, log, proxy_utils, cache) singletons.
 type SingletonTuple = (Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>);
@@ -334,6 +364,43 @@ pub fn set_isc_singleton(
     Ok(())
 }
 
+/// Register a host-provided Python namespace under `name`.
+///
+/// The supplied object becomes accessible to user scripts via
+/// `from siphon import <name>`. Called once per namespace by
+/// `SiphonServer::run_async()` before the script engine is created.
+///
+/// Errors if `name` collides with a built-in namespace
+/// (see `BUILT_IN_NAMESPACE_NAMES`) or duplicates a previously-registered
+/// host namespace.
+pub fn set_user_namespace(name: &str, py_obj: Py<PyAny>) -> Result<()> {
+    if BUILT_IN_NAMESPACE_NAMES.contains(&name) {
+        return Err(SiphonError::Script(format!(
+            "user namespace '{name}' collides with a built-in siphon namespace"
+        )));
+    }
+    let mut guard = USER_NAMESPACES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.iter().any(|(existing, _)| existing == name) {
+        return Err(SiphonError::Script(format!(
+            "user namespace '{name}' is already registered"
+        )));
+    }
+    guard.push((name.to_owned(), py_obj));
+    Ok(())
+}
+
+/// Test-only: clear all host-registered namespaces. Lets each test exercise
+/// `set_user_namespace` from a known-empty state.
+#[cfg(test)]
+pub fn clear_user_namespaces() {
+    let mut guard = USER_NAMESPACES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.clear();
+}
+
 /// Ensure the `_siphon_registry` module exists in `sys.modules`.
 ///
 /// Idempotent — safe to call multiple times.
@@ -503,6 +570,22 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("sbi", sbi_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr sbi: {error}")))?;
+    }
+
+    // Inject host-registered user namespaces. These were validated against
+    // BUILT_IN_NAMESPACE_NAMES at registration time, so they cannot shadow
+    // a built-in.
+    {
+        let guard = USER_NAMESPACES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (name, py_obj) in guard.iter() {
+            module
+                .setattr(name.as_str(), py_obj.bind(python))
+                .map_err(|error| {
+                    SiphonError::Script(format!("setattr {name} (user namespace): {error}"))
+                })?;
+        }
     }
 
     let sys = python

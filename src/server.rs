@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use pyo3::prelude::*;
 use tracing::{error, info, warn};
 
 use crate::config::{self, Config};
@@ -14,6 +15,12 @@ use crate::script::engine::{ScriptEngine, spawn_file_watcher};
 use crate::transport;
 use crate::uac::UacSender;
 use crate::{dispatcher, shutdown};
+
+/// Deferred constructor for a host-provided Python namespace.
+///
+/// Boxed because the inner closure is generic over the user's `#[pyclass]`
+/// type and we need to type-erase it for storage on the builder.
+type UserNamespaceFactory = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send>;
 
 /// Builder for running a siphon server instance.
 ///
@@ -33,6 +40,7 @@ pub struct SiphonServer {
     embedded_script: Option<&'static str>,
     embedded_bytecode: Option<&'static [u8]>,
     skip_logging_init: bool,
+    user_namespaces: Vec<(String, UserNamespaceFactory)>,
 }
 
 impl SiphonServer {
@@ -44,6 +52,7 @@ impl SiphonServer {
             embedded_script: None,
             embedded_bytecode: None,
             skip_logging_init: false,
+            user_namespaces: Vec::new(),
         }
     }
 
@@ -88,6 +97,62 @@ impl SiphonServer {
     /// default.
     pub fn skip_logging_init(mut self) -> Self {
         self.skip_logging_init = true;
+        self
+    }
+
+    /// Register a host-provided Python namespace.
+    ///
+    /// `value` must be a `#[pyclass]` instance — host applications use this
+    /// to expose their own Rust state to siphon scripts. The namespace is
+    /// injected alongside the built-ins, so user scripts can write
+    /// `from siphon import <name>`.
+    ///
+    /// Naming a host namespace after a built-in (e.g. `registrar`, `auth`,
+    /// `cache`) is rejected at startup with a fatal error — collisions are
+    /// never silently shadowed. Duplicate registrations of the same name
+    /// are also rejected.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use pyo3::prelude::*;
+    /// use siphon::SiphonServer;
+    ///
+    /// #[pyclass]
+    /// struct MyNamespace { /* … */ }
+    ///
+    /// SiphonServer::builder()
+    ///     .config_path("siphon.yaml")
+    ///     .register_namespace("my_app", MyNamespace { /* … */ })
+    ///     .run();
+    /// ```
+    pub fn register_namespace<T>(mut self, name: &str, value: T) -> Self
+    where
+        T: pyo3::PyClass + Send + 'static,
+        pyo3::PyClassInitializer<T>: From<T>,
+    {
+        let factory: UserNamespaceFactory =
+            Box::new(move |python| Py::new(python, value).map(|py_cell| py_cell.into_any()));
+        self.user_namespaces.push((name.to_owned(), factory));
+        self
+    }
+
+    /// Register a host-provided Python namespace with a deferred constructor.
+    ///
+    /// Use this form when the namespace's construction needs the `Python`
+    /// token — for example, to embed `Py<PyAny>` references or to import
+    /// other Python modules during init. For the common case of
+    /// "instantiate this `#[pyclass]`", prefer `register_namespace()`.
+    ///
+    /// The same collision rules as `register_namespace()` apply: the name
+    /// must not collide with a built-in or a previously-registered host
+    /// namespace.
+    pub fn register_namespace_with<F>(mut self, name: &str, factory: F) -> Self
+    where
+        F: FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send + 'static,
+    {
+        self.user_namespaces
+            .push((name.to_owned(), Box::new(factory)));
         self
     }
 
@@ -150,7 +215,7 @@ impl SiphonServer {
     }
 
     /// Async entry point — all the real work happens here.
-    async fn run_async(self) {
+    async fn run_async(mut self) {
         // --- Load configuration ---
         let config = if let Some(ref yaml) = self.config_string {
             Arc::new(Config::from_str(yaml).unwrap_or_else(|error| {
@@ -320,6 +385,34 @@ impl SiphonServer {
         // Must run after ISC singleton init so ifc_store_arc() is available
         // for the iFC Redis restore in init_ifc_redis_backend().
         init_registrar_backend(&config).await;
+
+        // --- Host-registered user namespaces ---
+        // Run each factory under Python::attach, then store the resulting
+        // Py<PyAny> on the global registry so install_siphon_module() picks
+        // it up. Collisions with built-in namespaces are fatal.
+        let user_namespaces = std::mem::take(&mut self.user_namespaces);
+        if !user_namespaces.is_empty() {
+            pyo3::Python::attach(|python| {
+                for (name, factory) in user_namespaces {
+                    let py_obj = match factory(python) {
+                        Ok(obj) => obj,
+                        Err(error) => {
+                            eprintln!(
+                                "Failed to construct user namespace '{name}': {error}"
+                            );
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(error) =
+                        crate::script::api::set_user_namespace(&name, py_obj)
+                    {
+                        eprintln!("Failed to register user namespace '{name}': {error}");
+                        std::process::exit(1);
+                    }
+                    info!(name = %name, "user namespace registered for injection");
+                }
+            });
+        }
 
         // --- Script engine ---
         let engine = if let Some(bytecode) = self.embedded_bytecode {

@@ -1488,4 +1488,106 @@ def route(request):
         assert_eq!(engine.state().handlers.len(), 1);
         assert!(!engine.auto_reload());
     }
+
+    // -----------------------------------------------------------------
+    // Host-registered user namespaces
+    // -----------------------------------------------------------------
+
+    use pyo3::prelude::*;
+
+    #[pyclass]
+    struct UserNamespaceProbe {
+        value: i64,
+    }
+
+    #[pymethods]
+    impl UserNamespaceProbe {
+        fn answer(&self) -> i64 {
+            self.value
+        }
+    }
+
+    /// Serializes the user-namespace tests against each other. Each test
+    /// mutates the global USER_NAMESPACES registry; running them in
+    /// parallel would cause spurious collisions on shared names.
+    static USER_NS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn user_namespace_visible_to_script() {
+        let _guard = USER_NS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Python::initialize();
+        crate::script::api::clear_user_namespaces();
+
+        Python::attach(|python| {
+            let probe = Py::new(python, UserNamespaceProbe { value: 42 })
+                .unwrap()
+                .into_any();
+            crate::script::api::set_user_namespace("probe_ns", probe).unwrap();
+        });
+
+        let source = r#"
+from siphon import probe_ns
+
+assert probe_ns.answer() == 42
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(source.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        ScriptEngine::compile_script(file.path()).unwrap();
+
+        crate::script::api::clear_user_namespaces();
+    }
+
+    #[test]
+    fn user_namespace_collision_with_builtin_errors() {
+        let _guard = USER_NS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Python::initialize();
+        crate::script::api::clear_user_namespaces();
+
+        Python::attach(|python| {
+            let probe = Py::new(python, UserNamespaceProbe { value: 1 })
+                .unwrap()
+                .into_any();
+            let result = crate::script::api::set_user_namespace("registrar", probe);
+            assert!(result.is_err());
+            let error = format!("{}", result.unwrap_err());
+            assert!(
+                error.contains("collides") && error.contains("built-in"),
+                "unexpected error: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn user_namespace_duplicate_name_errors() {
+        let _guard = USER_NS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Python::initialize();
+        crate::script::api::clear_user_namespaces();
+
+        Python::attach(|python| {
+            let probe1 = Py::new(python, UserNamespaceProbe { value: 1 })
+                .unwrap()
+                .into_any();
+            let probe2 = Py::new(python, UserNamespaceProbe { value: 2 })
+                .unwrap()
+                .into_any();
+            crate::script::api::set_user_namespace("dup_probe", probe1).unwrap();
+            let result = crate::script::api::set_user_namespace("dup_probe", probe2);
+            assert!(result.is_err());
+            let error = format!("{}", result.unwrap_err());
+            assert!(
+                error.contains("already registered"),
+                "unexpected error: {error}"
+            );
+        });
+
+        crate::script::api::clear_user_namespaces();
+    }
 }
