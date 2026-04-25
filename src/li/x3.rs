@@ -186,10 +186,23 @@ pub async fn receive_and_forward_task(
 
         let packet = &buffer[..length];
 
-        // Find the capture session that matches this source
-        // In production, RTPEngine tags packets with a cookie or we match by source addr.
-        // For now, iterate sessions to find one matching the source.
-        let session = find_session_by_source(&manager, source_address);
+        // Correlate the packet to a capture session (Call-ID + LIID).
+        //
+        // Production deployments must wire RTPEngine's media mirror so each
+        // intercepted call's RTP arrives from a distinct UDP source — set
+        // `rtpengine_source` on the session at start_capture time and
+        // `find_session_by_source` matches by the (ip, port) tuple.
+        //
+        // For development and single-call testing the mirror source isn't
+        // known up front, so:
+        //   1. Try the explicit source-address match.
+        //   2. If no match AND there's exactly one active session whose
+        //      source hasn't been learned yet, claim this source for that
+        //      session — every subsequent packet from the same source then
+        //      hits the fast path at step 1. This works with any rtpengine
+        //      configuration that mirrors a single call to a single port.
+        let session = find_session_by_source(&manager, source_address)
+            .or_else(|| learn_source_for_single_session(&manager, source_address));
 
         if let Some(session) = session {
             let encapsulated = manager.encapsulate(
@@ -217,6 +230,34 @@ pub async fn receive_and_forward_task(
         }
         // Packets not matching any session are silently dropped
     }
+}
+
+/// First-packet learning: when exactly one session is active AND has no
+/// rtpengine_source registered, attribute this source to it. Returns the
+/// session (with the source now bound) or None when learning isn't safe
+/// (zero active sessions, or multiple sessions all unbound — which would
+/// require explicit correlation provisioning to be unambiguous).
+fn learn_source_for_single_session(
+    manager: &X3Manager,
+    source: SocketAddr,
+) -> Option<CaptureSession> {
+    let unbound: Vec<String> = manager.sessions.iter()
+        .filter(|entry| entry.value().rtpengine_source.is_none())
+        .map(|entry| entry.key().clone())
+        .collect();
+    if unbound.len() != 1 {
+        return None;
+    }
+    let key = &unbound[0];
+    let mut entry = manager.sessions.get_mut(key)?;
+    entry.rtpengine_source = Some(source);
+    info!(
+        liid = %entry.liid,
+        correlation_id = %entry.correlation_id,
+        rtpengine_source = %source,
+        "X3: learned RTPEngine source for session (single-session fallback)"
+    );
+    Some(entry.clone())
 }
 
 /// Find a capture session matching the given source address.
@@ -332,5 +373,41 @@ mod tests {
         let session = manager.get_session("call-123").unwrap();
         assert_eq!(session.liid, "LI-001");
         assert_eq!(session.rtpengine_source.unwrap(), source);
+    }
+
+    #[test]
+    fn learn_source_binds_when_exactly_one_unbound_session() {
+        let manager = X3Manager::new(&test_config()).unwrap();
+        manager.start_capture("LI-001", "call-1", None);
+        let src: SocketAddr = "10.0.0.5:30000".parse().unwrap();
+
+        let matched = learn_source_for_single_session(&manager, src).unwrap();
+        assert_eq!(matched.liid, "LI-001");
+        // Subsequent lookup uses the fast path now that source is bound.
+        assert!(find_session_by_source(&manager, src).is_some());
+        assert_eq!(manager.get_session("call-1").unwrap().rtpengine_source, Some(src));
+    }
+
+    #[test]
+    fn learn_source_skips_when_multiple_unbound_sessions() {
+        let manager = X3Manager::new(&test_config()).unwrap();
+        manager.start_capture("LI-001", "call-1", None);
+        manager.start_capture("LI-002", "call-2", None);
+        let src: SocketAddr = "10.0.0.5:30000".parse().unwrap();
+
+        // Two unbound sessions — can't safely attribute a packet to either.
+        assert!(learn_source_for_single_session(&manager, src).is_none());
+    }
+
+    #[test]
+    fn learn_source_skips_when_only_bound_sessions() {
+        let manager = X3Manager::new(&test_config()).unwrap();
+        let bound: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+        manager.start_capture("LI-001", "call-1", Some(bound));
+        let src: SocketAddr = "10.0.0.5:30000".parse().unwrap();
+
+        // The lone session already has a source; don't overwrite it.
+        assert!(learn_source_for_single_session(&manager, src).is_none());
+        assert_eq!(manager.get_session("call-1").unwrap().rtpengine_source, Some(bound));
     }
 }
