@@ -32,6 +32,7 @@ pub struct SiphonServer {
     config_string: Option<String>,
     embedded_script: Option<&'static str>,
     embedded_bytecode: Option<&'static [u8]>,
+    skip_logging_init: bool,
 }
 
 impl SiphonServer {
@@ -42,6 +43,7 @@ impl SiphonServer {
             config_string: None,
             embedded_script: None,
             embedded_bytecode: None,
+            skip_logging_init: false,
         }
     }
 
@@ -71,6 +73,21 @@ impl SiphonServer {
     /// Hot-reload is automatically disabled.
     pub fn embedded_bytecode(mut self, pyc: &'static [u8]) -> Self {
         self.embedded_bytecode = Some(pyc);
+        self
+    }
+
+    /// Skip siphon's built-in tracing subscriber initialization.
+    ///
+    /// The embedder is responsible for installing a global subscriber before
+    /// calling `run()`. The values in the `log:` section of the config (level,
+    /// format, file) are ignored when this is set.
+    ///
+    /// Use this when the host application already configures `tracing` (e.g.
+    /// to rewrite log targets, add custom layers, or ship logs to a different
+    /// sink) — siphon's `.init()` would otherwise panic on a second global
+    /// default.
+    pub fn skip_logging_init(mut self) -> Self {
+        self.skip_logging_init = true;
         self
     }
 
@@ -149,7 +166,11 @@ impl SiphonServer {
         };
 
         // --- Initialise structured logging ---
-        let _log_guard = init_logging(&config.log);
+        let _log_guard = if self.skip_logging_init {
+            None
+        } else {
+            init_logging(&config.log)
+        };
 
         let script_desc = if self.embedded_script.is_some() || self.embedded_bytecode.is_some() {
             "<embedded>".to_owned()
