@@ -843,11 +843,16 @@ impl RegistrarBackend for PostgresBackend {
 enum BackendCommand {
     Save { aor: String, contacts: Vec<StoredContact> },
     Remove { aor: String },
+    CountAors {
+        reply: tokio::sync::oneshot::Sender<Result<usize, BackendError>>,
+    },
 }
 
-/// Handle for sending write-through commands to a backend task.
+/// Handle for sending commands to a backend task.
 ///
-/// Sends are fire-and-forget; failures are logged by the background task.
+/// Writes (Save / Remove) are fire-and-forget; failures are logged by the
+/// background task.  Reads (CountAors) round-trip through a oneshot reply
+/// channel and propagate backend errors to the caller.
 #[derive(Debug, Clone)]
 pub struct BackendWriter {
     tx: tokio::sync::mpsc::UnboundedSender<BackendCommand>,
@@ -868,6 +873,23 @@ impl BackendWriter {
             aor: aor.to_string(),
         });
     }
+
+    /// Ask the backend for the current number of registered AoRs.
+    ///
+    /// Authoritative across all siphon instances sharing the backend
+    /// (Redis, Postgres).  Returns `BackendError::Connection` if the writer
+    /// task has shut down or the reply channel is dropped.
+    pub async fn count_aors(&self) -> Result<usize, BackendError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(BackendCommand::CountAors { reply: tx })
+            .map_err(|_| {
+                BackendError::Connection("registrar backend writer task is closed".to_string())
+            })?;
+        rx.await.map_err(|_| {
+            BackendError::Connection("registrar backend reply channel dropped".to_string())
+        })?
+    }
 }
 
 /// Spawn a background task that processes write-through commands.
@@ -884,15 +906,21 @@ async fn backend_writer_loop<B: RegistrarBackend>(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<BackendCommand>,
 ) {
     while let Some(command) = rx.recv().await {
-        let result = match &command {
-            BackendCommand::Save { aor, contacts } => backend.save(aor, contacts).await,
-            BackendCommand::Remove { aor } => backend.remove(aor).await,
-        };
-        if let Err(error) = result {
-            let aor = match &command {
-                BackendCommand::Save { aor, .. } | BackendCommand::Remove { aor } => aor,
-            };
-            tracing::warn!(aor, %error, "registrar backend write-through failed");
+        match command {
+            BackendCommand::Save { aor, contacts } => {
+                if let Err(error) = backend.save(&aor, &contacts).await {
+                    tracing::warn!(aor, %error, "registrar backend write-through failed");
+                }
+            }
+            BackendCommand::Remove { aor } => {
+                if let Err(error) = backend.remove(&aor).await {
+                    tracing::warn!(aor, %error, "registrar backend write-through failed");
+                }
+            }
+            BackendCommand::CountAors { reply } => {
+                let result = backend.all_aors().await.map(|aors| aors.len());
+                let _ = reply.send(result);
+            }
         }
     }
 }
@@ -1285,6 +1313,46 @@ mod tests {
 
         // The registrar should now have Alice's contact
         assert!(registrar.is_registered("sip:alice@example.com"));
+    }
+
+    #[tokio::test]
+    async fn count_aors_through_writer() {
+        let backend = MemoryBackend::new();
+        let stored = sample_stored_contact();
+        backend.save("sip:a@x.com", std::slice::from_ref(&stored)).await.unwrap();
+        backend.save("sip:b@x.com", std::slice::from_ref(&stored)).await.unwrap();
+
+        let writer = spawn_backend_writer(backend);
+        assert_eq!(writer.count_aors().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn registrar_aor_count_distributed_uses_backend() {
+        let backend = MemoryBackend::new();
+        let stored = sample_stored_contact();
+        // Pre-load three AoRs into the backend — none of them are in the
+        // registrar's in-memory map.  aor_count_distributed() must see 3.
+        backend.save("sip:a@x.com", std::slice::from_ref(&stored)).await.unwrap();
+        backend.save("sip:b@x.com", std::slice::from_ref(&stored)).await.unwrap();
+        backend.save("sip:c@x.com", std::slice::from_ref(&stored)).await.unwrap();
+
+        let registrar = Registrar::default();
+        let writer = spawn_backend_writer(backend);
+        registrar.set_backend_writer(writer);
+
+        assert_eq!(registrar.aor_count(), 0, "in-memory map is empty");
+        assert_eq!(
+            registrar.aor_count_distributed().await.unwrap(),
+            3,
+            "distributed count must reflect the backend, not the local map"
+        );
+    }
+
+    #[tokio::test]
+    async fn registrar_aor_count_distributed_falls_back_when_no_backend() {
+        let registrar = Registrar::default();
+        // No backend writer set → falls back to local in-memory count (0).
+        assert_eq!(registrar.aor_count_distributed().await.unwrap(), 0);
     }
 
 }

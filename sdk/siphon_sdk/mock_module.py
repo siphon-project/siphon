@@ -549,6 +549,33 @@ class MockRegistrar:
         """
         return len(self.lookup(uri)) > 0
 
+    async def aor_count(self) -> int:
+        """Number of currently registered AoRs across the deployment.
+
+        Async — when a persistent backend (Redis, Postgres) is configured
+        the Rust implementation queries the backend so the count is
+        authoritative across all siphon instances sharing it.  Without a
+        backend it returns the local in-memory count.
+
+        The mock simply counts the in-memory store.
+
+        Returns:
+            Number of distinct AoRs that currently have at least one
+            non-expired contact binding.
+
+        Example::
+
+            from siphon import registrar, metrics, timer
+
+            gauge = metrics.gauge("siphon_aors_registered",
+                                  "Currently registered AoRs")
+
+            @timer.every(seconds=15)
+            async def publish_aor_count():
+                gauge.set(await registrar.aor_count())
+        """
+        return sum(1 for contacts in self._store.values() if contacts)
+
     def expire(self, uri: Union[str, SipUri]) -> None:
         """Force-expire all contacts for a URI.
 

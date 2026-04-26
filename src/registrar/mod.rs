@@ -437,12 +437,28 @@ impl Registrar {
         }
     }
 
-    /// Number of registered AoRs (with at least one non-expired contact).
+    /// Number of registered AoRs (with at least one non-expired contact)
+    /// known to *this* instance's in-memory map.
     pub fn aor_count(&self) -> usize {
         self.bindings
             .iter()
             .filter(|entry| entry.value().iter().any(|c| !c.is_expired()))
             .count()
+    }
+
+    /// Number of registered AoRs across the whole deployment.
+    ///
+    /// When a persistent backend (Redis, Postgres) is configured, this asks
+    /// the backend so the count is authoritative across all siphon instances
+    /// sharing it.  Without a backend, returns the local in-memory count.
+    ///
+    /// Backend errors propagate so the caller can distinguish "cluster
+    /// state unknown" from "cluster has zero AoRs".
+    pub async fn aor_count_distributed(&self) -> Result<usize, backend::BackendError> {
+        if let Some(writer) = self.backend_writer.get() {
+            return writer.count_aors().await;
+        }
+        Ok(self.aor_count())
     }
 
     /// Return all non-expired contacts across all AoRs, with their AoR key.

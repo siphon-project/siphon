@@ -325,6 +325,24 @@ impl PyRegistrar {
         Ok(self.inner.is_registered(&aor))
     }
 
+    /// Number of currently registered AoRs across the deployment.
+    ///
+    /// Async — when a persistent backend (Redis, Postgres) is configured this
+    /// queries the backend so the count is authoritative across all siphon
+    /// instances sharing it.  Without a backend, returns the local in-memory
+    /// count for this instance.  Backend errors are surfaced as Python
+    /// exceptions; fall back with `try/except` if you prefer best-effort.
+    fn aor_count<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let registrar = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            registrar.aor_count_distributed().await.map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "registrar backend aor_count failed: {error}"
+                ))
+            })
+        })
+    }
+
     /// Get stored Service-Route headers for a URI (RFC 3608).
     ///
     /// Returns a list of Route URI strings, or an empty list if none stored.
@@ -689,6 +707,43 @@ mod tests {
         let registrar = make_registrar();
         let py_reg = PyRegistrar::new(registrar);
         assert!(py_reg.lookup_str("sip:nobody@example.com").is_empty());
+    }
+
+    /// Drive `Registrar::aor_count_distributed()` through the local-only path
+    /// (no backend configured) — Python `aor_count()` ultimately calls this.
+    #[tokio::test]
+    async fn aor_count_distributed_local_path() {
+        let registrar = make_registrar();
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+        assert_eq!(registrar.aor_count_distributed().await.unwrap(), 0);
+
+        let (mut alice, _) = make_register_request(
+            "<sip:alice@example.com>",
+            "<sip:alice@10.0.0.1>",
+            &registrar,
+        );
+        py_reg.save(&mut alice, false).unwrap();
+
+        let (mut bob, _) = make_register_request(
+            "<sip:bob@example.com>",
+            "<sip:bob@10.0.0.2>",
+            &registrar,
+        );
+        py_reg.save(&mut bob, false).unwrap();
+        assert_eq!(registrar.aor_count_distributed().await.unwrap(), 2);
+
+        // Refreshing alice does not change the AoR count.
+        let (mut alice_refresh, _) = make_register_request(
+            "<sip:alice@example.com>",
+            "<sip:alice@10.0.0.1>",
+            &registrar,
+        );
+        py_reg.save(&mut alice_refresh, false).unwrap();
+        assert_eq!(registrar.aor_count_distributed().await.unwrap(), 2);
+
+        registrar.remove_all("sip:alice@example.com");
+        registrar.remove_all("sip:bob@example.com");
+        assert_eq!(registrar.aor_count_distributed().await.unwrap(), 0);
     }
 
     #[test]
