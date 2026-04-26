@@ -94,6 +94,21 @@ class Contact:
     """RFC 3327 Path headers stored with this binding.
     Use as Route headers when routing terminating requests to this contact."""
 
+    instance_id: Optional[str] = None
+    """Stable identity of the siphon instance that originally accepted the
+    REGISTER (typically the StatefulSet pod name).  ``None`` for legacy
+    bindings or deployments that do not configure ``server.instance_id``."""
+
+    instance_epoch: Optional[str] = None
+    """Boot-time epoch UUID of the process that accepted the REGISTER.
+    Combined with :attr:`instance_id`, distinguishes successive runs of the
+    same logical replica."""
+
+    is_local: bool = False
+    """``True`` when the binding's ``(instance_id, instance_epoch)`` matches
+    the *current* siphon process — i.e. this process accepted the REGISTER.
+    Useful for graceful-shutdown deregister and NAT keepalive ownership."""
+
 
 @dataclass
 class Action:

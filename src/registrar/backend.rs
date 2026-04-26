@@ -43,6 +43,14 @@ pub struct StoredContact {
     /// RFC 3327 Path headers (for routing terminating requests via proxies).
     #[serde(default)]
     pub path: Vec<String>,
+    /// Stable identity of the siphon instance that originally accepted this
+    /// REGISTER.  `None` for legacy entries written before this field existed.
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    /// Boot-time epoch UUID of the process that accepted this REGISTER.
+    /// `None` for legacy entries.
+    #[serde(default)]
+    pub instance_epoch: Option<String>,
 }
 
 impl StoredContact {
@@ -66,6 +74,8 @@ impl StoredContact {
             sip_instance: contact.sip_instance.clone(),
             reg_id: contact.reg_id,
             path: contact.path.clone(),
+            instance_id: contact.instance_id.clone(),
+            instance_epoch: contact.instance_epoch.clone(),
         }
     }
 
@@ -118,6 +128,8 @@ impl StoredContact {
             reg_id: self.reg_id,
             path: self.path.clone(),
             pending: false,
+            instance_id: self.instance_id.clone(),
+            instance_epoch: self.instance_epoch.clone(),
         })
     }
 }
@@ -1360,6 +1372,8 @@ mod tests {
             sip_instance: None,
             reg_id: None,
             path: vec![],
+            instance_id: None,
+            instance_epoch: None,
         }
     }
 
@@ -1572,6 +1586,8 @@ mod tests {
                 sip_instance: None,
                 reg_id: None,
                 path: vec![],
+                instance_id: None,
+                instance_epoch: None,
             }])
             .await
             .unwrap();
@@ -1589,6 +1605,8 @@ mod tests {
                     sip_instance: None,
                     reg_id: None,
                     path: vec![],
+                    instance_id: None,
+                    instance_epoch: None,
                 },
                 StoredContact {
                     uri: "sip:bob@10.0.0.3".to_string(),
@@ -1602,6 +1620,8 @@ mod tests {
                     sip_instance: None,
                     reg_id: None,
                     path: vec![],
+                    instance_id: None,
+                    instance_epoch: None,
                 },
             ])
             .await
@@ -1635,6 +1655,8 @@ mod tests {
                 sip_instance: None,
                 reg_id: None,
                 path: vec![],
+                instance_id: None,
+                instance_epoch: None,
             }])
             .await
             .unwrap();
@@ -1669,6 +1691,8 @@ mod tests {
                 sip_instance: None,
                 reg_id: None,
                 path: vec![],
+                instance_id: None,
+                instance_epoch: None,
             }])
             .await
             .unwrap();

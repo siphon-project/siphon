@@ -62,6 +62,16 @@ pub struct Contact {
     pub path: Vec<String>,
     /// IMS registration state: pending (awaiting SAR) vs active.
     pub pending: bool,
+    /// Stable identity of the siphon instance that originally accepted this
+    /// REGISTER (typically the StatefulSet pod name or hostname).  `None` for
+    /// bindings created before the field was introduced or when no identity
+    /// is configured.
+    pub instance_id: Option<String>,
+    /// Boot-time epoch UUID of the process that accepted this REGISTER.
+    /// Combined with `instance_id`, lets a restarted instance distinguish
+    /// "I (this pod) accepted this binding in a previous life" from
+    /// "another instance accepted it."
+    pub instance_epoch: Option<String>,
 }
 
 impl Contact {
@@ -101,6 +111,19 @@ impl Default for RegistrarConfig {
     }
 }
 
+/// Identity of the siphon process that accepts new REGISTERs.
+///
+/// `id` is stable across restarts of the same logical replica (e.g. the
+/// StatefulSet pod name `siphon-2`).  `epoch` is a fresh UUID generated at
+/// every boot, so two restarts of the same `id` are still distinguishable.
+/// Together they let a restarted instance recognise its own bindings while
+/// also detecting that they were written by a previous process.
+#[derive(Clone, Debug)]
+pub struct InstanceIdentity {
+    pub id: String,
+    pub epoch: String,
+}
+
 /// In-memory registrar store.
 pub struct Registrar {
     /// AoR → list of contact bindings.
@@ -116,6 +139,10 @@ pub struct Registrar {
     event_sender: broadcast::Sender<RegistrationEvent>,
     /// Optional backend writer for write-through persistence (set once at startup).
     backend_writer: OnceLock<backend::BackendWriter>,
+    /// Identity tag stamped onto every locally accepted contact.  Set once
+    /// at startup; `None` means scripts can't tell who owns a binding (the
+    /// pre-Tier-2 default).
+    instance_identity: OnceLock<InstanceIdentity>,
 }
 
 impl std::fmt::Debug for Registrar {
@@ -139,6 +166,7 @@ impl Registrar {
             config,
             event_sender,
             backend_writer: OnceLock::new(),
+            instance_identity: OnceLock::new(),
         }
     }
 
@@ -146,6 +174,38 @@ impl Registrar {
     /// Can only be called once (at startup); subsequent calls are ignored.
     pub fn set_backend_writer(&self, writer: backend::BackendWriter) {
         let _ = self.backend_writer.set(writer);
+    }
+
+    /// Set the per-process identity used to tag locally accepted bindings.
+    /// Should be called once at startup before traffic begins.  Subsequent
+    /// calls are ignored.
+    pub fn set_instance_identity(&self, identity: InstanceIdentity) {
+        let _ = self.instance_identity.set(identity);
+    }
+
+    /// Returns the configured per-process identity, if any.
+    pub fn instance_identity(&self) -> Option<&InstanceIdentity> {
+        self.instance_identity.get()
+    }
+
+    /// Snapshot of `(instance_id, instance_epoch)` cloned for stamping onto
+    /// a `Contact`.  Returns `(None, None)` if no identity is configured.
+    fn current_identity_pair(&self) -> (Option<String>, Option<String>) {
+        match self.instance_identity.get() {
+            Some(identity) => (Some(identity.id.clone()), Some(identity.epoch.clone())),
+            None => (None, None),
+        }
+    }
+
+    /// Returns true when the contact carries this instance's id *and* epoch.
+    /// Used by `PyContact.is_local` so scripts can distinguish bindings
+    /// accepted by this process from bindings restored from a peer or a
+    /// previous boot.
+    pub fn is_local_contact(&self, contact: &Contact) -> bool {
+        match (self.instance_identity.get(), contact.instance_id.as_deref(), contact.instance_epoch.as_deref()) {
+            (Some(identity), Some(id), Some(epoch)) => identity.id == id && identity.epoch == epoch,
+            _ => false,
+        }
     }
 
     /// Subscribe to registration change events.
@@ -287,6 +347,7 @@ impl Registrar {
             });
         }
 
+        let (instance_id, instance_epoch) = self.current_identity_pair();
         let contact = Contact {
             uri: uri.clone(),
             q,
@@ -300,6 +361,8 @@ impl Registrar {
             reg_id,
             path,
             pending: false,
+            instance_id,
+            instance_epoch,
         };
 
         let uri_string = uri.to_string();
@@ -699,6 +762,7 @@ impl Registrar {
         call_id: String,
         cseq: u32,
     ) {
+        let (instance_id, instance_epoch) = self.current_identity_pair();
         let contact = Contact {
             uri: uri.clone(),
             q,
@@ -712,6 +776,8 @@ impl Registrar {
             reg_id: None,
             path: vec![],
             pending: true,
+            instance_id,
+            instance_epoch,
         };
 
         let mut entry = self.bindings.entry(aor.to_string()).or_default();
@@ -970,6 +1036,83 @@ mod tests {
     }
 
     #[test]
+    fn save_stamps_instance_identity_when_set() {
+        let registrar = Registrar::default();
+        registrar.set_instance_identity(InstanceIdentity {
+            id: "siphon-2".to_string(),
+            epoch: "boot-1".to_string(),
+        });
+        registrar
+            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts[0].instance_id.as_deref(), Some("siphon-2"));
+        assert_eq!(contacts[0].instance_epoch.as_deref(), Some("boot-1"));
+        assert!(registrar.is_local_contact(&contacts[0]));
+    }
+
+    #[test]
+    fn save_without_identity_leaves_fields_none() {
+        let registrar = Registrar::default();
+        registrar
+            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert!(contacts[0].instance_id.is_none());
+        assert!(contacts[0].instance_epoch.is_none());
+        assert!(!registrar.is_local_contact(&contacts[0]));
+    }
+
+    #[test]
+    fn is_local_contact_rejects_foreign_or_stale_epoch() {
+        let registrar = Registrar::default();
+        registrar.set_instance_identity(InstanceIdentity {
+            id: "siphon-2".to_string(),
+            epoch: "boot-2".to_string(),
+        });
+
+        let foreign = Contact {
+            uri: contact_uri("alice", "10.0.0.1"),
+            q: 1.0,
+            registered_at: Instant::now(),
+            expires: Duration::from_secs(3600),
+            call_id: "c".into(),
+            cseq: 1,
+            source_addr: None,
+            source_transport: None,
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: Some("siphon-7".to_string()),
+            instance_epoch: Some("boot-2".to_string()),
+        };
+        assert!(
+            !registrar.is_local_contact(&foreign),
+            "different instance_id must not be local"
+        );
+
+        let stale = Contact {
+            instance_id: Some("siphon-2".to_string()),
+            instance_epoch: Some("boot-1".to_string()),
+            ..foreign.clone()
+        };
+        assert!(
+            !registrar.is_local_contact(&stale),
+            "matching instance_id but different epoch must not be local"
+        );
+
+        let exact = Contact {
+            instance_id: Some("siphon-2".to_string()),
+            instance_epoch: Some("boot-2".to_string()),
+            ..foreign
+        };
+        assert!(registrar.is_local_contact(&exact));
+    }
+
+    #[test]
     fn contact_remaining_seconds() {
         let contact = Contact {
             uri: contact_uri("alice", "10.0.0.1"),
@@ -984,6 +1127,8 @@ mod tests {
             reg_id: None,
             path: vec![],
             pending: false,
+            instance_id: None,
+            instance_epoch: None,
         };
         // Just registered — remaining should be very close to 3600
         assert!(contact.remaining_seconds() >= 3599);
@@ -1008,6 +1153,8 @@ mod tests {
                 reg_id: None,
                 path: vec![],
                 pending: false,
+                instance_id: None,
+                instance_epoch: None,
             };
             registrar.bindings.entry("sip:alice@example.com".to_string()).or_default().push(contact);
         }

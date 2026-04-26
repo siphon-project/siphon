@@ -288,6 +288,8 @@ mod tests {
             reg_id: None,
             path: vec![],
             pending: false,
+            instance_id: None,
+            instance_epoch: None,
         }
     }
 

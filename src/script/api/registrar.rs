@@ -28,6 +28,17 @@ pub struct PyContact {
     received_string: Option<String>,
     /// RFC 3327 Path headers stored with this binding.
     path_headers: Vec<String>,
+    /// Stable identity of the siphon instance that originally accepted this
+    /// REGISTER (typically StatefulSet pod name).  `None` for legacy
+    /// bindings or when the deployment doesn't tag identity.
+    instance_id_value: Option<String>,
+    /// Boot-time epoch UUID of the process that accepted this REGISTER.
+    /// Combined with `instance_id_value`, distinguishes "this pod, current
+    /// process" from "this pod, previous process".  `None` for legacy.
+    instance_epoch_value: Option<String>,
+    /// True when the binding's `(instance_id, instance_epoch)` matches the
+    /// running siphon process — i.e. this process accepted the REGISTER.
+    is_local_value: bool,
 }
 
 #[pymethods]
@@ -70,6 +81,40 @@ impl PyContact {
         self.path_headers.clone()
     }
 
+    /// Stable identity of the siphon instance that accepted this REGISTER.
+    ///
+    /// Typically the StatefulSet pod name (e.g. ``"siphon-0"``) when
+    /// configured via ``server.instance_id`` in ``siphon.yaml``.  Returns
+    /// ``None`` for bindings created before identity tagging was enabled or
+    /// when the deployment does not configure it.
+    #[getter]
+    fn instance_id(&self) -> Option<&str> {
+        self.instance_id_value.as_deref()
+    }
+
+    /// Boot-time epoch UUID of the process that accepted this REGISTER.
+    ///
+    /// Distinguishes successive runs of the same logical replica — pod
+    /// ``siphon-0`` after a restart shares ``instance_id`` with its previous
+    /// life but gets a fresh ``instance_epoch``.  Use ``is_local`` to test
+    /// "did *this* process accept the binding".  Returns ``None`` for
+    /// legacy entries.
+    #[getter]
+    fn instance_epoch(&self) -> Option<&str> {
+        self.instance_epoch_value.as_deref()
+    }
+
+    /// True when this binding was accepted by the *current* siphon process.
+    ///
+    /// Useful for graceful-shutdown deregister, NAT keepalive ownership,
+    /// and (later) RFC 5626 outbound flow tokens.  False for bindings
+    /// restored from another instance, from a previous boot of this
+    /// instance, or with no identity tag.
+    #[getter]
+    fn is_local(&self) -> bool {
+        self.is_local_value
+    }
+
     fn __str__(&self) -> &str {
         &self.uri_string
     }
@@ -84,18 +129,33 @@ impl PyContact {
 
 impl PyContact {
     pub fn from_rust_contact(contact: &Contact) -> Self {
+        Self::from_rust_contact_with_registrar(contact, None)
+    }
+
+    /// Same as [`from_rust_contact`] but resolves `is_local` against the
+    /// running registrar's instance identity when one is available.
+    pub fn from_rust_contact_with_registrar(
+        contact: &Contact,
+        registrar: Option<&Registrar>,
+    ) -> Self {
         let received_string = contact.source_addr.map(|addr| {
             // Build a SIP URI from source address + transport, matching the
             // format OpenSIPS uses for its received_avp / $param(received).
             let transport = contact.source_transport.as_deref().unwrap_or("udp");
             format!("sip:{}:{};transport={}", addr.ip(), addr.port(), transport)
         });
+        let is_local_value = registrar
+            .map(|registrar| registrar.is_local_contact(contact))
+            .unwrap_or(false);
         Self {
             uri_string: contact.uri.to_string(),
             q_value: contact.q,
             expires_remaining: contact.remaining_seconds(),
             received_string,
             path_headers: contact.path.clone(),
+            instance_id_value: contact.instance_id.clone(),
+            instance_epoch_value: contact.instance_epoch.clone(),
+            is_local_value,
         }
     }
 }
@@ -121,10 +181,11 @@ impl PyRegistrar {
     /// Rust-side lookup by string (for tests and internal use).
     pub fn lookup_str(&self, uri: &str) -> Vec<PyContact> {
         let aor = normalize_aor(uri);
-        self.inner
+        let inner = &self.inner;
+        inner
             .lookup(&aor)
             .iter()
-            .map(PyContact::from_rust_contact)
+            .map(|c| PyContact::from_rust_contact_with_registrar(c, Some(inner)))
             .collect()
     }
 
@@ -291,10 +352,11 @@ impl PyRegistrar {
     fn lookup(&self, uri: &Bound<'_, PyAny>) -> PyResult<Vec<PyContact>> {
         let uri_string = extract_uri_string(uri)?;
         let aor = normalize_aor(&uri_string);
-        Ok(self.inner
+        let inner = &self.inner;
+        Ok(inner
             .lookup(&aor)
             .iter()
-            .map(PyContact::from_rust_contact)
+            .map(|c| PyContact::from_rust_contact_with_registrar(c, Some(inner)))
             .collect())
     }
 
@@ -805,6 +867,9 @@ mod tests {
             expires_remaining: 3600,
             received_string: None,
             path_headers: vec![],
+            instance_id_value: None,
+            instance_epoch_value: None,
+            is_local_value: false,
         };
         assert_eq!(contact.__str__(), "sip:alice@10.0.0.1");
         assert!(contact.__repr__().contains("q=1"));

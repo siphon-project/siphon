@@ -512,7 +512,6 @@ fn default_diameter_port() -> u16 { 3868 }
 fn default_diameter_transport() -> String { "tcp".to_string() }
 fn default_watchdog_interval() -> u64 { 30 }
 fn default_reconnect_delay() -> u64 { 5 }
-fn default_diameter_product_name() -> String { "SIPhon".to_string() }
 fn default_diameter_route_algorithm() -> String { "failover".to_string() }
 
 // ---------------------------------------------------------------------------
@@ -530,9 +529,10 @@ pub struct DiameterConfig {
     pub origin_host: String,
     /// Origin-Realm for this SIPhon node.
     pub origin_realm: String,
-    /// Product-Name advertised in CER/CEA (default: "SIPhon").
-    #[serde(default = "default_diameter_product_name")]
-    pub product_name: String,
+    /// Product-Name advertised in CER/CEA. When unset, falls back to the
+    /// product name resolved by `SiphonServer::product()` (default "SIPhon").
+    #[serde(default)]
+    pub product_name: Option<String>,
     /// Default transport for all peers: "tcp" (default) or "sctp".
     #[serde(default = "default_diameter_transport")]
     pub transport: String,
@@ -643,9 +643,16 @@ impl DiameterConfig {
     /// Application IDs are collected from all routes that reference this peer,
     /// so a single peer connection can advertise support for multiple interfaces
     /// (e.g., Cx + Sh on the same HSS).
+    ///
+    /// `product_name` and `product_version` are the values resolved by
+    /// `SiphonServer::product()` — they back the Product-Name and
+    /// Firmware-Revision AVPs when the YAML `diameter.product_name`
+    /// override is unset.
     pub fn to_peer_config(
         &self,
         peer: &DiameterPeerEntry,
+        product_name: &str,
+        product_version: &str,
     ) -> crate::diameter::peer::PeerConfig {
         let application_ids: Vec<(u32, u32)> = self
             .routes
@@ -665,9 +672,10 @@ impl DiameterConfig {
             application_ids,
             watchdog_interval: peer.watchdog_interval.unwrap_or(self.watchdog_interval),
             reconnect_delay: peer.reconnect_delay.unwrap_or(self.reconnect_delay),
-            product_name: self.product_name.clone(),
+            product_name: self.product_name.clone()
+                .unwrap_or_else(|| product_name.to_string()),
             firmware_revision: crate::diameter::peer::version_to_firmware_revision(
-                env!("CARGO_PKG_VERSION"),
+                product_version,
             ),
         }
     }
@@ -939,6 +947,12 @@ pub struct ServerIdentityConfig {
     /// immediately on signal).
     #[serde(default = "default_drain_secs")]
     pub drain_secs: u64,
+    /// Stable per-replica identity, stamped onto every accepted REGISTER
+    /// binding so scripts can recognise their own bindings after restart.
+    /// Recommended: ``"${POD_NAME:-${HOSTNAME}}"`` for K8s StatefulSet
+    /// deployments.  When unset, siphon falls back to the ``HOSTNAME``
+    /// environment variable, then to ``"siphon"`` as a last resort.
+    pub instance_id: Option<String>,
 }
 
 fn default_drain_secs() -> u64 {
@@ -2858,7 +2872,7 @@ session_timer:
 
         assert_eq!(diameter.origin_host, "siphon.ims.example.com");
         assert_eq!(diameter.origin_realm, "ims.example.com");
-        assert_eq!(diameter.product_name, "SIPhon-Test");
+        assert_eq!(diameter.product_name.as_deref(), Some("SIPhon-Test"));
         assert_eq!(diameter.transport, "tcp");
         assert_eq!(diameter.watchdog_interval, 20);
         assert_eq!(diameter.reconnect_delay, 3);
@@ -2921,16 +2935,17 @@ session_timer:
         let diameter = config.diameter.as_ref().unwrap();
 
         // hss1: inherits parent defaults
-        let peer1 = diameter.to_peer_config(&diameter.peers[0]);
+        let peer1 = diameter.to_peer_config(&diameter.peers[0], "SIPhon", "1.2.3");
         assert_eq!(peer1.origin_host, "siphon.example.com");
         assert_eq!(peer1.origin_realm, "example.com");
         assert_eq!(peer1.host, "hss1.example.com");
         assert_eq!(peer1.watchdog_interval, 25);
         assert_eq!(peer1.reconnect_delay, 7);
-        assert_eq!(peer1.product_name, "SIPhon"); // default
+        assert_eq!(peer1.product_name, "SIPhon"); // builder fallback
+        assert_eq!(peer1.firmware_revision, 10203); // 1.2.3 → 1*10000+2*100+3
 
         // hss2: overrides parent defaults
-        let peer2 = diameter.to_peer_config(&diameter.peers[1]);
+        let peer2 = diameter.to_peer_config(&diameter.peers[1], "SIPhon", "1.2.3");
         assert_eq!(peer2.watchdog_interval, 60);
         assert_eq!(peer2.reconnect_delay, 10);
     }
@@ -2961,7 +2976,7 @@ session_timer:
         );
         let config = Config::from_str(yaml).unwrap();
         let diameter = config.diameter.as_ref().unwrap();
-        let peer_config = diameter.to_peer_config(&diameter.peers[0]);
+        let peer_config = diameter.to_peer_config(&diameter.peers[0], "SIPhon", "1.2.3");
 
         // hss1 is in both Cx and Sh routes — should get both app IDs
         assert_eq!(peer_config.application_ids.len(), 2);

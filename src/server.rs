@@ -399,6 +399,12 @@ impl SiphonServer {
             });
         }
 
+        // --- Stamp the per-process identity onto the registrar BEFORE the
+        // backend restore.  Bindings accepted from now on will carry
+        // (instance_id, instance_epoch); restored bindings keep whatever
+        // identity their original writer stamped on them.
+        init_registrar_identity(&config);
+
         // --- Restore registrar contacts + iFC profiles from backend ---
         // Must run after ISC singleton init so ifc_store_arc() is available
         // for the iFC Redis restore in init_ifc_redis_backend().
@@ -801,7 +807,7 @@ impl SiphonServer {
         if let Some(ref diameter_config) = config.diameter {
             if let Some(ref manager) = diameter_manager {
                 for peer_entry in &diameter_config.peers {
-                    let peer_config = diameter_config.to_peer_config(peer_entry);
+                    let peer_config = diameter_config.to_peer_config(peer_entry, product_name, product_version);
                     let peer_name = peer_entry.name.clone();
                     let manager_for_task = Arc::clone(manager);
                     let tx = diameter_incoming_tx.clone();
@@ -1055,6 +1061,8 @@ impl SiphonServer {
             diameter_incoming_rx,
             rtpengine_events_rx,
             Arc::clone(&drain),
+            product_name,
+            product_version,
         ));
 
         // Keep the sender alive for the lifetime of the server so the listener
@@ -1187,6 +1195,38 @@ fn init_logging(
         .init();
 
     guard
+}
+
+/// Compute the per-process identity tag from config + environment, then
+/// stamp it onto the registrar so subsequent `save()`s carry it.
+///
+/// Resolution order for `instance_id`:
+///   1. ``server.instance_id`` from siphon.yaml (env-expanded by serde_yml).
+///   2. The ``HOSTNAME`` environment variable (Linux default).
+///   3. Literal ``"siphon"`` as a last-resort fallback.
+///
+/// `instance_epoch` is always a fresh UUID v4 generated at startup so two
+/// runs of the same logical replica are distinguishable.
+fn init_registrar_identity(config: &Config) {
+    use crate::registrar::InstanceIdentity;
+    use crate::script::api::registrar_arc;
+
+    let registrar = match registrar_arc() {
+        Some(r) => r,
+        None => return,
+    };
+
+    let id = config
+        .server
+        .as_ref()
+        .and_then(|server| server.instance_id.clone())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "siphon".to_string());
+
+    let epoch = uuid::Uuid::new_v4().to_string();
+
+    info!(instance_id = %id, instance_epoch = %epoch, "registrar instance identity");
+    registrar.set_instance_identity(InstanceIdentity { id, epoch });
 }
 
 async fn init_registrar_backend(config: &Config) {
