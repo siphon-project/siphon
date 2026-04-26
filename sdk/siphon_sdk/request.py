@@ -81,6 +81,7 @@ class Request:
         content_type: Optional[str] = None,
         transport: str = "udp",
         source_ip: str = "127.0.0.1",
+        source_port: int = 5060,
         user_agent: Optional[str] = None,
         auth_user: Optional[str] = None,
         contact_expires: Optional[int] = None,
@@ -100,6 +101,7 @@ class Request:
         self._content_type = content_type
         self._transport = transport
         self._source_ip = source_ip
+        self._source_port = source_port
         self._user_agent = user_agent
         self._auth_user = auth_user
         self._contact_expires = contact_expires
@@ -178,6 +180,11 @@ class Request:
     def source_ip(self) -> str:
         """Source IP address of the sender."""
         return self._source_ip
+
+    @property
+    def source_port(self) -> int:
+        """Source port of the sender."""
+        return self._source_port
 
     @property
     def user_agent(self) -> Optional[str]:

@@ -508,6 +508,12 @@ impl PyRequest {
         self.source_ip.clone()
     }
 
+    /// Source port.
+    #[getter]
+    fn source_port(&self) -> u16 {
+        self.source_port
+    }
+
     /// User-Agent header value.
     #[getter]
     fn user_agent(&self) -> PyResult<Option<String>> {
@@ -1127,6 +1133,7 @@ mod tests {
         let request = make_request();
         assert_eq!(request.transport(), "udp");
         assert_eq!(request.source_ip(), "10.0.0.1");
+        assert_eq!(request.source_port(), 5060);
     }
 
     #[test]
