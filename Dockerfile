@@ -1,14 +1,54 @@
+# SIPhon container image.
+#
+# Python: free-threaded CPython 3.14t (PEP 703) installed via uv. Siphon's
+# Rust hot loop calls into embedded Python on every SIP request — the
+# persistent-attach optimization in src/server.rs (PyGILState_Ensure +
+# PyEval_SaveThread per worker) only pays off on no-GIL CPython. With a
+# regular GIL'd 3.14 the workload is GIL-limited and the README baseline
+# is unreachable. PyO3 0.28 auto-detects Py_GIL_DISABLED — no extra
+# feature flags needed.
+
 # ── Chef base ────────────────────────────────────────────────────────────────
-FROM python:3.14-rc-slim AS chef
+FROM debian:trixie-slim AS chef
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
         curl \
         build-essential \
         pkg-config \
         libssl-dev \
         libsctp-dev \
+        xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# uv: standalone Python installer + project manager. Pulls
+# python-build-standalone binaries (no apt python needed).
+ENV UV_INSTALL_DIR=/usr/local/bin
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install free-threaded CPython 3.14t to a known location so the runtime
+# stage can copy it deterministically. Wire it as the canonical `python3`
+# so pyo3's build.rs picks it up automatically.
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
+RUN uv python install 3.14t && \
+    ln -sfn "$(uv python find 3.14t)" /usr/local/bin/python3.14t && \
+    ln -sfn /usr/local/bin/python3.14t /usr/local/bin/python3 && \
+    ln -sfn /usr/local/bin/python3.14t /usr/local/bin/python
+ENV PYO3_PYTHON=/usr/local/bin/python3.14t
+
+# Runtime python packages that scripts commonly need. Installed into the
+# free-threaded interpreter's site-packages so they ride along when the
+# runtime stage copies /opt/python.
+RUN uv pip install --system --python /usr/local/bin/python3.14t \
+        --break-system-packages \
+        httpx \
+        redis \
+        aioboto3 \
+        prometheus_client \
+        opentelemetry-api \
+        opentelemetry-sdk
+
+# Rust toolchain.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -26,31 +66,35 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Build dependencies (cached until Cargo.toml/lock change) ─────────────────
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
-RUN PYO3_PYTHON=python3 cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
 # Build the real binary
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-RUN PYO3_PYTHON=python3 cargo build --release
+RUN cargo build --release
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
-FROM python:3.14-rc-slim
+FROM debian:trixie-slim
 
 # Runtime shared libraries needed by the siphon binary
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
         libsctp1 \
         iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install runtime Python packages that scripts commonly need.
-# Users can extend this by building FROM this image.
-RUN pip install --no-cache-dir \
-    httpx \
-    redis \
-    aioboto3 \
-    prometheus_client \
-    opentelemetry-api \
-    opentelemetry-sdk
+# Bring the python-build-standalone install (interpreter + site-packages)
+# over wholesale, then expose its interpreter and shared libs to the
+# dynamic linker.
+COPY --from=builder /opt/python /opt/python
+RUN PY_BIN=$(find /opt/python -type f -name python3.14t -perm -u+x | head -n1) && \
+    PY_PREFIX=$(dirname $(dirname "$PY_BIN")) && \
+    ln -sfn "$PY_BIN" /usr/local/bin/python3.14t && \
+    ln -sfn "$PY_BIN" /usr/local/bin/python3 && \
+    ln -sfn "$PY_BIN" /usr/local/bin/python && \
+    echo "$PY_PREFIX/lib" > /etc/ld.so.conf.d/python3.14t.conf && \
+    ldconfig
 
 # SIPhon binary
 COPY --from=builder /build/target/release/siphon /usr/local/bin/siphon
@@ -60,9 +104,14 @@ COPY scripts/ /etc/siphon/scripts/
 COPY examples/ /etc/siphon/examples/
 COPY siphon.yaml /etc/siphon/siphon.yaml
 
+# Free-threaded interpreters print a runtime warning unless this is set.
+ENV PYTHON_GIL=0
+# Print the C stack on a fatal signal so we never have to chase a silent SIGSEGV.
+ENV PYTHONFAULTHANDLER=1
+
 # SIP ports
 # 5060 UDP/TCP — standard SIP
-# 5061 TCP     — SIP over TLS (future)
+# 5061 TCP     — SIP over TLS
 EXPOSE 5060/udp
 EXPOSE 5060/tcp
 EXPOSE 5061/tcp
