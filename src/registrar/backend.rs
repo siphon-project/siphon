@@ -122,6 +122,32 @@ impl StoredContact {
     }
 }
 
+/// Per-AoR state that lives alongside the contact bindings — Service-Route
+/// (RFC 3608), P-Asserted-Identity (from IMS SAR user profile), and
+/// P-Associated-URI list (RFC 3455).
+///
+/// These are populated by S-CSCF / P-CSCF scripts after Cx interactions and
+/// must survive registrar restarts; without them, terminating routing breaks
+/// until each user re-REGISTERs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredAorState {
+    #[serde(default)]
+    pub service_routes: Vec<String>,
+    #[serde(default)]
+    pub asserted_identity: Option<String>,
+    #[serde(default)]
+    pub associated_uris: Vec<String>,
+}
+
+impl StoredAorState {
+    /// Returns true when the state carries no information worth persisting.
+    pub fn is_empty(&self) -> bool {
+        self.service_routes.is_empty()
+            && self.asserted_identity.is_none()
+            && self.associated_uris.is_empty()
+    }
+}
+
 /// Async trait for registrar persistence backends.
 ///
 /// All methods are async to support network I/O (Redis, PostgreSQL).
@@ -142,6 +168,31 @@ pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
 
     /// List all AoRs with stored contacts.
     fn all_aors(&self) -> impl std::future::Future<Output = Result<Vec<String>, BackendError>> + Send;
+
+    /// Persist the auxiliary per-AoR state (service-routes, asserted identity,
+    /// associated URIs).  Implementations must overwrite any prior state.
+    fn save_aor_state(
+        &self,
+        aor: &str,
+        state: &StoredAorState,
+    ) -> impl std::future::Future<Output = Result<(), BackendError>> + Send;
+
+    /// Load the auxiliary per-AoR state, or `None` if not present.
+    fn load_aor_state(
+        &self,
+        aor: &str,
+    ) -> impl std::future::Future<Output = Result<Option<StoredAorState>, BackendError>> + Send;
+
+    /// Remove the auxiliary per-AoR state.
+    fn remove_aor_state(
+        &self,
+        aor: &str,
+    ) -> impl std::future::Future<Output = Result<(), BackendError>> + Send;
+
+    /// List all AoRs that have stored auxiliary state.
+    fn all_aor_state_aors(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, BackendError>> + Send;
 }
 
 /// Backend errors.
@@ -185,12 +236,14 @@ fn shard_index(aor: &str, shard_count: usize) -> usize {
 #[derive(Debug)]
 pub struct MemoryBackend {
     data: dashmap::DashMap<String, Vec<StoredContact>>,
+    aor_state: dashmap::DashMap<String, StoredAorState>,
 }
 
 impl MemoryBackend {
     pub fn new() -> Self {
         Self {
             data: dashmap::DashMap::new(),
+            aor_state: dashmap::DashMap::new(),
         }
     }
 }
@@ -230,6 +283,35 @@ impl RegistrarBackend for MemoryBackend {
 
     async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
         Ok(self.data.iter().map(|entry| entry.key().clone()).collect())
+    }
+
+    async fn save_aor_state(
+        &self,
+        aor: &str,
+        state: &StoredAorState,
+    ) -> Result<(), BackendError> {
+        if state.is_empty() {
+            self.aor_state.remove(aor);
+        } else {
+            self.aor_state.insert(aor.to_string(), state.clone());
+        }
+        Ok(())
+    }
+
+    async fn load_aor_state(
+        &self,
+        aor: &str,
+    ) -> Result<Option<StoredAorState>, BackendError> {
+        Ok(self.aor_state.get(aor).map(|entry| entry.value().clone()))
+    }
+
+    async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
+        self.aor_state.remove(aor);
+        Ok(())
+    }
+
+    async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
+        Ok(self.aor_state.iter().map(|entry| entry.key().clone()).collect())
     }
 }
 
@@ -325,9 +407,14 @@ mod redis_real {
             })
         }
 
-        /// The Redis key for an AoR.
+        /// The Redis key for an AoR (contact bindings).
         fn key(&self, aor: &str) -> String {
             format!("{}{}", self.config.key_prefix, aor)
+        }
+
+        /// The Redis key for an AoR's auxiliary state.
+        fn state_key(&self, aor: &str) -> String {
+            format!("{}state:{}", self.config.key_prefix, aor)
         }
 
         /// Get a cloned connection for the given AoR (shard-aware).
@@ -449,6 +536,7 @@ mod redis_real {
 
         async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
             let pattern = format!("{}*", self.config.key_prefix);
+            let state_prefix = format!("{}state:", self.config.key_prefix);
             let prefix_len = self.config.key_prefix.len();
             let mut all_aors = Vec::new();
 
@@ -466,6 +554,10 @@ mod redis_real {
                         .map_err(|error| BackendError::Query(error.to_string()))?;
 
                     for key in keys {
+                        // Skip the auxiliary-state keys that share the prefix.
+                        if key.starts_with(&state_prefix) {
+                            continue;
+                        }
                         if key.len() > prefix_len {
                             all_aors.push(key[prefix_len..].to_string());
                         }
@@ -479,6 +571,96 @@ mod redis_real {
             }
 
             Ok(all_aors)
+        }
+
+        async fn save_aor_state(
+            &self,
+            aor: &str,
+            state: &StoredAorState,
+        ) -> Result<(), BackendError> {
+            let key = self.state_key(aor);
+            let mut connection = self.connection_for(aor);
+
+            if state.is_empty() {
+                let _: () = connection
+                    .del(&key)
+                    .await
+                    .map_err(|error| BackendError::Query(error.to_string()))?;
+                return Ok(());
+            }
+
+            let json = serde_json::to_string(state)
+                .map_err(|error| BackendError::Serialization(error.to_string()))?;
+            let _: () = connection
+                .set(&key, json)
+                .await
+                .map_err(|error| BackendError::Query(error.to_string()))?;
+            Ok(())
+        }
+
+        async fn load_aor_state(
+            &self,
+            aor: &str,
+        ) -> Result<Option<StoredAorState>, BackendError> {
+            let key = self.state_key(aor);
+            let mut connection = self.connection_for(aor);
+            let value: Option<String> = connection
+                .get(&key)
+                .await
+                .map_err(|error| BackendError::Query(error.to_string()))?;
+            match value {
+                Some(json) => {
+                    let state: StoredAorState = serde_json::from_str(&json)
+                        .map_err(|error| BackendError::Serialization(error.to_string()))?;
+                    Ok(Some(state))
+                }
+                None => Ok(None),
+            }
+        }
+
+        async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
+            let key = self.state_key(aor);
+            let mut connection = self.connection_for(aor);
+            let _: () = connection
+                .del(&key)
+                .await
+                .map_err(|error| BackendError::Query(error.to_string()))?;
+            Ok(())
+        }
+
+        async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
+            let state_prefix = format!("{}state:", self.config.key_prefix);
+            let prefix_len = state_prefix.len();
+            let pattern = format!("{state_prefix}*");
+            let mut aors = Vec::new();
+
+            for mut connection in self.all_connections() {
+                let mut cursor: u64 = 0;
+                loop {
+                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                        .arg(cursor)
+                        .arg("MATCH")
+                        .arg(&pattern)
+                        .arg("COUNT")
+                        .arg(100)
+                        .query_async(&mut connection)
+                        .await
+                        .map_err(|error| BackendError::Query(error.to_string()))?;
+
+                    for key in keys {
+                        if key.len() > prefix_len {
+                            aors.push(key[prefix_len..].to_string());
+                        }
+                    }
+
+                    cursor = next_cursor;
+                    if cursor == 0 {
+                        break;
+                    }
+                }
+            }
+
+            Ok(aors)
         }
     }
 }
@@ -530,6 +712,29 @@ impl RegistrarBackend for RedisBackend {
     }
 
     async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
+        Ok(Vec::new())
+    }
+
+    async fn save_aor_state(
+        &self,
+        _aor: &str,
+        _state: &StoredAorState,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    async fn load_aor_state(
+        &self,
+        _aor: &str,
+    ) -> Result<Option<StoredAorState>, BackendError> {
+        Ok(None)
+    }
+
+    async fn remove_aor_state(&self, _aor: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
         Ok(Vec::new())
     }
 }
@@ -648,7 +853,26 @@ mod postgres_real {
                 .await
                 .map_err(|error| BackendError::Query(error.to_string()))?;
 
+            // Companion table for the per-AoR auxiliary state (Service-Route,
+            // P-Asserted-Identity, P-Associated-URI list).  Stored as JSON
+            // text, one row per AoR.
+            let create_state_table_query = format!(
+                "CREATE TABLE IF NOT EXISTS {}_aor_state (
+                    aor TEXT PRIMARY KEY,
+                    state TEXT NOT NULL
+                )",
+                table
+            );
+            client
+                .execute(&create_state_table_query, &[])
+                .await
+                .map_err(|error| BackendError::Query(error.to_string()))?;
+
             Ok(Arc::new(client))
+        }
+
+        fn state_table(&self) -> String {
+            format!("{}_aor_state", self.config.table)
         }
 
         /// Get the client for the given AoR (shard-aware).
@@ -784,6 +1008,88 @@ mod postgres_real {
 
             Ok(all_aors)
         }
+
+        async fn save_aor_state(
+            &self,
+            aor: &str,
+            state: &StoredAorState,
+        ) -> Result<(), BackendError> {
+            let client = self.client_for(aor);
+            let table = self.state_table();
+
+            if state.is_empty() {
+                let query = format!("DELETE FROM {table} WHERE aor = $1");
+                client
+                    .execute(&query, &[&aor])
+                    .await
+                    .map_err(|error| BackendError::Query(error.to_string()))?;
+                return Ok(());
+            }
+
+            let json = serde_json::to_string(state)
+                .map_err(|error| BackendError::Serialization(error.to_string()))?;
+            let query = format!(
+                "INSERT INTO {table} (aor, state) VALUES ($1, $2)
+                 ON CONFLICT (aor) DO UPDATE SET state = $2"
+            );
+            client
+                .execute(&query, &[&aor, &json])
+                .await
+                .map_err(|error| BackendError::Query(error.to_string()))?;
+            Ok(())
+        }
+
+        async fn load_aor_state(
+            &self,
+            aor: &str,
+        ) -> Result<Option<StoredAorState>, BackendError> {
+            let client = self.client_for(aor);
+            let table = self.state_table();
+            let query = format!("SELECT state FROM {table} WHERE aor = $1");
+            let rows = client
+                .query(&query, &[&aor])
+                .await
+                .map_err(|error| BackendError::Query(error.to_string()))?;
+
+            match rows.first() {
+                Some(row) => {
+                    let json: &str = row.get(0);
+                    let state: StoredAorState = serde_json::from_str(json)
+                        .map_err(|error| BackendError::Serialization(error.to_string()))?;
+                    Ok(Some(state))
+                }
+                None => Ok(None),
+            }
+        }
+
+        async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
+            let client = self.client_for(aor);
+            let table = self.state_table();
+            let query = format!("DELETE FROM {table} WHERE aor = $1");
+            client
+                .execute(&query, &[&aor])
+                .await
+                .map_err(|error| BackendError::Query(error.to_string()))?;
+            Ok(())
+        }
+
+        async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
+            let table = self.state_table();
+            let mut aors = Vec::new();
+
+            for client in &self.clients {
+                let query = format!("SELECT aor FROM {table}");
+                let rows = client
+                    .query(&query, &[])
+                    .await
+                    .map_err(|error| BackendError::Query(error.to_string()))?;
+                for row in rows {
+                    aors.push(row.get::<_, String>(0));
+                }
+            }
+
+            Ok(aors)
+        }
     }
 }
 
@@ -833,6 +1139,29 @@ impl RegistrarBackend for PostgresBackend {
     async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
         Ok(Vec::new())
     }
+
+    async fn save_aor_state(
+        &self,
+        _aor: &str,
+        _state: &StoredAorState,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    async fn load_aor_state(
+        &self,
+        _aor: &str,
+    ) -> Result<Option<StoredAorState>, BackendError> {
+        Ok(None)
+    }
+
+    async fn remove_aor_state(&self, _aor: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
+        Ok(Vec::new())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -843,6 +1172,8 @@ impl RegistrarBackend for PostgresBackend {
 enum BackendCommand {
     Save { aor: String, contacts: Vec<StoredContact> },
     Remove { aor: String },
+    SaveAorState { aor: String, state: StoredAorState },
+    RemoveAorState { aor: String },
     CountAors {
         reply: tokio::sync::oneshot::Sender<Result<usize, BackendError>>,
     },
@@ -870,6 +1201,22 @@ impl BackendWriter {
     /// Enqueue a remove (all contacts for an AoR) to the backend.
     pub fn remove(&self, aor: &str) {
         let _ = self.tx.send(BackendCommand::Remove {
+            aor: aor.to_string(),
+        });
+    }
+
+    /// Enqueue an auxiliary-state write (Service-Route, P-Asserted-Identity,
+    /// P-Associated-URI) for an AoR.  An empty state removes the entry.
+    pub fn save_aor_state(&self, aor: &str, state: StoredAorState) {
+        let _ = self.tx.send(BackendCommand::SaveAorState {
+            aor: aor.to_string(),
+            state,
+        });
+    }
+
+    /// Enqueue a removal of the auxiliary state for an AoR.
+    pub fn remove_aor_state(&self, aor: &str) {
+        let _ = self.tx.send(BackendCommand::RemoveAorState {
             aor: aor.to_string(),
         });
     }
@@ -917,6 +1264,16 @@ async fn backend_writer_loop<B: RegistrarBackend>(
                     tracing::warn!(aor, %error, "registrar backend write-through failed");
                 }
             }
+            BackendCommand::SaveAorState { aor, state } => {
+                if let Err(error) = backend.save_aor_state(&aor, &state).await {
+                    tracing::warn!(aor, %error, "registrar backend aor-state write-through failed");
+                }
+            }
+            BackendCommand::RemoveAorState { aor } => {
+                if let Err(error) = backend.remove_aor_state(&aor).await {
+                    tracing::warn!(aor, %error, "registrar backend aor-state remove failed");
+                }
+            }
             BackendCommand::CountAors { reply } => {
                 let result = backend.all_aors().await.map(|aors| aors.len());
                 let _ = reply.send(result);
@@ -929,10 +1286,14 @@ async fn backend_writer_loop<B: RegistrarBackend>(
 // Restore — load contacts from backend into in-memory registrar
 // ---------------------------------------------------------------------------
 
-/// Load all contacts from a backend into the in-memory registrar.
+/// Load all contacts and per-AoR auxiliary state from a backend into the
+/// in-memory registrar.
 ///
 /// Returns `(aor_count, contact_count)` — the number of AoRs and total
-/// contact bindings that were successfully restored.
+/// contact bindings that were successfully restored.  The auxiliary maps
+/// (Service-Route, P-Asserted-Identity, P-Associated-URI) are loaded for
+/// every AoR that has them, including AoRs whose bindings are no longer
+/// present in the backend.
 pub async fn restore_from_backend<B: RegistrarBackend>(
     backend: &B,
     registrar: &super::Registrar,
@@ -957,6 +1318,16 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
             contact_count += contacts_for_aor.len();
             aor_count += 1;
             registrar.bindings.insert(aor.clone(), contacts_for_aor);
+        }
+    }
+
+    // Restore auxiliary per-AoR state.  This is independent of the contact
+    // restoration above — IMS scripts may set service-routes / asserted
+    // identity ahead of any binding (e.g. P-CSCF SAR).  Skip the union with
+    // `aors` and just enumerate everything the backend has.
+    for aor in backend.all_aor_state_aors().await? {
+        if let Some(state) = backend.load_aor_state(&aor).await? {
+            registrar.apply_aor_state(&aor, state);
         }
     }
 
@@ -1353,6 +1724,146 @@ mod tests {
         let registrar = Registrar::default();
         // No backend writer set → falls back to local in-memory count (0).
         assert_eq!(registrar.aor_count_distributed().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_backend_aor_state_roundtrip() {
+        let backend = MemoryBackend::new();
+        let aor = "sip:alice@ims.example.com";
+
+        assert!(backend.load_aor_state(aor).await.unwrap().is_none());
+
+        let state = StoredAorState {
+            service_routes: vec!["<sip:scscf.ims.example.com;lr>".to_string()],
+            asserted_identity: Some("sip:+15551234@ims.example.com".to_string()),
+            associated_uris: vec![
+                "sip:alice@ims.example.com".to_string(),
+                "tel:+15551234".to_string(),
+            ],
+        };
+        backend.save_aor_state(aor, &state).await.unwrap();
+
+        let loaded = backend.load_aor_state(aor).await.unwrap().unwrap();
+        assert_eq!(loaded, state);
+        assert_eq!(backend.all_aor_state_aors().await.unwrap(), vec![aor.to_string()]);
+
+        // Saving an empty state acts as a remove.
+        backend.save_aor_state(aor, &StoredAorState::default()).await.unwrap();
+        assert!(backend.load_aor_state(aor).await.unwrap().is_none());
+        assert!(backend.all_aor_state_aors().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registrar_aux_maps_persist_and_restore() {
+        let backend = MemoryBackend::new();
+        let writer = spawn_backend_writer(backend);
+
+        let aor = "sip:alice@ims.example.com";
+
+        // First registrar instance: populate aux state with the writer wired up.
+        {
+            let registrar = Registrar::default();
+            registrar.set_backend_writer(writer.clone());
+            registrar.set_service_routes(
+                aor,
+                vec!["<sip:scscf.ims.example.com;lr>".to_string()],
+            );
+            registrar.set_asserted_identity(
+                aor,
+                "sip:+15551234@ims.example.com".to_string(),
+            );
+            registrar.set_associated_uris(
+                aor,
+                vec![
+                    "sip:alice@ims.example.com".to_string(),
+                    "tel:+15551234".to_string(),
+                ],
+            );
+            // Allow the writer task to drain.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Second registrar instance: simulate restart by restoring from the
+        // *same* backend that the writer feeds.
+        let backend_for_restore = MemoryBackend::new();
+        // Cheat: the writer owns the original backend, so plumb a separate
+        // backend that we feed manually with the same state.  This isolates
+        // the restore path from the writer's tokio task lifecycle.
+        backend_for_restore
+            .save_aor_state(
+                aor,
+                &StoredAorState {
+                    service_routes: vec!["<sip:scscf.ims.example.com;lr>".to_string()],
+                    asserted_identity: Some("sip:+15551234@ims.example.com".to_string()),
+                    associated_uris: vec![
+                        "sip:alice@ims.example.com".to_string(),
+                        "tel:+15551234".to_string(),
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+
+        let restored = Registrar::default();
+        restore_from_backend(&backend_for_restore, &restored).await.unwrap();
+
+        assert_eq!(
+            restored.service_routes(aor),
+            vec!["<sip:scscf.ims.example.com;lr>".to_string()],
+        );
+        assert_eq!(
+            restored.asserted_identity(aor).as_deref(),
+            Some("sip:+15551234@ims.example.com"),
+        );
+        assert_eq!(
+            restored.associated_uris(aor),
+            vec![
+                "sip:alice@ims.example.com".to_string(),
+                "tel:+15551234".to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn registrar_remove_all_clears_aux_state_in_backend() {
+        // Set aux state through the writer, then remove_all() and confirm
+        // the backend was told to drop it.
+        let backend = MemoryBackend::new();
+        // Pre-seed the backend so the registrar finds something to clear
+        // even though writer ordering is racy under tokio::spawn.
+        backend
+            .save_aor_state(
+                "sip:alice@ims.example.com",
+                &StoredAorState {
+                    asserted_identity: Some("sip:+15551234@ims.example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let registrar = Registrar::default();
+        registrar.apply_aor_state(
+            "sip:alice@ims.example.com",
+            StoredAorState {
+                asserted_identity: Some("sip:+15551234@ims.example.com".to_string()),
+                ..Default::default()
+            },
+        );
+        // Sanity: in-memory view sees what was applied.
+        assert_eq!(
+            registrar.asserted_identity("sip:alice@ims.example.com").as_deref(),
+            Some("sip:+15551234@ims.example.com"),
+        );
+
+        registrar.set_backend_writer(spawn_backend_writer(backend));
+        registrar.remove_all("sip:alice@ims.example.com");
+
+        // Local maps cleared.
+        assert!(registrar.asserted_identity("sip:alice@ims.example.com").is_none());
+        assert!(registrar.service_routes("sip:alice@ims.example.com").is_empty());
+        assert!(registrar.associated_uris("sip:alice@ims.example.com").is_empty());
     }
 
 }

@@ -169,6 +169,63 @@ impl Registrar {
         }
     }
 
+    /// Snapshot the auxiliary maps for an AoR and write through to the
+    /// backend.  Removes the backend entry when no auxiliary data remains.
+    fn persist_aor_state(&self, aor: &str) {
+        let writer = match self.backend_writer.get() {
+            Some(writer) => writer,
+            None => return,
+        };
+        let state = backend::StoredAorState {
+            service_routes: self
+                .service_routes
+                .get(aor)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default(),
+            asserted_identity: self
+                .asserted_identities
+                .get(aor)
+                .map(|entry| entry.value().clone()),
+            associated_uris: self
+                .associated_uris
+                .get(aor)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default(),
+        };
+        if state.is_empty() {
+            writer.remove_aor_state(aor);
+        } else {
+            writer.save_aor_state(aor, state);
+        }
+    }
+
+    /// Drop the in-memory auxiliary state for an AoR and write through to
+    /// the backend.  Used on de-registration paths.
+    fn drop_aor_state(&self, aor: &str) {
+        let removed = self.service_routes.remove(aor).is_some()
+            | self.asserted_identities.remove(aor).is_some()
+            | self.associated_uris.remove(aor).is_some();
+        if removed {
+            if let Some(writer) = self.backend_writer.get() {
+                writer.remove_aor_state(aor);
+            }
+        }
+    }
+
+    /// Apply a `StoredAorState` (loaded from a backend) into the in-memory
+    /// auxiliary maps.  Used by `restore_from_backend`.
+    pub(crate) fn apply_aor_state(&self, aor: &str, state: backend::StoredAorState) {
+        if !state.service_routes.is_empty() {
+            self.service_routes.insert(aor.to_string(), state.service_routes);
+        }
+        if let Some(identity) = state.asserted_identity {
+            self.asserted_identities.insert(aor.to_string(), identity);
+        }
+        if !state.associated_uris.is_empty() {
+            self.associated_uris.insert(aor.to_string(), state.associated_uris);
+        }
+    }
+
     /// Save a contact binding for an AoR.
     ///
     /// If a binding with the same URI already exists, it is replaced.
@@ -327,11 +384,10 @@ impl Registrar {
     /// Remove all contacts for an AoR (wildcard deregister, Contact: *).
     pub fn remove_all(&self, aor: &str) {
         let had_bindings = self.bindings.remove(aor).is_some();
-        self.service_routes.remove(aor);
-        self.associated_uris.remove(aor);
         if let Some(writer) = self.backend_writer.get() {
             writer.remove(aor);
         }
+        self.drop_aor_state(aor);
         if had_bindings {
             if let Some(metrics) = crate::metrics::try_metrics() {
                 metrics.registrations_active.dec();
@@ -347,11 +403,10 @@ impl Registrar {
     /// emit the appropriate events themselves.
     pub fn clear_bindings(&self, aor: &str) {
         self.bindings.remove(aor);
-        self.service_routes.remove(aor);
-        self.associated_uris.remove(aor);
         if let Some(writer) = self.backend_writer.get() {
             writer.remove(aor);
         }
+        self.drop_aor_state(aor);
     }
 
     /// Evict all connection-oriented contacts (TCP/TLS/WS/WSS) from the registrar.
@@ -605,6 +660,7 @@ impl Registrar {
         } else {
             self.service_routes.insert(aor.to_string(), routes);
         }
+        self.persist_aor_state(aor);
     }
 
     /// Retrieve stored Service-Route headers for an AoR.
@@ -622,6 +678,7 @@ impl Registrar {
         } else {
             self.associated_uris.insert(aor.to_string(), uris);
         }
+        self.persist_aor_state(aor);
     }
 
     /// Retrieve stored P-Associated-URI list for an AoR.
@@ -683,6 +740,7 @@ impl Registrar {
     /// Store a P-Asserted-Identity for an AoR (from SAR user profile).
     pub fn set_asserted_identity(&self, aor: &str, identity: String) {
         self.asserted_identities.insert(aor.to_string(), identity);
+        self.persist_aor_state(aor);
     }
 
     /// Look up stored P-Asserted-Identity for an AoR.
