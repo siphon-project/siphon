@@ -65,6 +65,13 @@ pub struct SubscribeDialog {
     pub created_at_unix: u64,
     /// Monotonic CSeq counter for NOTIFYs sent in this dialog.
     pub cseq: u32,
+    /// Monotonic event-package version counter — used in NOTIFY bodies that
+    /// require monotonicity (RFC 3680 reginfo `version=`, RFC 4235
+    /// dialog-info, RFC 4575 conference).  RFC 6665 §4.4.1 forbids
+    /// non-monotonic body versions, so this is persisted alongside the
+    /// dialog and survives restart when an L2 cache is configured.
+    #[serde(default)]
+    pub event_version: u32,
     /// Once true, the dialog is terminated and no further NOTIFYs may
     /// be sent.  Kept in the store briefly so late cross-instance
     /// lookups don't see a revived dialog.
@@ -82,6 +89,12 @@ impl SubscribeDialog {
     pub fn next_cseq(&mut self) -> u32 {
         self.cseq = self.cseq.saturating_add(1);
         self.cseq
+    }
+
+    /// Increment and return the next event-package body version.
+    pub fn next_event_version(&mut self) -> u32 {
+        self.event_version = self.event_version.saturating_add(1);
+        self.event_version
     }
 
     /// Refresh the created-at anchor (e.g. on SUBSCRIBE refresh).
@@ -239,6 +252,7 @@ mod tests {
             expires_secs: 3600,
             created_at_unix: unix_now(),
             cseq: 0,
+            event_version: 0,
             terminated: false,
         }
     }
@@ -271,6 +285,45 @@ mod tests {
             })
             .expect("dialog present");
         assert_eq!(updated.cseq, 1);
+    }
+
+    #[tokio::test]
+    async fn update_increments_event_version_independently_of_cseq() {
+        let store = SubscribeStore::new();
+        store.put(sample_dialog("abc"));
+
+        let after_first = store
+            .update("abc", |dialog| {
+                dialog.next_event_version();
+            })
+            .expect("dialog present");
+        assert_eq!(after_first.event_version, 1);
+        assert_eq!(after_first.cseq, 0, "event_version must not piggyback on CSeq");
+
+        let after_second = store
+            .update("abc", |dialog| {
+                dialog.next_event_version();
+            })
+            .expect("dialog present");
+        assert_eq!(after_second.event_version, 2);
+    }
+
+    #[test]
+    fn event_version_serde_default_for_legacy_payloads() {
+        // Older cached dialogs predating event_version are deserialised
+        // with the field defaulted to 0 — ensures we don't reject existing
+        // L2 cache entries on upgrade.
+        let legacy_json = r#"{
+            "id":"abc","call_id":"c1","local_tag":"l","remote_tag":"r",
+            "local_uri":"sip:s@example","remote_uri":"sip:c@example",
+            "remote_target":"sip:c@10.0.0.1","route_set":[],
+            "event":"reg","expires_secs":3600,"created_at_unix":1000,
+            "cseq":3,"terminated":false
+        }"#;
+        let dialog: SubscribeDialog =
+            serde_json::from_str(legacy_json).expect("legacy json parses");
+        assert_eq!(dialog.event_version, 0);
+        assert_eq!(dialog.cseq, 3);
     }
 
     #[tokio::test]

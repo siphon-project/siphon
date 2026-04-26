@@ -157,6 +157,7 @@ impl PySubscribeState {
             expires_secs,
             created_at_unix: now_unix(),
             cseq: 0,
+            event_version: 0,
             terminated: false,
         };
 
@@ -221,6 +222,43 @@ impl PySubscribeHandle {
     fn expires(&self) -> PyResult<u64> {
         let dialog = self.load_sync()?;
         Ok(dialog.remaining_secs())
+    }
+
+    /// Current event-package body version (monotonic NOTIFY body counter).
+    ///
+    /// Used for RFC 3680 reginfo, RFC 4235 dialog-info, RFC 4575 conference,
+    /// etc.  Persisted alongside the dialog so it survives restart when an
+    /// L2 cache is configured.  Read-only — call
+    /// :meth:`next_event_version` to advance it.
+    #[getter]
+    fn event_version(&self) -> PyResult<u32> {
+        let dialog = self.load_sync()?;
+        Ok(dialog.event_version)
+    }
+
+    /// Atomically increment and return the next event-package body version.
+    ///
+    /// Call before building a NOTIFY body that requires monotonicity (e.g.
+    /// the `version=` attribute on RFC 3680 reginfo).  Python usage:
+    ///
+    /// ```python
+    /// version = handle.next_event_version()
+    /// body = registrar.reginfo_xml(aor, state="full", version=version)
+    /// handle.notify(body=body, content_type="application/reginfo+xml")
+    /// ```
+    fn next_event_version(&self) -> PyResult<u32> {
+        // Hydrate L1 in case we're on a different worker than the creator.
+        let _ = self.load_sync()?;
+        let updated = self.store.update(&self.id, |dialog| {
+            dialog.next_event_version();
+        });
+        match updated {
+            Some(dialog) => Ok(dialog.event_version),
+            None => Err(pyo3::exceptions::PyLookupError::new_err(format!(
+                "subscribe_state dialog '{}' not found",
+                self.id
+            ))),
+        }
     }
 
     fn __repr__(&self) -> String {

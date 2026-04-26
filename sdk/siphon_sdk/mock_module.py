@@ -230,6 +230,30 @@ class MockSubscribeHandle:
     def expires(self) -> int:
         return int(self._dialog.get("expires_secs", 0))
 
+    @property
+    def event_version(self) -> int:
+        """Current event-package body version (read-only).
+
+        Mirrors the Rust ``SubscribeHandle.event_version`` — used for
+        RFC 3680 reginfo / RFC 4235 dialog-info / RFC 4575 conference
+        bodies that require a monotonic ``version=`` attribute.
+        """
+        return int(self._dialog.get("event_version", 0))
+
+    def next_event_version(self) -> int:
+        """Atomically increment and return the next event-package body version.
+
+        Call before building a NOTIFY body whose monotonicity matters::
+
+            version = handle.next_event_version()
+            body = registrar.reginfo_xml(aor, state="full", version=version)
+            handle.notify(body=body, content_type="application/reginfo+xml")
+        """
+        current = int(self._dialog.get("event_version", 0))
+        new_version = current + 1
+        self._dialog["event_version"] = new_version
+        return new_version
+
     def notify(self, body=None, content_type: Optional[str] = None,
                state: Optional[str] = None) -> bool:
         if self._id not in self._parent._dialogs:
@@ -283,6 +307,7 @@ class MockSubscribeState:
             "expires_secs": expires_secs,
             "call_id": getattr(request, "call_id", ""),
             "remote_tag": getattr(request, "from_tag", ""),
+            "event_version": 0,
         }
         self._dialogs[handle_id] = dialog
         return MockSubscribeHandle(self, handle_id, dialog)
