@@ -268,6 +268,8 @@ pub async fn run(
     )>,
     rtpengine_events_rx: tokio::sync::mpsc::Receiver<crate::rtpengine::events::RtpEngineEvent>,
     drain: Arc<DrainState>,
+    product_name: &'static str,
+    product_version: &'static str,
 ) {
     // Resolve the local address for Via insertion.
     // If bound to 0.0.0.0 / [::], use advertised_address from config, or loopback.
@@ -298,7 +300,7 @@ pub async fn run(
         local_addr
     };
 
-    let default_server = format!("SIPhon/{}", env!("CARGO_PKG_VERSION"));
+    let default_server = format!("{product_name}/{product_version}");
     let server_header = Some(
         config
             .server
@@ -366,7 +368,7 @@ pub async fn run(
         rtpengine_profiles,
         session_timer_config: config.session_timer.clone(),
         registrant_manager,
-        recording_manager: Arc::new(crate::siprec::RecordingManager::new()),
+        recording_manager: Arc::new(crate::siprec::RecordingManager::new(product_name, product_version)),
         li_siprec_srs_uri: config.lawful_intercept.as_ref()
             .and_then(|li| li.siprec.as_ref())
             .map(|siprec| siprec.srs_uri.clone()),
@@ -384,7 +386,7 @@ pub async fn run(
         nat_fix_contact: config.nat.as_ref().map(|n| n.fix_contact).unwrap_or(false),
         sdp_name: config.media.as_ref()
             .and_then(|m| m.sdp_name.clone())
-            .unwrap_or_else(|| "SIPhon".to_string()),
+            .unwrap_or_else(|| product_name.to_string()),
         call_event_receivers: Arc::new(DashMap::new()),
         reliable_provisionals: Arc::new(DashMap::new()),
         is_draining: drain.clone(),

@@ -92,21 +92,19 @@ pub struct RecordingManager {
     branch_to_session: DashMap<String, String>,
     /// CSeq counter for recording INVITEs.
     cseq_counter: AtomicU32,
-}
-
-impl Default for RecordingManager {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Default User-Agent value for recording INVITEs when the caller does
+    /// not pass one. Sourced from `SiphonServer::product()`.
+    default_user_agent: String,
 }
 
 impl RecordingManager {
-    pub fn new() -> Self {
+    pub fn new(product_name: &str, product_version: &str) -> Self {
         Self {
             sessions: DashMap::new(),
             call_sessions: DashMap::new(),
             branch_to_session: DashMap::new(),
             cseq_counter: AtomicU32::new(1),
+            default_user_agent: format!("{product_name}/{product_version}"),
         }
     }
 
@@ -244,7 +242,7 @@ impl RecordingManager {
             .header("Contact", format!("<sip:recorder@{local_addr}>"))
             .header("Content-Type", format!("multipart/mixed;boundary={boundary}"))
             .header("Require", "siprec".to_string())
-            .header("User-Agent", user_agent.unwrap_or(concat!("SIPhon/", env!("CARGO_PKG_VERSION"))).to_string())
+            .header("User-Agent", user_agent.unwrap_or(&self.default_user_agent).to_string())
             .max_forwards(70)
             .body(multipart_body)
             .build();
@@ -929,14 +927,14 @@ mod tests {
 
     #[test]
     fn recording_manager_new_is_empty() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         assert_eq!(manager.active_count(), 0);
         assert!(!manager.is_recording("call-1"));
     }
 
     #[test]
     fn start_recording_creates_session() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -985,7 +983,7 @@ mod tests {
 
     #[test]
     fn handle_success_activates_session() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1035,7 +1033,7 @@ mod tests {
 
     #[test]
     fn handle_success_ack_uses_tcp_when_srs_uri_requires_it() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1075,7 +1073,7 @@ mod tests {
 
     #[test]
     fn handle_failure_marks_failed() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1108,7 +1106,7 @@ mod tests {
 
     #[test]
     fn stop_recording_sends_bye() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1152,14 +1150,14 @@ mod tests {
 
     #[test]
     fn stop_recording_no_op_for_non_active() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let bye_messages = manager.stop_recording("no-such-call", "10.0.0.1:5060".parse().unwrap());
         assert!(bye_messages.is_empty());
     }
 
     #[test]
     fn session_for_branch_routing() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1426,7 +1424,7 @@ mod tests {
 
     #[test]
     fn multiple_recordings_per_call() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1481,7 +1479,7 @@ mod tests {
 
     #[test]
     fn start_recording_transport_tcp() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1522,7 +1520,7 @@ mod tests {
 
     #[test]
     fn start_recording_uri_no_transport_param() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1560,7 +1558,7 @@ mod tests {
 
     #[test]
     fn start_recording_uri_default_port() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1591,7 +1589,7 @@ mod tests {
 
     #[test]
     fn stop_recording_bye_uses_correct_transport() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1632,7 +1630,7 @@ mod tests {
 
     #[test]
     fn start_recording_uses_configured_user_agent() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1780,7 +1778,7 @@ mod tests {
 
     #[test]
     fn start_recording_dual_sdp_produces_two_m_lines() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let fallback_sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
@@ -1856,7 +1854,7 @@ mod tests {
 
     #[test]
     fn start_recording_single_sdp_fallback() {
-        let manager = RecordingManager::new();
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
         let fallback_sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 10.0.0.1\r\n",
