@@ -476,6 +476,30 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
             SiphonError::Script(format!("failed to create siphon module: {error}"))
         })?;
 
+    // Register pyclasses as top-level attributes on the `siphon` module
+    // so scripts can `from siphon import Transform, SecurityOffer, …`
+    // without going through a singleton.  Without these, the types are
+    // defined but unreachable from Python — `Transform.HmacSha1_96Null`
+    // can't be evaluated because there's no `Transform` symbol in scope.
+    module
+        .add_class::<ipsec::PyTransform>()
+        .map_err(|error| SiphonError::Script(format!("add_class Transform: {error}")))?;
+    module
+        .add_class::<ipsec::PySecurityOffer>()
+        .map_err(|error| SiphonError::Script(format!("add_class SecurityOffer: {error}")))?;
+    module
+        .add_class::<ipsec::PyAuthVectorHandle>()
+        .map_err(|error| SiphonError::Script(format!("add_class AuthVectorHandle: {error}")))?;
+    module
+        .add_class::<ipsec::PyPendingSA>()
+        .map_err(|error| SiphonError::Script(format!("add_class PendingSA: {error}")))?;
+    module
+        .add_class::<ipsec::PySecurityServerParams>()
+        .map_err(|error| SiphonError::Script(format!("add_class SecurityServerParams: {error}")))?;
+    module
+        .add_class::<ipsec::PySAHandle>()
+        .map_err(|error| SiphonError::Script(format!("add_class SAHandle: {error}")))?;
+
     // If Rust singletons are available, inject them now — before any user
     // script does `from siphon import auth`.
     if let Some((auth_py, reg_py, log_py, proxy_utils_py, cache_py)) = RUST_SINGLETONS.get() {

@@ -17,7 +17,7 @@ Equivalent to: opensips_ims_pcscf/opensips.cfg from docker_open5gs
 
 Config: examples/ims_pcscf.yaml
 """
-from siphon import proxy, registrar, ipsec, diameter, log
+from siphon import proxy, registrar, ipsec, diameter, log, Transform
 
 REALM = "ims.example.com"
 PCSCF_URI = f"sip:{REALM};lr"
@@ -28,8 +28,8 @@ rx_sessions = {}
 
 # Operator transform policy — first one acceptable to the UE wins.
 PREFERRED_TRANSFORMS = [
-    ipsec.Transform.HmacSha1_96Null,
-    ipsec.Transform.HmacMd5_96Null,
+    Transform.HmacSha1_96Null,
+    Transform.HmacMd5_96Null,
 ]
 
 

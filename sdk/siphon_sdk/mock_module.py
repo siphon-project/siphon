@@ -3604,6 +3604,16 @@ def install() -> ModuleType:
     mod.ipsec = _ipsec  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
 
+    # IPsec types — exposed at top level so scripts can do
+    # `from siphon import Transform, SecurityOffer, …` (matching the
+    # Rust binding's `module.add_class::<…>()` registration).
+    mod.Transform = _TransformEnum  # type: ignore[attr-defined]
+    mod.SecurityOffer = MockSecurityOffer  # type: ignore[attr-defined]
+    mod.AuthVectorHandle = MockAuthVectorHandle  # type: ignore[attr-defined]
+    mod.PendingSA = MockPendingSA  # type: ignore[attr-defined]
+    mod.SecurityServerParams = MockSecurityServerParams  # type: ignore[attr-defined]
+    mod.SAHandle = MockSAHandle  # type: ignore[attr-defined]
+
     # Also install the _siphon_registry mock
     registry_mod = ModuleType("_siphon_registry")
     registry_mod.register = _registry.register  # type: ignore[attr-defined]
