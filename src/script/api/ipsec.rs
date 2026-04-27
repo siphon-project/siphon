@@ -1,0 +1,1271 @@
+//! Python-callable IMS-AKA + IPsec sec-agree primitives (3GPP TS 33.203).
+//!
+//! Exposed to scripts as ``siphon.ipsec`` plus a handful of method/property
+//! additions on :class:`Request` and :class:`Reply`.  Layered on top of the
+//! existing [`crate::ipsec::IpsecManager`] which performs the actual kernel
+//! ``ip xfrm`` calls.
+//!
+//! Lifecycle (Phase 1):
+//!
+//! 1. ``request.parse_security_client()`` — parse the UE's
+//!    ``Security-Client`` header into a list of :class:`SecurityOffer`.
+//!    Each offer carries the UE address from ``request.source_ip``, so it
+//!    is enough on its own to fully describe the UE side of the SA pair.
+//! 2. ``reply.take_av()`` — on the relayed 401 from the S-CSCF, extract
+//!    ``ck=``/``ik=`` from any auth header and **strip them in place** so
+//!    they don't leak to the access side.  Returns an opaque
+//!    :class:`AuthVectorHandle`.
+//! 3. ``ipsec.allocate(av, offer, transform)`` — consume the AV, allocate
+//!    SPIs, install the four XFRM SAs and policies, return a
+//!    :class:`PendingSA`.
+//! 4. ``pending.security_server_params()`` — produce the
+//!    ``Security-Server`` parameters; the script formats and injects the
+//!    header on the relayed 401.
+//! 5. ``ipsec.stash(call_id, pending)`` — keep the PendingSA alive across
+//!    the second REGISTER round-trip (TTL default 30 s; abandoned entries
+//!    auto-cleanup).
+//! 6. On 200 OK to the auth REGISTER: ``ipsec.unstash(call_id).activate()``
+//!    (state transition; SAs were already installed in step 3).
+//! 7. On de-REGISTER: ``pending.cleanup()`` (or auto-cleanup via the
+//!    dispatcher de-register hook).
+//!
+//! What's intentionally *not* in this module today (Phase 2/3 deferrals):
+//!
+//! * HMAC-SHA-256 / AES-CBC transforms.
+//! * 3GPP TS 33.203 Annex H key derivation (we use raw CK/IK with
+//!   zero-padding, matching the existing ``IpsecManager`` behaviour).
+//! * Replacement of ``ip xfrm`` shell-out with rtnetlink.
+//! * Real ``request.is_ipsec_protected`` / ``request.matched_sa`` — these
+//!   getters are stubbed (always ``False``/``None``) until the transport
+//!   layer plumbs the SA discriminator through.
+
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
+use pyo3::prelude::*;
+use pyo3_async_runtimes::tokio::future_into_py;
+use tracing::{debug, info, warn};
+
+use crate::config::IpsecConfig;
+use crate::ipsec::{
+    EncryptionAlgorithm, IntegrityAlgorithm, IpsecError, IpsecManager,
+    SecurityAssociationPair, SecurityClient,
+};
+
+/// Default TTL for a stashed PendingSA awaiting the auth REGISTER round-trip.
+const DEFAULT_STASH_TTL: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
+// Direct Rust-side accessors for the IpsecManager + IpsecConfig.
+//
+// Used by `PyRequest::is_ipsec_protected` and `PyRequest::matched_sa` to
+// look up whether the request arrived on a protected port and whether it
+// matches an active SA — both without holding the GIL or descending into
+// the Python type system.
+// ---------------------------------------------------------------------------
+
+static IPSEC_MANAGER_REF: OnceLock<Arc<IpsecManager>> = OnceLock::new();
+static IPSEC_CONFIG_REF: OnceLock<Arc<IpsecConfig>> = OnceLock::new();
+
+/// Whether the given local port matches one of the configured P-CSCF
+/// protected ports (`pcscf_port_c` / `pcscf_port_s`).  Returns `false`
+/// when no IPsec config is wired (i.e. siphon is not running as P-CSCF).
+pub fn is_protected_local_port(local_port: u16) -> bool {
+    match IPSEC_CONFIG_REF.get() {
+        Some(config) => local_port == config.pcscf_port_c || local_port == config.pcscf_port_s,
+        None => false,
+    }
+}
+
+/// Find the active SA pair (if any) matching the given UE address and
+/// source port.  The UE may be sending from either its client port
+/// (`ue_port_c`) or its server port (`ue_port_s`); we try both keys
+/// (cheap DashMap walk over the small number of currently-active SAs).
+pub fn find_sa_for_ue(ue_addr: &IpAddr, ue_port: u16) -> Option<SecurityAssociationPair> {
+    let manager = IPSEC_MANAGER_REF.get()?;
+    // Direct hit on the (ue_addr, ue_port_c) key — the common case where
+    // the UE is sending requests from its client port to our server port.
+    if let Some(sa) = manager.get_sa(ue_addr, ue_port) {
+        return Some(sa);
+    }
+    // Otherwise the UE may be sending replies from its server port — walk
+    // for a match on `ue_port_s`.
+    manager.find_sa_by_ue(ue_addr, ue_port)
+}
+
+// ---------------------------------------------------------------------------
+// SecurityOffer — parsed UE proposal from the Security-Client header.
+// ---------------------------------------------------------------------------
+
+/// One UE-side IPsec proposal from a ``Security-Client`` header
+/// (3GPP TS 33.203 §6.1, RFC 3329).  A header may carry multiple
+/// comma-separated offers; each is exposed as one :class:`SecurityOffer`.
+#[pyclass(name = "SecurityOffer")]
+#[derive(Clone, Debug)]
+pub struct PySecurityOffer {
+    /// Security mechanism, typically ``"ipsec-3gpp"``.
+    #[pyo3(get)]
+    pub mechanism: String,
+    /// Integrity algorithm, e.g. ``"hmac-sha-1-96"``.
+    #[pyo3(get)]
+    pub alg: String,
+    /// Encryption algorithm.  Always a string — ``"null"`` when the UE
+    /// did not propose encryption (most common case for IMS-AKA).
+    #[pyo3(get)]
+    pub ealg: String,
+    /// Client SPI proposed by the UE.
+    #[pyo3(get)]
+    pub spi_c: u32,
+    /// Server SPI proposed by the UE.
+    #[pyo3(get)]
+    pub spi_s: u32,
+    /// Client port proposed by the UE.
+    #[pyo3(get)]
+    pub port_c: u16,
+    /// Server port proposed by the UE.
+    #[pyo3(get)]
+    pub port_s: u16,
+    /// UE source address (string), captured from
+    /// ``request.source_ip`` at parse time.
+    #[pyo3(get)]
+    pub ue_addr: String,
+}
+
+impl PySecurityOffer {
+    pub(crate) fn from_security_client(client: SecurityClient, ue_addr: &str) -> Self {
+        Self {
+            mechanism: client.mechanism,
+            alg: client.algorithm,
+            ealg: client.ealg.unwrap_or_else(|| "null".to_string()),
+            spi_c: client.spi_c,
+            spi_s: client.spi_s,
+            port_c: client.port_c,
+            port_s: client.port_s,
+            ue_addr: ue_addr.to_string(),
+        }
+    }
+}
+
+#[pymethods]
+impl PySecurityOffer {
+    fn __repr__(&self) -> String {
+        format!(
+            "SecurityOffer(mechanism={:?}, alg={:?}, ealg={:?}, spi_c={}, spi_s={}, port_c={}, port_s={}, ue_addr={:?})",
+            self.mechanism,
+            self.alg,
+            self.ealg,
+            self.spi_c,
+            self.spi_s,
+            self.port_c,
+            self.port_s,
+            self.ue_addr,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transform — operator-policy choice, exposed as a Python enum.
+// ---------------------------------------------------------------------------
+
+/// Operator policy choice for which IPsec transform to install.
+///
+/// Phase 1 shipped the two NULL-encryption transforms we already had
+/// kernel ``xfrm`` algorithm names for.  Phase 2 adds:
+///
+/// * HMAC-SHA-256-128 integrity (RFC 4868) — required for newer IMS
+///   profiles, with 256-bit keys derived via 3GPP TS 33.203 Annex H.
+/// * AES-CBC-128 encryption variants for confidentiality.
+///
+/// All transforms install identical xfrm policies; only the algorithm
+/// IDs and key material change.
+#[pyclass(name = "Transform", eq, eq_int)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PyTransform {
+    /// HMAC-SHA-1-96 integrity, NULL encryption.
+    HmacSha1_96Null,
+    /// HMAC-MD5-96 integrity, NULL encryption.
+    HmacMd5_96Null,
+    /// HMAC-SHA-256-128 integrity, NULL encryption.
+    HmacSha256_128Null,
+    /// HMAC-SHA-1-96 integrity, AES-CBC-128 encryption.
+    HmacSha1_96AesCbc128,
+    /// HMAC-MD5-96 integrity, AES-CBC-128 encryption.
+    HmacMd5_96AesCbc128,
+    /// HMAC-SHA-256-128 integrity, AES-CBC-128 encryption.
+    HmacSha256_128AesCbc128,
+}
+
+impl PyTransform {
+    fn aalg(&self) -> IntegrityAlgorithm {
+        match self {
+            PyTransform::HmacSha1_96Null | PyTransform::HmacSha1_96AesCbc128 => {
+                IntegrityAlgorithm::HmacSha1
+            }
+            PyTransform::HmacMd5_96Null | PyTransform::HmacMd5_96AesCbc128 => {
+                IntegrityAlgorithm::HmacMd5
+            }
+            PyTransform::HmacSha256_128Null | PyTransform::HmacSha256_128AesCbc128 => {
+                IntegrityAlgorithm::HmacSha256
+            }
+        }
+    }
+
+    fn ealg(&self) -> EncryptionAlgorithm {
+        match self {
+            PyTransform::HmacSha1_96Null
+            | PyTransform::HmacMd5_96Null
+            | PyTransform::HmacSha256_128Null => EncryptionAlgorithm::Null,
+            PyTransform::HmacSha1_96AesCbc128
+            | PyTransform::HmacMd5_96AesCbc128
+            | PyTransform::HmacSha256_128AesCbc128 => EncryptionAlgorithm::AesCbc128,
+        }
+    }
+
+    fn alg_str(&self) -> &'static str {
+        match self {
+            PyTransform::HmacSha1_96Null | PyTransform::HmacSha1_96AesCbc128 => "hmac-sha-1-96",
+            PyTransform::HmacMd5_96Null | PyTransform::HmacMd5_96AesCbc128 => "hmac-md5-96",
+            PyTransform::HmacSha256_128Null | PyTransform::HmacSha256_128AesCbc128 => {
+                "hmac-sha-256-128"
+            }
+        }
+    }
+
+    fn ealg_str(&self) -> &'static str {
+        match self {
+            PyTransform::HmacSha1_96Null
+            | PyTransform::HmacMd5_96Null
+            | PyTransform::HmacSha256_128Null => "null",
+            PyTransform::HmacSha1_96AesCbc128
+            | PyTransform::HmacMd5_96AesCbc128
+            | PyTransform::HmacSha256_128AesCbc128 => "aes-cbc",
+        }
+    }
+}
+
+#[pymethods]
+impl PyTransform {
+    /// Whether this transform is compatible with the UE's offer.
+    ///
+    /// True when the offer's ``alg`` and ``ealg`` strings match
+    /// (case-insensitive).  Empty/missing ``ealg`` on the offer is
+    /// treated as ``"null"`` (most IMS UEs do not advertise an ealg
+    /// when they want NULL encryption).
+    pub fn compatible_with(&self, offer: &PySecurityOffer) -> bool {
+        let offer_alg = offer.alg.to_lowercase();
+        let offer_ealg = offer.ealg.to_lowercase();
+        let want_ealg = self.ealg_str();
+        offer_alg == self.alg_str()
+            && (offer_ealg == want_ealg
+                || (offer_ealg.is_empty() && want_ealg == "null"))
+    }
+
+    fn __repr__(&self) -> String {
+        match self {
+            PyTransform::HmacSha1_96Null => "Transform.HmacSha1_96Null".to_string(),
+            PyTransform::HmacMd5_96Null => "Transform.HmacMd5_96Null".to_string(),
+            PyTransform::HmacSha256_128Null => "Transform.HmacSha256_128Null".to_string(),
+            PyTransform::HmacSha1_96AesCbc128 => "Transform.HmacSha1_96AesCbc128".to_string(),
+            PyTransform::HmacMd5_96AesCbc128 => "Transform.HmacMd5_96AesCbc128".to_string(),
+            PyTransform::HmacSha256_128AesCbc128 => {
+                "Transform.HmacSha256_128AesCbc128".to_string()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AuthVectorHandle — opaque key-material container.
+// ---------------------------------------------------------------------------
+
+/// Opaque handle carrying the CK/IK pair extracted from a relayed 401.
+///
+/// No Python-side accessor returns the raw bytes.  The handle is consumed
+/// by :func:`siphon.ipsec.allocate`; calling ``allocate`` twice with the
+/// same handle raises :class:`ValueError`.
+#[pyclass(name = "AuthVectorHandle")]
+pub struct PyAuthVectorHandle {
+    inner: Mutex<Option<AuthVectorBytes>>,
+}
+
+pub struct AuthVectorBytes {
+    pub ck: [u8; 16],
+    pub ik: [u8; 16],
+}
+
+impl Drop for AuthVectorBytes {
+    fn drop(&mut self) {
+        // Best-effort zeroize — no `zeroize` crate dependency for one struct.
+        for byte in self.ck.iter_mut() {
+            *byte = 0;
+        }
+        for byte in self.ik.iter_mut() {
+            *byte = 0;
+        }
+    }
+}
+
+impl PyAuthVectorHandle {
+    pub fn new(ck: [u8; 16], ik: [u8; 16]) -> Self {
+        Self {
+            inner: Mutex::new(Some(AuthVectorBytes { ck, ik })),
+        }
+    }
+
+    /// Take the bytes out of the handle, leaving it empty.  Returns
+    /// ``None`` if already consumed.  Rust-only — never exposed to Python.
+    pub fn take(&self) -> Option<AuthVectorBytes> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.take()
+    }
+}
+
+#[pymethods]
+impl PyAuthVectorHandle {
+    fn __repr__(&self) -> String {
+        let consumed = self
+            .inner
+            .lock()
+            .map(|guard| guard.is_none())
+            .unwrap_or(true);
+        if consumed {
+            "AuthVectorHandle(<consumed>)".to_string()
+        } else {
+            "AuthVectorHandle(<128-bit CK + 128-bit IK>)".to_string()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SAHandle — read-only view of an active SA, returned by request.matched_sa.
+// ---------------------------------------------------------------------------
+
+/// Read-only handle to the IPsec SA pair that decrypted an incoming
+/// protected request.  Distinct from :class:`PendingSA` (which is
+/// script-owned and supports lifecycle transitions); this handle is
+/// purely informational — for logging, metrics, audit trail, etc.
+#[pyclass(name = "SAHandle")]
+#[derive(Clone, Debug)]
+pub struct PySAHandle {
+    #[pyo3(get)]
+    ue_addr: String,
+    #[pyo3(get)]
+    pcscf_addr: String,
+    #[pyo3(get)]
+    ue_port_c: u16,
+    #[pyo3(get)]
+    ue_port_s: u16,
+    #[pyo3(get)]
+    pcscf_port_c: u16,
+    #[pyo3(get)]
+    pcscf_port_s: u16,
+    #[pyo3(get)]
+    spi_uc: u32,
+    #[pyo3(get)]
+    spi_us: u32,
+    #[pyo3(get)]
+    spi_pc: u32,
+    #[pyo3(get)]
+    spi_ps: u32,
+    #[pyo3(get)]
+    alg: String,
+    #[pyo3(get)]
+    ealg: String,
+}
+
+impl PySAHandle {
+    pub fn from_sa(sa: &SecurityAssociationPair) -> Self {
+        Self {
+            ue_addr: sa.ue_addr.to_string(),
+            pcscf_addr: sa.pcscf_addr.to_string(),
+            ue_port_c: sa.ue_port_c,
+            ue_port_s: sa.ue_port_s,
+            pcscf_port_c: sa.pcscf_port_c,
+            pcscf_port_s: sa.pcscf_port_s,
+            spi_uc: sa.spi_uc,
+            spi_us: sa.spi_us,
+            spi_pc: sa.spi_pc,
+            spi_ps: sa.spi_ps,
+            alg: format!("{}", sa.aalg),
+            ealg: format!("{}", sa.ealg),
+        }
+    }
+}
+
+#[pymethods]
+impl PySAHandle {
+    fn __repr__(&self) -> String {
+        format!(
+            "SAHandle(ue={}:{}, pcscf={}:{}, spi_pc={}, spi_ps={}, alg={:?}, ealg={:?})",
+            self.ue_addr,
+            self.ue_port_c,
+            self.pcscf_addr,
+            self.pcscf_port_c,
+            self.spi_pc,
+            self.spi_ps,
+            self.alg,
+            self.ealg,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecurityServerParams — what the script needs to format the response header.
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the chosen ``Security-Server`` parameters after
+/// :func:`siphon.ipsec.allocate` has run.  All fields are read-only.
+#[pyclass(name = "SecurityServerParams")]
+#[derive(Clone, Debug)]
+pub struct PySecurityServerParams {
+    /// Always ``"ipsec-3gpp"`` in Phase 1.
+    #[pyo3(get)]
+    pub mechanism: String,
+    /// Integrity algorithm name as it should appear in the
+    /// ``Security-Server`` header (e.g. ``"hmac-sha-1-96"``).
+    #[pyo3(get)]
+    pub alg: String,
+    /// Encryption algorithm name (e.g. ``"null"``).
+    #[pyo3(get)]
+    pub ealg: String,
+    /// P-CSCF client SPI.
+    #[pyo3(get)]
+    pub spi_c: u32,
+    /// P-CSCF server SPI.
+    #[pyo3(get)]
+    pub spi_s: u32,
+    /// P-CSCF protected client port (shared across all UEs — see
+    /// ``ipsec.pcscf_port_c`` in ``siphon.yaml``).
+    #[pyo3(get)]
+    pub port_c: u16,
+    /// P-CSCF protected server port.
+    #[pyo3(get)]
+    pub port_s: u16,
+}
+
+#[pymethods]
+impl PySecurityServerParams {
+    fn __repr__(&self) -> String {
+        format!(
+            "SecurityServerParams(mechanism={:?}, alg={:?}, ealg={:?}, spi_c={}, spi_s={}, port_c={}, port_s={})",
+            self.mechanism,
+            self.alg,
+            self.ealg,
+            self.spi_c,
+            self.spi_s,
+            self.port_c,
+            self.port_s,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PendingSA — handle for a freshly-installed but not-yet-acknowledged SA pair.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingState {
+    Pending,
+    Active,
+    Cleaned,
+}
+
+struct PendingSAInner {
+    manager: Arc<IpsecManager>,
+    sa: SecurityAssociationPair,
+    params: PySecurityServerParams,
+    state: PendingState,
+}
+
+/// Handle to an installed-but-not-yet-confirmed pair of IPsec SAs.
+///
+/// Keeps the four kernel ``xfrm`` states + four policies installed by
+/// :func:`siphon.ipsec.allocate` reachable for header-formatting (via
+/// :meth:`security_server_params`) and lifecycle transitions
+/// (:meth:`activate`, :meth:`cleanup`, :meth:`refresh`).
+#[pyclass(name = "PendingSA")]
+pub struct PyPendingSA {
+    inner: Arc<Mutex<PendingSAInner>>,
+}
+
+impl PyPendingSA {
+    fn new(
+        manager: Arc<IpsecManager>,
+        sa: SecurityAssociationPair,
+        params: PySecurityServerParams,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(PendingSAInner {
+                manager,
+                sa,
+                params,
+                state: PendingState::Pending,
+            })),
+        }
+    }
+}
+
+#[pymethods]
+impl PyPendingSA {
+    /// The chosen ``Security-Server`` parameters — feed these into the
+    /// header you set on the relayed 401.
+    fn security_server_params(&self) -> PyResult<PySecurityServerParams> {
+        let guard = self.inner.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "PendingSA lock poisoned: {error}"
+            ))
+        })?;
+        Ok(guard.params.clone())
+    }
+
+    /// Mark the SA pair active.  Call on receipt of the 200 OK to the auth
+    /// REGISTER (the SAs are already installed in the kernel — this is a
+    /// metadata-only transition).  Idempotent on repeated calls; raises
+    /// :class:`ValueError` if the PendingSA was already cleaned up.
+    fn activate(&self) -> PyResult<()> {
+        let mut guard = self.inner.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "PendingSA lock poisoned: {error}"
+            ))
+        })?;
+        if guard.state == PendingState::Cleaned {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "PendingSA already cleaned up",
+            ));
+        }
+        guard.state = PendingState::Active;
+        info!(
+            spi_pc = guard.sa.spi_pc,
+            spi_ps = guard.sa.spi_ps,
+            ue = %guard.sa.ue_addr,
+            "ipsec.PendingSA: activated"
+        );
+        Ok(())
+    }
+
+    /// Whether this PendingSA is in the active state.
+    #[getter]
+    fn is_active(&self) -> PyResult<bool> {
+        let guard = self.inner.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "PendingSA lock poisoned: {error}"
+            ))
+        })?;
+        Ok(guard.state == PendingState::Active)
+    }
+
+    /// Whether this PendingSA has been torn down.
+    #[getter]
+    fn is_cleaned(&self) -> PyResult<bool> {
+        let guard = self.inner.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "PendingSA lock poisoned: {error}"
+            ))
+        })?;
+        Ok(guard.state == PendingState::Cleaned)
+    }
+
+    /// Tear down all four XFRM states + policies for this pair.
+    /// Idempotent — calling on an already-cleaned PendingSA is a no-op.
+    fn cleanup<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        future_into_py(python, async move {
+            let (manager, ue_addr, ue_port_c, already_cleaned) = {
+                let mut guard = inner.lock().map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "PendingSA lock poisoned: {error}"
+                    ))
+                })?;
+                let already = guard.state == PendingState::Cleaned;
+                let manager = Arc::clone(&guard.manager);
+                let ue_addr = guard.sa.ue_addr;
+                let ue_port_c = guard.sa.ue_port_c;
+                if !already {
+                    guard.state = PendingState::Cleaned;
+                }
+                (manager, ue_addr, ue_port_c, already)
+            };
+            if already_cleaned {
+                return Ok(());
+            }
+            if let Err(error) = manager.delete_sa_pair(&ue_addr, ue_port_c).await {
+                warn!(%error, ue = %ue_addr, "ipsec.PendingSA.cleanup: delete failed");
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "delete_sa_pair failed: {error}"
+                )));
+            }
+            debug!(ue = %ue_addr, ue_port_c, "ipsec.PendingSA: cleaned up");
+            Ok(())
+        })
+    }
+
+    /// Re-key the SA pair for a re-REGISTER under the same Call-ID.
+    ///
+    /// Phase 1 implementation: tears down the existing pair and reinstalls
+    /// it with the same UE/P-CSCF ports and SPIs but fresh CK/IK.  SPI/port
+    /// reuse keeps the UE's selectors stable; only the keys change.
+    fn refresh<'py>(
+        &self,
+        python: Python<'py>,
+        av_new: Bound<'py, PyAuthVectorHandle>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let new_keys = av_new.borrow().take().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("AuthVectorHandle already consumed")
+        })?;
+        let inner = Arc::clone(&self.inner);
+        future_into_py(python, async move {
+            let manager;
+            let mut sa_new;
+            {
+                let guard = inner.lock().map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "PendingSA lock poisoned: {error}"
+                    ))
+                })?;
+                if guard.state == PendingState::Cleaned {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "PendingSA already cleaned up",
+                    ));
+                }
+                manager = Arc::clone(&guard.manager);
+                sa_new = guard.sa.clone();
+            }
+            // Tear down the old SAs first; ignore errors (xfrm may have
+            // already lost them — we still want the new ones to land).
+            if let Err(error) = manager.delete_sa_pair(&sa_new.ue_addr, sa_new.ue_port_c).await {
+                debug!(
+                    %error,
+                    "ipsec.PendingSA.refresh: prior delete_sa_pair returned error (ignored)"
+                );
+            }
+            sa_new.integrity_key = hex_encode(&new_keys.ik);
+            sa_new.encryption_key = if sa_new.ealg == EncryptionAlgorithm::Null {
+                String::new()
+            } else {
+                hex_encode(&new_keys.ck)
+            };
+            manager
+                .create_sa_pair(sa_new.clone())
+                .await
+                .map_err(map_ipsec_error)?;
+            {
+                let mut guard = inner.lock().map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "PendingSA lock poisoned: {error}"
+                    ))
+                })?;
+                guard.sa = sa_new;
+            }
+            Ok(())
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return "PendingSA(<lock-poisoned>)".to_string(),
+        };
+        format!(
+            "PendingSA(state={:?}, ue={}, ue_port_c={}, spi_pc={}, spi_ps={})",
+            guard.state, guard.sa.ue_addr, guard.sa.ue_port_c, guard.sa.spi_pc, guard.sa.spi_ps,
+        )
+    }
+}
+
+fn map_ipsec_error(error: IpsecError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("IPsec allocate failed: {error}"))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// PyIpsec — the singleton injected as ``siphon.ipsec``.
+// ---------------------------------------------------------------------------
+
+struct StashEntry {
+    pending: Py<PyPendingSA>,
+    expires_at: Instant,
+}
+
+/// Python-visible namespace.
+#[pyclass(name = "Ipsec")]
+pub struct PyIpsec {
+    manager: Arc<IpsecManager>,
+    config: Arc<IpsecConfig>,
+    /// Local P-CSCF address.  Captured at startup from the listener
+    /// configuration.
+    pcscf_addr: IpAddr,
+    /// Stash for PendingSAs awaiting the auth REGISTER round-trip.
+    stash: Arc<DashMap<String, StashEntry>>,
+    /// TTL for stashed entries.
+    stash_ttl: Duration,
+}
+
+impl PyIpsec {
+    pub fn new(manager: Arc<IpsecManager>, config: Arc<IpsecConfig>, pcscf_addr: IpAddr) -> Self {
+        // Wire up the direct Rust-side accessors so `PyRequest`'s
+        // `is_ipsec_protected` and `matched_sa` getters can resolve
+        // without going through the Python type system.  Idempotent —
+        // safe to call multiple times (only the first wins).
+        let _ = IPSEC_MANAGER_REF.set(Arc::clone(&manager));
+        let _ = IPSEC_CONFIG_REF.set(Arc::clone(&config));
+        Self {
+            manager,
+            config,
+            pcscf_addr,
+            stash: Arc::new(DashMap::new()),
+            stash_ttl: DEFAULT_STASH_TTL,
+        }
+    }
+}
+
+#[pymethods]
+impl PyIpsec {
+    /// The configured P-CSCF protected client port (shared across all UEs).
+    #[getter]
+    fn pcscf_port_c(&self) -> u16 {
+        self.config.pcscf_port_c
+    }
+
+    /// The configured P-CSCF protected server port (shared across all UEs).
+    #[getter]
+    fn pcscf_port_s(&self) -> u16 {
+        self.config.pcscf_port_s
+    }
+
+    /// Number of PendingSAs currently stashed awaiting the auth REGISTER.
+    #[getter]
+    fn stash_size(&self) -> usize {
+        self.stash.len()
+    }
+
+    /// Number of active SA pairs in the kernel (across all UEs).
+    #[getter]
+    fn active_count(&self) -> usize {
+        self.manager.active_count()
+    }
+
+    /// Allocate SPIs and install the four IPsec SAs + four policies in the
+    /// kernel.  Consumes ``av``.  Returns a :class:`PendingSA`.
+    ///
+    /// ``expires_secs`` (optional) sets a kernel-enforced hard lifetime on
+    /// each of the four SAs.  Pass the SIP registration's ``expires`` to
+    /// tie SA lifetime to the registration per 3GPP TS 33.203 §7.4 — once
+    /// the kernel marks the SA expired, no further packets decrypt and
+    /// the script must allocate fresh SAs on re-REGISTER.  Default is
+    /// ``None`` (no kernel-enforced expiry).
+    ///
+    /// Raises :class:`ValueError` when ``av`` was already consumed, when
+    /// the chosen ``transform`` is not compatible with ``offer``, or when
+    /// ``offer.ue_addr`` is not a valid IP literal.
+    /// Raises :class:`RuntimeError` on kernel/SPI failures.
+    #[pyo3(signature = (av, offer, transform, expires_secs=None))]
+    fn allocate<'py>(
+        &self,
+        python: Python<'py>,
+        av: Bound<'py, PyAuthVectorHandle>,
+        offer: PySecurityOffer,
+        transform: PyTransform,
+        expires_secs: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !transform.compatible_with(&offer) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "transform {:?} not compatible with offer alg={:?} ealg={:?}",
+                transform, offer.alg, offer.ealg
+            )));
+        }
+        let keys = av.borrow().take().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("AuthVectorHandle already consumed")
+        })?;
+        let ue_addr: IpAddr = offer.ue_addr.parse().map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "offer.ue_addr {:?} is not a valid IP: {error}",
+                offer.ue_addr
+            ))
+        })?;
+        let manager = Arc::clone(&self.manager);
+        let pcscf_addr = self.pcscf_addr;
+        let pcscf_port_c = self.config.pcscf_port_c;
+        let pcscf_port_s = self.config.pcscf_port_s;
+
+        future_into_py(python, async move {
+            let (spi_pc, spi_ps) = manager.allocate_spi_pair();
+            let aalg = transform.aalg();
+            let ealg = transform.ealg();
+
+            // 3GPP TS 33.203 Annex H key derivation — produces a key
+            // matching the algorithm's required length.  Falls back to
+            // raw IK on derivation failure (which only happens with a
+            // non-128-bit IK, never in practice for IMS-AKA).
+            let integrity_bytes = crate::ipsec::IpsecManager::derive_integrity_key(aalg, &keys.ik)
+                .unwrap_or_else(|| keys.ik.to_vec());
+            let integrity_key = crate::ipsec::bytes_to_hex(&integrity_bytes);
+            let encryption_key = if ealg == EncryptionAlgorithm::Null {
+                String::new()
+            } else {
+                // AES-CBC-128 key — first 16 bytes of CK directly.
+                crate::ipsec::bytes_to_hex(&keys.ck)
+            };
+            let sa = SecurityAssociationPair {
+                ue_addr,
+                pcscf_addr,
+                ue_port_c: offer.port_c,
+                ue_port_s: offer.port_s,
+                pcscf_port_c,
+                pcscf_port_s,
+                spi_uc: offer.spi_c,
+                spi_us: offer.spi_s,
+                spi_pc,
+                spi_ps,
+                ealg,
+                aalg,
+                encryption_key,
+                integrity_key,
+                hard_lifetime_secs: expires_secs,
+            };
+            manager
+                .create_sa_pair(sa.clone())
+                .await
+                .map_err(map_ipsec_error)?;
+            let params = PySecurityServerParams {
+                mechanism: "ipsec-3gpp".to_string(),
+                alg: transform.alg_str().to_string(),
+                ealg: transform.ealg_str().to_string(),
+                spi_c: spi_pc,
+                spi_s: spi_ps,
+                port_c: pcscf_port_c,
+                port_s: pcscf_port_s,
+            };
+            let pending = PyPendingSA::new(manager, sa, params);
+            Python::attach(|python| Py::new(python, pending))
+        })
+    }
+
+    /// Stash a :class:`PendingSA` under ``call_id`` so it survives until the
+    /// auth REGISTER round-trip.  Replaces any prior entry under the same
+    /// key (which is auto-cleaned).  Auto-cleanup of the stashed entry
+    /// fires after the configured TTL (default 30 s).
+    fn stash(&self, call_id: String, pending: Py<PyPendingSA>) {
+        let expires_at = Instant::now() + self.stash_ttl;
+        let entry = StashEntry { pending, expires_at };
+        if let Some(prior) = self.stash.insert(call_id.clone(), entry) {
+            spawn_pending_cleanup(prior.pending);
+        }
+
+        let stash = Arc::clone(&self.stash);
+        let ttl = self.stash_ttl;
+        tokio::spawn(async move {
+            tokio::time::sleep(ttl).await;
+            if let Some((_, expired)) = stash.remove(&call_id) {
+                debug!(call_id, "ipsec.stash: TTL expired, cleaning up PendingSA");
+                spawn_pending_cleanup(expired.pending);
+            }
+        });
+    }
+
+    /// Pop a stashed :class:`PendingSA`.  Returns ``None`` if the call_id
+    /// is unknown or its TTL already expired.
+    fn unstash(&self, call_id: &str) -> Option<Py<PyPendingSA>> {
+        self.stash.remove(call_id).and_then(|(_, entry)| {
+            if entry.expires_at < Instant::now() {
+                spawn_pending_cleanup(entry.pending);
+                None
+            } else {
+                Some(entry.pending)
+            }
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Ipsec(pcscf_addr={}, pcscf_port_c={}, pcscf_port_s={}, active={}, stashed={})",
+            self.pcscf_addr,
+            self.config.pcscf_port_c,
+            self.config.pcscf_port_s,
+            self.manager.active_count(),
+            self.stash.len(),
+        )
+    }
+}
+
+fn spawn_pending_cleanup(pending: Py<PyPendingSA>) {
+    // Fire-and-forget kernel teardown of an abandoned/displaced PendingSA.
+    let inner = Python::attach(|python| {
+        let bound = pending.bind(python);
+        let cell = bound.borrow();
+        Arc::clone(&cell.inner)
+    });
+    tokio::spawn(async move {
+        let (manager, ue_addr, ue_port_c, already_cleaned) = {
+            let mut guard = match inner.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let already = guard.state == PendingState::Cleaned;
+            let manager = Arc::clone(&guard.manager);
+            let ue_addr = guard.sa.ue_addr;
+            let ue_port_c = guard.sa.ue_port_c;
+            if !already {
+                guard.state = PendingState::Cleaned;
+            }
+            (manager, ue_addr, ue_port_c, already)
+        };
+        if already_cleaned {
+            return;
+        }
+        if let Err(error) = manager.delete_sa_pair(&ue_addr, ue_port_c).await {
+            warn!(%error, ue = %ue_addr, "ipsec auto-cleanup: delete_sa_pair failed");
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Free helpers — used by PyRequest::parse_security_client and PyReply::take_av.
+// ---------------------------------------------------------------------------
+
+/// Parse a ``Security-Client`` header value containing one *or more*
+/// comma-separated offers (RFC 3329 §2.2 grammar).  Returns the offers
+/// successfully parsed; malformed sub-offers are silently skipped.
+pub fn parse_security_client_multi(value: &str, ue_addr: &str) -> Vec<PySecurityOffer> {
+    split_top_level_commas(value)
+        .into_iter()
+        .filter_map(|chunk| {
+            let trimmed = chunk.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            crate::ipsec::parse_security_client(trimmed)
+                .map(|client| PySecurityOffer::from_security_client(client, ue_addr))
+        })
+        .collect()
+}
+
+/// Strip ``ck=…`` and ``ik=…`` parameters from a single auth header value
+/// (e.g. a ``Digest …`` ``WWW-Authenticate`` value).  Returns the rewritten
+/// header and the extracted (CK, IK) pair only when **both** parsed
+/// cleanly.  When either is missing or malformed, returns the original
+/// value unchanged and ``None``.
+///
+/// The parser is conservative: it splits on top-level commas (respecting
+/// double-quoted strings), removes whole tokens whose name is ``ck`` or
+/// ``ik`` (case-insensitive), and rejoins the surviving tokens with
+/// ``", "`` separators.  Quoting style of untouched parameters is
+/// preserved byte-for-byte.
+pub fn strip_ck_ik(value: &str) -> (String, Option<([u8; 16], [u8; 16])>) {
+    let (scheme, rest) = match value.split_once(char::is_whitespace) {
+        Some((scheme, rest)) => (scheme, rest),
+        None => return (value.to_string(), None),
+    };
+
+    let tokens = split_top_level_commas(rest);
+    let mut kept = Vec::with_capacity(tokens.len());
+    let mut ck = None;
+    let mut ik = None;
+
+    for token in tokens {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (name, raw_value) = match trimmed.split_once('=') {
+            Some(parts) => parts,
+            None => {
+                kept.push(trimmed.to_string());
+                continue;
+            }
+        };
+        let name_lower = name.trim().to_lowercase();
+        if name_lower == "ck" {
+            ck = parse_hex_param(raw_value);
+            continue;
+        }
+        if name_lower == "ik" {
+            ik = parse_hex_param(raw_value);
+            continue;
+        }
+        kept.push(trimmed.to_string());
+    }
+
+    match (ck, ik) {
+        (Some(ck_bytes), Some(ik_bytes)) => {
+            let rewritten = format!("{} {}", scheme, kept.join(", "));
+            (rewritten, Some((ck_bytes, ik_bytes)))
+        }
+        _ => (value.to_string(), None),
+    }
+}
+
+/// Split a header parameter list on top-level commas, treating
+/// double-quoted strings as opaque (commas inside quotes are kept).
+/// The result is a list of slices including their original interior
+/// whitespace; callers trim as needed.
+fn split_top_level_commas(value: &str) -> Vec<&str> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if in_quote => {
+                escaped = true;
+            }
+            b'"' => {
+                in_quote = !in_quote;
+            }
+            b',' if !in_quote => {
+                out.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&value[start..]);
+    out
+}
+
+/// Parse ``"hex…"`` or ``hex…`` into a 16-byte array.  Returns ``None``
+/// for any length other than 16 bytes (32 hex chars) — IMS-AKA AVs are
+/// always 128-bit.
+fn parse_hex_param(raw: &str) -> Option<[u8; 16]> {
+    let trimmed = raw.trim();
+    let unquoted = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    if unquoted.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (index, chunk) in unquoted.as_bytes().chunks(2).enumerate() {
+        let high = hex_nibble(chunk[0])?;
+        let low = hex_nibble(chunk[1])?;
+        out[index] = (high << 4) | low;
+    }
+    Some(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_top_level_commas_respects_quotes() {
+        let value = r#"realm="ims, example", nonce="abc", qop="auth""#;
+        let parts = split_top_level_commas(value);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].trim(), r#"realm="ims, example""#);
+        assert_eq!(parts[1].trim(), r#"nonce="abc""#);
+        assert_eq!(parts[2].trim(), r#"qop="auth""#);
+    }
+
+    #[test]
+    fn split_top_level_commas_handles_escaped_quote() {
+        let value = r#"a="x\"y", b=2"#;
+        let parts = split_top_level_commas(value);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].trim(), r#"a="x\"y""#);
+        assert_eq!(parts[1].trim(), "b=2");
+    }
+
+    #[test]
+    fn parse_hex_param_quoted_and_bare() {
+        let bytes = parse_hex_param("\"0123456789abcdef0123456789abcdef\"").unwrap();
+        assert_eq!(bytes[0], 0x01);
+        assert_eq!(bytes[15], 0xef);
+        let bytes2 = parse_hex_param("0123456789ABCDEF0123456789ABCDEF").unwrap();
+        assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    fn parse_hex_param_rejects_wrong_length() {
+        assert!(parse_hex_param("abc").is_none());
+        assert!(parse_hex_param("\"00\"").is_none());
+    }
+
+    #[test]
+    fn strip_ck_ik_basic_extraction() {
+        let header = r#"Digest realm="ims.example.com", nonce="abc", algorithm=AKAv1-MD5, ck="0123456789abcdef0123456789abcdef", ik="fedcba9876543210fedcba9876543210", qop="auth""#;
+        let (rewritten, parsed) = strip_ck_ik(header);
+        let (ck, ik) = parsed.expect("expected ck+ik to parse");
+        assert_eq!(ck[0], 0x01);
+        assert_eq!(ik[0], 0xfe);
+        assert!(!rewritten.contains("ck="));
+        assert!(!rewritten.contains("ik="));
+        assert!(rewritten.contains(r#"realm="ims.example.com""#));
+        assert!(rewritten.contains(r#"nonce="abc""#));
+        assert!(rewritten.contains(r#"qop="auth""#));
+        assert!(rewritten.starts_with("Digest "));
+    }
+
+    #[test]
+    fn strip_ck_ik_idempotent_after_strip() {
+        let header = r#"Digest realm="ims.example.com", nonce="abc", ck="0123456789abcdef0123456789abcdef", ik="fedcba9876543210fedcba9876543210""#;
+        let (first, parsed1) = strip_ck_ik(header);
+        assert!(parsed1.is_some());
+        let (second, parsed2) = strip_ck_ik(&first);
+        assert_eq!(first, second);
+        assert!(parsed2.is_none());
+    }
+
+    #[test]
+    fn strip_ck_ik_missing_ik_returns_none_and_preserves_input() {
+        let header = r#"Digest realm="x", nonce="y", ck="0123456789abcdef0123456789abcdef""#;
+        let (out, parsed) = strip_ck_ik(header);
+        assert!(parsed.is_none());
+        assert_eq!(out, header);
+    }
+
+    #[test]
+    fn strip_ck_ik_missing_ck_returns_none_and_preserves_input() {
+        let header = r#"Digest realm="x", nonce="y", ik="0123456789abcdef0123456789abcdef""#;
+        let (out, parsed) = strip_ck_ik(header);
+        assert!(parsed.is_none());
+        assert_eq!(out, header);
+    }
+
+    #[test]
+    fn strip_ck_ik_preserves_quoted_commas_in_realm() {
+        let header = r#"Digest realm="ims, example", nonce="abc", ck="0123456789abcdef0123456789abcdef", ik="fedcba9876543210fedcba9876543210""#;
+        let (rewritten, parsed) = strip_ck_ik(header);
+        assert!(parsed.is_some());
+        assert!(rewritten.contains(r#"realm="ims, example""#));
+    }
+
+    #[test]
+    fn strip_ck_ik_handles_no_quotes() {
+        let header = "Digest realm=x, nonce=y, ck=0123456789abcdef0123456789abcdef, ik=fedcba9876543210fedcba9876543210";
+        let (rewritten, parsed) = strip_ck_ik(header);
+        let (ck, ik) = parsed.expect("expected ck+ik to parse");
+        assert_eq!(ck[0], 0x01);
+        assert_eq!(ik[0], 0xfe);
+        assert_eq!(rewritten, "Digest realm=x, nonce=y");
+    }
+
+    #[test]
+    fn strip_ck_ik_uppercase_param_names_recognized() {
+        let header = r#"Digest realm="x", nonce="y", CK="0123456789abcdef0123456789abcdef", IK="fedcba9876543210fedcba9876543210""#;
+        let (_rewritten, parsed) = strip_ck_ik(header);
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn parse_security_client_multi_single_offer() {
+        let header = "ipsec-3gpp; alg=hmac-sha-1-96; spi-c=11111; spi-s=22222; port-c=5060; port-s=5062";
+        let offers = parse_security_client_multi(header, "10.0.0.1");
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].mechanism, "ipsec-3gpp");
+        assert_eq!(offers[0].alg, "hmac-sha-1-96");
+        assert_eq!(offers[0].spi_c, 11111);
+        assert_eq!(offers[0].ue_addr, "10.0.0.1");
+    }
+
+    #[test]
+    fn parse_security_client_multi_two_offers() {
+        let header = concat!(
+            "ipsec-3gpp; alg=hmac-md5-96; spi-c=11111; spi-s=22222; port-c=5060; port-s=5062, ",
+            "ipsec-3gpp; alg=hmac-sha-1-96; spi-c=33333; spi-s=44444; port-c=5063; port-s=5064",
+        );
+        let offers = parse_security_client_multi(header, "10.0.0.1");
+        assert_eq!(offers.len(), 2);
+        assert_eq!(offers[0].alg, "hmac-md5-96");
+        assert_eq!(offers[0].spi_c, 11111);
+        assert_eq!(offers[1].alg, "hmac-sha-1-96");
+        assert_eq!(offers[1].spi_c, 33333);
+    }
+
+    #[test]
+    fn parse_security_client_multi_skips_malformed_subsection() {
+        let header = "junk-without-required-params, ipsec-3gpp; alg=hmac-sha-1-96; spi-c=1; spi-s=2; port-c=3; port-s=4";
+        let offers = parse_security_client_multi(header, "10.0.0.1");
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].spi_c, 1);
+    }
+
+    #[test]
+    fn transform_compatible_with_matches_alg() {
+        let offer = PySecurityOffer {
+            mechanism: "ipsec-3gpp".into(),
+            alg: "hmac-sha-1-96".into(),
+            ealg: "null".into(),
+            spi_c: 1,
+            spi_s: 2,
+            port_c: 3,
+            port_s: 4,
+            ue_addr: "10.0.0.1".into(),
+        };
+        assert!(PyTransform::HmacSha1_96Null.compatible_with(&offer));
+        assert!(!PyTransform::HmacMd5_96Null.compatible_with(&offer));
+    }
+
+    #[test]
+    fn transform_compatible_with_treats_empty_ealg_as_null() {
+        let offer = PySecurityOffer {
+            mechanism: "ipsec-3gpp".into(),
+            alg: "hmac-sha-1-96".into(),
+            ealg: "".into(),
+            spi_c: 1,
+            spi_s: 2,
+            port_c: 3,
+            port_s: 4,
+            ue_addr: "10.0.0.1".into(),
+        };
+        assert!(PyTransform::HmacSha1_96Null.compatible_with(&offer));
+    }
+
+    #[test]
+    fn auth_vector_handle_take_consumes() {
+        let handle = PyAuthVectorHandle::new([1u8; 16], [2u8; 16]);
+        let first = handle.take();
+        assert!(first.is_some());
+        let second = handle.take();
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn auth_vector_bytes_zeroize_on_drop() {
+        // Smoke test — we can't observe the zeroization from outside, but
+        // the Drop impl runs.  This just ensures the type compiles and
+        // drops cleanly with the contained bytes.
+        let bytes = AuthVectorBytes {
+            ck: [0xab; 16],
+            ik: [0xcd; 16],
+        };
+        drop(bytes);
+    }
+
+    #[test]
+    fn hex_encode_round_trip() {
+        let bytes = [0x00u8, 0x01, 0xff, 0xab];
+        assert_eq!(hex_encode(&bytes), "0001ffab");
+    }
+}

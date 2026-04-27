@@ -76,6 +76,10 @@ pub struct PyRequest {
     /// Optional body to attach to the response built by `reply()` — set by
     /// `set_reply_body()`.  Carries ``(body, content_type)``.
     reply_body: Option<(Vec<u8>, String)>,
+    /// Local port the request arrived on.  Used by `is_ipsec_protected`
+    /// and `matched_sa` to detect protected traffic.  `None` for
+    /// constructors that don't supply it (defaults to non-protected).
+    local_port: Option<u16>,
 }
 
 impl PyRequest {
@@ -100,6 +104,7 @@ impl PyRequest {
             on_failure_callback: None,
             reply_headers: vec![],
             reply_body: None,
+            local_port: None,
         }
     }
 
@@ -126,7 +131,14 @@ impl PyRequest {
             on_failure_callback: None,
             reply_headers: vec![],
             reply_body: None,
+            local_port: None,
         }
+    }
+
+    /// Set the local port the request arrived on (used by IPsec-aware
+    /// getters like `is_ipsec_protected` and `matched_sa`).
+    pub fn set_local_port(&mut self, port: u16) {
+        self.local_port = Some(port);
     }
 
     /// Get the action the script chose.
@@ -552,6 +564,58 @@ impl PyRequest {
     fn event(&self) -> PyResult<Option<String>> {
         let message = self.lock()?;
         Ok(message.headers.get("Event").cloned())
+    }
+
+    // -----------------------------------------------------------------------
+    // IPsec / 3GPP TS 33.203 — see src/script/api/ipsec.rs for the broader
+    // sec-agree primitive surface.
+    // -----------------------------------------------------------------------
+
+    /// Parse the ``Security-Client`` header (RFC 3329, 3GPP TS 33.203) into
+    /// a list of :class:`SecurityOffer`.  Returns ``[]`` when the header is
+    /// absent or contains no parseable offers.  Each offer carries the UE
+    /// address from :attr:`source_ip` so it can be passed directly to
+    /// :func:`siphon.ipsec.allocate`.
+    fn parse_security_client(&self) -> PyResult<Vec<super::ipsec::PySecurityOffer>> {
+        let message = self.lock()?;
+        match message.headers.get("Security-Client") {
+            Some(value) => Ok(super::ipsec::parse_security_client_multi(
+                value,
+                &self.source_ip,
+            )),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Whether this request arrived over an IPsec-protected SA.
+    ///
+    /// Returns ``True`` when the request's local port matches one of the
+    /// configured P-CSCF protected ports (`ipsec.pcscf_port_c` /
+    /// `ipsec.pcscf_port_s`).  Always ``False`` when no `ipsec` block is
+    /// configured.  This is a fast, allocation-free check; the heavier
+    /// SA lookup happens via :attr:`matched_sa`.
+    #[getter]
+    fn is_ipsec_protected(&self) -> bool {
+        match self.local_port {
+            Some(port) => super::ipsec::is_protected_local_port(port),
+            None => false,
+        }
+    }
+
+    /// Handle to the SA that decrypted this request, or ``None``.
+    ///
+    /// Resolves by walking the active SA table for one matching this
+    /// request's source `(addr, port)`.  Returns ``None`` when no SA
+    /// matches (including when `ipsec` is not configured).
+    #[getter]
+    fn matched_sa(&self) -> Option<super::ipsec::PySAHandle> {
+        let port = self.local_port?;
+        if !super::ipsec::is_protected_local_port(port) {
+            return None;
+        }
+        let ue_addr: std::net::IpAddr = self.source_ip.parse().ok()?;
+        let sa = super::ipsec::find_sa_for_ue(&ue_addr, self.source_port)?;
+        Some(super::ipsec::PySAHandle::from_sa(&sa))
     }
 
     // -----------------------------------------------------------------------

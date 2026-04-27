@@ -18,22 +18,30 @@ SCSCF_URI = "sip:scscf.ims.example.com:6060"
 # ---------------------------------------------------------------------------
 
 class TestPcscf:
-    """P-CSCF: local AKA auth, no HSS Diameter needed."""
+    """P-CSCF: relays REGISTER to S-CSCF and handles IPsec sec-agree on the
+    401 reply path.  The P-CSCF itself never authenticates — that's S-CSCF's
+    job — so the registration tests here assert relay behaviour, not 200.
+    """
+
+    _SECURITY_CLIENT = (
+        "ipsec-3gpp;alg=hmac-sha-1-96;spi-c=1000;spi-s=1001;"
+        "port-c=5064;port-s=5066"
+    )
 
     def setup_method(self):
         self.harness = SipTestHarness(local_domains=[REALM, "10.0.0.10"])
         self.harness.auth._allow = True
         self.harness.load_script(_PCSCF_SCRIPT)
 
-    def test_register_success(self):
+    def test_register_with_security_client_relays_to_scscf(self):
         result = self.harness.send_request(
             "REGISTER", f"sip:{REALM}",
             from_uri=f"sip:alice@{REALM}",
-            auth_user="alice",
             source_ip="10.0.0.1",
-            headers={"Security-Client": "ipsec-3gpp;alg=hmac-sha-1-96;spi-c=1000;spi-s=1001;port-c=5064;port-s=5066"},
+            headers={"Security-Client": self._SECURITY_CLIENT},
         )
-        assert result.status_code == 200
+        assert result.was_relayed
+        assert result.record_routed
 
     def test_register_rejects_without_security_client(self):
         """REGISTER without Security-Client gets 421 Extension Required."""
@@ -45,39 +53,56 @@ class TestPcscf:
         require = result.request.get_reply_header("Require")
         assert require == "sec-agree"
 
-    def test_register_sets_service_route(self):
+    def test_register_rejects_malformed_security_client(self):
+        """Security-Client without required SPIs/ports parses as empty → 421."""
         result = self.harness.send_request(
             "REGISTER", f"sip:{REALM}",
             from_uri=f"sip:alice@{REALM}",
-            auth_user="alice",
             headers={"Security-Client": "ipsec-3gpp;alg=hmac-sha-1-96"},
         )
-        assert result.status_code == 200
-        # Verify Service-Route was set for the outgoing 200 OK response.
-        service_route = result.request.get_reply_header("Service-Route")
-        assert service_route is not None
-        assert REALM in service_route
+        assert result.status_code == 421
 
-    def test_register_sets_p_associated_uri(self):
-        result = self.harness.send_request(
+    def test_401_reply_strips_ck_ik_and_injects_security_server(self):
+        """The on_reply handler should consume CK/IK from S-CSCF's 401 and
+        inject a Security-Server header before forwarding to the UE."""
+        # First send a REGISTER so the on_reply handler has the matching
+        # request context (Security-Client offers).
+        request_result = self.harness.send_request(
             "REGISTER", f"sip:{REALM}",
             from_uri=f"sip:alice@{REALM}",
-            auth_user="alice",
-            headers={"Security-Client": "ipsec-3gpp;alg=hmac-sha-1-96"},
+            source_ip="10.0.0.1",
+            call_id="alice-401-flow@10.0.0.1",
+            headers={"Security-Client": self._SECURITY_CLIENT},
         )
-        assert result.status_code == 200
-        pai = result.request.get_reply_header("P-Associated-URI")
-        assert pai is not None
-        assert "alice" in pai
+        assert request_result.was_relayed
 
-    def test_register_challenge_when_auth_fails(self):
-        self.harness.auth._allow = False
-        result = self.harness.send_request(
-            "REGISTER", f"sip:{REALM}",
-            from_uri=f"sip:alice@{REALM}",
-            headers={"Security-Client": "ipsec-3gpp;alg=hmac-sha-1-96"},
+        # Now simulate the S-CSCF's 401 with CK/IK in WWW-Authenticate.
+        ck_hex = "0123456789abcdef0123456789abcdef"
+        ik_hex = "fedcba9876543210fedcba9876543210"
+        www_auth = (
+            f'Digest realm="{REALM}", nonce="abc", algorithm=AKAv1-MD5, '
+            f'ck="{ck_hex}", ik="{ik_hex}", qop="auth"'
         )
-        assert result.status_code == 401
+        reply_result = self.harness.send_reply(
+            request=request_result.request,
+            status_code=401,
+            reason="Unauthorized",
+            headers={"WWW-Authenticate": www_auth},
+        )
+        # Verify the script forwarded the reply.
+        assert any(a.kind == "relay" for a in reply_result.actions)
+        # The injected Security-Server header should be present.
+        security_server = reply_result.reply.get_header("Security-Server")
+        assert security_server is not None
+        assert "ipsec-3gpp" in security_server
+        assert "hmac-sha-1-96" in security_server
+        assert "port-c=5064" in security_server
+        assert "port-s=5066" in security_server
+        # And ck=/ik= must be gone from the upstream WWW-Authenticate.
+        rewritten = reply_result.reply.get_header("WWW-Authenticate")
+        assert rewritten is not None
+        assert "ck=" not in rewritten
+        assert "ik=" not in rewritten
 
     def test_options_local(self):
         result = self.harness.send_request(

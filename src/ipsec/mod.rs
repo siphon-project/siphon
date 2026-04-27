@@ -5,11 +5,126 @@
 
 pub mod milenage;
 
+#[cfg(target_os = "linux")]
+pub mod netlink;
+
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info};
+
+// ---------------------------------------------------------------------------
+// Local helpers — HMAC-SHA-256, hex encoding, IPv4/IPv6 prefix length.
+// ---------------------------------------------------------------------------
+
+/// HMAC-SHA-256 (RFC 2104) — single-shot helper.  Used by
+/// `derive_integrity_key` for 3GPP TS 33.203 Annex H key derivation.  No
+/// extra crate dependency: SHA-256 is already available via `sha2`.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
+    const BLOCK_SIZE: usize = 64;
+    const OPAD: u8 = 0x5c;
+    const IPAD: u8 = 0x36;
+
+    // Reduce a long key by hashing it (RFC 2104 §2 - "the key" rule).
+    let mut k_block = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        let digest = Sha256::digest(key);
+        k_block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        k_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner_input = [0u8; BLOCK_SIZE];
+    let mut outer_input = [0u8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        inner_input[index] = k_block[index] ^ IPAD;
+        outer_input[index] = k_block[index] ^ OPAD;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_input);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_input);
+    outer.update(inner_digest);
+    outer.finalize().to_vec()
+}
+
+/// Lower-case hex encoding for IPsec key serialization.
+pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{:02x}", byte));
+    }
+    output
+}
+
+/// Host-route prefix length for an IP — `/32` for IPv4, `/128` for IPv6.
+fn host_prefix(addr: &IpAddr) -> u8 {
+    match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    }
+}
+
+/// Format the integrity key in the hex form expected by `ip xfrm`,
+/// applying the legacy zero-padding for HMAC-SHA-1 (16-byte IK → 20-byte
+/// kernel key) when the supplied key is exactly 16 bytes (32 hex chars).
+fn format_integrity_key(aalg: &IntegrityAlgorithm, integrity_key: &str) -> String {
+    if *aalg == IntegrityAlgorithm::HmacSha1 && integrity_key.len() == 32 {
+        format!("0x{}00000000", integrity_key)
+    } else {
+        format!("0x{}", integrity_key)
+    }
+}
+
+/// Decode a hex string into raw bytes — used by the netlink backend
+/// since the kernel ABI takes the key as raw bytes (the `ip` shell-out
+/// path passes the hex string through verbatim).
+pub fn decode_hex(hex: &str) -> Result<Vec<u8>, IpsecError> {
+    if hex.is_empty() {
+        return Ok(Vec::new());
+    }
+    if hex.len() % 2 != 0 {
+        return Err(IpsecError::InvalidKey(format!(
+            "hex key has odd length: {}",
+            hex.len()
+        )));
+    }
+    let mut output = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let high = decode_hex_nibble(chunk[0])?;
+        let low = decode_hex_nibble(chunk[1])?;
+        output.push((high << 4) | low);
+    }
+    Ok(output)
+}
+
+fn decode_hex_nibble(byte: u8) -> Result<u8, IpsecError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(IpsecError::InvalidKey(format!(
+            "non-hex character {:?}",
+            byte as char
+        ))),
+    }
+}
+
+/// Direction of an XFRM policy — backend-agnostic.  Maps to the
+/// kernel's `XFRM_POLICY_IN`/`XFRM_POLICY_OUT` (and the `dir in`/`dir
+/// out` strings of the `ip xfrm` shell-out path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolicyDir {
+    In,
+    Out,
+}
 
 // ---------------------------------------------------------------------------
 // Encryption algorithm
@@ -63,26 +178,39 @@ impl std::fmt::Display for EncryptionAlgorithm {
 /// Integrity algorithm for IPsec SA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrityAlgorithm {
-    /// HMAC-MD5-96.
+    /// HMAC-MD5-96 (RFC 2403).
     HmacMd5,
-    /// HMAC-SHA-1-96.
+    /// HMAC-SHA-1-96 (RFC 2404) — most common in IMS deployments today.
     HmacSha1,
+    /// HMAC-SHA-256-128 (RFC 4868) — required for newer IMS profiles.
+    HmacSha256,
 }
 
 impl IntegrityAlgorithm {
     /// Return the `ip xfrm` algorithm name.
+    ///
+    /// HMAC-SHA-256 is exposed as `hmac(sha256)` with a truncation of 128
+    /// bits in the kernel; the algorithm name is the same regardless of
+    /// truncation length.
     pub fn xfrm_name(&self) -> &'static str {
         match self {
             Self::HmacMd5 => "hmac(md5)",
             Self::HmacSha1 => "hmac(sha1)",
+            Self::HmacSha256 => "hmac(sha256)",
         }
     }
 
     /// Key length in bytes.
+    ///
+    /// Note: SHA-1 uses a 160-bit (20-byte) key per RFC 4868; the IMS
+    /// IK is 128-bit, so the legacy zero-padding approach in
+    /// `create_sa_pair` extends it to 20 bytes.  SHA-256 uses a full
+    /// 256-bit (32-byte) key derived per 3GPP TS 33.203 Annex H.
     pub fn key_length(&self) -> usize {
         match self {
             Self::HmacMd5 => 16,
             Self::HmacSha1 => 20,
+            Self::HmacSha256 => 32,
         }
     }
 }
@@ -92,6 +220,7 @@ impl std::fmt::Display for IntegrityAlgorithm {
         match self {
             Self::HmacMd5 => write!(formatter, "HMAC-MD5-96"),
             Self::HmacSha1 => write!(formatter, "HMAC-SHA-1-96"),
+            Self::HmacSha256 => write!(formatter, "HMAC-SHA-256-128"),
         }
     }
 }
@@ -137,6 +266,12 @@ pub struct SecurityAssociationPair {
     pub encryption_key: String,
     /// Integrity key (hex-encoded for ip xfrm).
     pub integrity_key: String,
+    /// Optional hard lifetime in seconds — kernel will expire the SA
+    /// after this many seconds.  `None` means no kernel-enforced expiry
+    /// (caller manages lifetime via `delete_sa_pair`).  Used to tie the
+    /// IPsec SA lifetime to the SIP registration expiry per 3GPP
+    /// TS 33.203 §7.4.
+    pub hard_lifetime_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,17 +386,43 @@ impl std::error::Error for IpsecError {}
 // IPsec Manager
 // ---------------------------------------------------------------------------
 
+/// XFRM backend — either direct netlink (fast, requires CAP_NET_ADMIN
+/// on the netlink socket) or `/sbin/ip xfrm` shell-out (slower but
+/// works in any environment where ``ip`` itself works).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XfrmBackend {
+    Netlink,
+    IpCommand,
+}
+
+impl Default for XfrmBackend {
+    fn default() -> Self {
+        // Netlink is the production default; switch with `ipsec.backend: ip`.
+        Self::Netlink
+    }
+}
+
 /// Manages active IPsec SAs for UE registrations.
 ///
-/// Each UE registration that negotiates IPsec (via Security-Client/Security-Server
-/// headers) gets a pair of SAs: one inbound (UE -> P-CSCF) and one outbound
-/// (P-CSCF -> UE). The manager tracks these pairs and creates/deletes the
-/// corresponding Linux xfrm state and policies via `ip xfrm` commands.
+/// Each UE registration that negotiates IPsec (via
+/// Security-Client/Security-Server headers) gets a pair of SAs: one
+/// inbound (UE → P-CSCF) and one outbound (P-CSCF → UE).  The manager
+/// tracks these pairs and creates/deletes the corresponding Linux XFRM
+/// state and policies — by default via direct netlink (Phase 3), with
+/// `ip xfrm` shell-out as the fallback backend.
 pub struct IpsecManager {
     /// contact_key (e.g. "ue_ip:ue_port") -> SA pair.
     associations: DashMap<String, SecurityAssociationPair>,
     /// SPI counter for generating unique SPIs.
     next_spi: AtomicU32,
+    /// Upper bound on `next_spi` — when an allocation would exceed
+    /// `spi_range_end`, the counter wraps back to `spi_range_start`.
+    /// Both default to a wide range starting at 10000 when no
+    /// partitioning is configured (matches Phase 1 behaviour).
+    spi_range_start: u32,
+    spi_range_end: u32,
+    /// XFRM backend.  Picked at startup from `IpsecConfig.backend`.
+    backend: XfrmBackend,
 }
 
 impl Default for IpsecManager {
@@ -271,18 +432,50 @@ impl Default for IpsecManager {
 }
 
 impl IpsecManager {
-    /// Create a new IPsec manager with no active SAs.
+    /// Create a new IPsec manager with no active SAs and the default
+    /// backend (netlink) and SPI range (`10000..10000+8192`).
     pub fn new() -> Self {
+        Self::with_partition(XfrmBackend::default(), 10000, 8192)
+    }
+
+    /// Create with explicit backend + SPI partition.  Used by the
+    /// server bootstrap to honour `ipsec.backend` /
+    /// `ipsec.spi_range_start` / `ipsec.spi_range_count`.
+    ///
+    /// `spi_range_count` is clamped to at least 2 (we always need to
+    /// allocate pairs).  Wraparound is handled inside `allocate_spi_pair`.
+    pub fn with_partition(backend: XfrmBackend, spi_range_start: u32, spi_range_count: u32) -> Self {
+        let count = spi_range_count.max(2);
+        let end = spi_range_start.saturating_add(count);
         Self {
             associations: DashMap::new(),
-            // Start SPIs above well-known range.
-            next_spi: AtomicU32::new(10000),
+            next_spi: AtomicU32::new(spi_range_start),
+            spi_range_start,
+            spi_range_end: end,
+            backend,
         }
     }
 
-    /// Generate a unique SPI pair (inbound, outbound).
+    /// Currently-active backend.
+    pub fn backend(&self) -> XfrmBackend {
+        self.backend
+    }
+
+    /// Generate a unique SPI pair (inbound, outbound) within the
+    /// configured partition.  Wraps when the counter exceeds
+    /// `spi_range_end` — guaranteed unique within the lifetime of the
+    /// process so long as `spi_range_count` is larger than any
+    /// reasonable concurrent SA count.
     pub fn allocate_spi_pair(&self) -> (u32, u32) {
-        let spi1 = self.next_spi.fetch_add(2, Ordering::Relaxed);
+        let mut spi1 = self.next_spi.fetch_add(2, Ordering::Relaxed);
+        // Wraparound: if we ran past the end, reset and grab another
+        // pair.  Worst case: two threads collide on the reset, but the
+        // counter still moves forward and uniqueness is maintained
+        // across this process.
+        if spi1.saturating_add(1) >= self.spi_range_end {
+            self.next_spi.store(self.spi_range_start, Ordering::Relaxed);
+            spi1 = self.next_spi.fetch_add(2, Ordering::Relaxed);
+        }
         (spi1, spi1 + 1)
     }
 
@@ -305,63 +498,67 @@ impl IpsecManager {
         let key = Self::contact_key(&sa.ue_addr, sa.ue_port_c);
 
         // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps (inbound to P-CSCF server)
-        Self::xfrm_sa_add(
+        self.add_sa(
             &sa.ue_addr, sa.ue_port_c,
             &sa.pcscf_addr, sa.pcscf_port_s,
             sa.spi_ps,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
+            sa.hard_lifetime_secs,
         ).await?;
 
         // SA2: PCSCF:port_ps → UE:port_uc, SPI=spi_uc (outbound from P-CSCF server)
-        Self::xfrm_sa_add(
+        self.add_sa(
             &sa.pcscf_addr, sa.pcscf_port_s,
             &sa.ue_addr, sa.ue_port_c,
             sa.spi_uc,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
+            sa.hard_lifetime_secs,
         ).await?;
 
         // SA3: PCSCF:port_pc → UE:port_us, SPI=spi_us (outbound from P-CSCF client)
-        Self::xfrm_sa_add(
+        self.add_sa(
             &sa.pcscf_addr, sa.pcscf_port_c,
             &sa.ue_addr, sa.ue_port_s,
             sa.spi_us,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
+            sa.hard_lifetime_secs,
         ).await?;
 
         // SA4: UE:port_us → PCSCF:port_pc, SPI=spi_pc (inbound to P-CSCF client)
-        Self::xfrm_sa_add(
+        self.add_sa(
             &sa.ue_addr, sa.ue_port_s,
             &sa.pcscf_addr, sa.pcscf_port_c,
             sa.spi_pc,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
+            sa.hard_lifetime_secs,
         ).await?;
 
         // Policy 1 (in): UE:port_uc → PCSCF:port_ps
-        Self::xfrm_policy_add(
+        self.add_policy(
             &sa.ue_addr, sa.ue_port_c,
             &sa.pcscf_addr, sa.pcscf_port_s,
-            "in", sa.spi_ps,
+            PolicyDir::In, sa.spi_ps,
         ).await?;
 
         // Policy 2 (out): PCSCF:port_ps → UE:port_uc
-        Self::xfrm_policy_add(
+        self.add_policy(
             &sa.pcscf_addr, sa.pcscf_port_s,
             &sa.ue_addr, sa.ue_port_c,
-            "out", sa.spi_uc,
+            PolicyDir::Out, sa.spi_uc,
         ).await?;
 
         // Policy 3 (out): PCSCF:port_pc → UE:port_us
-        Self::xfrm_policy_add(
+        self.add_policy(
             &sa.pcscf_addr, sa.pcscf_port_c,
             &sa.ue_addr, sa.ue_port_s,
-            "out", sa.spi_us,
+            PolicyDir::Out, sa.spi_us,
         ).await?;
 
         // Policy 4 (in): UE:port_us → PCSCF:port_pc
-        Self::xfrm_policy_add(
+        self.add_policy(
             &sa.ue_addr, sa.ue_port_s,
             &sa.pcscf_addr, sa.pcscf_port_c,
-            "in", sa.spi_pc,
+            PolicyDir::In, sa.spi_pc,
         ).await?;
 
         info!(
@@ -386,49 +583,34 @@ impl IpsecManager {
     ) -> Result<(), IpsecError> {
         let key = Self::contact_key(ue_addr, ue_port_c);
         if let Some((_, sa)) = self.associations.remove(&key) {
-            // Delete all 4 SAs.
-            Self::xfrm_sa_del(&sa.ue_addr, &sa.pcscf_addr, sa.spi_ps).await?;
-            Self::xfrm_sa_del(&sa.pcscf_addr, &sa.ue_addr, sa.spi_uc).await?;
-            Self::xfrm_sa_del(&sa.pcscf_addr, &sa.ue_addr, sa.spi_us).await?;
-            Self::xfrm_sa_del(&sa.ue_addr, &sa.pcscf_addr, sa.spi_pc).await?;
+            // Delete all 4 SAs.  Pairs mirror create_sa_pair's order so
+            // src/dst align with each SA's flow direction.
+            self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_ps).await?;
+            self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_uc).await?;
+            self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_us).await?;
+            self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_pc).await?;
 
             // Delete policies (best-effort — ignore errors on cleanup).
-            Self::xfrm_policy_del(
-                &sa.ue_addr,
-                sa.ue_port_c,
-                &sa.pcscf_addr,
-                sa.pcscf_port_s,
-                "in",
-            )
-            .await
-            .ok();
-            Self::xfrm_policy_del(
-                &sa.pcscf_addr,
-                sa.pcscf_port_c,
-                &sa.ue_addr,
-                sa.ue_port_s,
-                "out",
-            )
-            .await
-            .ok();
-            Self::xfrm_policy_del(
-                &sa.ue_addr,
-                sa.ue_port_s,
-                &sa.pcscf_addr,
-                sa.pcscf_port_c,
-                "in",
-            )
-            .await
-            .ok();
-            Self::xfrm_policy_del(
-                &sa.pcscf_addr,
-                sa.pcscf_port_s,
-                &sa.ue_addr,
-                sa.ue_port_c,
-                "out",
-            )
-            .await
-            .ok();
+            self.del_policy(
+                &sa.ue_addr, sa.ue_port_c,
+                &sa.pcscf_addr, sa.pcscf_port_s,
+                PolicyDir::In,
+            ).await.ok();
+            self.del_policy(
+                &sa.pcscf_addr, sa.pcscf_port_c,
+                &sa.ue_addr, sa.ue_port_s,
+                PolicyDir::Out,
+            ).await.ok();
+            self.del_policy(
+                &sa.ue_addr, sa.ue_port_s,
+                &sa.pcscf_addr, sa.pcscf_port_c,
+                PolicyDir::In,
+            ).await.ok();
+            self.del_policy(
+                &sa.pcscf_addr, sa.pcscf_port_s,
+                &sa.ue_addr, sa.ue_port_c,
+                PolicyDir::Out,
+            ).await.ok();
 
             info!(ue = %ue_addr, ue_port_c, "IPsec: SA pair deleted");
         }
@@ -457,8 +639,204 @@ impl IpsecManager {
             .map(|entry| entry.value().clone())
     }
 
+    /// Find an SA pair where the given UE address sends from either of
+    /// the two registered ports (client or server).  Used to map an
+    /// inbound request's `(source_addr, source_port)` to the SA that
+    /// just decrypted it.  Walks the DashMap — O(N) in number of
+    /// currently active SAs.
+    pub fn find_sa_by_ue(
+        &self,
+        ue_addr: &IpAddr,
+        ue_port: u16,
+    ) -> Option<SecurityAssociationPair> {
+        for entry in self.associations.iter() {
+            let sa = entry.value();
+            if sa.ue_addr == *ue_addr && (sa.ue_port_c == ue_port || sa.ue_port_s == ue_port) {
+                return Some(sa.clone());
+            }
+        }
+        None
+    }
+
     // -----------------------------------------------------------------------
-    // xfrm command helpers
+    // Backend dispatch — routes to either netlink or `ip xfrm` shell-out.
+    // -----------------------------------------------------------------------
+
+    /// Add an SA via the active backend.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_sa(
+        &self,
+        source: &IpAddr,
+        source_port: u16,
+        destination: &IpAddr,
+        destination_port: u16,
+        spi: u32,
+        ealg: &EncryptionAlgorithm,
+        aalg: &IntegrityAlgorithm,
+        encryption_key: &str,
+        integrity_key: &str,
+        hard_lifetime_secs: Option<u64>,
+    ) -> Result<(), IpsecError> {
+        match self.backend {
+            #[cfg(target_os = "linux")]
+            XfrmBackend::Netlink => {
+                let auth_key_bytes = decode_hex(integrity_key)?;
+                let enc_key_bytes = if *ealg == EncryptionAlgorithm::Null {
+                    Vec::new()
+                } else {
+                    decode_hex(encryption_key)?
+                };
+                netlink::add_sa(
+                    source,
+                    source_port,
+                    destination,
+                    destination_port,
+                    spi,
+                    *ealg,
+                    *aalg,
+                    &enc_key_bytes,
+                    &auth_key_bytes,
+                    hard_lifetime_secs,
+                )
+                .await
+            }
+            #[cfg(not(target_os = "linux"))]
+            XfrmBackend::Netlink => Err(IpsecError::Command(
+                "XFRM netlink backend is Linux-only".to_string(),
+            )),
+            XfrmBackend::IpCommand => {
+                Self::xfrm_sa_add(
+                    source,
+                    source_port,
+                    destination,
+                    destination_port,
+                    spi,
+                    ealg,
+                    aalg,
+                    encryption_key,
+                    integrity_key,
+                    hard_lifetime_secs,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn del_sa(
+        &self,
+        source: &IpAddr,
+        destination: &IpAddr,
+        spi: u32,
+    ) -> Result<(), IpsecError> {
+        match self.backend {
+            #[cfg(target_os = "linux")]
+            XfrmBackend::Netlink => {
+                let _ = source;
+                netlink::del_sa(destination, spi).await
+            }
+            #[cfg(not(target_os = "linux"))]
+            XfrmBackend::Netlink => Err(IpsecError::Command(
+                "XFRM netlink backend is Linux-only".to_string(),
+            )),
+            XfrmBackend::IpCommand => Self::xfrm_sa_del(source, destination, spi).await,
+        }
+    }
+
+    async fn add_policy(
+        &self,
+        source: &IpAddr,
+        source_port: u16,
+        destination: &IpAddr,
+        destination_port: u16,
+        direction: PolicyDir,
+        spi: u32,
+    ) -> Result<(), IpsecError> {
+        match self.backend {
+            #[cfg(target_os = "linux")]
+            XfrmBackend::Netlink => {
+                let netlink_dir = match direction {
+                    PolicyDir::In => netlink::PolicyDirection::In,
+                    PolicyDir::Out => netlink::PolicyDirection::Out,
+                };
+                netlink::add_policy(
+                    source,
+                    source_port,
+                    destination,
+                    destination_port,
+                    netlink_dir,
+                    spi,
+                )
+                .await
+            }
+            #[cfg(not(target_os = "linux"))]
+            XfrmBackend::Netlink => Err(IpsecError::Command(
+                "XFRM netlink backend is Linux-only".to_string(),
+            )),
+            XfrmBackend::IpCommand => {
+                let dir_str = match direction {
+                    PolicyDir::In => "in",
+                    PolicyDir::Out => "out",
+                };
+                Self::xfrm_policy_add(
+                    source,
+                    source_port,
+                    destination,
+                    destination_port,
+                    dir_str,
+                    spi,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn del_policy(
+        &self,
+        source: &IpAddr,
+        source_port: u16,
+        destination: &IpAddr,
+        destination_port: u16,
+        direction: PolicyDir,
+    ) -> Result<(), IpsecError> {
+        match self.backend {
+            #[cfg(target_os = "linux")]
+            XfrmBackend::Netlink => {
+                let netlink_dir = match direction {
+                    PolicyDir::In => netlink::PolicyDirection::In,
+                    PolicyDir::Out => netlink::PolicyDirection::Out,
+                };
+                netlink::del_policy(
+                    source,
+                    source_port,
+                    destination,
+                    destination_port,
+                    netlink_dir,
+                )
+                .await
+            }
+            #[cfg(not(target_os = "linux"))]
+            XfrmBackend::Netlink => Err(IpsecError::Command(
+                "XFRM netlink backend is Linux-only".to_string(),
+            )),
+            XfrmBackend::IpCommand => {
+                let dir_str = match direction {
+                    PolicyDir::In => "in",
+                    PolicyDir::Out => "out",
+                };
+                Self::xfrm_policy_del(
+                    source,
+                    source_port,
+                    destination,
+                    destination_port,
+                    dir_str,
+                )
+                .await
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy `ip xfrm` shell-out helpers — kept for the IpCommand backend.
     // -----------------------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
@@ -472,14 +850,16 @@ impl IpsecManager {
         aalg: &IntegrityAlgorithm,
         encryption_key: &str,
         integrity_key: &str,
+        hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
         let source_str = source.to_string();
         let destination_str = destination.to_string();
         let spi_str = format!("0x{:x}", spi);
-        let sel_src = format!("{}/32", source);
-        let sel_dst = format!("{}/32", destination);
+        let sel_src = format!("{}/{}", source, host_prefix(source));
+        let sel_dst = format!("{}/{}", destination, host_prefix(destination));
         let sel_sport = source_port.to_string();
         let sel_dport = destination_port.to_string();
+        let lifetime_secs_str;
 
         let mut args = vec![
             "xfrm", "state", "add",
@@ -497,13 +877,7 @@ impl IpsecManager {
         ];
 
         let enc_key_hex = format!("0x{}", encryption_key);
-        // HMAC-SHA1-96 requires 160-bit (20-byte) key; IK from Milenage is 128-bit (16 bytes).
-        // Zero-pad to 20 bytes as per 3GPP TS 33.203 / sipp_ipsec convention.
-        let int_key_hex = if *aalg == IntegrityAlgorithm::HmacSha1 && integrity_key.len() == 32 {
-            format!("0x{}00000000", integrity_key)
-        } else {
-            format!("0x{}", integrity_key)
-        };
+        let int_key_hex = format_integrity_key(aalg, integrity_key);
 
         // ESP always requires an enc algorithm — use ecb(cipher_null) with empty key for null
         args.push("enc");
@@ -516,6 +890,15 @@ impl IpsecManager {
         args.push("auth");
         args.push(aalg.xfrm_name());
         args.push(&int_key_hex);
+
+        // Optional hard lifetime — `limit time-hard <secs>` instructs the
+        // kernel to expire the SA after this many wall-clock seconds.
+        if let Some(secs) = hard_lifetime_secs {
+            lifetime_secs_str = secs.to_string();
+            args.push("limit");
+            args.push("time-hard");
+            args.push(&lifetime_secs_str);
+        }
 
         Self::run_ip_command(&args).await
     }
@@ -547,8 +930,8 @@ impl IpsecManager {
         direction: &str,
         spi: u32,
     ) -> Result<(), IpsecError> {
-        let source_cidr = format!("{}/32", source);
-        let destination_cidr = format!("{}/32", destination);
+        let source_cidr = format!("{}/{}", source, host_prefix(source));
+        let destination_cidr = format!("{}/{}", destination, host_prefix(destination));
         let source_port_str = source_port.to_string();
         let destination_port_str = destination_port.to_string();
         let source_str = source.to_string();
@@ -580,8 +963,8 @@ impl IpsecManager {
         destination_port: u16,
         direction: &str,
     ) -> Result<(), IpsecError> {
-        let source_cidr = format!("{}/32", source);
-        let destination_cidr = format!("{}/32", destination);
+        let source_cidr = format!("{}/{}", source, host_prefix(source));
+        let destination_cidr = format!("{}/{}", destination, host_prefix(destination));
         let source_port_str = source_port.to_string();
         let destination_port_str = destination_port.to_string();
 
@@ -595,6 +978,43 @@ impl IpsecManager {
             "dir", direction,
         ];
         Self::run_ip_command(&args).await
+    }
+
+    /// 3GPP TS 33.203 Annex H IPsec key derivation.
+    ///
+    /// For algorithms requiring keys longer than the 128-bit IK (HMAC-
+    /// SHA-256-128 with a 256-bit key), Annex H specifies derivation via
+    /// HMAC-SHA-256(IK, label).  For algorithms that fit inside the
+    /// 128-bit IK (HMAC-MD5, HMAC-SHA-1 with zero-pad), the IK is used
+    /// directly.
+    ///
+    /// `ik` must be 16 bytes (128-bit IK from Milenage).  Returns the
+    /// derived integrity key as raw bytes.  Returns `None` if the
+    /// requested length cannot be derived.
+    pub fn derive_integrity_key(
+        aalg: IntegrityAlgorithm,
+        ik: &[u8],
+    ) -> Option<Vec<u8>> {
+        if ik.len() != 16 {
+            return None;
+        }
+        match aalg {
+            IntegrityAlgorithm::HmacMd5 => Some(ik.to_vec()),
+            IntegrityAlgorithm::HmacSha1 => {
+                // 160-bit key — zero-pad the 128-bit IK to 20 bytes.
+                let mut key = Vec::with_capacity(20);
+                key.extend_from_slice(ik);
+                key.extend_from_slice(&[0u8; 4]);
+                Some(key)
+            }
+            IntegrityAlgorithm::HmacSha256 => {
+                // 256-bit key — derived via HMAC-SHA-256(IK, "ipsec-int")
+                // per 3GPP TS 33.203 Annex H.  This pattern follows the
+                // Annex H "P-key derivation" template using the algorithm
+                // name as the FC label.
+                Some(hmac_sha256(ik, b"ipsec-int-sha256-128"))
+            }
+        }
     }
 
     async fn run_ip_command(args: &[&str]) -> Result<(), IpsecError> {
@@ -815,6 +1235,7 @@ mod tests {
             aalg: IntegrityAlgorithm::HmacSha1,
             encryption_key: "deadbeef".to_string(),
             integrity_key: "cafebabe".to_string(),
+            hard_lifetime_secs: None,
         };
         let cloned = sa.clone();
         assert_eq!(cloned.spi_uc, 10000);

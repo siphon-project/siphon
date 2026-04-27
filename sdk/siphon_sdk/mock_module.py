@@ -3312,6 +3312,255 @@ _sbi = MockSbi()
 
 
 # ---------------------------------------------------------------------------
+# IPsec namespace (3GPP TS 33.203 P-CSCF sec-agree primitives)
+# ---------------------------------------------------------------------------
+
+
+class MockSecurityOffer:
+    """Mock :class:`SecurityOffer` — UE-side IPsec proposal."""
+
+    def __init__(self, mechanism: str = "ipsec-3gpp", alg: str = "hmac-sha-1-96",
+                 ealg: str = "null", spi_c: int = 1, spi_s: int = 2,
+                 port_c: int = 3, port_s: int = 4, ue_addr: str = "10.0.0.1") -> None:
+        self.mechanism = mechanism
+        self.alg = alg
+        self.ealg = ealg
+        self.spi_c = spi_c
+        self.spi_s = spi_s
+        self.port_c = port_c
+        self.port_s = port_s
+        self.ue_addr = ue_addr
+
+    def __repr__(self) -> str:
+        return (f"SecurityOffer(mechanism={self.mechanism!r}, alg={self.alg!r}, "
+                f"ealg={self.ealg!r}, spi_c={self.spi_c}, spi_s={self.spi_s}, "
+                f"port_c={self.port_c}, port_s={self.port_s}, ue_addr={self.ue_addr!r})")
+
+
+class MockTransform:
+    """Mock :class:`Transform` enum — operator policy choice."""
+
+    def __init__(self, name: str, alg: str, ealg: str = "null") -> None:
+        self._name = name
+        self.alg = alg
+        self.ealg = ealg
+
+    def compatible_with(self, offer: MockSecurityOffer) -> bool:
+        offer_ealg = (offer.ealg or "").lower()
+        want = self.ealg.lower()
+        return (offer.alg.lower() == self.alg.lower()
+                and (offer_ealg == want or (offer_ealg == "" and want == "null")))
+
+    def __repr__(self) -> str:
+        return f"Transform.{self._name}"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, MockTransform) and self._name == other._name
+
+    def __hash__(self) -> int:
+        return hash(self._name)
+
+
+class _TransformEnum:
+    HmacSha1_96Null = MockTransform("HmacSha1_96Null", "hmac-sha-1-96", "null")
+    HmacMd5_96Null = MockTransform("HmacMd5_96Null", "hmac-md5-96", "null")
+    HmacSha256_128Null = MockTransform("HmacSha256_128Null", "hmac-sha-256-128", "null")
+    HmacSha1_96AesCbc128 = MockTransform("HmacSha1_96AesCbc128", "hmac-sha-1-96", "aes-cbc")
+    HmacMd5_96AesCbc128 = MockTransform("HmacMd5_96AesCbc128", "hmac-md5-96", "aes-cbc")
+    HmacSha256_128AesCbc128 = MockTransform(
+        "HmacSha256_128AesCbc128", "hmac-sha-256-128", "aes-cbc"
+    )
+
+
+class MockAuthVectorHandle:
+    """Mock :class:`AuthVectorHandle` — opaque CK/IK container.
+
+    The bytes are not exposed to Python in the real binding; the mock
+    keeps them accessible via ``_ck``/``_ik`` for tests, but treats them
+    as consumed after one ``allocate``.
+    """
+
+    def __init__(self, ck: bytes = b"\x01" * 16, ik: bytes = b"\x02" * 16) -> None:
+        self._ck = ck
+        self._ik = ik
+        self._consumed = False
+
+    def _take(self) -> tuple[bytes, bytes]:
+        if self._consumed:
+            raise ValueError("AuthVectorHandle already consumed")
+        self._consumed = True
+        return (self._ck, self._ik)
+
+    def __repr__(self) -> str:
+        return ("AuthVectorHandle(<consumed>)" if self._consumed
+                else "AuthVectorHandle(<128-bit CK + 128-bit IK>)")
+
+
+class MockSAHandle:
+    """Mock :class:`SAHandle` — read-only view of an active SA returned by
+    ``request.matched_sa``.  Tests can construct one directly and assign
+    it to ``request._matched_sa``.
+    """
+
+    def __init__(self, ue_addr: str = "10.0.0.1", pcscf_addr: str = "10.0.0.10",
+                 ue_port_c: int = 50000, ue_port_s: int = 50001,
+                 pcscf_port_c: int = 5064, pcscf_port_s: int = 5066,
+                 spi_uc: int = 1000, spi_us: int = 1001,
+                 spi_pc: int = 10000, spi_ps: int = 10001,
+                 alg: str = "HMAC-SHA-1-96", ealg: str = "NULL") -> None:
+        self.ue_addr = ue_addr
+        self.pcscf_addr = pcscf_addr
+        self.ue_port_c = ue_port_c
+        self.ue_port_s = ue_port_s
+        self.pcscf_port_c = pcscf_port_c
+        self.pcscf_port_s = pcscf_port_s
+        self.spi_uc = spi_uc
+        self.spi_us = spi_us
+        self.spi_pc = spi_pc
+        self.spi_ps = spi_ps
+        self.alg = alg
+        self.ealg = ealg
+
+    def __repr__(self) -> str:
+        return (f"SAHandle(ue={self.ue_addr}:{self.ue_port_c}, "
+                f"pcscf={self.pcscf_addr}:{self.pcscf_port_c}, "
+                f"spi_pc={self.spi_pc}, spi_ps={self.spi_ps}, "
+                f"alg={self.alg!r}, ealg={self.ealg!r})")
+
+
+class MockSecurityServerParams:
+    """Mock :class:`SecurityServerParams`."""
+
+    def __init__(self, mechanism: str, alg: str, ealg: str,
+                 spi_c: int, spi_s: int, port_c: int, port_s: int) -> None:
+        self.mechanism = mechanism
+        self.alg = alg
+        self.ealg = ealg
+        self.spi_c = spi_c
+        self.spi_s = spi_s
+        self.port_c = port_c
+        self.port_s = port_s
+
+    def __repr__(self) -> str:
+        return (f"SecurityServerParams(mechanism={self.mechanism!r}, "
+                f"alg={self.alg!r}, ealg={self.ealg!r}, "
+                f"spi_c={self.spi_c}, spi_s={self.spi_s}, "
+                f"port_c={self.port_c}, port_s={self.port_s})")
+
+
+class MockPendingSA:
+    """Mock :class:`PendingSA`."""
+
+    _next_spi = 10000
+
+    def __init__(self, transform: MockTransform, offer: MockSecurityOffer,
+                 pcscf_port_c: int, pcscf_port_s: int,
+                 expires_secs: Optional[int] = None) -> None:
+        cls = type(self)
+        spi_pc = cls._next_spi
+        cls._next_spi += 1
+        spi_ps = cls._next_spi
+        cls._next_spi += 1
+        self._params = MockSecurityServerParams(
+            mechanism="ipsec-3gpp",
+            alg=transform.alg,
+            ealg=transform.ealg,
+            spi_c=spi_pc,
+            spi_s=spi_ps,
+            port_c=pcscf_port_c,
+            port_s=pcscf_port_s,
+        )
+        self._offer = offer
+        self.expires_secs = expires_secs
+        self.is_active = False
+        self.is_cleaned = False
+
+    def security_server_params(self) -> MockSecurityServerParams:
+        return self._params
+
+    def activate(self) -> None:
+        if self.is_cleaned:
+            raise ValueError("PendingSA already cleaned up")
+        self.is_active = True
+
+    async def cleanup(self) -> None:
+        self.is_cleaned = True
+        self.is_active = False
+
+    async def refresh(self, av_new: MockAuthVectorHandle) -> None:
+        if self.is_cleaned:
+            raise ValueError("PendingSA already cleaned up")
+        av_new._take()  # consume the new AV
+
+    def __repr__(self) -> str:
+        state = ("Cleaned" if self.is_cleaned
+                 else "Active" if self.is_active else "Pending")
+        return f"PendingSA(state={state}, spi_pc={self._params.spi_c})"
+
+
+class MockIpsec:
+    """Mock :class:`Ipsec` namespace."""
+
+    Transform = _TransformEnum
+
+    def __init__(self) -> None:
+        self.pcscf_port_c = 5064
+        self.pcscf_port_s = 5066
+        self._stash: dict[str, MockPendingSA] = {}
+        self._allocate_should_fail: Optional[type[BaseException]] = None
+        self._allocate_failure_message = "mock allocate failure"
+
+    @property
+    def stash_size(self) -> int:
+        return len(self._stash)
+
+    @property
+    def active_count(self) -> int:
+        return sum(1 for p in self._stash.values() if p.is_active)
+
+    async def allocate(self, av: MockAuthVectorHandle, offer: MockSecurityOffer,
+                       transform: MockTransform,
+                       expires_secs: Optional[int] = None) -> MockPendingSA:
+        if not transform.compatible_with(offer):
+            raise ValueError(
+                f"transform {transform!r} not compatible with offer alg={offer.alg!r}"
+                f" ealg={offer.ealg!r}"
+            )
+        av._take()  # raises ValueError if already consumed
+        if self._allocate_should_fail is not None:
+            raise self._allocate_should_fail(self._allocate_failure_message)
+        return MockPendingSA(
+            transform, offer, self.pcscf_port_c, self.pcscf_port_s,
+            expires_secs=expires_secs,
+        )
+
+    def stash(self, call_id: str, pending: MockPendingSA) -> None:
+        self._stash[call_id] = pending
+
+    def unstash(self, call_id: str) -> Optional[MockPendingSA]:
+        return self._stash.pop(call_id, None)
+
+    # -- Test helpers -------------------------------------------------------
+
+    def set_allocate_failure(self, exc_type: Optional[type[BaseException]],
+                             message: str = "mock allocate failure") -> None:
+        """Configure the next ``allocate()`` call to raise ``exc_type``.
+
+        Pass ``None`` to clear and let ``allocate`` succeed again.
+        """
+        self._allocate_should_fail = exc_type
+        self._allocate_failure_message = message
+
+    def clear(self) -> None:
+        self._stash.clear()
+        self._allocate_should_fail = None
+        MockPendingSA._next_spi = 10000
+
+
+_ipsec = MockIpsec()
+
+
+# ---------------------------------------------------------------------------
 # SDP namespace
 # ---------------------------------------------------------------------------
 
@@ -3352,6 +3601,7 @@ def install() -> ModuleType:
     mod.metrics = _metrics  # type: ignore[attr-defined]
     mod.isc = _isc  # type: ignore[attr-defined]
     mod.sbi = _sbi  # type: ignore[attr-defined]
+    mod.ipsec = _ipsec  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
 
     # Also install the _siphon_registry mock
@@ -3382,6 +3632,7 @@ def reset() -> None:
     _srs.clear()
     _metrics.clear()
     _isc.clear()
+    _ipsec.clear()
     _auth._allow = False
     _auth._credentials.clear()
     _proxy._utils._rate_limit_allow = True
@@ -3473,3 +3724,8 @@ def get_metrics() -> MockMetrics:
 def get_isc() -> MockIsc:
     """Access the mock ISC singleton."""
     return _isc
+
+
+def get_ipsec() -> MockIpsec:
+    """Access the mock IPsec singleton."""
+    return _ipsec

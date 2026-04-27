@@ -118,6 +118,13 @@ regex = "1"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
 
+# Netlink — used by `src/ipsec/netlink.rs` to install XFRM SAs/policies
+# without the `ip xfrm` shell-out (3GPP TS 33.203 P-CSCF role).  The crate
+# itself is Linux-only because the netlink protocol family does not exist
+# on other kernels; consumers gate the netlink backend on cfg(target_os).
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-sys = "0.8"
+
 [dev-dependencies]
 proptest = "1"
 tokio-test = "0.4"

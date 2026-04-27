@@ -50,3 +50,6 @@ mod media_tests;
 
 #[path = "integration/srs_tests.rs"]
 mod srs_tests;
+
+#[path = "integration/ipsec_tests.rs"]
+mod ipsec_tests;

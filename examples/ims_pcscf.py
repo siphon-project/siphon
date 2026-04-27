@@ -1,20 +1,23 @@
 """
 SIPhon IMS P-CSCF script — first contact point for UEs.
 
-Handles VoLTE/IMS registration with IPsec and media anchoring.
+Handles VoLTE/IMS registration with IPsec sec-agree and media anchoring.
 
 Flow (3GPP TS 33.203 / TS 24.229):
   1. UE sends initial REGISTER with Security-Client header (unprotected, port 5060)
-  2. P-CSCF sends 401 with AKA challenge + Security-Server header
-  3. UE establishes IPsec SAs, re-sends REGISTER over protected path (port 5064/5066)
-  4. P-CSCF verifies credentials, creates server-side SAs, returns 200 OK
-  5. Subsequent requests flow over IPsec-protected ports
+  2. P-CSCF relays REGISTER to S-CSCF; S-CSCF returns 401 with WWW-Authenticate
+     containing ck=/ik=
+  3. P-CSCF strips ck=/ik= from the relayed 401, allocates IPsec SAs, injects
+     Security-Server, forwards 401 to UE
+  4. UE establishes IPsec SAs, re-sends REGISTER over protected ports
+  5. P-CSCF activates the SAs on the 200 OK from S-CSCF
+  6. Subsequent requests flow over IPsec-protected ports
 
 Equivalent to: opensips_ims_pcscf/opensips.cfg from docker_open5gs
 
 Config: examples/ims_pcscf.yaml
 """
-from siphon import proxy, registrar, auth, diameter, log
+from siphon import proxy, registrar, ipsec, diameter, log
 
 REALM = "ims.example.com"
 PCSCF_URI = f"sip:{REALM};lr"
@@ -22,6 +25,21 @@ PCSCF_URI = f"sip:{REALM};lr"
 # Track Rx sessions per dialog (call_id -> rx_session_id).
 # Used to release QoS resources on BYE.
 rx_sessions = {}
+
+# Operator transform policy — first one acceptable to the UE wins.
+PREFERRED_TRANSFORMS = [
+    ipsec.Transform.HmacSha1_96Null,
+    ipsec.Transform.HmacMd5_96Null,
+]
+
+
+def _select_transform(offers):
+    """Pick the first PREFERRED_TRANSFORM that any UE offer accepts."""
+    for transform in PREFERRED_TRANSFORMS:
+        for offer in offers:
+            if transform.compatible_with(offer):
+                return transform, offer
+    return None, None
 
 
 def on_invite_reply(request, reply):
@@ -36,8 +54,6 @@ def on_invite_reply(request, reply):
     if diameter.peer_count() == 0:
         return
 
-    # Extract media info from SDP for the Rx flow description.
-    # For now, request a generic audio bearer.
     call_id = request.call_id
     source_ip = request.source_ip
 
@@ -59,43 +75,110 @@ def handle_register(request):
     log.info(f"REGISTER from {request.from_uri} via {request.transport}")
 
     # Force UE to use security agreement (IPsec): reject REGISTER without
-    # Security-Client header (3GPP TS 33.203 sec 6.1, RFC 3329).
-    if not request.has_header("Security-Client"):
+    # Security-Client (3GPP TS 33.203 §6.1, RFC 3329).
+    offers = request.parse_security_client()
+    if not offers and not request.has_header("Security-Verify"):
         request.set_reply_header("Require", "sec-agree")
         request.reply(421, "Extension Required")
         log.info(f"rejected {request.from_uri}: no Security-Client (IPsec required)")
         return
 
-    # Add Path header so subsequent requests route through P-CSCF (RFC 3327).
+    # Add Path so subsequent requests route through us (RFC 3327).
     request.add_path(PCSCF_URI)
-
-    # Add P-Visited-Network-ID (3GPP TS 24.229 sec 5.2.2.2).
     request.set_header("P-Visited-Network-ID", REALM)
 
-    # Challenge with AKA digest auth (401 WWW-Authenticate with AKAv1-MD5).
-    # Uses locally-configured Milenage credentials (K, OP, AMF) — no HSS needed.
-    # The nonce contains base64(RAND || AUTN) per 3GPP TS 33.203.
-    # CK/IK are derived and stored for IPsec SA creation.
-    if not auth.require_aka_digest(request, realm=REALM):
-        # 401 challenge includes Security-Server header with our IPsec params.
-        # The Rust-side auth handler injects Security-Server automatically when
-        # AKA credentials are configured and CK/IK are derived.
-        log.info(f"sent 401 AKA challenge to {request.from_uri}")
+    # Relay to S-CSCF.  The 401 flow-back is handled by handle_register_reply.
+    request.record_route()
+    request.relay()
+
+
+@proxy.on_reply
+async def handle_reply(request, reply):
+    """P-CSCF reply path — handles AKA challenge stripping + SA setup.
+
+    Async because ``ipsec.allocate()`` does kernel ``ip xfrm`` work and
+    returns a coroutine.  The Rust dispatcher detects async handlers via
+    ``asyncio.iscoroutinefunction`` and awaits them.
+    """
+
+    # We only care about REGISTER replies on the IPsec path.
+    if request.method != "REGISTER":
+        reply.relay()
         return
 
-    # Authenticated — save the registration.
-    registrar.save(request)
+    if reply.status_code == 401:
+        await _handle_401_register(request, reply)
+        reply.relay()
+        return
 
-    # Add P-Associated-URI for the authenticated user (3GPP TS 24.229 sec 5.2.2.4).
-    public_id = f"sip:{request.auth_user}"
-    if "@" not in public_id:
-        public_id = f"{public_id}@{REALM}"
-    request.set_reply_header("P-Associated-URI", f"<{public_id}>")
+    if reply.status_code == 200:
+        _handle_200_register(request, reply)
+        reply.relay()
+        return
 
-    # Add Service-Route so subsequent requests from this UE route through us.
-    request.set_reply_header("Service-Route", f"<{PCSCF_URI}>")
+    reply.relay()
 
-    log.info(f"registered {request.from_uri}")
+
+async def _handle_401_register(request, reply):
+    """Extract CK/IK from S-CSCF challenge, install SAs, inject Security-Server."""
+    offers = request.parse_security_client()
+    if not offers:
+        log.warn(f"401 REGISTER for {request.call_id}: no Security-Client to negotiate against")
+        return
+
+    transform, chosen = _select_transform(offers)
+    if transform is None:
+        log.warn(f"401 REGISTER for {request.call_id}: no acceptable UE transform offered")
+        return
+
+    # take_av() strips ck=/ik= from the 401's auth headers in place — this
+    # is what protects the access side from leaking key material.
+    av = reply.take_av()
+    if av is None:
+        log.debug(f"401 REGISTER for {request.call_id}: no ck/ik params in WWW-Authenticate")
+        return
+
+    # Tie SA lifetime to the registration's Expires (3GPP TS 33.203 §7.4) —
+    # the kernel will expire the SAs even if the script forgets to clean
+    # up.  +60 s grace allows a re-REGISTER round-trip before expiry.
+    expires_secs = (request.contact_expires or 600) + 60
+
+    try:
+        pending = await ipsec.allocate(av, chosen, transform, expires_secs=expires_secs)
+    except (ValueError, RuntimeError) as exc:
+        log.error(f"ipsec.allocate failed for {request.call_id}: {exc}")
+        return
+
+    params = pending.security_server_params()
+    reply.set_header(
+        "Security-Server",
+        f"{params.mechanism}; alg={params.alg}; ealg={params.ealg}; "
+        f"spi-c={params.spi_c}; spi-s={params.spi_s}; "
+        f"port-c={params.port_c}; port-s={params.port_s}",
+    )
+
+    ipsec.stash(request.call_id, pending)
+    log.info(
+        f"401 REGISTER for {request.call_id}: SAs allocated, "
+        f"Security-Server injected (alg={params.alg})"
+    )
+
+
+def _handle_200_register(request, reply):
+    """Activate stashed SAs and cache P-Associated-URI."""
+    pending = ipsec.unstash(request.call_id)
+    if pending is not None:
+        try:
+            pending.activate()
+            log.info(f"200 REGISTER for {request.call_id}: SAs activated")
+        except ValueError as exc:
+            log.warn(f"PendingSA.activate failed: {exc}")
+
+    pau = reply.get_header("P-Associated-URI")
+    if pau:
+        aor = str(request.from_uri)
+        registrar.set_associated_uris(aor, [pau])
+        log.info(f"cached P-Associated-URI for {aor}: {pau}")
 
 
 @proxy.on_request("SUBSCRIBE|PUBLISH")
@@ -172,29 +255,3 @@ def handle_request(request):
             request.relay(contacts[0].uri)
     else:
         request.fork([c.uri for c in contacts])
-
-
-# ---------------------------------------------------------------------------
-# Reply handler: cache P-Associated-URI from upstream 200 OK REGISTER
-# ---------------------------------------------------------------------------
-
-@proxy.on_reply
-def cache_associated_uris(request, reply):
-    """Cache P-Associated-URI from the S-CSCF 200 OK to REGISTER.
-
-    In relay mode (P-CSCF → I-CSCF → S-CSCF), the S-CSCF includes
-    P-Associated-URI in the 200 OK listing all public identities
-    (3GPP TS 24.229 §5.2.2.4). The P-CSCF caches them for later use
-    (e.g. applying PAU to outgoing requests for identity assertion).
-    """
-    if request.method != "REGISTER" or reply.status_code != 200:
-        reply.relay()
-        return
-
-    pau = reply.get_header("P-Associated-URI")
-    if pau:
-        aor = str(request.from_uri)
-        registrar.set_associated_uris(aor, [pau])
-        log.info(f"cached P-Associated-URI for {aor}: {pau}")
-
-    reply.relay()

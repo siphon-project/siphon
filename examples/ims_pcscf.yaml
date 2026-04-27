@@ -64,8 +64,11 @@ auth:
 # IPsec — 3GPP TS 33.203 security associations
 # ---------------------------------------------------------------------------
 ipsec:
-  pcscf_port_c: 5064         # P-CSCF client port (protected)
-  pcscf_port_s: 5066         # P-CSCF server port (protected)
+  pcscf_port_c: 5064         # P-CSCF client port (protected, shared across UEs)
+  pcscf_port_s: 5066         # P-CSCF server port (protected, shared across UEs)
+  backend: netlink           # "netlink" (default, fastest) or "ip" (shell-out fallback)
+  # spi_range_start: 10000   # set per-instance for multi-process P-CSCFs
+  # spi_range_count: 8192
 
 # ---------------------------------------------------------------------------
 # NAT traversal

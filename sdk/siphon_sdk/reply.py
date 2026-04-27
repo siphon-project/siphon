@@ -124,6 +124,33 @@ class Reply:
         """
         return self._body is not None and self._content_type == content_type
 
+    # -- IPsec / 3GPP TS 33.203 ------------------------------------------------
+
+    def take_av(self):
+        """Extract IMS-AKA CK/IK from auth headers and strip ``ck=``/``ik=``.
+
+        Scans ``WWW-Authenticate``, ``Proxy-Authenticate`` and
+        ``Authentication-Info`` (in that order).  Returns a
+        :class:`MockAuthVectorHandle` only when **both** ``ck`` and ``ik``
+        parsed cleanly; otherwise leaves the headers untouched and returns
+        ``None``.
+
+        Idempotent: after stripping, a second call returns ``None`` because
+        no header still carries ``ck``/``ik``.
+        """
+        from siphon_sdk.mock_module import MockAuthVectorHandle
+
+        for header_name in ("WWW-Authenticate", "Proxy-Authenticate", "Authentication-Info"):
+            value = self.get_header(header_name)
+            if value is None:
+                continue
+            rewritten, parsed = _strip_ck_ik(value)
+            if parsed is not None:
+                ck, ik = parsed
+                self.set_header(header_name, rewritten)
+                return MockAuthVectorHandle(ck=ck, ik=ik)
+        return None
+
     # -- Forwarding ------------------------------------------------------------
 
     def relay(self) -> None:
@@ -152,3 +179,77 @@ class Reply:
     def last_action(self) -> Optional[Action]:
         """Most recent action, or ``None``."""
         return self._actions[-1] if self._actions else None
+
+
+def _split_top_level_commas(value: str) -> list[str]:
+    """Split a header parameter list on top-level commas, respecting
+    double-quoted strings and backslash escapes inside them."""
+    out: list[str] = []
+    start = 0
+    in_quote = False
+    escaped = False
+    for i, ch in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_quote:
+            escaped = True
+        elif ch == '"':
+            in_quote = not in_quote
+        elif ch == "," and not in_quote:
+            out.append(value[start:i])
+            start = i + 1
+    out.append(value[start:])
+    return out
+
+
+def _parse_hex_param(raw: str) -> Optional[bytes]:
+    """Parse ``"hex…"`` or ``hex…`` into 16 bytes; ``None`` on length
+    mismatch (IMS-AKA AV components are always 128-bit)."""
+    trimmed = raw.strip()
+    if len(trimmed) >= 2 and trimmed.startswith('"') and trimmed.endswith('"'):
+        body = trimmed[1:-1]
+    else:
+        body = trimmed
+    if len(body) != 32:
+        return None
+    try:
+        return bytes.fromhex(body)
+    except ValueError:
+        return None
+
+
+def _strip_ck_ik(value: str) -> tuple[str, Optional[tuple[bytes, bytes]]]:
+    """Conservative strip — mirrors the Rust ``strip_ck_ik`` logic.
+
+    Returns ``(rewritten, (ck, ik))`` only when both params parsed; the
+    original string is returned unchanged with ``None`` otherwise.
+    """
+    parts = value.split(None, 1)
+    if len(parts) < 2:
+        return value, None
+    scheme, rest = parts[0], parts[1]
+    tokens = _split_top_level_commas(rest)
+    kept: list[str] = []
+    ck: Optional[bytes] = None
+    ik: Optional[bytes] = None
+    for token in tokens:
+        trimmed = token.strip()
+        if not trimmed:
+            continue
+        if "=" not in trimmed:
+            kept.append(trimmed)
+            continue
+        name, raw = trimmed.split("=", 1)
+        name_lower = name.strip().lower()
+        if name_lower == "ck":
+            ck = _parse_hex_param(raw)
+            continue
+        if name_lower == "ik":
+            ik = _parse_hex_param(raw)
+            continue
+        kept.append(trimmed)
+    if ck is None or ik is None:
+        return value, None
+    rewritten = f"{scheme} {', '.join(kept)}"
+    return rewritten, (ck, ik)

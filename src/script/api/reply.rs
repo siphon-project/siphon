@@ -210,6 +210,40 @@ impl PyReply {
             .unwrap_or(false))
     }
 
+    /// Extract the IMS-AKA authentication vector (CK/IK) from any auth
+    /// header on this 401 and **strip** the ``ck=`` / ``ik=`` parameters
+    /// in place.
+    ///
+    /// Scans ``WWW-Authenticate``, ``Proxy-Authenticate`` and
+    /// ``Authentication-Info`` (in that order — RFC 3310 §3.2 / TS 33.203
+    /// §6.1.4 allow CK/IK to appear in any of them).  Returns an opaque
+    /// :class:`AuthVectorHandle` only when **both** ``ck`` and ``ik`` parsed
+    /// cleanly; otherwise leaves the headers untouched and returns
+    /// ``None``.
+    ///
+    /// Idempotent: after the AV has been stripped, a second call returns
+    /// ``None`` because no header still carries ``ck``/``ik``.
+    fn take_av(&self, python: Python<'_>) -> PyResult<Option<Py<super::ipsec::PyAuthVectorHandle>>> {
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+
+        for header_name in ["WWW-Authenticate", "Proxy-Authenticate", "Authentication-Info"] {
+            let original = match message.headers.get(header_name).cloned() {
+                Some(value) => value,
+                None => continue,
+            };
+            let (rewritten, parsed) = super::ipsec::strip_ck_ik(&original);
+            if let Some((ck, ik)) = parsed {
+                message.headers.set(header_name, rewritten);
+                drop(message);
+                let handle = super::ipsec::PyAuthVectorHandle::new(ck, ik);
+                return Ok(Some(Py::new(python, handle)?));
+            }
+        }
+        Ok(None)
+    }
+
     /// Mark this reply for forwarding upstream.
     fn relay(&mut self) {
         self.forwarded = true;

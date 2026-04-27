@@ -1833,6 +1833,36 @@ pub struct IpsecConfig {
     /// P-CSCF protected server port.
     #[serde(default = "default_ipsec_port_s")]
     pub pcscf_port_s: u16,
+    /// XFRM backend.  ``"netlink"`` (default — direct kernel netlink,
+    /// fastest) or ``"ip"`` (legacy ``/sbin/ip xfrm`` shell-out, used
+    /// as a fallback when running in containers without
+    /// CAP_NET_ADMIN-on-netlink or for parity with older deployments).
+    #[serde(default = "default_ipsec_backend")]
+    pub backend: IpsecBackend,
+    /// Optional SPI range for this siphon instance.  When set,
+    /// `allocate_spi_pair()` only returns SPIs in `[start, start+count)`,
+    /// letting multiple siphon processes coexist on the same kernel
+    /// without colliding on SPI values.  When unset (default), siphon
+    /// uses the historical wide range starting at 10000.
+    #[serde(default)]
+    pub spi_range_start: Option<u32>,
+    /// Number of SPIs available in the partition (paired with
+    /// `spi_range_start`).  Default 8192 — far more than any practical
+    /// concurrent registration count.
+    #[serde(default = "default_spi_range_count")]
+    pub spi_range_count: u32,
+}
+
+/// XFRM backend selection.  Defaults to `Netlink` on Linux (the only
+/// platform where IPsec is meaningful).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IpsecBackend {
+    /// Direct XFRM netlink protocol — fastest, no shell-out.
+    Netlink,
+    /// Legacy `/sbin/ip xfrm` shell-out — used when netlink is
+    /// unavailable (e.g. inside containers without netlink access).
+    Ip,
 }
 
 fn default_ipsec_port_c() -> u16 {
@@ -1841,6 +1871,14 @@ fn default_ipsec_port_c() -> u16 {
 
 fn default_ipsec_port_s() -> u16 {
     5066
+}
+
+fn default_ipsec_backend() -> IpsecBackend {
+    IpsecBackend::Netlink
+}
+
+fn default_spi_range_count() -> u32 {
+    8192
 }
 
 // ---------------------------------------------------------------------------

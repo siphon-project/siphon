@@ -12,6 +12,7 @@ pub mod call;
 pub mod cdr;
 pub mod diameter;
 pub mod gateway;
+pub mod ipsec;
 pub mod isc;
 pub mod li;
 pub mod log;
@@ -61,6 +62,7 @@ pub const BUILT_IN_NAMESPACE_NAMES: &[&str] = &[
     "sbi",
     "srs",
     "subscribe_state",
+    "ipsec",
 ];
 
 /// Host-registered Python namespaces. Populated by `SiphonServer` at
@@ -110,6 +112,9 @@ static SBI_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 static TIMER_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 static SUBSCRIBE_STATE_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// Optional IPsec singleton — set only when `ipsec` is configured (P-CSCF role).
+static IPSEC_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// The IfcStore Arc — stored so the backend can wire Redis persistence.
 static IFC_STORE_ARC: OnceLock<std::sync::Arc<crate::ifc::IfcStore>> = OnceLock::new();
@@ -347,6 +352,22 @@ pub fn set_subscribe_state_singleton(
     Ok(())
 }
 
+/// Store the IPsec singleton for injection into the siphon module.
+///
+/// Called at startup only when `ipsec` is configured (i.e. siphon is
+/// running as a P-CSCF).  Wires the existing `IpsecManager` and the
+/// configured shared protected ports into the Python ``ipsec`` namespace.
+pub fn set_ipsec_singleton(
+    python: Python<'_>,
+    py_ipsec: ipsec::PyIpsec,
+) -> Result<()> {
+    let ipsec_py: Py<PyAny> = Py::new(python, py_ipsec)
+        .map_err(|error| SiphonError::Script(format!("Py::new(ipsec): {error}")))?
+        .into_any();
+    let _ = IPSEC_SINGLETON.set(ipsec_py);
+    Ok(())
+}
+
 /// Store the ISC singleton for injection into the siphon module.
 ///
 /// Always called at startup — the iFC store is always available (even if
@@ -570,6 +591,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("sbi", sbi_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr sbi: {error}")))?;
+    }
+
+    // Inject optional IPsec singleton (P-CSCF role).
+    if let Some(ipsec_py) = IPSEC_SINGLETON.get() {
+        module
+            .setattr("ipsec", ipsec_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr ipsec: {error}")))?;
     }
 
     // Inject host-registered user namespaces. These were validated against

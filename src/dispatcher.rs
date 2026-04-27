@@ -1620,13 +1620,16 @@ fn handle_request(
     // Create PyRequest wrapping the message
     let transport_name = format!("{}", inbound.transport).to_lowercase();
     let message_arc = Arc::new(std::sync::Mutex::new(message));
-    let request = PyRequest::with_local_domains(
+    let mut request = PyRequest::with_local_domains(
         message_arc.clone(),
         transport_name,
         inbound.remote_addr.ip().to_string(),
         inbound.remote_addr.port(),
         Arc::clone(&state.local_domains),
     );
+    // Tag the request with its arrival local port so `is_ipsec_protected`
+    // / `matched_sa` can resolve when running as P-CSCF (3GPP TS 33.203).
+    request.set_local_port(inbound.local_addr.port());
 
     // Call Python handlers
     let (action, record_routed, on_reply_cb, on_failure_cb, send_via_transport, send_via_target, reply_headers, reply_body) = Python::attach(|python| {
@@ -1753,39 +1756,10 @@ fn handle_request(
             }
             let _ = reliable_provisional_armed;
 
-            // IPsec: inject Security-Server on 401 REGISTER and create SAs immediately.
-            // Per 3GPP TS 33.203, the P-CSCF creates SAs right after sending the 401
-            // so the UE's re-REGISTER over the protected port can be decrypted.
-            if *code == 401 && method == "REGISTER" && state.ipsec_config.is_some() {
-                // Look up CK/IK stored by auth module during AKA challenge generation
-                let nonce_key = response
-                    .headers
-                    .get("WWW-Authenticate")
-                    .and_then(|value| {
-                        value.find("nonce=\"").map(|start| {
-                            let after = &value[start + 7..];
-                            after.split('"').next().unwrap_or("").to_string()
-                        })
-                    })
-                    .unwrap_or_default();
-
-                let key_material = if !nonce_key.is_empty() {
-                    crate::script::api::auth::aka_key_store().remove(&nonce_key)
-                } else {
-                    None
-                };
-
-                if let Some((_, keys)) = key_material {
-                    setup_ipsec_on_401(
-                        &mut response,
-                        &message_guard,
-                        &keys.ck,
-                        &keys.ik,
-                        inbound.remote_addr.ip(),
-                        state,
-                    );
-                }
-            }
+            // IPsec Security-Server / SA setup on 401 REGISTER is now driven
+            // by the P-CSCF script (see `siphon.ipsec` and `reply.take_av()`).
+            // The dispatcher only retains de-register auto-cleanup as a safety
+            // net for SA leaks.
 
             // IPsec: delete SA pair on deregistration (REGISTER with Expires: 0)
             if *code == 200 && method == "REGISTER" {
@@ -2715,26 +2689,10 @@ fn handle_response(
             }
             message = updated_message;
 
-            // IPsec: strip CK/IK from relayed 401 REGISTER responses (TS 33.203).
-            // The S-CSCF may include CK/IK in the AKA nonce — the P-CSCF must
-            // consume them for SA creation and forward only RAND||AUTN to the UE.
-            if status_code == 401 && state.ipsec_config.is_some() {
-                let is_register = message.headers.get("CSeq")
-                    .map(|cseq| cseq.contains("REGISTER"))
-                    .unwrap_or(false);
-                if is_register {
-                    if let Some((ck, ik)) = strip_ckik_from_401(&mut message) {
-                        setup_ipsec_on_401(
-                            &mut message,
-                            &original_request,
-                            &ck,
-                            &ik,
-                            source_addr.ip(),
-                            state,
-                        );
-                    }
-                }
-            }
+            // IPsec CK/IK extraction from relayed 401 REGISTER responses is
+            // now driven by the P-CSCF script via `reply.take_av()` (see
+            // `siphon.ipsec`).  The dispatcher no longer transparently
+            // strips/installs SAs on this path.
 
             // Invoke per-relay on_reply / on_failure callbacks if set
             if relay_on_reply.is_some() || (relay_on_failure.is_some() && status_code >= 400) {
@@ -3110,168 +3068,6 @@ fn run_reply_handlers(
     };
 
     (extracted, forwarded)
-}
-
-/// Strip CK/IK from a relayed 401 REGISTER response (TS 33.203 §6.1).
-///
-/// When the P-CSCF relays a 401 from the S-CSCF, the AKA nonce in the
-/// WWW-Authenticate header may be `base64(RAND(16) || AUTN(16) || CK(16) || IK(16))`
-/// (64 bytes total). The P-CSCF must:
-/// 1. Strip CK/IK (last 32 bytes) from the nonce
-/// 2. Store CK/IK for IPsec SA creation
-/// 3. Forward only `base64(RAND || AUTN)` to the UE
-///
-/// If the nonce is already 32 bytes (locally generated), it is left unchanged.
-/// Returns the extracted CK and IK if stripping occurred.
-fn strip_ckik_from_401(message: &mut crate::sip::message::SipMessage) -> Option<(Vec<u8>, Vec<u8>)> {
-    use crate::script::api::auth::{base64_decode, base64_encode};
-
-    let www_auth = message.headers.get("WWW-Authenticate")?;
-
-    // Extract nonce value from: ... nonce="<value>" ...
-    let nonce_start = www_auth.find("nonce=\"")? + 7;
-    let after_nonce = &www_auth[nonce_start..];
-    let nonce_end = after_nonce.find('"')?;
-    let nonce_b64 = &after_nonce[..nonce_end];
-
-    let nonce_bytes = base64_decode(nonce_b64)?;
-
-    // 32 bytes = RAND(16) + AUTN(16) — already stripped or locally generated
-    // 64 bytes = RAND(16) + AUTN(16) + CK(16) + IK(16) — needs stripping
-    if nonce_bytes.len() != 64 {
-        if nonce_bytes.len() != 32 {
-            warn!(
-                nonce_len = nonce_bytes.len(),
-                "unexpected AKA nonce length in relayed 401 (expected 32 or 64)"
-            );
-        }
-        return None;
-    }
-
-    let ck = nonce_bytes[32..48].to_vec();
-    let ik = nonce_bytes[48..64].to_vec();
-
-    // Re-encode nonce as base64(RAND || AUTN) only
-    let stripped_nonce = base64_encode(&nonce_bytes[..32]);
-
-    // Replace nonce in the WWW-Authenticate header
-    let new_www_auth = format!(
-        "{}{}{}",
-        &www_auth[..nonce_start],
-        stripped_nonce,
-        &www_auth[nonce_start + nonce_end..],
-    );
-    message.headers.set("WWW-Authenticate", new_www_auth);
-
-    debug!("CK/IK stripped from relayed 401 AKA nonce (64→32 bytes)");
-    Some((ck, ik))
-}
-
-/// Create IPsec Security Associations for a 401 REGISTER response.
-///
-/// Shared between the local-401 path (RequestAction::Reply) and the
-/// relayed-401 path (response forwarding). Extracts Security-Client from
-/// the original REGISTER request, allocates SPIs, adds Security-Server
-/// to the response, and spawns SA creation.
-fn setup_ipsec_on_401(
-    response: &mut crate::sip::message::SipMessage,
-    original_request: &crate::sip::message::SipMessage,
-    ck: &[u8],
-    ik: &[u8],
-    ue_addr: std::net::IpAddr,
-    state: &DispatcherState,
-) {
-    let (Some(ref ipsec_config), Some(ref ipsec_manager)) =
-        (&state.ipsec_config, &state.ipsec_manager)
-    else {
-        return;
-    };
-
-    let security_client_value = match original_request.headers.get("Security-Client") {
-        Some(v) => v.to_string(),
-        None => {
-            debug!("no Security-Client in original REGISTER — skipping IPsec SA setup");
-            return;
-        }
-    };
-
-    let security_client = match crate::ipsec::parse_security_client(&security_client_value) {
-        Some(sc) => sc,
-        None => {
-            warn!("failed to parse Security-Client header for IPsec SA setup");
-            return;
-        }
-    };
-
-    let (spi_pc, spi_ps) = ipsec_manager.allocate_spi_pair();
-
-    // Build Security-Server with P-CSCF's SPIs and ports
-    let security_server = format!(
-        "ipsec-3gpp; alg={}; spi-c={}; spi-s={}; port-c={}; port-s={}",
-        security_client.algorithm,
-        spi_pc,
-        spi_ps,
-        ipsec_config.pcscf_port_c,
-        ipsec_config.pcscf_port_s,
-    );
-    response.headers.set("Security-Server", security_server);
-
-    // Store CK/IK in key store for potential later use
-    let nonce_key = response
-        .headers
-        .get("WWW-Authenticate")
-        .and_then(|value| {
-            value.find("nonce=\"").map(|start| {
-                let after = &value[start + 7..];
-                after.split('"').next().unwrap_or("").to_string()
-            })
-        })
-        .unwrap_or_default();
-
-    if !nonce_key.is_empty() {
-        let mut ck_arr = [0u8; 16];
-        let mut ik_arr = [0u8; 16];
-        ck_arr.copy_from_slice(&ck[..16.min(ck.len())]);
-        ik_arr.copy_from_slice(&ik[..16.min(ik.len())]);
-        crate::script::api::auth::aka_key_store().insert(
-            nonce_key,
-            crate::script::api::auth::AkaKeyMaterial { ck: ck_arr, ik: ik_arr },
-        );
-    }
-
-    let sa_pair = crate::ipsec::SecurityAssociationPair {
-        ue_addr,
-        pcscf_addr: state.local_addr.ip(),
-        ue_port_c: security_client.port_c,
-        ue_port_s: security_client.port_s,
-        pcscf_port_c: ipsec_config.pcscf_port_c,
-        pcscf_port_s: ipsec_config.pcscf_port_s,
-        spi_uc: security_client.spi_c,
-        spi_us: security_client.spi_s,
-        spi_pc,
-        spi_ps,
-        ealg: crate::ipsec::EncryptionAlgorithm::Null,
-        aalg: crate::ipsec::IntegrityAlgorithm::HmacSha1,
-        encryption_key: String::new(),
-        integrity_key: ik.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
-    };
-
-    let ipsec_manager = Arc::clone(ipsec_manager);
-    tokio::spawn(async move {
-        if let Err(error) = ipsec_manager.create_sa_pair(sa_pair).await {
-            error!(%error, "IPsec: failed to create SA pair on relayed 401");
-        }
-    });
-
-    debug!(
-        spi_pc,
-        spi_ps,
-        spi_uc = security_client.spi_c,
-        spi_us = security_client.spi_s,
-        pcscf_port_c = ipsec_config.pcscf_port_c,
-        pcscf_port_s = ipsec_config.pcscf_port_s,
-        "IPsec: Security-Server added to relayed 401, SAs created"
-    );
 }
 
 /// Rewrite the Contact URI in a response with the observed source address.
@@ -8810,95 +8606,4 @@ mod tests {
         );
     }
 
-    // -- CK/IK stripping tests --
-
-    /// Build a minimal 401 response with a given WWW-Authenticate nonce.
-    fn build_401_with_nonce(nonce_b64: &str) -> SipMessage {
-        use crate::sip::message::{StartLine, StatusLine, Version};
-        let mut message = SipMessage {
-            start_line: StartLine::Response(StatusLine {
-                version: Version::sip_2_0(),
-                status_code: 401,
-                reason_phrase: "Unauthorized".to_string(),
-            }),
-            headers: SipHeaders::new(),
-            body: Vec::new(),
-        };
-        let www_auth = format!(
-            "Digest realm=\"ims.example.com\", nonce=\"{nonce_b64}\", algorithm=AKAv1-MD5, qop=\"auth\""
-        );
-        message.headers.set("WWW-Authenticate", www_auth);
-        message.headers.set("CSeq", "1 REGISTER".to_string());
-        message
-    }
-
-    #[test]
-    fn strip_ckik_from_64_byte_nonce() {
-        use crate::script::api::auth::{base64_encode, base64_decode};
-        // RAND(16) + AUTN(16) + CK(16) + IK(16) = 64 bytes
-        let rand = [0x01u8; 16];
-        let autn = [0x02u8; 16];
-        let ck = [0x03u8; 16];
-        let ik = [0x04u8; 16];
-        let mut nonce_bytes = Vec::with_capacity(64);
-        nonce_bytes.extend_from_slice(&rand);
-        nonce_bytes.extend_from_slice(&autn);
-        nonce_bytes.extend_from_slice(&ck);
-        nonce_bytes.extend_from_slice(&ik);
-        let nonce_b64 = base64_encode(&nonce_bytes);
-
-        let mut message = build_401_with_nonce(&nonce_b64);
-        let result = strip_ckik_from_401(&mut message);
-
-        assert!(result.is_some(), "should strip CK/IK from 64-byte nonce");
-        let (extracted_ck, extracted_ik) = result.unwrap();
-        assert_eq!(extracted_ck, ck.to_vec());
-        assert_eq!(extracted_ik, ik.to_vec());
-
-        // Verify the nonce in the header is now 32 bytes (RAND + AUTN only)
-        let www_auth = message.headers.get("WWW-Authenticate").unwrap();
-        let nonce_start = www_auth.find("nonce=\"").unwrap() + 7;
-        let after = &www_auth[nonce_start..];
-        let new_nonce = &after[..after.find('"').unwrap()];
-        let decoded = base64_decode(new_nonce).unwrap();
-        assert_eq!(decoded.len(), 32);
-        assert_eq!(&decoded[..16], &rand);
-        assert_eq!(&decoded[16..32], &autn);
-    }
-
-    #[test]
-    fn strip_ckik_from_32_byte_nonce_is_noop() {
-        use crate::script::api::auth::base64_encode;
-        // Already stripped — 32 bytes = RAND(16) + AUTN(16)
-        let nonce_bytes = [0xAAu8; 32];
-        let nonce_b64 = base64_encode(&nonce_bytes);
-
-        let mut message = build_401_with_nonce(&nonce_b64);
-        let original_header = message.headers.get("WWW-Authenticate").unwrap().to_string();
-
-        let result = strip_ckik_from_401(&mut message);
-        assert!(result.is_none(), "32-byte nonce should not be stripped");
-
-        // Header should be unchanged
-        assert_eq!(
-            message.headers.get("WWW-Authenticate").unwrap(),
-            &original_header,
-        );
-    }
-
-    #[test]
-    fn strip_ckik_no_www_authenticate_header() {
-        use crate::sip::message::{StartLine, StatusLine, Version};
-        let mut message = SipMessage {
-            start_line: StartLine::Response(StatusLine {
-                version: Version::sip_2_0(),
-                status_code: 401,
-                reason_phrase: "Unauthorized".to_string(),
-            }),
-            headers: SipHeaders::new(),
-            body: Vec::new(),
-        };
-        let result = strip_ckik_from_401(&mut message);
-        assert!(result.is_none());
-    }
 }

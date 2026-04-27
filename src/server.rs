@@ -865,12 +865,45 @@ impl SiphonServer {
         spawn_li_tasks(li_state, &config);
 
         // --- IPsec SA manager ---
-        let ipsec_manager = if config.ipsec.is_some() {
-            let manager = Arc::new(crate::ipsec::IpsecManager::new());
+        let ipsec_manager = if let Some(ref ipsec_config) = config.ipsec {
+            // Pick the backend (default: netlink — Phase 3) and SPI
+            // partition (default: wide range starting at 10000).
+            let backend = match ipsec_config.backend {
+                crate::config::IpsecBackend::Netlink => crate::ipsec::XfrmBackend::Netlink,
+                crate::config::IpsecBackend::Ip => crate::ipsec::XfrmBackend::IpCommand,
+            };
+            let spi_start = ipsec_config.spi_range_start.unwrap_or(10000);
+            let spi_count = ipsec_config.spi_range_count;
+            let manager = Arc::new(crate::ipsec::IpsecManager::with_partition(
+                backend, spi_start, spi_count,
+            ));
             info!(
+                backend = ?backend,
+                spi_start,
+                spi_count,
                 active = manager.active_count(),
-                "IPsec SA manager initialized (SAs created on REGISTER)"
+                "IPsec SA manager initialized (script-driven via siphon.ipsec)"
             );
+
+            // Expose the manager to Python scripts as `siphon.ipsec`.
+            let ipsec_manager_for_singleton = Arc::clone(&manager);
+            let ipsec_config_arc = Arc::new(ipsec_config.clone());
+            let pcscf_addr = local_addr.ip();
+            pyo3::Python::attach(|python| {
+                let py_ipsec = crate::script::api::ipsec::PyIpsec::new(
+                    ipsec_manager_for_singleton,
+                    ipsec_config_arc,
+                    pcscf_addr,
+                );
+                if let Err(error) =
+                    crate::script::api::set_ipsec_singleton(python, py_ipsec)
+                {
+                    error!("failed to store IPsec singleton: {error}");
+                } else {
+                    info!("ipsec namespace registered for injection");
+                }
+            });
+
             Some(manager)
         } else {
             None

@@ -469,6 +469,73 @@ class Request:
         """
         return any(k.lower() == name.lower() for k in self._headers)
 
+    def parse_security_client(self) -> list:
+        """Parse the ``Security-Client`` header (RFC 3329 / 3GPP TS 33.203).
+
+        Returns a list of :class:`MockSecurityOffer` objects (one per
+        comma-separated offer).  Empty list when the header is absent or
+        no offer parses cleanly.
+
+        The mock parser is byte-compatible with the Rust side:
+
+        * Splits on top-level commas (respecting quoted strings).
+        * Splits each offer on ``;``; the first token is the mechanism, the
+          remaining ``key=value`` pairs populate the offer.
+        * UE address is taken from :attr:`source_ip`.
+        """
+        from siphon_sdk.mock_module import MockSecurityOffer
+
+        raw = self.get_header("Security-Client")
+        if not raw:
+            return []
+
+        # Top-level comma split (no quoted-string handling needed for
+        # Security-Client — it doesn't permit quoted strings per RFC 3329).
+        offers: list[MockSecurityOffer] = []
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            parts = [p.strip() for p in chunk.split(";")]
+            if not parts:
+                continue
+            mechanism = parts[0]
+            params: dict[str, str] = {}
+            for token in parts[1:]:
+                if "=" not in token:
+                    continue
+                k, v = token.split("=", 1)
+                params[k.strip().lower()] = v.strip()
+            try:
+                offer = MockSecurityOffer(
+                    mechanism=mechanism,
+                    alg=params["alg"],
+                    ealg=params.get("ealg", "null"),
+                    spi_c=int(params["spi-c"]),
+                    spi_s=int(params["spi-s"]),
+                    port_c=int(params["port-c"]),
+                    port_s=int(params["port-s"]),
+                    ue_addr=self._source_ip,
+                )
+            except (KeyError, ValueError):
+                continue
+            offers.append(offer)
+        return offers
+
+    @property
+    def is_ipsec_protected(self) -> bool:
+        """Whether this request arrived over an IPsec-protected SA.
+
+        Mock returns ``False`` by default; tests can override the underlying
+        ``_is_ipsec_protected`` attribute.
+        """
+        return getattr(self, "_is_ipsec_protected", False)
+
+    @property
+    def matched_sa(self):
+        """Handle to the SA that decrypted this request, or ``None``."""
+        return getattr(self, "_matched_sa", None)
+
     def has_body(self, content_type: str) -> bool:
         """Check if the request has a body matching the given content type.
 

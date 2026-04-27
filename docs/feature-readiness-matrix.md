@@ -256,7 +256,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Diameter peer management | **Production** | `diameter.peers` | Failover + round-robin across HSS/DRA peers |
 | AKA authentication (Milenage, local) | Implemented | `auth.aka_credentials` | 3GPP TS 35.206 — local key derivation without HSS |
 | AKA authentication (HSS-backed) | **Production** | `auth.require_ims_digest()` | 3GPP TS 33.203 via Cx MAR/MAA |
-| IPsec SA management (P-CSCF) | **Production** | `ipsec` | Protected client/server ports for IMS AKA |
+| IPsec SA management (P-CSCF) | Implemented | `ipsec` | Shared protected client/server ports; SAs installed via direct XFRM netlink (Phase 3) with `ip xfrm` shell-out as fallback backend |
+| IPsec sec-agree primitives (script-driven) | Implemented | `siphon.ipsec`, `request.parse_security_client()`, `reply.take_av()` | 3GPP TS 33.203 §6 + RFC 3329; HMAC-SHA-1-96 / HMAC-MD5-96 / HMAC-SHA-256-128 with NULL or AES-CBC-128; Annex H key derivation; registration-tied lifetimes; IPv6; multi-instance SPI partitioning |
 | Initial Filter Criteria (iFC) | **Production** | `isc` | XML trigger-point matching + per-user profile storage from Cx SAR |
 | IMS P-CSCF role | **Production** | Example `examples/ims_pcscf.{py,yaml}` | |
 | IMS I-CSCF role | **Production** | Example `examples/ims_icscf.{py,yaml}` | |
