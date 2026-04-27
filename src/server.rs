@@ -438,6 +438,68 @@ impl SiphonServer {
             });
         }
 
+        // --- IPsec SA manager + singleton ---
+        //
+        // Must be wired BEFORE `ScriptEngine::new()` so the script's
+        // top-level `from siphon import ipsec` resolves.  The manager
+        // Arc is also passed to the dispatcher much later in this fn.
+        //
+        // pcscf_addr is derived from the first UDP listen entry in
+        // config (no actual binding has happened yet).  Falls back to
+        // 0.0.0.0 if no UDP listener is configured — XFRM will not
+        // match traffic against the wildcard, but the singleton is
+        // still wired so the script can import it.
+        let ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>> = if let Some(ref ipsec_config) = config.ipsec {
+            let backend = match ipsec_config.backend {
+                crate::config::IpsecBackend::Netlink => crate::ipsec::XfrmBackend::Netlink,
+                crate::config::IpsecBackend::Ip => crate::ipsec::XfrmBackend::IpCommand,
+            };
+            let spi_start = ipsec_config.spi_range_start.unwrap_or(10000);
+            let spi_count = ipsec_config.spi_range_count;
+            let manager = Arc::new(crate::ipsec::IpsecManager::with_partition(
+                backend, spi_start, spi_count,
+            ));
+            info!(
+                backend = ?backend,
+                spi_start,
+                spi_count,
+                active = manager.active_count(),
+                "IPsec SA manager initialized (script-driven via siphon.ipsec)"
+            );
+
+            // Derive pcscf_addr from the first UDP listen entry without
+            // binding the listener.  Used at SA creation time as the
+            // P-CSCF side of the kernel's xfrm selectors.
+            let pcscf_addr = config
+                .listen
+                .udp
+                .first()
+                .and_then(|entry| entry.address().parse::<std::net::SocketAddr>().ok())
+                .map(|addr| addr.ip())
+                .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+            let ipsec_manager_for_singleton = Arc::clone(&manager);
+            let ipsec_config_arc = Arc::new(ipsec_config.clone());
+            pyo3::Python::attach(|python| {
+                let py_ipsec = crate::script::api::ipsec::PyIpsec::new(
+                    ipsec_manager_for_singleton,
+                    ipsec_config_arc,
+                    pcscf_addr,
+                );
+                if let Err(error) =
+                    crate::script::api::set_ipsec_singleton(python, py_ipsec)
+                {
+                    error!("failed to store IPsec singleton: {error}");
+                } else {
+                    info!(pcscf_addr = %pcscf_addr, "ipsec namespace registered for injection");
+                }
+            });
+
+            Some(manager)
+        } else {
+            None
+        };
+
         // --- Script engine ---
         let engine = if let Some(bytecode) = self.embedded_bytecode {
             Arc::new(ScriptEngine::new_from_bytecode(bytecode).unwrap_or_else(|error| {
@@ -864,50 +926,10 @@ impl SiphonServer {
         // --- LI tasks ---
         spawn_li_tasks(li_state, &config);
 
-        // --- IPsec SA manager ---
-        let ipsec_manager = if let Some(ref ipsec_config) = config.ipsec {
-            // Pick the backend (default: netlink — Phase 3) and SPI
-            // partition (default: wide range starting at 10000).
-            let backend = match ipsec_config.backend {
-                crate::config::IpsecBackend::Netlink => crate::ipsec::XfrmBackend::Netlink,
-                crate::config::IpsecBackend::Ip => crate::ipsec::XfrmBackend::IpCommand,
-            };
-            let spi_start = ipsec_config.spi_range_start.unwrap_or(10000);
-            let spi_count = ipsec_config.spi_range_count;
-            let manager = Arc::new(crate::ipsec::IpsecManager::with_partition(
-                backend, spi_start, spi_count,
-            ));
-            info!(
-                backend = ?backend,
-                spi_start,
-                spi_count,
-                active = manager.active_count(),
-                "IPsec SA manager initialized (script-driven via siphon.ipsec)"
-            );
-
-            // Expose the manager to Python scripts as `siphon.ipsec`.
-            let ipsec_manager_for_singleton = Arc::clone(&manager);
-            let ipsec_config_arc = Arc::new(ipsec_config.clone());
-            let pcscf_addr = local_addr.ip();
-            pyo3::Python::attach(|python| {
-                let py_ipsec = crate::script::api::ipsec::PyIpsec::new(
-                    ipsec_manager_for_singleton,
-                    ipsec_config_arc,
-                    pcscf_addr,
-                );
-                if let Err(error) =
-                    crate::script::api::set_ipsec_singleton(python, py_ipsec)
-                {
-                    error!("failed to store IPsec singleton: {error}");
-                } else {
-                    info!("ipsec namespace registered for injection");
-                }
-            });
-
-            Some(manager)
-        } else {
-            None
-        };
+        // The IPsec SA manager + singleton are wired earlier (before
+        // `ScriptEngine::new`) so user scripts can `from siphon import
+        // ipsec` at top level.  We just thread the already-built Arc
+        // into the dispatcher below.
 
         // --- SBI client ---
         if let Some(ref sbi_config) = config.sbi {
