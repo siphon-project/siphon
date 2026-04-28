@@ -59,6 +59,12 @@ struct TimerEntry {
     transport: Option<Transport>,
     /// Connection ID for sending.
     connection_id: Option<ConnectionId>,
+    /// Local socket the original request arrived on — required by
+    /// 3GPP TS 33.203 §7.4 so retransmitted server-transaction-cached
+    /// responses egress on the same SA's local endpoint as the
+    /// original.  None for client transactions or when the source
+    /// doesn't matter (TCP/TLS connection-affine sends).
+    source_local_addr: Option<SocketAddr>,
 }
 
 /// Shared state for the dispatcher, passed to each spawned task.
@@ -1153,6 +1159,7 @@ fn fire_expired_timers(state: &DispatcherState) {
                         entry.destination,
                         entry.transport,
                         entry.connection_id,
+                        entry.source_local_addr,
                         state,
                     );
                 }
@@ -1182,6 +1189,7 @@ fn fire_expired_timers(state: &DispatcherState) {
                         entry.destination,
                         entry.transport,
                         entry.connection_id,
+                        entry.source_local_addr,
                         state,
                     );
                 }
@@ -1194,12 +1202,20 @@ fn fire_expired_timers(state: &DispatcherState) {
 }
 
 /// Process actions from a timer-driven state machine event.
+///
+/// `source_local_addr` is the local socket the original request
+/// arrived on — required by 3GPP TS 33.203 §7.4 for IPsec sec-agree
+/// (responses cached by server transactions and re-emitted as
+/// `Action::SendMessage` must egress on the same socket the request
+/// arrived on).  For client transactions or paths where the source
+/// doesn't matter, callers pass `None`.
 fn process_timer_actions(
     actions: &[Action],
     key: &TransactionKey,
     destination: Option<SocketAddr>,
     transport: Option<Transport>,
     connection_id: Option<ConnectionId>,
+    source_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
 ) {
     for action in actions {
@@ -1207,7 +1223,7 @@ fn process_timer_actions(
             Action::SendMessage(message) => {
                 if let (Some(dest), Some(trans)) = (destination, transport) {
                     let conn_id = connection_id.unwrap_or_default();
-                    send_message(message.clone(), trans, dest, conn_id, state);
+                    send_message_from(message.clone(), trans, dest, conn_id, source_local_addr, state);
                 }
             }
             Action::StartTimer(name, duration) => {
@@ -1219,6 +1235,7 @@ fn process_timer_actions(
                     destination,
                     transport,
                     connection_id,
+                    source_local_addr,
                 });
             }
             Action::CancelTimer(name) => {
@@ -1350,6 +1367,7 @@ fn handle_request(
                     Some(inbound.remote_addr),
                     Some(inbound.transport),
                     Some(inbound.connection_id),
+                    Some(inbound.local_addr),
                     state,
                 );
                 return;
@@ -1588,6 +1606,9 @@ fn handle_request(
                         destination: Some(inbound.remote_addr),
                         transport: Some(inbound.transport),
                         connection_id: Some(inbound.connection_id),
+                        // Retransmit cached responses on the same SA's
+                        // local endpoint (TS 33.203 §7.4).
+                        source_local_addr: Some(inbound.local_addr),
                     });
                 }
             }
@@ -1821,6 +1842,7 @@ fn handle_request(
                                 Some(inbound.remote_addr),
                                 Some(inbound.transport),
                                 Some(inbound.connection_id),
+                                Some(inbound.local_addr),
                                 state,
                             );
                             sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
@@ -2063,6 +2085,9 @@ fn relay_request(
                         destination: Some(destination),
                         transport: Some(outbound_transport),
                         connection_id: Some(placeholder_connection_id),
+                        // Client transactions are outbound — no inbound
+                        // socket to pin.
+                        source_local_addr: None,
                     });
                 }
             }
@@ -2296,6 +2321,9 @@ fn relay_fork_branch(
                         destination: Some(destination),
                         transport: Some(outbound_transport),
                         connection_id: Some(placeholder_connection_id),
+                        // Client transactions are outbound — no inbound
+                        // socket to pin.
+                        source_local_addr: None,
                     });
                 }
             }
@@ -2588,6 +2616,7 @@ fn handle_response(
                                     destination: None,
                                     transport: None,
                                     connection_id: None,
+                                    source_local_addr: None,
                                 });
                             }
                             Action::ProtocolError(message) => {
@@ -2939,6 +2968,7 @@ fn handle_response(
                         Some(source_addr),
                         Some(transport),
                         Some(connection_id),
+                        Some(inbound_local_addr),
                         state,
                     );
                 }
@@ -8242,6 +8272,7 @@ mod tests {
             destination: Some("10.0.0.1:5060".parse().unwrap()),
             transport: Some(Transport::Udp),
             connection_id: Some(ConnectionId::default()),
+            source_local_addr: None,
         };
         assert_eq!(entry.key, key);
         assert_eq!(entry.name, TimerName::A);
