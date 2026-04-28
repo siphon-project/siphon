@@ -529,15 +529,50 @@ impl SiphonServer {
 
         // --- Transport channels ---
         let (inbound_tx, inbound_rx) = flume::unbounded();
-        let (udp_outbound_tx, udp_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
         let (tcp_outbound_tx, tcp_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
         let (tls_outbound_tx, tls_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
         let (ws_outbound_tx, ws_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
         let (wss_outbound_tx, wss_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
         let (sctp_outbound_tx, sctp_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
 
+        // UDP listeners get a dedicated outbound channel each — required
+        // for IPsec sec-agree on the P-CSCF role (3GPP TS 33.203 §7.4)
+        // where a reply must egress on the same local socket the request
+        // arrived on.  The first listener's channel doubles as the
+        // default fallback for messages without a `source_local_addr`.
+        let mut udp_listener_channels: std::collections::HashMap<
+            std::net::SocketAddr,
+            (flume::Sender<transport::OutboundMessage>, flume::Receiver<transport::OutboundMessage>),
+        > = std::collections::HashMap::new();
+        for entry in &config.listen.udp {
+            let addr: std::net::SocketAddr = match entry.address().parse() {
+                Ok(addr) => addr,
+                Err(_) => continue, // re-validated by the listener loop below
+            };
+            udp_listener_channels
+                .entry(addr)
+                .or_insert_with(flume::unbounded);
+        }
+        // Build the OutboundRouter's `udp_by_local` map (sender side
+        // only) and pick a default sender from the first listener.  If
+        // no UDP listeners are configured (rare — TCP/WS-only deploy),
+        // synthesize a placeholder channel that just discards.
+        let mut udp_by_local: std::collections::HashMap<
+            std::net::SocketAddr,
+            flume::Sender<transport::OutboundMessage>,
+        > = std::collections::HashMap::new();
+        let mut udp_default: Option<flume::Sender<transport::OutboundMessage>> = None;
+        for (addr, (tx, _)) in udp_listener_channels.iter() {
+            udp_by_local.insert(*addr, tx.clone());
+            if udp_default.is_none() {
+                udp_default = Some(tx.clone());
+            }
+        }
+        let udp_default = udp_default.unwrap_or_else(|| flume::unbounded().0);
+
         let outbound_senders = Arc::new(transport::OutboundRouter {
-            udp: udp_outbound_tx,
+            udp: udp_default,
+            udp_by_local,
             tcp: tcp_outbound_tx,
             tls: tls_outbound_tx,
             ws: ws_outbound_tx,
@@ -573,7 +608,15 @@ impl SiphonServer {
             }
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting UDP transport");
-            transport::udp::listen(addr, inbound_tx.clone(), udp_outbound_rx.clone(), Arc::clone(&transport_acl), tos).await;
+            // Use this listener's dedicated outbound channel (TS 33.203
+            // §7.4 — replies to IPsec-protected requests must egress on
+            // the same socket they arrived on; sharing one channel makes
+            // that impossible because any listener can pick up any send).
+            let listener_rx = udp_listener_channels
+                .get(&addr)
+                .map(|(_, rx)| rx.clone())
+                .unwrap_or_else(|| flume::unbounded().1);
+            transport::udp::listen(addr, inbound_tx.clone(), listener_rx, Arc::clone(&transport_acl), tos).await;
         }
 
         // TCP

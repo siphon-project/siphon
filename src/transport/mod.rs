@@ -132,11 +132,30 @@ pub struct OutboundMessage {
     pub transport: Transport,
     pub destination: SocketAddr,
     pub data: Bytes,
+    /// Local socket the message must egress from.  When `Some(addr)`,
+    /// the [`OutboundRouter`] forwards to the UDP listener bound to
+    /// `addr`.  Required for IPsec-protected replies (3GPP TS 33.203
+    /// §7.4: a response must leave on the same SA's local endpoint
+    /// that the request arrived on, otherwise the kernel egress XFRM
+    /// policy won't match).  When `None`, the message goes to the
+    /// default UDP channel (typically the first listener configured).
+    pub source_local_addr: Option<SocketAddr>,
 }
 
 /// Routes outbound messages to the correct transport channel.
+///
+/// UDP traffic supports per-listener routing: when a message carries
+/// `source_local_addr = Some(addr)` and a listener is bound to that
+/// address (registered via `udp_by_local`), the message is delivered
+/// to that listener's private channel.  Otherwise it falls back to
+/// the default UDP channel.
 pub struct OutboundRouter {
+    /// Default UDP sender — used for messages without a specific
+    /// `source_local_addr` and for any address not in `udp_by_local`.
     pub udp: flume::Sender<OutboundMessage>,
+    /// Per-listener UDP channels keyed by local socket address.
+    /// Populated at server startup; empty in test fixtures.
+    pub udp_by_local: std::collections::HashMap<SocketAddr, flume::Sender<OutboundMessage>>,
     pub tcp: flume::Sender<OutboundMessage>,
     pub tls: flume::Sender<OutboundMessage>,
     pub ws: flume::Sender<OutboundMessage>,
@@ -147,7 +166,14 @@ pub struct OutboundRouter {
 impl OutboundRouter {
     pub fn send(&self, message: OutboundMessage) -> Result<(), flume::SendError<OutboundMessage>> {
         match message.transport {
-            Transport::Udp => self.udp.send(message),
+            Transport::Udp => {
+                if let Some(source) = message.source_local_addr {
+                    if let Some(sender) = self.udp_by_local.get(&source) {
+                        return sender.send(message);
+                    }
+                }
+                self.udp.send(message)
+            }
             Transport::Tcp => self.tcp.send(message),
             Transport::Tls => self.tls.send(message),
             Transport::WebSocket => self.ws.send(message),
@@ -324,6 +350,7 @@ mod tests {
             transport: Transport::Udp,
             destination: "10.0.0.1:5060".parse().unwrap(),
             data: Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"),
+            source_local_addr: None,
         };
         assert_eq!(message.connection_id, ConnectionId(99));
         assert_eq!(message.transport, Transport::Udp);

@@ -98,6 +98,7 @@ async fn udp_roundtrip() {
             transport: inbound.transport,
             destination: inbound.remote_addr,
             data: Bytes::from_static(sip_200_ok().as_bytes()),
+            source_local_addr: None,
         })
         .await
         .unwrap();
@@ -152,6 +153,7 @@ async fn tcp_roundtrip() {
             transport: inbound.transport,
             destination: inbound.remote_addr,
             data: Bytes::from_static(sip_200_ok().as_bytes()),
+            source_local_addr: None,
         })
         .await
         .unwrap();
@@ -217,6 +219,7 @@ async fn tls_roundtrip() {
             transport: inbound.transport,
             destination: inbound.remote_addr,
             data: Bytes::from_static(sip_200_ok().as_bytes()),
+            source_local_addr: None,
         })
         .await
         .unwrap();
@@ -275,6 +278,7 @@ async fn ws_roundtrip() {
             transport: inbound.transport,
             destination: inbound.remote_addr,
             data: Bytes::from_static(sip_200_ok().as_bytes()),
+            source_local_addr: None,
         })
         .await
         .unwrap();
@@ -346,6 +350,7 @@ async fn wss_roundtrip() {
             transport: inbound.transport,
             destination: inbound.remote_addr,
             data: Bytes::from_static(sip_200_ok().as_bytes()),
+            source_local_addr: None,
         })
         .await
         .unwrap();

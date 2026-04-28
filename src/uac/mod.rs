@@ -237,6 +237,7 @@ impl UacSender {
             transport,
             destination,
             data,
+            source_local_addr: None,
         };
 
         let (sender, receiver) = oneshot::channel();
@@ -335,6 +336,7 @@ impl UacSender {
             transport,
             destination,
             data,
+            source_local_addr: None,
         };
 
         self.pending.insert(branch.clone(), PendingRequest { sender });
@@ -379,6 +381,7 @@ impl UacSender {
             transport,
             destination,
             data,
+            source_local_addr: None,
         };
 
         debug!(
@@ -425,6 +428,7 @@ mod tests {
 
         let router = Arc::new(OutboundRouter {
             udp: udp_tx,
+            udp_by_local: std::collections::HashMap::new(),
             tcp: tcp_tx,
             tls: tls_tx,
             ws: ws_tx,
@@ -648,7 +652,13 @@ mod tests {
         let (sctp_tx, _sctp_rx) = flume::unbounded();
 
         let router = Arc::new(OutboundRouter {
-            udp: udp_tx, tcp: tcp_tx, tls: tls_tx, ws: ws_tx, wss: wss_tx, sctp: sctp_tx,
+            udp: udp_tx,
+            udp_by_local: HashMap::new(),
+            tcp: tcp_tx,
+            tls: tls_tx,
+            ws: ws_tx,
+            wss: wss_tx,
+            sctp: sctp_tx,
         });
 
         let sender = UacSender::new(
@@ -678,7 +688,13 @@ mod tests {
         let (sctp_tx, _sctp_rx) = flume::unbounded();
 
         let router = Arc::new(OutboundRouter {
-            udp: udp_tx, tcp: tcp_tx, tls: tls_tx, ws: ws_tx, wss: wss_tx, sctp: sctp_tx,
+            udp: udp_tx,
+            udp_by_local: HashMap::new(),
+            tcp: tcp_tx,
+            tls: tls_tx,
+            ws: ws_tx,
+            wss: wss_tx,
+            sctp: sctp_tx,
         });
 
         let sender = UacSender::new(

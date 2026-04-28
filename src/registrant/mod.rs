@@ -719,6 +719,7 @@ pub async fn registration_loop(
                             transport,
                             destination,
                             data,
+                            source_local_addr: None,
                         };
                         debug!(aor = %aor, branch = %branch, "sending REGISTER");
                         if let Err(error) = outbound.send(outbound_message) {
@@ -746,6 +747,7 @@ pub async fn registration_loop(
                             transport,
                             destination,
                             data,
+                            source_local_addr: None,
                         };
                         let _ = outbound.send(outbound_message);
                     }

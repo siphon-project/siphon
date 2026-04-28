@@ -1066,6 +1066,7 @@ mod tests {
 
         let router = Arc::new(OutboundRouter {
             udp: udp_tx,
+            udp_by_local: std::collections::HashMap::new(),
             tcp: tcp_tx,
             tls: tls_tx,
             ws: ws_tx,

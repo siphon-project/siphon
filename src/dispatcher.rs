@@ -1425,11 +1425,12 @@ fn handle_request(
             for action in &actions {
                 if let Action::SendMessage(response) = action {
                     // Send response back to the UAC (the original request source)
-                    send_message(
+                    send_message_from(
                         response.clone(),
                         inbound.transport,
                         inbound.remote_addr,
                         inbound.connection_id,
+                        Some(inbound.local_addr),
                         state,
                     );
                 }
@@ -1486,7 +1487,7 @@ fn handle_request(
                 &message, 503, "Service Unavailable",
                 state.server_header.as_deref(), &[],
             );
-            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             return;
         }
     }
@@ -1548,7 +1549,7 @@ fn handle_request(
                     "PRACK matches our reliable 1xx — cancelling retransmits and sending 200 OK"
                 );
                 let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
-                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
                 return;
             }
         }
@@ -1603,7 +1604,7 @@ fn handle_request(
     if message.headers.max_forwards() == Some(0) {
         debug!(method = %method, "Max-Forwards is 0, rejecting with 483");
         let response = build_response(&message, 483, "Too Many Hops", state.server_header.as_deref(), &[]);
-        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
         return;
     }
 
@@ -1613,7 +1614,7 @@ fn handle_request(
     if handlers.is_empty() {
         warn!(method = %method, "no script handler registered");
         let response = build_response(&message, 500, "No Script Handler", state.server_header.as_deref(), &[]);
-        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
         return;
     }
 
@@ -1831,7 +1832,7 @@ fn handle_request(
                 }
             }
             if !sent_by_transaction {
-                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             }
 
         }
@@ -1840,7 +1841,7 @@ fn handle_request(
             // immediately upon receiving an INVITE to stop UAC retransmissions.
             if method == "INVITE" {
                 let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref(), &[]);
-                send_message(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+                send_message_from(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             }
             relay_request(
                 &message_guard,
@@ -1859,11 +1860,11 @@ fn handle_request(
             if targets.is_empty() {
                 warn!("fork with empty targets list");
                 let response = build_response(&message_guard, 500, "No Targets", state.server_header.as_deref(), &[]);
-                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             } else {
                 if method == "INVITE" {
                     let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref(), &[]);
-                    send_message(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+                    send_message_from(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
                 }
                 let fork_strategy = match strategy.as_str() {
                     "sequential" => crate::proxy::fork::ForkStrategy::Sequential,
@@ -1933,7 +1934,7 @@ fn relay_request(
         None => {
             warn!(target = %target_uri_string, "cannot resolve relay target");
             let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref(), &[]);
-            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             return;
         }
     };
@@ -1972,7 +1973,7 @@ fn relay_request(
             "relay loop detected — destination is ourselves"
         );
         let response = build_response(message, 482, "Loop Detected", state.server_header.as_deref(), &[]);
-        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
         return;
     }
 
@@ -1982,7 +1983,7 @@ fn relay_request(
     // Decrement Max-Forwards
     if core::decrement_max_forwards(&mut relayed.headers).is_err() {
         let response = build_response(message, 483, "Too Many Hops", state.server_header.as_deref(), &[]);
-        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
         return;
     }
 
@@ -2136,7 +2137,7 @@ fn relay_fork_request(
     if target_uris.is_empty() {
         warn!("fork: no valid target URIs");
         let response = build_response(message, 500, "No Valid Targets", state.server_header.as_deref(), &[]);
-        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
         return;
     }
 
@@ -3220,6 +3221,7 @@ fn send_to_target(
                     transport: Transport::Tls,
                     destination,
                     data,
+                    source_local_addr: None,
                 };
                 if let Err(error) = state.outbound.send(outbound_message) {
                     error!(destination = %destination, "TLS connection reuse send failed: {error}");
@@ -3263,6 +3265,7 @@ fn send_to_target(
                 transport,
                 destination,
                 data,
+                source_local_addr: None,
             };
             if let Err(error) = state.outbound.send(outbound_message) {
                 error!("failed to enqueue relayed request: {error}");
@@ -3779,9 +3782,27 @@ fn send_outbound(
     connection_id: ConnectionId,
     state: &DispatcherState,
 ) {
+    send_outbound_from(data, transport, destination, connection_id, None, state);
+}
+
+/// Like [`send_outbound`] but pins the local egress address.  Reply
+/// paths set `source_local_addr = Some(inbound.local_addr)` so the
+/// response leaves on the same SA's local endpoint that the request
+/// arrived on (3GPP TS 33.203 §7.4 — required for IPsec-protected
+/// REGISTER cycles).
+fn send_outbound_from(
+    data: Bytes,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
     // HEP capture — outbound (sent to network)
     if let Some(ref hep) = state.hep_sender {
-        let local = state.listen_addrs.get(&transport).copied().unwrap_or(state.local_addr);
+        let local = source_local_addr
+            .or_else(|| state.listen_addrs.get(&transport).copied())
+            .unwrap_or(state.local_addr);
         hep.capture_outbound(local, destination, transport, &data);
     }
 
@@ -3790,6 +3811,7 @@ fn send_outbound(
         transport,
         destination,
         data,
+        source_local_addr,
     };
 
     if let Err(error) = state.outbound.send(outbound_message) {
@@ -3805,6 +3827,22 @@ fn send_message(
     connection_id: ConnectionId,
     state: &DispatcherState,
 ) {
+    send_message_from(message, transport, destination, connection_id, None, state);
+}
+
+/// Like [`send_message`] but pins the local egress address.  Used for
+/// reply-direction sends (responses to inbound requests, server-
+/// transaction retransmits) so the packet leaves on the same SA's
+/// local endpoint that the request arrived on — required by 3GPP
+/// TS 33.203 §7.4 for IPsec-protected REGISTER / MO INVITE cycles.
+fn send_message_from(
+    message: SipMessage,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
     let data = Bytes::from(message.to_bytes());
 
     debug!(
@@ -3813,7 +3851,7 @@ fn send_message(
         "sending message"
     );
 
-    send_outbound(data, transport, destination, connection_id, state);
+    send_outbound_from(data, transport, destination, connection_id, source_local_addr, state);
 }
 
 /// Drain deferred messages queued by presence.notify() etc. during the handler
@@ -4267,7 +4305,7 @@ fn handle_cancel(
     // No matching session or B2BUA call
     debug!(uac_branch = %uac_branch, "CANCEL for unknown transaction");
     let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref(), &[]);
-    send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+    send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
 }
 
 // ---------------------------------------------------------------------------
@@ -4343,7 +4381,7 @@ fn handle_cancel_via_session(
         Err(_) => {
             error!("ProxySession lock poisoned during CANCEL handling");
             let response = build_response(&message, 500, "Internal Server Error", state.server_header.as_deref(), &[]);
-            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             return;
         }
     };
@@ -4428,7 +4466,7 @@ fn handle_b2bua_cancel(
         None => {
             warn!(sip_call_id = %sip_call_id, "B2BUA CANCEL: no matching call");
             let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref(), &[]);
-            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             return;
         }
     };
@@ -4442,7 +4480,7 @@ fn handle_b2bua_cancel(
     if call.state != CallState::Calling && call.state != CallState::Ringing {
         debug!(call_id = %call_id, state = ?call.state, "B2BUA CANCEL: call already answered/terminated");
         let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
-        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
         drop(call);
         return;
     }
@@ -4616,7 +4654,7 @@ fn handle_b2bua_invite(
                             state.server_header.as_deref(),
                             &[],
                         );
-                        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+                        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
                         return;
                     }
                 }
@@ -4634,7 +4672,7 @@ fn handle_b2bua_invite(
                     state.server_header.as_deref(),
                     &[],
                 );
-                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
                 return;
             }
         }
@@ -4799,7 +4837,7 @@ fn handle_b2bua_invite(
         CallAction::Reject { code, reason } => {
             debug!(call_id = %call_id, code, "B2BUA: rejecting call");
             let response = build_response(&message_guard, code, &reason, state.server_header.as_deref(), &[]);
-            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
         }
@@ -4836,7 +4874,7 @@ fn handle_b2bua_invite(
                 response.headers.set("Content-Length", body_bytes.len().to_string());
                 response.body = body_bytes;
             }
-            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             // Actor stays alive — the A-leg dialog is now confirmed and the
             // @b2bua.on_bye handler takes over when the UAC BYEs.
         }
@@ -7110,7 +7148,11 @@ fn arm_reliable_provisional_retransmit(
                         "retransmitting reliable 1xx (RFC 3262)"
                     );
                     let _ = outbound.send(OutboundMessage {
-                        connection_id, transport, destination, data: bytes.clone(),
+                        connection_id,
+                        transport,
+                        destination,
+                        data: bytes.clone(),
+                        source_local_addr: None,
                     });
                     interval = (interval * 2).min(cap);
                 }
@@ -7210,7 +7252,7 @@ fn handle_b2bua_reinvite(
             "B2BUA: rejecting re-INVITE with 491 — target leg not yet ACKed"
         );
         let response = build_response(&message, 491, "Request Pending", state.server_header.as_deref(), &[]);
-        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
         return;
     }
 
@@ -7228,7 +7270,7 @@ fn handle_b2bua_reinvite(
             "B2BUA: rejecting re-INVITE with 491 — another re-INVITE already pending toward target"
         );
         let response = build_response(&message, 491, "Request Pending", state.server_header.as_deref(), &[]);
-        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, state);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
         return;
     }
 
@@ -7510,7 +7552,7 @@ fn handle_srs_invite(
             None => {
                 warn!(call_id = %call_id, "SRS: SIPREC INVITE missing Content-Type");
                 let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
-                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
                 return;
             }
         };
@@ -7518,7 +7560,7 @@ fn handle_srs_invite(
         if message.body.is_empty() {
             warn!(call_id = %call_id, "SRS: SIPREC INVITE has no body");
             let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
-            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
             return;
         }
         let body = message.body.clone();
@@ -7528,7 +7570,7 @@ fn handle_srs_invite(
             Err(error) => {
                 warn!(call_id = %call_id, error = %error, "SRS: failed to parse multipart body");
                 let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
-                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
                 return;
             }
         };
@@ -7542,7 +7584,7 @@ fn handle_srs_invite(
             None => {
                 warn!(call_id = %call_id, "SRS: no rs-metadata+xml part in SIPREC INVITE");
                 let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
-                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
                 return;
             }
         };
@@ -7553,7 +7595,7 @@ fn handle_srs_invite(
             Err(error) => {
                 warn!(call_id = %call_id, error = %error, "SRS: failed to parse recording metadata");
                 let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
-                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
                 return;
             }
         };
@@ -7607,7 +7649,7 @@ fn handle_srs_invite(
         if !should_accept {
             info!(call_id = %call_id, "SRS: recording rejected by script");
             let response = build_response(&message, 403, "Forbidden", state.server_header.as_deref(), &[]);
-            send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
             return;
         }
 
@@ -7625,7 +7667,7 @@ fn handle_srs_invite(
                 None => {
                     warn!(call_id = %call_id, "SRS: re-INVITE but session not found");
                     let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref(), &[]);
-                    send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                    send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
                     return;
                 }
             }
@@ -7636,7 +7678,7 @@ fn handle_srs_invite(
                 None => {
                     warn!(call_id = %call_id, "SRS: session creation failed (max sessions?)");
                     let response = build_response(&message, 503, "Service Unavailable", state.server_header.as_deref(), &[]);
-                    send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                    send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
                     return;
                 }
             }
@@ -7805,7 +7847,7 @@ fn handle_srs_invite(
                     session_id = %session_id,
                     "SRS: sending 200 OK to SRC"
                 );
-                send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
             }
             Err(error) => {
                 error!(call_id = %call_id, error = %error, "SRS: failed to build 200 OK");
@@ -7849,7 +7891,7 @@ fn handle_srs_bye(
 
         // Send 200 OK for the BYE.
         let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
-        send_message(response, inbound.transport, inbound.remote_addr, inbound.connection_id, &state);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
 
         // Store recording metadata via configured backend.
         if let Some(record) = record {
