@@ -50,6 +50,14 @@ pub struct ProxySession {
     pub client_keys: Vec<TransactionKey>,
     /// Where to send responses back to the UAC.
     pub source_addr: SocketAddr,
+    /// Local socket the original inbound request arrived on.
+    /// Required for IPsec sec-agree (3GPP TS 33.203 §7.4) — the
+    /// relayed-back response must egress on the same SA's local
+    /// endpoint.  Without this, the OutboundRouter falls back to the
+    /// default UDP listener and the kernel's outbound XFRM policy
+    /// (keyed on src=local_addr:port_s, dst=ue:port_c) doesn't match,
+    /// so the response leaves in the clear.
+    pub inbound_local_addr: SocketAddr,
     /// Connection ID for the original inbound transport.
     pub connection_id: ConnectionId,
     /// Transport type for the original inbound connection.
@@ -77,6 +85,7 @@ impl ProxySession {
     pub fn new(
         server_key: TransactionKey,
         source_addr: SocketAddr,
+        inbound_local_addr: SocketAddr,
         connection_id: ConnectionId,
         transport: Transport,
         original_request: SipMessage,
@@ -89,6 +98,7 @@ impl ProxySession {
             fork_aggregator: None,
             branch_index_map: HashMap::new(),
             source_addr,
+            inbound_local_addr,
             connection_id,
             transport,
             original_request,
@@ -472,10 +482,15 @@ mod tests {
         "10.0.0.1:5060".parse().unwrap()
     }
 
+    fn local_addr() -> SocketAddr {
+        "127.0.0.1:5060".parse().unwrap()
+    }
+
     fn make_session() -> ProxySession {
         let mut session = ProxySession::new(
             server_key(),
             source_addr(),
+            local_addr(),
             ConnectionId::default(),
             Transport::Udp,
             dummy_request(),
@@ -696,6 +711,7 @@ mod tests {
                 let mut session = ProxySession::new(
                     server,
                     source_addr(),
+                    local_addr(),
                     ConnectionId::default(),
                     Transport::Udp,
                     dummy_request(),
@@ -769,6 +785,7 @@ mod tests {
         let mut session = ProxySession::new(
             server_key(),
             source_addr(),
+            local_addr(),
             ConnectionId::default(),
             Transport::Udp,
             dummy_request(),
@@ -845,6 +862,7 @@ mod tests {
         let mut session1 = ProxySession::new(
             leg1_server.clone(),
             "10.0.0.1:5060".parse().unwrap(),
+            local_addr(),
             ConnectionId::default(),
             Transport::Udp,
             leg1_request,
@@ -874,6 +892,7 @@ mod tests {
         let mut session2 = ProxySession::new(
             leg2_server.clone(),
             "10.0.0.2:5060".parse().unwrap(),
+            local_addr(),
             ConnectionId::default(),
             Transport::Udp,
             leg2_request,

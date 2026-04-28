@@ -2071,6 +2071,7 @@ fn relay_request(
                 let mut session = ProxySession::new(
                     srv_key.clone(),
                     inbound.remote_addr,
+                    inbound.local_addr,
                     inbound.connection_id,
                     inbound.transport,
                     message.clone(),
@@ -2158,6 +2159,7 @@ fn relay_fork_request(
     let mut session = ProxySession::new(
         srv_key.clone(),
         inbound.remote_addr,
+        inbound.local_addr,
         inbound.connection_id,
         inbound.transport,
         message.clone(),
@@ -2615,7 +2617,7 @@ fn handle_response(
 
     if let Some(ref client_key) = client_txn_key {
         if let Some(session_arc) = state.session_store.get_by_client_key(client_key) {
-            let (source_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure, client_branch) = {
+            let (source_addr, inbound_local_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure, client_branch) = {
                 let session = match session_arc.read() {
                     Ok(s) => s,
                     Err(error) => {
@@ -2625,6 +2627,7 @@ fn handle_response(
                 };
                 (
                     session.source_addr,
+                    session.inbound_local_addr,
                     session.connection_id,
                     session.transport,
                     session.server_key.clone(),
@@ -2883,9 +2886,14 @@ fn handle_response(
                                 Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
                                 Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                             };
-                            send_message(final_response, transport, source_addr, connection_id, state);
+                            // 3GPP TS 33.203 §7.4: the relayed-back response
+                            // must egress on the same SA's local endpoint
+                            // that the request arrived on.  Pass the session's
+                            // captured inbound_local_addr so the OutboundRouter
+                            // hits the right per-listener UDP channel.
+                            send_message_from(final_response, transport, source_addr, connection_id, Some(inbound_local_addr), state);
                         } else {
-                            send_message(best_response, transport, source_addr, connection_id, state);
+                            send_message_from(best_response, transport, source_addr, connection_id, Some(inbound_local_addr), state);
                         }
 
                         state.session_store.remove_by_server_key(&server_key);
@@ -2943,7 +2951,7 @@ fn handle_response(
                     branch = %branch,
                     "forwarding response via session"
                 );
-                send_message(message, transport, source_addr, connection_id, state);
+                send_message_from(message, transport, source_addr, connection_id, Some(inbound_local_addr), state);
             }
 
             // Clean up on final response
@@ -4433,11 +4441,12 @@ fn handle_cancel_via_session(
         state.server_header.as_deref(),
         &[],
     );
-    send_message(
+    send_message_from(
         response_487,
         session.transport,
         session.source_addr,
         session.connection_id,
+        Some(session.inbound_local_addr),
         state,
     );
 
