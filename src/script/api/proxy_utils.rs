@@ -804,4 +804,211 @@ mod tests {
             assert_eq!(message.body, body.as_bytes());
         });
     }
+
+    /// End-to-end PyO3 dispatch test: call `proxy_utils.send_request(...)`
+    /// from Python with `body=` and `headers=` kwargs, then read the wire
+    /// bytes off a flume channel.  This is what `build_send_request_message`
+    /// tests *can't* catch — it exercises the kwarg-binding path that the
+    /// 3PR bug report says is dropping the body.
+    ///
+    /// Runs three scenarios back-to-back (UAC_SENDER is a OnceLock — only
+    /// one test per process can install it, so we cover everything here):
+    /// 1. The reporter's 3PR shape: 9 headers including Content-Type,
+    ///    1809-byte str body.
+    /// 2. body=bytes (binary SDP-style).
+    /// 3. headers dict containing `Content-Length: 0` plus a non-empty
+    ///    body — the builder must override the stale CL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_request_python_kwargs_preserve_body_and_content_type() {
+        use crate::transport::OutboundRouter;
+        use crate::uac::UacSender;
+        use std::collections::HashMap;
+        use pyo3::types::PyTuple;
+
+        pyo3::Python::initialize();
+
+        // Wire up a UAC sender whose UDP egress lands on a flume channel
+        // so the test can read back the bytes that would have hit the wire.
+        let (udp_tx, udp_rx) = flume::unbounded();
+        let (tcp_tx, _tcp_rx) = flume::unbounded();
+        let (tls_tx, _tls_rx) = flume::unbounded();
+        let (ws_tx, _ws_rx) = flume::unbounded();
+        let (wss_tx, _wss_rx) = flume::unbounded();
+        let (sctp_tx, _sctp_rx) = flume::unbounded();
+
+        let router = Arc::new(OutboundRouter {
+            udp: udp_tx,
+            udp_by_local: HashMap::new(),
+            tcp: tcp_tx,
+            tls: tls_tx,
+            ws: ws_tx,
+            wss: wss_tx,
+            sctp: sctp_tx,
+        });
+        let sender = Arc::new(UacSender::new(
+            router,
+            "127.0.0.1:5060".parse().unwrap(),
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            None,
+            None,
+        ));
+        let resolver = Arc::new(SipResolver::from_system().unwrap());
+
+        // OnceLock — first test to set wins.  Ignore the result; subsequent
+        // tests on the same process just reuse whatever is installed.
+        let _ = UAC_SENDER.set(sender);
+        let _ = SEND_RESOLVER.set(Arc::clone(&resolver));
+
+        let utils = PyProxyUtils::new(resolver);
+        let utils_py = Python::attach(|py| Py::new(py, utils).unwrap());
+
+        // ---------------------------------------------------------------
+        // Scenario 1 — exact 3PR shape from the bug report:
+        // 9 headers (incl. Content-Type), 1809-byte str body.
+        // ---------------------------------------------------------------
+        let mut body_1 = String::with_capacity(1809);
+        body_1.push_str(
+            "REGISTER sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org SIP/2.0\r\n",
+        );
+        body_1.push_str(
+            "Via: SIP/2.0/UDP 172.30.0.50:5060;branch=z9hG4bK-ue-1\r\n",
+        );
+        body_1.push_str("From: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>;tag=ue-1\r\n");
+        body_1.push_str("To: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>\r\n");
+        body_1.push_str("Call-ID: orig-call-id\r\n");
+        body_1.push_str("CSeq: 2 REGISTER\r\n");
+        body_1.push_str(
+            "Contact: <sip:001010000000001@172.30.0.50:5060>;expires=600000;+sip.instance=\"<urn:gsma:imei:35-209900-176148-1>\"\r\n",
+        );
+        body_1.push_str("Authorization: Digest username=\"001010000000001\", realm=\"ims.mnc001.mcc001.3gppnetwork.org\", uri=\"sip:ims.mnc001.mcc001.3gppnetwork.org\", response=\"deadbeef\", nonce=\"feedface\", algorithm=AKAv1-MD5, opaque=\"000000\"\r\n");
+        body_1.push_str("P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=00101D0F\r\n");
+        body_1.push_str("P-Visited-Network-ID: ims.mnc001.mcc001.3gppnetwork.org\r\n");
+        // pad to 1809 bytes total to mirror the diagnostic body_len.
+        while body_1.len() < 1809 - 4 {
+            body_1.push_str(".");
+        }
+        body_1.push_str("\r\n\r\n");
+        let body_1: &str = &body_1;
+
+        Python::attach(|py| {
+            let bound = utils_py.bind(py);
+
+            let headers = PyDict::new(py);
+            headers.set_item("Contact", "<sip:scscf-0.ims.mnc001.mcc001.3gppnetwork.org:6060>").unwrap();
+            headers.set_item("Content-Type", "message/sip").unwrap();
+            headers.set_item("Event", "registration").unwrap();
+            headers.set_item("Expires", "0").unwrap();
+            headers.set_item("From", "<sip:scscf-0.ims.mnc001.mcc001.3gppnetwork.org:6060>;tag=scscf-3preg").unwrap();
+            headers.set_item("P-Associated-URI", "<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>").unwrap();
+            headers.set_item("P-Visited-Network-ID", "ims.mnc001.mcc001.3gppnetwork.org").unwrap();
+            headers.set_item("Path", "<sip:term@pcscf.ims.mnc001.mcc001.3gppnetwork.org:5060;lr>").unwrap();
+            headers.set_item("To", "<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>").unwrap();
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("headers", headers).unwrap();
+            kwargs.set_item("body", body_1).unwrap();
+
+            // Numeric IP — the resolver short-circuits without DNS.
+            let args = PyTuple::new(py, ["REGISTER", "sip:127.0.0.1:5060"]).unwrap();
+            bound
+                .call_method("send_request", args, Some(&kwargs))
+                .expect("scenario 1: kwarg dispatch");
+        });
+
+        let outbound = udp_rx
+            .try_recv()
+            .expect("scenario 1: no UDP egress — dispatch dropped the message");
+        let wire = String::from_utf8(outbound.data.to_vec()).unwrap();
+        assert!(
+            wire.contains("Content-Type: message/sip"),
+            "scenario 1: missing Content-Type:\n{wire}"
+        );
+        assert!(
+            wire.contains(&format!("Content-Length: {}", body_1.len())),
+            "scenario 1: wrong Content-Length (expected {}, body {} bytes):\n{wire}",
+            body_1.len(),
+            body_1.len()
+        );
+        assert!(
+            wire.ends_with(body_1),
+            "scenario 1: body not verbatim on wire — kwarg dispatch dropped body="
+        );
+
+        // ---------------------------------------------------------------
+        // Scenario 2 — body=bytes through the same dispatch path.
+        // ---------------------------------------------------------------
+        let body_2: &[u8] = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\n";
+        Python::attach(|py| {
+            let bound = utils_py.bind(py);
+
+            let headers = PyDict::new(py);
+            headers.set_item("Content-Type", "application/sdp").unwrap();
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("headers", headers).unwrap();
+            kwargs
+                .set_item("body", pyo3::types::PyBytes::new(py, body_2))
+                .unwrap();
+
+            let args = PyTuple::new(py, ["MESSAGE", "sip:127.0.0.1:5060"]).unwrap();
+            bound
+                .call_method("send_request", args, Some(&kwargs))
+                .expect("scenario 2: bytes-body dispatch");
+        });
+
+        let outbound = udp_rx
+            .try_recv()
+            .expect("scenario 2: no UDP egress for bytes body");
+        assert!(
+            outbound.data.windows(body_2.len()).any(|w| w == body_2),
+            "scenario 2: bytes body lost"
+        );
+        let wire = String::from_utf8(outbound.data.to_vec()).unwrap();
+        assert!(
+            wire.contains(&format!("Content-Length: {}", body_2.len())),
+            "scenario 2: wrong Content-Length:\n{wire}"
+        );
+
+        // ---------------------------------------------------------------
+        // Scenario 3 — caller passes Content-Length: 0 in the headers
+        // dict but supplies a non-empty body.  build_send_request_message
+        // must override the stale Content-Length from the dict.
+        // ---------------------------------------------------------------
+        let body_3 = "abc\r\nhello\r\n";
+        Python::attach(|py| {
+            let bound = utils_py.bind(py);
+
+            let headers = PyDict::new(py);
+            headers.set_item("Content-Length", "0").unwrap();
+            headers.set_item("Content-Type", "text/plain").unwrap();
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("headers", headers).unwrap();
+            kwargs.set_item("body", body_3).unwrap();
+
+            let args = PyTuple::new(py, ["MESSAGE", "sip:127.0.0.1:5060"]).unwrap();
+            bound
+                .call_method("send_request", args, Some(&kwargs))
+                .expect("scenario 3: stale-CL dispatch");
+        });
+
+        let outbound = udp_rx
+            .try_recv()
+            .expect("scenario 3: no UDP egress for stale-CL test");
+        let wire = String::from_utf8(outbound.data.to_vec()).unwrap();
+        assert!(
+            wire.contains(&format!("Content-Length: {}", body_3.len())),
+            "scenario 3: stale Content-Length: 0 leaked from headers dict:\n{wire}"
+        );
+        assert!(
+            !wire.contains("Content-Length: 0\r\n"),
+            "scenario 3: Content-Length: 0 still present in wire output:\n{wire}"
+        );
+        assert!(
+            wire.ends_with(body_3),
+            "scenario 3: body not verbatim on wire:\n{wire}"
+        );
+    }
 }
