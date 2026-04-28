@@ -81,6 +81,11 @@ impl SipResolver {
     /// - `sip` + UDP → `_sip._udp.host`
     /// - `sip` + TCP → `_sip._tcp.host`
     /// - No hint → try UDP first, then TCP
+    ///
+    /// Records are ordered per RFC 2782: ascending priority, with weighted
+    /// random selection within each priority group. The selection is fresh
+    /// on every call, so callers that pick `.next()` will hit different
+    /// equal-cost targets across resolutions.
     async fn resolve_srv(
         &self,
         host: &str,
@@ -111,22 +116,26 @@ impl SipResolver {
             let srv_name = format!("{service_prefix}.{host}.");
             match self.resolver.srv_lookup(&srv_name).await {
                 Ok(lookup) => {
-                    let mut records: Vec<_> = lookup.iter().collect();
-                    // Sort by priority (ascending), then by weight (descending)
-                    records.sort_by(|a, b| {
-                        a.priority()
-                            .cmp(&b.priority())
-                            .then_with(|| b.weight().cmp(&a.weight()))
-                    });
+                    let entries: Vec<SrvEntry> = lookup
+                        .iter()
+                        .map(|record| SrvEntry {
+                            priority: record.priority(),
+                            weight: record.weight(),
+                            port: record.port(),
+                            target: record
+                                .target()
+                                .to_string()
+                                .trim_end_matches('.')
+                                .to_string(),
+                        })
+                        .collect();
 
-                    for record in records {
-                        let target_host = record.target().to_string();
-                        let target_host = target_host.trim_end_matches('.');
-                        let port = record.port();
+                    let ordered = order_srv_entries(entries);
 
-                        // Resolve the SRV target hostname to IP addresses
-                        let addresses =
-                            self.resolve_a_aaaa(target_host, port, Some(transport)).await;
+                    for entry in ordered {
+                        let addresses = self
+                            .resolve_a_aaaa(&entry.target, entry.port, Some(transport))
+                            .await;
                         results.extend(addresses);
                     }
 
@@ -216,9 +225,101 @@ impl SipResolver {
     }
 }
 
+/// Extracted SRV record fields for RFC 2782 selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SrvEntry {
+    priority: u16,
+    weight: u16,
+    port: u16,
+    target: String,
+}
+
+/// Order SRV records per RFC 2782.
+///
+/// Records are grouped by priority (ascending). Within a priority group,
+/// records are ordered by weighted random selection: a record's chance of
+/// being placed at any given position is proportional to its weight relative
+/// to the remaining unordered records. Weight-0 records are placed at the
+/// front of the candidate list and only get picked when the random draw is 0
+/// or when they are all that remain.
+///
+/// The randomness is fresh on every call, so consecutive resolutions of the
+/// same SRV name produce different orderings — that is the whole point of
+/// RFC 2782.
+fn order_srv_entries(mut entries: Vec<SrvEntry>) -> Vec<SrvEntry> {
+    entries.sort_by_key(|entry| entry.priority);
+
+    let mut ordered = Vec::with_capacity(entries.len());
+    let mut group_start = 0usize;
+    while group_start < entries.len() {
+        let mut group_end = group_start + 1;
+        while group_end < entries.len()
+            && entries[group_end].priority == entries[group_start].priority
+        {
+            group_end += 1;
+        }
+        let group: Vec<SrvEntry> = entries[group_start..group_end].to_vec();
+        ordered.extend(rfc2782_select(group, random_u32_inclusive));
+        group_start = group_end;
+    }
+    ordered
+}
+
+/// RFC 2782 weighted random selection for one priority group.
+///
+/// `random_inclusive(max)` must return a uniform integer in `[0, max]`.
+/// Factored as a parameter so tests can pump in deterministic draws.
+fn rfc2782_select<F>(items: Vec<SrvEntry>, mut random_inclusive: F) -> Vec<SrvEntry>
+where
+    F: FnMut(u32) -> u32,
+{
+    // RFC 2782: "all those with weight 0 are placed at the beginning of the
+    // list". sort_by_key is stable, so the relative order of zero-weight and
+    // non-zero-weight subgroups is preserved from the input.
+    let mut remaining = items;
+    remaining.sort_by_key(|entry| u8::from(entry.weight != 0));
+
+    let mut ordered = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let total: u32 = remaining.iter().map(|entry| u32::from(entry.weight)).sum();
+        let pick = random_inclusive(total);
+
+        let mut cumulative: u32 = 0;
+        let mut chosen_index = remaining.len() - 1;
+        for (index, entry) in remaining.iter().enumerate() {
+            cumulative += u32::from(entry.weight);
+            if cumulative >= pick {
+                chosen_index = index;
+                break;
+            }
+        }
+        ordered.push(remaining.remove(chosen_index));
+    }
+    ordered
+}
+
+/// Uniform `u32` in `[0, max]` (inclusive on both ends) using `getrandom`.
+///
+/// On the (vanishingly rare) event that the OS RNG fails, falls back to 0,
+/// which simply biases that single draw toward the head of the candidate
+/// list — still RFC-compliant, just unbiased over the next call.
+fn random_u32_inclusive(max: u32) -> u32 {
+    if max == 0 {
+        return 0;
+    }
+    let range = u64::from(max) + 1;
+    let mut buf = [0u8; 8];
+    if getrandom::fill(&mut buf).is_err() {
+        return 0;
+    }
+    let value = u64::from_le_bytes(buf);
+    (value % range) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     #[tokio::test]
     async fn resolve_numeric_ipv4() {
@@ -299,5 +400,122 @@ mod tests {
             .resolve("this-domain-should-not-exist-xyzzy.invalid", None, "sip", None)
             .await;
         assert!(results.is_empty());
+    }
+
+    fn entry(priority: u16, weight: u16, target: &str) -> SrvEntry {
+        SrvEntry { priority, weight, port: 5060, target: target.to_string() }
+    }
+
+    fn scripted_random(values: Vec<u32>) -> impl FnMut(u32) -> u32 {
+        let cell = RefCell::new(values.into_iter());
+        move |max| {
+            let drawn = cell.borrow_mut().next().unwrap_or(0);
+            assert!(drawn <= max, "scripted draw {drawn} > max {max}");
+            drawn
+        }
+    }
+
+    #[test]
+    fn rfc2782_priority_groups_processed_in_ascending_order() {
+        let entries = vec![
+            entry(20, 100, "low-prio"),
+            entry(10, 100, "high-prio-a"),
+            entry(10, 100, "high-prio-b"),
+        ];
+        let ordered = order_srv_entries(entries);
+        // Priority 10 entries come first regardless of which one wins the
+        // weight draw between them.
+        assert_eq!(ordered[2].target, "low-prio");
+        assert_eq!(ordered[0].priority, 10);
+        assert_eq!(ordered[1].priority, 10);
+    }
+
+    #[test]
+    fn rfc2782_equal_weights_pick_first_when_random_at_lower_bound() {
+        // Two equal records, weights 50+50, total=100. Draw=0 must hit the
+        // first entry's running sum (50). The remaining record then has
+        // total=50, draw=0 hits that one.
+        let group = vec![entry(10, 50, "a"), entry(10, 50, "b")];
+        let ordered = rfc2782_select(group, scripted_random(vec![0, 0]));
+        assert_eq!(ordered[0].target, "a");
+        assert_eq!(ordered[1].target, "b");
+    }
+
+    #[test]
+    fn rfc2782_equal_weights_pick_second_when_random_in_upper_half() {
+        // Draw=51 falls past the first running sum (50), so the second
+        // record wins. Then the second draw on the remaining record (total
+        // = 50) must be ≤ 50; use 50 to keep the assert_le invariant.
+        let group = vec![entry(10, 50, "a"), entry(10, 50, "b")];
+        let ordered = rfc2782_select(group, scripted_random(vec![51, 50]));
+        assert_eq!(ordered[0].target, "b");
+        assert_eq!(ordered[1].target, "a");
+    }
+
+    #[test]
+    fn rfc2782_weight_zero_only_picked_on_zero_draw() {
+        // weight-0 placed first; draw=0 picks it; second pass has only the
+        // weighted record left, draw any.
+        let group = vec![entry(10, 100, "weighted"), entry(10, 0, "zero")];
+        let ordered = rfc2782_select(group, scripted_random(vec![0, 50]));
+        assert_eq!(ordered[0].target, "zero");
+        assert_eq!(ordered[1].target, "weighted");
+
+        // Any non-zero draw skips the zero-weight prefix and lands on the
+        // weighted record.
+        let group = vec![entry(10, 100, "weighted"), entry(10, 0, "zero")];
+        let ordered = rfc2782_select(group, scripted_random(vec![1, 0]));
+        assert_eq!(ordered[0].target, "weighted");
+        assert_eq!(ordered[1].target, "zero");
+    }
+
+    #[test]
+    fn rfc2782_all_weight_zero_falls_back_to_input_order() {
+        let group = vec![entry(10, 0, "first"), entry(10, 0, "second")];
+        let ordered = rfc2782_select(group, scripted_random(vec![0, 0]));
+        assert_eq!(ordered[0].target, "first");
+        assert_eq!(ordered[1].target, "second");
+    }
+
+    #[test]
+    fn rfc2782_distribution_roughly_proportional_to_weight() {
+        // Real RNG, large sample. With weights 90/10, the high-weight target
+        // should win the first slot the overwhelming majority of the time.
+        let mut wins_a = 0u32;
+        let trials = 2000u32;
+        for _ in 0..trials {
+            let group = vec![entry(10, 90, "a"), entry(10, 10, "b")];
+            let ordered = order_srv_entries(group);
+            if ordered[0].target == "a" {
+                wins_a += 1;
+            }
+        }
+        // Expected ~90% (1800/2000). Allow generous slack for RNG variance.
+        assert!(
+            wins_a > 1500 && wins_a < 1950,
+            "weighted distribution looks broken: a won {wins_a}/{trials}"
+        );
+    }
+
+    #[test]
+    fn rfc2782_real_rng_eventually_picks_both_equal_targets() {
+        // The bug this test pins: equal-priority equal-weight records must
+        // not be sticky across resolutions. Run order_srv_entries many
+        // times; both targets must appear at index 0 at least once.
+        let mut a_first = false;
+        let mut b_first = false;
+        for _ in 0..200 {
+            let group = vec![entry(10, 50, "a"), entry(10, 50, "b")];
+            let ordered = order_srv_entries(group);
+            match ordered[0].target.as_str() {
+                "a" => a_first = true,
+                "b" => b_first = true,
+                _ => unreachable!(),
+            }
+            if a_first && b_first {
+                return;
+            }
+        }
+        panic!("RFC 2782 random selection is sticky: a_first={a_first} b_first={b_first}");
     }
 }
