@@ -15,8 +15,11 @@ use crate::sip::builder::SipMessageBuilder;
 use crate::sip::headers::cseq::CSeq;
 use crate::sip::message::{Method, StartLine};
 use crate::sip::parser::parse_uri_standalone;
+use crate::sip::uri::SipUri;
 use crate::transport::Transport;
 use crate::uac::UacSender;
+
+use std::net::SocketAddr;
 
 use super::reply::PyReply;
 use super::request::PyRequest;
@@ -333,60 +336,14 @@ impl PyProxyUtils {
             None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
         };
 
-        // Build the SIP message
-        let sip_method = Method::from_str(method);
-        // Always use the z9hG4bK-uac- prefix — harmless for fire-and-forget
-        // (no pending entry is registered), required for wait_for_response
-        // so UacSender::match_response picks it up.
-        let branch = format!("z9hG4bK-uac-py-{}", uuid::Uuid::new_v4());
-        let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
-        let call_id = format!("py-{}", uuid::Uuid::new_v4());
-        let cseq_str = format!("1 {}", sip_method.as_str());
-
-        let mut builder = SipMessageBuilder::new()
-            .request(sip_method, uri)
-            .via(via)
-            .call_id(call_id)
-            .cseq(cseq_str)
-            .max_forwards(70);
-
-        // Merge user-provided headers
-        if let Some(header_dict) = headers {
-            for (key, value) in header_dict.iter() {
-                let name: String = key.extract().map_err(|error| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "header name must be str: {error}"
-                    ))
-                })?;
-                let val: String = value.extract().map_err(|error| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "header value must be str: {error}"
-                    ))
-                })?;
-                builder = builder.header(&name, val);
-            }
-        }
-
-        // Set body if provided — accept str or bytes.
-        if let Some(body_obj) = body {
-            if let Ok(body_str) = body_obj.extract::<&str>() {
-                builder = builder.body_str(body_str);
-            } else if let Ok(body_bytes) = body_obj.extract::<Vec<u8>>() {
-                builder = builder.body(body_bytes);
-            } else {
-                return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "body must be str or bytes",
-                ));
-            }
-        } else {
-            builder = builder.content_length(0);
-        }
-
-        let message = builder.build().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to build SIP message: {error}"
-            ))
-        })?;
+        let message = build_send_request_message(
+            method,
+            uri,
+            transport,
+            target.address,
+            headers,
+            body,
+        )?;
 
         if !wait_for_response {
             uac_sender.send_request(message, target.address, transport);
@@ -429,6 +386,69 @@ impl PyProxyUtils {
             0
         }
     }
+}
+
+/// Build the SIP message originated by `proxy.send_request()`.
+///
+/// Pulled out as a free function so it can be unit-tested without a UAC
+/// sender / DNS resolver — the bug that motivated the extraction was the
+/// body argument silently dropping on REGISTER 3PR (TS 24.229 §5.4.1.7).
+fn build_send_request_message(
+    method: &str,
+    uri: SipUri,
+    transport: Transport,
+    destination: SocketAddr,
+    headers: Option<&Bound<'_, PyDict>>,
+    body: Option<&Bound<'_, PyAny>>,
+) -> PyResult<SipMessage> {
+    let sip_method = Method::from_str(method);
+    // Always use the z9hG4bK-uac- prefix — harmless for fire-and-forget
+    // (no pending entry is registered), required for wait_for_response so
+    // UacSender::match_response picks it up.
+    let branch = format!("z9hG4bK-uac-py-{}", uuid::Uuid::new_v4());
+    let via = format!("SIP/2.0/{} {};branch={}", transport, destination, branch);
+    let call_id = format!("py-{}", uuid::Uuid::new_v4());
+    let cseq_str = format!("1 {}", sip_method.as_str());
+
+    let mut builder = SipMessageBuilder::new()
+        .request(sip_method, uri)
+        .via(via)
+        .call_id(call_id)
+        .cseq(cseq_str)
+        .max_forwards(70);
+
+    // Merge user-provided headers first so that body_str() / body() can
+    // overwrite Content-Length authoritatively after.
+    if let Some(header_dict) = headers {
+        for (key, value) in header_dict.iter() {
+            let name: String = key.extract().map_err(|error| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "header name must be str: {error}"
+                ))
+            })?;
+            let val: String = value.extract().map_err(|error| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "header value must be str: {error}"
+                ))
+            })?;
+            builder = builder.header(&name, val);
+        }
+    }
+
+    // Set body if provided — accept str or bytes.  body_str() / body() each
+    // refresh Content-Length so any caller-provided value is corrected.
+    if let Some(body_obj) = body {
+        let bytes = super::request::extract_body_bytes(body_obj)?;
+        builder = builder.body(bytes);
+    } else {
+        builder = builder.content_length(0);
+    }
+
+    builder.build().map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to build SIP message: {error}"
+        ))
+    })
 }
 
 /// Perform ENUM NAPTR lookup for a phone number.
@@ -642,5 +662,146 @@ mod tests {
         let pct = utils.memory_used_pct();
         // Should be between 0 and 100 for any running process
         assert!(pct <= 100, "memory_used_pct returned {pct}");
+    }
+
+    fn destination() -> SocketAddr {
+        "10.0.0.1:5060".parse().unwrap()
+    }
+
+    fn target_uri() -> SipUri {
+        SipUri::new("mmtel.ims.example.org".to_string())
+    }
+
+    /// 3PR (TS 24.229 §5.4.1.7): S-CSCF sends a REGISTER body containing
+    /// the original REGISTER as `message/sip` to the AS.  Both the body
+    /// and the script-supplied `Content-Type` MUST appear on the wire.
+    #[test]
+    fn send_request_preserves_str_body_and_content_type() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("Content-Type", "message/sip").unwrap();
+            headers.set_item("Event", "registration").unwrap();
+            headers.set_item("Expires", "0").unwrap();
+
+            let body = "REGISTER sip:bob@biloxi.com SIP/2.0\r\n\
+                        Content-Length: 0\r\n\
+                        \r\n";
+            let body_obj = body.into_pyobject(py).unwrap();
+            let body_any = body_obj.as_any();
+
+            let message = build_send_request_message(
+                "REGISTER",
+                target_uri(),
+                Transport::Udp,
+                destination(),
+                Some(&headers),
+                Some(body_any),
+            )
+            .expect("build_send_request_message");
+
+            assert_eq!(
+                message.body, body.as_bytes(),
+                "body must round-trip through the builder"
+            );
+            assert_eq!(
+                message.headers.content_length(),
+                Some(body.len()),
+                "Content-Length must reflect the body length, not 0"
+            );
+            assert_eq!(
+                message.headers.get("Content-Type").map(String::as_str),
+                Some("message/sip"),
+                "Content-Type from headers dict must propagate"
+            );
+
+            // Wire bytes carry the body verbatim after the blank line.
+            let wire = message.to_bytes();
+            let wire_str = String::from_utf8_lossy(&wire);
+            assert!(
+                wire_str.contains("Content-Type: message/sip"),
+                "wire output must include Content-Type, got:\n{wire_str}"
+            );
+            assert!(
+                wire_str.ends_with(body),
+                "wire output must end with the body, got:\n{wire_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn send_request_accepts_bytes_body() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("Content-Type", "application/sdp").unwrap();
+
+            let body_bytes: &[u8] = b"v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n";
+            let body_obj = pyo3::types::PyBytes::new(py, body_bytes);
+
+            let message = build_send_request_message(
+                "MESSAGE",
+                target_uri(),
+                Transport::Udp,
+                destination(),
+                Some(&headers),
+                Some(body_obj.as_any()),
+            )
+            .expect("build_send_request_message");
+
+            assert_eq!(message.body, body_bytes);
+            assert_eq!(message.headers.content_length(), Some(body_bytes.len()));
+        });
+    }
+
+    #[test]
+    fn send_request_without_body_sets_content_length_zero() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("Event", "reg").unwrap();
+
+            let message = build_send_request_message(
+                "OPTIONS",
+                target_uri(),
+                Transport::Udp,
+                destination(),
+                Some(&headers),
+                None,
+            )
+            .expect("build_send_request_message");
+
+            assert!(message.body.is_empty());
+            assert_eq!(message.headers.content_length(), Some(0));
+        });
+    }
+
+    #[test]
+    fn send_request_caller_content_length_is_overridden_by_body() {
+        // A caller that sets `Content-Length: 0` in the headers dict (e.g.
+        // because they copied headers from another message) must not end up
+        // with a stale Content-Length on the wire — body() refreshes it.
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("Content-Length", "0").unwrap();
+            headers.set_item("Content-Type", "message/sip").unwrap();
+
+            let body = "REGISTER sip:bob@biloxi.com SIP/2.0\r\n\r\n";
+            let body_obj = body.into_pyobject(py).unwrap();
+
+            let message = build_send_request_message(
+                "REGISTER",
+                target_uri(),
+                Transport::Udp,
+                destination(),
+                Some(&headers),
+                Some(body_obj.as_any()),
+            )
+            .expect("build_send_request_message");
+
+            assert_eq!(message.headers.content_length(), Some(body.len()));
+            assert_eq!(message.body, body.as_bytes());
+        });
     }
 }
