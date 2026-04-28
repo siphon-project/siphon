@@ -21,6 +21,44 @@ use super::sip_uri::PySipUri;
 /// Shared list of local domains from config.
 pub type LocalDomains = Arc<Vec<String>>;
 
+/// Build a loose-route header value (`<uri;lr>`) idempotently.
+///
+/// Accepts URIs with or without surrounding angle brackets and with or
+/// without an existing `;lr` URI parameter, returning the canonical
+/// `<uri;lr>` form exactly once.  Required so scripts can pass back
+/// values they previously received from siphon (stored Path entries,
+/// Service-Route bindings) without producing wire forms like
+/// `<<sip:host;lr>;lr>` or `<sip:host;lr;lr>` — both of which break
+/// downstream loose-route detection (RFC 3261 §16.4 / §16.12).
+fn format_loose_route_entry(uri: &str) -> String {
+    let trimmed = uri.trim();
+    let inner = if trimmed.starts_with('<') && trimmed.ends_with('>') {
+        trimmed[1..trimmed.len() - 1].trim()
+    } else {
+        trimmed
+    };
+    if has_lr_uri_param(inner) {
+        format!("<{inner}>")
+    } else {
+        format!("<{inner};lr>")
+    }
+}
+
+/// True when `uri` (the contents inside `<...>`) already carries `;lr`
+/// as a URI parameter.  RFC 3261 §25.1 allows URI parameters in any
+/// order, so this checks every `;`-delimited parameter (not just the
+/// last).  The `?headers` portion of a URI is excluded — `lr` after
+/// `?` is a URI header named `lr`, not the loose-route parameter.
+fn has_lr_uri_param(uri: &str) -> bool {
+    let params_section = uri.split('?').next().unwrap_or(uri);
+    let mut parts = params_section.split(';');
+    parts.next();
+    parts.any(|param| {
+        let name = param.split('=').next().unwrap_or("").trim();
+        name.eq_ignore_ascii_case("lr")
+    })
+}
+
 /// The action the script chose for this request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestAction {
@@ -885,7 +923,7 @@ impl PyRequest {
 
     /// Prepend a `Path: <uri;lr>` header.
     fn add_path(&self, uri: &str) -> PyResult<()> {
-        let path_value = format!("<{uri};lr>");
+        let path_value = format_loose_route_entry(uri);
         let mut message = self.lock_mut()?;
         let existing = message.headers.get("Path").cloned();
         match existing {
@@ -897,7 +935,7 @@ impl PyRequest {
 
     /// Prepend a `Route: <uri;lr>` header.
     fn prepend_route(&self, uri: &str) -> PyResult<()> {
-        let route_value = format!("<{uri};lr>");
+        let route_value = format_loose_route_entry(uri);
         let mut message = self.lock_mut()?;
         let existing = message.headers.get("Route").cloned();
         match existing {
@@ -1493,6 +1531,104 @@ mod tests {
         let route = request.get_header("Route").unwrap().unwrap();
         assert!(route.starts_with("<sip:proxy1.example.com;lr>"));
         assert!(route.contains("proxy2.example.com"));
+    }
+
+    /// Bug regression: prepend_route must be idempotent so scripts can pass
+    /// back values previously emitted by siphon (stored Path entries,
+    /// Service-Route bindings).  Without this, downstream RFC 3261 §16.4
+    /// loose-route detection breaks — observed as 482 Loop Detected at
+    /// peer P-CSCFs.
+    #[test]
+    fn prepend_route_idempotent_with_existing_lr() {
+        let request = make_request();
+        request.remove_header("Route").unwrap();
+        request.prepend_route("sip:pcscf.ims.example.com:5060;lr").unwrap();
+        let route = request.get_header("Route").unwrap().unwrap();
+        assert_eq!(route, "<sip:pcscf.ims.example.com:5060;lr>");
+        assert!(!route.contains(";lr;lr"));
+    }
+
+    #[test]
+    fn prepend_route_idempotent_with_brackets_and_lr() {
+        let request = make_request();
+        request.remove_header("Route").unwrap();
+        request.prepend_route("<sip:scscf.example.com;lr>").unwrap();
+        let route = request.get_header("Route").unwrap().unwrap();
+        assert_eq!(route, "<sip:scscf.example.com;lr>");
+        assert!(!route.starts_with("<<"));
+        assert!(!route.contains(";lr;lr"));
+    }
+
+    #[test]
+    fn prepend_route_strips_outer_brackets_when_no_lr() {
+        let request = make_request();
+        request.remove_header("Route").unwrap();
+        request.prepend_route("<sip:proxy.example.com>").unwrap();
+        let route = request.get_header("Route").unwrap().unwrap();
+        assert_eq!(route, "<sip:proxy.example.com;lr>");
+    }
+
+    #[test]
+    fn prepend_route_lr_with_other_uri_params() {
+        let request = make_request();
+        request.remove_header("Route").unwrap();
+        request
+            .prepend_route("sip:proxy.example.com;transport=tcp;lr")
+            .unwrap();
+        let route = request.get_header("Route").unwrap().unwrap();
+        assert_eq!(route, "<sip:proxy.example.com;transport=tcp;lr>");
+    }
+
+    #[test]
+    fn add_path_idempotent_with_existing_lr() {
+        let request = make_request();
+        request.add_path("sip:pcscf.example.com:5060;lr").unwrap();
+        let path = request.get_header("Path").unwrap().unwrap();
+        assert!(path.starts_with("<sip:pcscf.example.com:5060;lr>"));
+        assert!(!path.contains(";lr;lr"));
+    }
+
+    #[test]
+    fn add_path_idempotent_with_brackets_and_lr() {
+        let request = make_request();
+        request.add_path("<sip:pcscf.example.com:5060;lr>").unwrap();
+        let path = request.get_header("Path").unwrap().unwrap();
+        assert!(path.starts_with("<sip:pcscf.example.com:5060;lr>"));
+        assert!(!path.starts_with("<<"));
+        assert!(!path.contains(";lr;lr"));
+    }
+
+    /// Idempotency must not fire on parameter names that merely *start
+    /// with* "lr" or *contain* "lr" — only on a parameter literally
+    /// named `lr`.  Substring matching here would silently drop the
+    /// loose-route flag from such URIs.
+    #[test]
+    fn prepend_route_does_not_match_lr_lookalike_params() {
+        let request = make_request();
+        request.remove_header("Route").unwrap();
+        // ;lrid=foo is not loose-routing; siphon must still add ;lr.
+        request.prepend_route("sip:proxy.example.com;lrid=foo").unwrap();
+        let route = request.get_header("Route").unwrap().unwrap();
+        assert_eq!(route, "<sip:proxy.example.com;lrid=foo;lr>");
+    }
+
+    #[test]
+    fn prepend_route_does_not_match_lr_inside_hostname() {
+        let request = make_request();
+        request.remove_header("Route").unwrap();
+        // "sbclr" looks like it contains "lr" but is part of the host.
+        request.prepend_route("sip:sbclr.example.com").unwrap();
+        let route = request.get_header("Route").unwrap().unwrap();
+        assert_eq!(route, "<sip:sbclr.example.com;lr>");
+    }
+
+    #[test]
+    fn prepend_route_lr_match_is_case_insensitive() {
+        let request = make_request();
+        request.remove_header("Route").unwrap();
+        request.prepend_route("sip:proxy.example.com;LR").unwrap();
+        let route = request.get_header("Route").unwrap().unwrap();
+        assert_eq!(route, "<sip:proxy.example.com;LR>");
     }
 
     #[test]

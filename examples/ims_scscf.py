@@ -229,7 +229,7 @@ def handle_request(request):
                      f"default_handling={matches[0]['default_handling']})")
             request.record_route()
             # Prepend Route so the request returns to S-CSCF after AS processing.
-            request.prepend_route(f"<sip:orig@{REALM}:6060;lr>")
+            request.prepend_route(f"sip:orig@{REALM}:6060")
             request.relay(target_as)
             return
 
