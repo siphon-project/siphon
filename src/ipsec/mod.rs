@@ -861,6 +861,10 @@ impl IpsecManager {
         let sel_dport = destination_port.to_string();
         let lifetime_secs_str;
 
+        // iproute2 UPSPEC grammar (man ip-xfrm) requires `proto X` to
+        // precede `sport`/`dport` — sport/dport are sub-arguments of the
+        // protocol token.  Putting them out of order makes iproute2 fail
+        // with `argument "udp" is wrong: PROTO value is invalid`.
         let mut args = vec![
             "xfrm", "state", "add",
             "src", &source_str,
@@ -871,9 +875,9 @@ impl IpsecManager {
             "sel",
             "src", &sel_src,
             "dst", &sel_dst,
+            "proto", "udp",
             "sport", &sel_sport,
             "dport", &sel_dport,
-            "proto", "udp",
         ];
 
         let enc_key_hex = format!("0x{}", encryption_key);
@@ -938,13 +942,15 @@ impl IpsecManager {
         let destination_str = destination.to_string();
         let spi_str = format!("0x{:x}", spi);
 
+        // `proto X` must precede `sport`/`dport` per the iproute2 UPSPEC
+        // grammar — see xfrm_sa_add for the same ordering constraint.
         let args = vec![
             "xfrm", "policy", "add",
             "src", &source_cidr,
             "dst", &destination_cidr,
+            "proto", "udp",
             "sport", &source_port_str,
             "dport", &destination_port_str,
-            "proto", "udp",
             "dir", direction,
             "tmpl",
             "src", &source_str,
@@ -968,13 +974,14 @@ impl IpsecManager {
         let source_port_str = source_port.to_string();
         let destination_port_str = destination_port.to_string();
 
+        // Same UPSPEC ordering as xfrm_policy_add — `proto X` first.
         let args = vec![
             "xfrm", "policy", "delete",
             "src", &source_cidr,
             "dst", &destination_cidr,
+            "proto", "udp",
             "sport", &source_port_str,
             "dport", &destination_port_str,
-            "proto", "udp",
             "dir", direction,
         ];
         Self::run_ip_command(&args).await

@@ -247,15 +247,24 @@ fn encode_xfrm_usersa_info(
     out.push(XFRM_MODE_TRANSPORT);
     out.push(0); // replay_window
     out.push(0); // flags
-    // Pad to 4-byte alignment so total = 220 (selector 56 + id 24 +
-    // saddr 16 + lft 64 + curlft 32 + stats 12 + 4 + 4 + 2 + 1 + 1 + 1 = 217,
-    // pad +3).
-    out.push(0);
-    out.push(0);
-    out.push(0);
+    // The C struct embeds `xfrm_lifetime_cfg` whose `__u64` fields force
+    // 8-byte struct alignment.  sizeof(struct xfrm_usersa_info) on
+    // x86_64 is therefore 224, not 220 — content spans 217 bytes
+    // (selector 56 + id 24 + saddr 16 + lft 64 + curlft 32 + stats 12 +
+    // seq 4 + reqid 4 + family 2 + mode 1 + replay 1 + flags 1) and the
+    // struct pads 7 bytes to round to 224.  The kernel rejects with
+    // EINVAL when the netlink body is shorter than its expected
+    // `min_len = sizeof(...)`, so emitting 220 (4-byte-aligned) is not
+    // enough.
+    for _ in 0..7 {
+        out.push(0);
+    }
 }
 
-/// Encode `struct xfrm_userpolicy_info`.
+/// Encode `struct xfrm_userpolicy_info`.  Total size 168 bytes on
+/// x86_64 (selector 56 + lft 64 + curlft 32 + priority 4 + index 4 +
+/// 4 single-byte fields + 4 bytes of trailing alignment padding to
+/// the struct's 8-byte alignment, forced by lft's u64 fields).
 fn encode_xfrm_userpolicy_info(
     source: &IpAddr,
     source_port: u16,
@@ -273,6 +282,13 @@ fn encode_xfrm_userpolicy_info(
     out.push(XFRM_POLICY_ALLOW);
     out.push(0); // flags
     out.push(XFRM_SHARE_ANY);
+    // Trailing padding to 168 bytes (8-byte struct alignment).  Same
+    // root cause as xfrm_usersa_info — embedded xfrm_lifetime_cfg has
+    // u64 fields and the kernel's min_len validation enforces the full
+    // sizeof.
+    for _ in 0..4 {
+        out.push(0);
+    }
 }
 
 /// Encode `struct xfrm_user_tmpl`.
@@ -719,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn xfrm_usersa_info_size_220_bytes() {
+    fn xfrm_usersa_info_size_224_bytes() {
         let mut out = Vec::new();
         encode_xfrm_usersa_info(
             &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
@@ -730,12 +746,131 @@ mod tests {
             None,
             &mut out,
         );
-        // 56 sel + 24 id + 16 saddr + 64 lft + 32 curlft + 12 stats + 4 seq
-        // + 4 reqid + 2 family + 1 mode + 1 replay + 1 flags + 1 pad = 218.
-        // The actual kernel struct is 220; the discrepancy is alignment
-        // padding tied to the surrounding nlmsghdr.  Since the kernel
-        // accepts at least the documented size, we emit 220.
-        assert_eq!(out.len(), 220);
+        // sizeof(struct xfrm_usersa_info) on x86_64 = 224.  The struct
+        // alignment is 8 because it embeds xfrm_lifetime_cfg with u64
+        // fields, and 217 bytes of content rounds up to 224.  The
+        // kernel validates the body size against this in xfrm_user_rcv_msg
+        // — emitting 220 yields EINVAL.
+        assert_eq!(out.len(), 224);
+    }
+
+    #[test]
+    fn xfrm_userpolicy_info_size_168_bytes() {
+        let mut out = Vec::new();
+        encode_xfrm_userpolicy_info(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            5060,
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5066,
+            XFRM_POLICY_OUT,
+            &mut out,
+        );
+        assert_eq!(out.len(), 168);
+    }
+
+    /// Compile-time cross-check — mirror the kernel C ABI structs as
+    /// `#[repr(C)]` in Rust so the compiler computes the same layout
+    /// the kernel does, then assert sizes match what the encoders emit.
+    /// If the kernel ever adds a field, this catches it at build time.
+    #[test]
+    fn struct_sizes_match_kernel_abi() {
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct XfrmAddress(u32, u32, u32, u32);
+
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct XfrmSelector {
+            daddr: XfrmAddress,
+            saddr: XfrmAddress,
+            dport: u16,
+            dport_mask: u16,
+            sport: u16,
+            sport_mask: u16,
+            family: u16,
+            prefixlen_d: u8,
+            prefixlen_s: u8,
+            proto: u8,
+            ifindex: i32,
+            user: u32,
+        }
+
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct XfrmId {
+            daddr: XfrmAddress,
+            spi: u32,
+            proto: u8,
+        }
+
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct XfrmLifetimeCfg {
+            soft_byte_limit: u64,
+            hard_byte_limit: u64,
+            soft_packet_limit: u64,
+            hard_packet_limit: u64,
+            soft_add_expires_seconds: u64,
+            hard_add_expires_seconds: u64,
+            soft_use_expires_seconds: u64,
+            hard_use_expires_seconds: u64,
+        }
+
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct XfrmLifetimeCur {
+            bytes: u64,
+            packets: u64,
+            add_time: u64,
+            use_time: u64,
+        }
+
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct XfrmStats {
+            replay_window: u32,
+            replay: u32,
+            integrity_failed: u32,
+        }
+
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct XfrmUsersaInfo {
+            sel: XfrmSelector,
+            id: XfrmId,
+            saddr: XfrmAddress,
+            lft: XfrmLifetimeCfg,
+            curlft: XfrmLifetimeCur,
+            stats: XfrmStats,
+            seq: u32,
+            reqid: u32,
+            family: u16,
+            mode: u8,
+            replay_window: u8,
+            flags: u8,
+        }
+
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct XfrmUserpolicyInfo {
+            sel: XfrmSelector,
+            lft: XfrmLifetimeCfg,
+            curlft: XfrmLifetimeCur,
+            priority: u32,
+            index: u32,
+            dir: u8,
+            action: u8,
+            flags: u8,
+            share: u8,
+        }
+
+        assert_eq!(std::mem::size_of::<XfrmSelector>(), 56);
+        assert_eq!(std::mem::size_of::<XfrmId>(), 24);
+        assert_eq!(std::mem::size_of::<XfrmLifetimeCfg>(), 64);
+        assert_eq!(std::mem::size_of::<XfrmLifetimeCur>(), 32);
+        assert_eq!(std::mem::size_of::<XfrmStats>(), 12);
+        assert_eq!(std::mem::size_of::<XfrmUsersaInfo>(), 224);
+        assert_eq!(std::mem::size_of::<XfrmUserpolicyInfo>(), 168);
     }
 
     #[test]
