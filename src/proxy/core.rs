@@ -210,7 +210,15 @@ pub fn top_route_is_local(headers: &SipHeaders, local_domains: &[String]) -> boo
 /// transport.  RFC 3261 §16.4 says we remove Route entries that indicate
 /// *this* proxy.  This function pops them all in one pass so the relay path
 /// sees the first *external* Route (or falls back to the Request-URI).
-pub fn pop_local_routes(headers: &mut SipHeaders, local_domains: &[String]) {
+///
+/// Returns the popped entries in the order they were removed (top first) so
+/// callers can expose pre-pop metadata (e.g. an `orig`/`term` user-part the
+/// P-CSCF preloaded on the IMS service-route) to scripts.
+pub fn pop_local_routes(
+    headers: &mut SipHeaders,
+    local_domains: &[String],
+) -> Vec<RouteEntry> {
+    let mut popped = Vec::new();
     loop {
         let route_raw = match headers.get("Route") {
             Some(raw) => raw.clone(),
@@ -225,11 +233,16 @@ pub fn pop_local_routes(headers: &mut SipHeaders, local_domains: &[String]) {
             .iter()
             .any(|domain| domain.eq_ignore_ascii_case(host));
         if is_local {
-            pop_top_route(headers);
+            if let Some(entry) = pop_top_route(headers) {
+                popped.push(entry);
+            } else {
+                break;
+            }
         } else {
             break;
         }
     }
+    popped
 }
 
 /// Return the URI of the topmost Route header, if any.

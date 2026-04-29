@@ -118,6 +118,12 @@ pub struct PyRequest {
     /// and `matched_sa` to detect protected traffic.  `None` for
     /// constructors that don't supply it (defaults to non-protected).
     local_port: Option<u16>,
+    /// URIs of Route entries consumed by `loose_route()` (RFC 3261 §16.4),
+    /// captured in pop order (topmost first).  Exposed via the
+    /// `consumed_routes` / `consumed_route_user` getters so scripts can
+    /// recover pre-pop metadata such as the `orig`/`term` user-part the
+    /// P-CSCF preloaded on the IMS service-route.
+    consumed_routes: Vec<String>,
 }
 
 impl PyRequest {
@@ -143,6 +149,7 @@ impl PyRequest {
             reply_headers: vec![],
             reply_body: None,
             local_port: None,
+            consumed_routes: vec![],
         }
     }
 
@@ -170,6 +177,7 @@ impl PyRequest {
             reply_headers: vec![],
             reply_body: None,
             local_port: None,
+            consumed_routes: vec![],
         }
     }
 
@@ -717,40 +725,51 @@ impl PyRequest {
     /// Per RFC 3261 §16.4, a proxy MUST only consume Route entries that
     /// identify itself.  A Route addressed to another server (e.g. the
     /// S-CSCF Route seen by a TAS) must be left for relay().
-    fn loose_route(&self) -> PyResult<bool> {
-        let mut message = self.lock_mut()?;
+    fn loose_route(&mut self) -> PyResult<bool> {
+        // Borrow the message lock in its own scope so we don't hold it
+        // across the self-mutation that records the popped Route URIs.
+        let mut popped: Vec<String> = Vec::new();
+        {
+            let mut message = self.lock_mut()?;
 
-        // No Route header at all — nothing to consume, relay to R-URI.
-        if message.headers.get("Route").is_none() {
-            return Ok(true);
-        }
+            // No Route header at all — nothing to consume, relay to R-URI.
+            if message.headers.get("Route").is_none() {
+                return Ok(true);
+            }
 
-        // Check if top Route has ;lr
-        let is_lr = crate::proxy::core::check_loose_route(&message.headers);
-        if !is_lr {
-            return Ok(false);
-        }
-
-        // Per RFC 3261 §16.4: only consume Route entries that identify *this*
-        // server.  If the top Route host doesn't match our local domains,
-        // leave it intact — relay() will forward to it.
-        if let Some(ref domains) = self.local_domains {
-            let top_is_local = crate::proxy::core::top_route_is_local(
-                &message.headers, domains,
-            );
-            if !top_is_local {
+            // Check if top Route has ;lr
+            let is_lr = crate::proxy::core::check_loose_route(&message.headers);
+            if !is_lr {
                 return Ok(false);
             }
-        }
 
-        // Pop the first (topmost) Route — it was addressed to us.
-        crate::proxy::core::pop_top_route(&mut message.headers);
+            // Per RFC 3261 §16.4: only consume Route entries that identify
+            // *this* server.  If the top Route host doesn't match our local
+            // domains, leave it intact — relay() will forward to it.
+            if let Some(ref domains) = self.local_domains {
+                let top_is_local = crate::proxy::core::top_route_is_local(
+                    &message.headers, domains,
+                );
+                if !top_is_local {
+                    return Ok(false);
+                }
+            }
 
-        // Pop any additional Routes that also point to us (double
-        // Record-Route from transport bridging).
-        if let Some(ref domains) = self.local_domains {
-            crate::proxy::core::pop_local_routes(&mut message.headers, domains);
+            // Pop the first (topmost) Route — it was addressed to us.
+            if let Some(entry) = crate::proxy::core::pop_top_route(&mut message.headers) {
+                popped.push(entry.uri.to_string());
+            }
+
+            // Pop any additional Routes that also point to us (double
+            // Record-Route from transport bridging).
+            if let Some(ref domains) = self.local_domains {
+                let extra = crate::proxy::core::pop_local_routes(
+                    &mut message.headers, domains,
+                );
+                popped.extend(extra.into_iter().map(|entry| entry.uri.to_string()));
+            }
         }
+        self.consumed_routes.extend(popped);
         Ok(true)
     }
 
@@ -970,6 +989,13 @@ impl PyRequest {
     }
 
     /// User part of the top Route header URI, or None.
+    ///
+    /// This reflects the *current* state of the Route header — after any
+    /// `loose_route()` calls have consumed routes addressed to this proxy.
+    /// To recover the user-part of a Route the framework consumed (e.g.
+    /// the IMS service-route's ``orig``/``term`` user the P-CSCF preloaded
+    /// before the S-CSCF stripped its own entry), use
+    /// :attr:`consumed_route_user` instead.
     #[getter]
     fn route_user(&self) -> PyResult<Option<String>> {
         let message = self.lock()?;
@@ -979,6 +1005,43 @@ impl PyRequest {
             }
         }
         Ok(None)
+    }
+
+    /// User part of the first Route entry that ``loose_route()`` consumed,
+    /// or ``None`` if no Route was consumed yet.
+    ///
+    /// On an IMS S-CSCF, the P-CSCF preloads the topmost Route from the
+    /// stored Service-Route as ``<sip:orig@scscf-N.ims...:6060;lr>`` for
+    /// originating sessions or ``<sip:term@...>`` for terminating ones.
+    /// `loose_route()` is required to consume that Route (RFC 3261 §16.4),
+    /// after which ``route_user`` reads the *next* Route — losing the
+    /// service-case indicator.  This accessor returns the user-part of the
+    /// popped entry so the script can drive originating- vs terminating-
+    /// session-case logic without having to inspect ``P-Served-User`` as a
+    /// fallback.
+    #[getter]
+    fn consumed_route_user(&self) -> PyResult<Option<String>> {
+        for raw in &self.consumed_routes {
+            if let Ok(uri) = parse_uri_standalone(raw) {
+                if uri.user.is_some() {
+                    return Ok(uri.user);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// URIs of all Route entries consumed by ``loose_route()`` (in the
+    /// order they were popped, topmost first).  Empty until the script
+    /// calls ``loose_route()``.
+    ///
+    /// Useful when more than one local Route was on the wire — e.g. a
+    /// double Record-Route from transport bridging — and the script
+    /// needs to inspect headers/parameters on more than just the first
+    /// popped entry.
+    #[getter]
+    fn consumed_routes(&self) -> PyResult<Vec<String>> {
+        Ok(self.consumed_routes.clone())
     }
 
     // -----------------------------------------------------------------------
@@ -1312,8 +1375,11 @@ mod tests {
 
     #[test]
     fn loose_route_no_route_header() {
-        let request = make_request();
+        let mut request = make_request();
         assert!(request.loose_route().unwrap());
+        // Nothing consumed when there was no Route to begin with.
+        assert!(request.consumed_routes().unwrap().is_empty());
+        assert!(request.consumed_route_user().unwrap().is_none());
     }
 
     #[test]
@@ -1336,7 +1402,7 @@ mod tests {
             body: vec![],
         };
         let local_domains = Arc::new(vec!["172.16.0.152".to_string()]);
-        let request = PyRequest::with_local_domains(
+        let mut request = PyRequest::with_local_domains(
             Arc::new(Mutex::new(message)),
             "tcp".to_string(),
             "10.0.0.1".to_string(),
@@ -1347,10 +1413,13 @@ mod tests {
         // loose_route() should return false — Route doesn't match us
         assert!(!request.loose_route().unwrap());
 
-        // Route header must still be intact
-        let msg_arc = request.message();
-        let msg = msg_arc.lock().unwrap();
-        assert!(msg.headers.get("Route").is_some());
+        // Route header must still be intact, and nothing was consumed.
+        {
+            let msg_arc = request.message();
+            let msg = msg_arc.lock().unwrap();
+            assert!(msg.headers.get("Route").is_some());
+        }
+        assert!(request.consumed_routes().unwrap().is_empty());
     }
 
     #[test]
@@ -1371,7 +1440,7 @@ mod tests {
             body: vec![],
         };
         let local_domains = Arc::new(vec!["scscf.example.com".to_string()]);
-        let request = PyRequest::with_local_domains(
+        let mut request = PyRequest::with_local_domains(
             Arc::new(Mutex::new(message)),
             "tcp".to_string(),
             "10.0.0.1".to_string(),
@@ -1382,10 +1451,69 @@ mod tests {
         // loose_route() should return true and consume the Route
         assert!(request.loose_route().unwrap());
 
-        // Route header should be gone
-        let msg_arc = request.message();
-        let msg = msg_arc.lock().unwrap();
-        assert!(msg.headers.get("Route").is_none());
+        // Route header should be gone, and the consumed-route accessors
+        // expose the popped entry's user-part — what an S-CSCF script needs
+        // for orig/term sescase decisions.
+        {
+            let msg_arc = request.message();
+            let msg = msg_arc.lock().unwrap();
+            assert!(msg.headers.get("Route").is_none());
+        }
+        assert_eq!(
+            request.consumed_route_user().unwrap().as_deref(),
+            Some("orig"),
+        );
+        assert_eq!(request.consumed_routes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn loose_route_double_record_route_captures_all_consumed() {
+        // Double Record-Route (transport bridging) leaves two consecutive
+        // local Routes — both must be popped, both must be visible via
+        // `consumed_routes`.
+        let message = SipMessage {
+            start_line: StartLine::Request(RequestLine {
+                method: Method::Invite,
+                request_uri: crate::sip::uri::SipUri::new("bob.example.com".to_string()),
+                version: Version::sip_2_0(),
+            }),
+            headers: {
+                let mut headers = SipHeaders::new();
+                headers.add("Via", "SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK-1".into());
+                headers.add(
+                    "Route",
+                    "<sip:orig@scscf.example.com;lr>, \
+                     <sip:scscf.example.com;lr;transport=tcp>".into(),
+                );
+                headers
+            },
+            body: vec![],
+        };
+        let local_domains = Arc::new(vec!["scscf.example.com".to_string()]);
+        let mut request = PyRequest::with_local_domains(
+            Arc::new(Mutex::new(message)),
+            "tcp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+            local_domains,
+        );
+
+        assert!(request.loose_route().unwrap());
+
+        let consumed = request.consumed_routes().unwrap();
+        assert_eq!(consumed.len(), 2, "both local Routes should be captured");
+        // The first popped entry carries the orig sescase user.
+        assert_eq!(
+            request.consumed_route_user().unwrap().as_deref(),
+            Some("orig"),
+        );
+    }
+
+    #[test]
+    fn consumed_routes_empty_before_loose_route() {
+        let request = make_request();
+        assert!(request.consumed_routes().unwrap().is_empty());
+        assert!(request.consumed_route_user().unwrap().is_none());
     }
 
     #[test]

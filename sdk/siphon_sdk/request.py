@@ -108,6 +108,11 @@ class Request:
         self._event = event
         self._headers: dict[str, str] = dict(headers) if headers else {}
         self._actions: list[Action] = []
+        # Route URIs popped by ``loose_route()``.  Mirrors the production
+        # ``PyRequest.consumed_routes`` field — used so scripts that read
+        # ``consumed_route_user`` (e.g. for IMS orig/term sescase) can be
+        # exercised in tests.
+        self._consumed_routes: list[str] = []
 
     # -- Read-only properties --------------------------------------------------
 
@@ -212,12 +217,44 @@ class Request:
 
     @property
     def route_user(self) -> Optional[str]:
-        """User part of the top Route header URI, or ``None``."""
+        """User part of the top Route header URI, or ``None``.
+
+        Reflects the *current* state of the Route header — after any
+        ``loose_route()`` calls have stripped routes addressed to this
+        proxy.  For the user-part of a Route the framework consumed
+        (e.g. the IMS service-route's ``orig``/``term`` indicator), use
+        :attr:`consumed_route_user`.
+        """
         route = self._headers.get("Route")
         if route:
-            uri = _parse_uri(route.strip("<>").split(">")[0])
+            first = route.split(",", 1)[0].strip()
+            uri = _parse_uri(first.strip("<>").split(">")[0].split(";")[0])
             return uri.user if uri else None
         return None
+
+    @property
+    def consumed_route_user(self) -> Optional[str]:
+        """User part of the first Route entry that ``loose_route()``
+        consumed, or ``None`` if no Route was popped yet.
+
+        Mirrors the production ``request.consumed_route_user`` getter so
+        IMS scripts can read the ``orig``/``term`` user-part of the
+        service-route the P-CSCF preloaded.
+        """
+        for raw in self._consumed_routes:
+            uri = _parse_uri(raw)
+            if uri and uri.user:
+                return uri.user
+        return None
+
+    @property
+    def consumed_routes(self) -> list[str]:
+        """URIs of all Route entries consumed by ``loose_route()``,
+        in the order they were popped (topmost first).
+
+        Empty until the script calls :meth:`loose_route`.
+        """
+        return list(self._consumed_routes)
 
     # -- Response & forwarding -------------------------------------------------
 
@@ -316,13 +353,17 @@ class Request:
         self._actions.append(Action(kind="record_route"))
 
     def loose_route(self) -> bool:
-        """Perform RFC 3261 section 16.12 loose routing.
+        """Perform RFC 3261 §16.4 loose routing.
 
-        If the top Route header has an ``lr`` parameter and matches a local
-        domain, strip it and return ``True``.  Otherwise return ``False``.
+        If the topmost Route entry carries an ``lr`` parameter, pop it,
+        record its URI on :attr:`consumed_routes`, and return ``True``.
+        If a Route header is present but the topmost entry is a strict
+        route (no ``lr``), return ``False`` and leave it intact.
 
-        In the mock, this returns ``True`` if ``in_dialog`` is ``True``
-        (simulating that the proxy previously Record-Routed).
+        When *no* Route header is present, the mock falls back to
+        returning :attr:`in_dialog` to preserve compatibility with
+        scripts that gate ``loose_route()`` behind ``in_dialog`` checks
+        without setting up explicit Route headers in the test request.
 
         Example::
 
@@ -332,7 +373,29 @@ class Request:
                 else:
                     request.reply(404, "Not Here")
         """
-        return self.in_dialog
+        route = self._headers.get("Route")
+        if not route:
+            return self.in_dialog
+
+        entries = [entry.strip() for entry in route.split(",") if entry.strip()]
+        if not entries:
+            return self.in_dialog
+
+        top = entries[0]
+        # ;lr is the loose-route flag (RFC 3261 §19.1.1).
+        if ";lr" not in top.lower():
+            return False
+
+        # Pop the topmost entry and record its URI (without angle brackets
+        # or parameters) on consumed_routes.
+        popped_uri = top.strip("<>").split(">")[0].split(";")[0].strip()
+        self._consumed_routes.append(popped_uri)
+        remaining = entries[1:]
+        if remaining:
+            self._headers["Route"] = ", ".join(remaining)
+        else:
+            self._headers.pop("Route", None)
+        return True
 
     # -- Header access ---------------------------------------------------------
 
