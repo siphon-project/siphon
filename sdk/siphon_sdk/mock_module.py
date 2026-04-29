@@ -2390,6 +2390,18 @@ class MockDiameter:
 # Presence namespace
 # ---------------------------------------------------------------------------
 
+
+def _is_terminated_subscription_state(subscription_state: str) -> bool:
+    """Mirror of the production helper — recognizes RFC 6665 §4.1.3
+    ``terminated`` and ``terminated;reason=...`` Subscription-State values.
+    """
+    trimmed = subscription_state.lstrip()
+    if not trimmed.startswith("terminated"):
+        return False
+    rest = trimmed[len("terminated"):]
+    return rest == "" or rest.startswith(";") or rest[:1].isspace()
+
+
 class MockPresence:
     """Mock ``presence`` namespace — SIP presence publish/subscribe for testing.
 
@@ -2550,6 +2562,11 @@ class MockPresence:
 
         In the mock, this records the notification for test assertions.
 
+        When ``subscription_state`` indicates a terminated subscription
+        (RFC 6665 §4.1.3 — bare ``"terminated"`` or
+        ``"terminated;reason=..."``) the subscription is also removed from
+        the store, mirroring the production auto-GC behavior.
+
         Args:
             subscription_id: The subscription ID from ``subscribe_dialog()``.
             body: Optional body string (reginfo XML, PIDF XML, etc.).
@@ -2562,6 +2579,48 @@ class MockPresence:
             "content_type": content_type,
             "subscription_state": subscription_state,
         })
+        if _is_terminated_subscription_state(subscription_state):
+            self._subscriptions.pop(subscription_id, None)
+
+    def terminate(self, subscription_id: str, reason: Optional[str] = None,
+                  body: Optional[str] = None,
+                  content_type: Optional[str] = None) -> bool:
+        """Send a terminating NOTIFY and remove the subscription (RFC 6665 §4.4.1).
+
+        Sends an in-dialog NOTIFY with
+        ``Subscription-State: terminated;reason=<reason>``, then removes
+        the subscription's dialog state from the store.  Idempotent: a
+        second call with the same ``subscription_id`` returns ``False``.
+
+        Args:
+            subscription_id: The subscription ID from ``subscribe_dialog()``.
+            reason: Termination reason per RFC 6665 §4.2.2 — one of
+                ``"deactivated"``, ``"probation"``, ``"rejected"``,
+                ``"timeout"``, ``"giveup"``, ``"noresource"``,
+                ``"invariant"``.  Defaults to ``"noresource"``.
+            body: Optional final body.
+            content_type: Content-Type of the body.
+
+        Returns:
+            ``True`` if the subscription existed and the NOTIFY was
+            recorded; ``False`` if the ``subscription_id`` was unknown.
+
+        Example::
+
+            sub_id = presence.subscribe_dialog(...)
+            ...
+            presence.terminate(sub_id, reason="timeout")
+        """
+        if subscription_id not in self._subscriptions:
+            return False
+        reason_str = reason or "noresource"
+        self.notify(
+            subscription_id,
+            body=body,
+            content_type=content_type,
+            subscription_state=f"terminated;reason={reason_str}",
+        )
+        return True
 
     @property
     def notifications(self) -> list:

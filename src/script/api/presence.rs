@@ -16,6 +16,9 @@
 //!
 //! presence.notify("sip:bob@example.com", body=xml, content_type="application/reginfo+xml",
 //!                 subscription_state="active", event="reg")
+//!
+//! # Close out a subscription (final NOTIFY + remove from store) per RFC 6665 §4.4.1:
+//! presence.terminate(sub_id, reason="timeout")
 //! ```
 
 use std::sync::Arc;
@@ -29,6 +32,19 @@ use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::Method;
 use crate::sip::parser::parse_uri_standalone;
 use crate::transport::Transport;
+
+/// Returns true if the given Subscription-State header value indicates a
+/// terminated subscription per RFC 6665 §4.1.3.  Matches both the bare
+/// ``terminated`` token and ``terminated;reason=...`` forms; tolerates
+/// leading whitespace.
+fn is_terminated_subscription_state(subscription_state: &str) -> bool {
+    let trimmed = subscription_state.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("terminated") {
+        rest.is_empty() || rest.starts_with(';') || rest.starts_with(char::is_whitespace)
+    } else {
+        false
+    }
+}
 
 /// Python-visible presence namespace.
 #[pyclass(name = "PresenceNamespace", skip_from_py_object)]
@@ -376,7 +392,58 @@ impl PyPresence {
         if !super::proxy_utils::try_defer_send(message.clone(), target.address, transport) {
             uac_sender.send_request(message, target.address, transport);
         }
+
+        // RFC 6665 §4.4.1: after the terminating NOTIFY, the subscription is
+        // gone — drop the dialog state so subsequent state-change events for
+        // this resource don't keep emitting NOTIFYs to a watcher that is no
+        // longer subscribed.
+        if is_terminated_subscription_state(subscription_state) {
+            self.store.remove_subscription(subscription_id);
+        }
         Ok(())
+    }
+
+    /// Send a terminating NOTIFY for a subscription and remove it from the
+    /// store (RFC 6665 §4.4.1).
+    ///
+    /// Sends an in-dialog NOTIFY with ``Subscription-State:
+    /// terminated;reason=<reason>``, then removes the subscription's dialog
+    /// state.  Without this, scripts that respond to ``SUBSCRIBE Expires=0``
+    /// (or any other termination trigger) leak dialog state on every
+    /// short-lived subscription, and subsequent reg-event refreshes for the
+    /// resource fan out NOTIFYs to long-departed watchers.
+    ///
+    /// Args:
+    ///     subscription_id: ID returned by :meth:`subscribe_dialog`.
+    ///     reason: Termination reason per RFC 6665 §4.2.2 — one of
+    ///         ``"deactivated"``, ``"probation"``, ``"rejected"``,
+    ///         ``"timeout"``, ``"giveup"``, ``"noresource"``, ``"invariant"``.
+    ///         Defaults to ``"noresource"``.
+    ///     body: Optional final body (e.g. terminal reginfo XML).
+    ///     content_type: Content-Type of the body.
+    ///
+    /// Returns:
+    ///     ``True`` if the subscription existed and the NOTIFY was sent;
+    ///     ``False`` if the ``subscription_id`` was unknown (idempotent — safe
+    ///     to call repeatedly).
+    #[pyo3(signature = (subscription_id, reason=None, body=None, content_type=None))]
+    fn terminate(
+        &self,
+        subscription_id: &str,
+        reason: Option<&str>,
+        body: Option<&str>,
+        content_type: Option<&str>,
+    ) -> PyResult<bool> {
+        if self.store.get_subscription(subscription_id).is_none() {
+            return Ok(false);
+        }
+        let reason_str = reason.unwrap_or("noresource");
+        let subscription_state = format!("terminated;reason={reason_str}");
+        // notify() auto-removes the subscription when the state is terminated;
+        // we rely on that path so terminate() and notify(state="terminated;…")
+        // are observably equivalent.
+        self.notify(subscription_id, body, content_type, &subscription_state)?;
+        Ok(true)
     }
 }
 
@@ -477,6 +544,35 @@ mod tests {
         let subscription = store.get_subscription(&subscription_id).unwrap();
         assert_eq!(subscription.event, "dialog");
         assert_eq!(subscription.expires, Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn terminate_nonexistent_returns_false() {
+        let store = make_store();
+        let presence = PyPresence::new(store);
+
+        let result = presence.terminate("sub-nonexistent", None, None, None).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn is_terminated_subscription_state_recognizes_terminated_forms() {
+        // RFC 6665 §4.1.3 forms:
+        assert!(is_terminated_subscription_state("terminated"));
+        assert!(is_terminated_subscription_state("terminated;reason=timeout"));
+        assert!(is_terminated_subscription_state("terminated;reason=noresource"));
+        assert!(is_terminated_subscription_state("terminated;reason=deactivated;retry-after=60"));
+        // Tolerate leading whitespace and the SP separator some impls use:
+        assert!(is_terminated_subscription_state(" terminated;reason=foo"));
+        assert!(is_terminated_subscription_state("terminated reason=foo"));
+
+        // Non-terminated states must NOT match:
+        assert!(!is_terminated_subscription_state("active"));
+        assert!(!is_terminated_subscription_state("active;expires=3600"));
+        assert!(!is_terminated_subscription_state("pending"));
+        assert!(!is_terminated_subscription_state(""));
+        // Don't match prefix-but-not-token (defensive — no real header would say this):
+        assert!(!is_terminated_subscription_state("terminatedsoon"));
     }
 
     #[test]

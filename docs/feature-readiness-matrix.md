@@ -215,7 +215,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| SUBSCRIBE/NOTIFY (RFC 6665) | **Production** | Python `presence` API | reg-event package |
+| SUBSCRIBE/NOTIFY (RFC 6665) | **Production** | Python `presence` API | reg-event package; `presence.terminate()` + auto-GC on terminated NOTIFY drops dialog state per RFC 6665 §4.4.1 |
 | PIDF (RFC 3863) | Implemented | | |
 | Resource List Server (RFC 4662) | Implemented | | |
 | Watcher Info (RFC 3857/3858) | Implemented | | |
