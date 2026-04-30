@@ -13,6 +13,7 @@
 //! With free-threaded Python 3.14t there is no GIL — multiple Rust worker
 //! threads can call into Python concurrently.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -842,18 +843,57 @@ async fn timer_loop(
 // Async Python coroutine runner (shared by dispatcher and timer scheduler)
 // ---------------------------------------------------------------------------
 
-/// Run a Python coroutine to completion using `asyncio.run()`.
+thread_local! {
+    /// Per-thread asyncio event loop reused across `run_coroutine` calls.
+    ///
+    /// `pyo3_async_runtimes::tokio::future_into_py(...)` captures the asyncio
+    /// loop that is running at the moment a script `await`s the bridged
+    /// awaitable, then later wakes the awaiter from a Tokio worker via
+    /// `loop.call_soon_threadsafe(...)`.  Driving each handler with a fresh
+    /// `asyncio.run(coro)` would close that loop between handler invocations,
+    /// racing the Tokio side and surfacing as `RuntimeError: Event loop is
+    /// closed` (with the chained `TypeError` because the awaiter's result is
+    /// never delivered).  Reusing one long-lived loop per worker thread keeps
+    /// `call_soon_threadsafe` targets valid for the lifetime of the thread.
+    static PYTHON_LOOP: RefCell<Option<Py<PyAny>>> = const { RefCell::new(None) };
+}
+
+/// Run a Python coroutine to completion on this thread's persistent asyncio
+/// event loop.
 ///
-/// `block_in_place` allows blocking in a Tokio multi-threaded runtime while
-/// `asyncio.run()` drives the Python event loop. The Tokio runtime continues
-/// on other worker threads so Tokio-backed futures (e.g. RTPEngine UDP I/O)
-/// can still make progress.
+/// `block_in_place` lets the multi-threaded Tokio runtime steal this worker
+/// for the duration of the synchronous `loop.run_until_complete(...)` call so
+/// other Tokio tasks (transport I/O, timers, RTPEngine UDP, etc.) keep
+/// progressing on other workers.
 pub(crate) fn run_coroutine(
     python: Python<'_>,
     coroutine: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<()> {
-    let asyncio = python.import("asyncio")?;
-    tokio::task::block_in_place(|| asyncio.call_method1("run", (coroutine,)))?;
+    let loop_handle = PYTHON_LOOP.with(|cell| -> PyResult<Py<PyAny>> {
+        let mut slot = cell.borrow_mut();
+        let handle = match slot.as_ref() {
+            Some(handle) => handle.clone_ref(python),
+            None => {
+                let asyncio = python.import("asyncio")?;
+                let new_loop = asyncio.call_method0("new_event_loop")?;
+                // Bind this loop to the thread for any code path that still
+                // calls the (deprecated) `asyncio.get_event_loop()`.  The
+                // running-loop lookup used by `pyo3_async_runtimes` is set
+                // automatically by `run_until_complete`.
+                asyncio.call_method1("set_event_loop", (&new_loop,))?;
+                let unbound = new_loop.unbind();
+                let handle = unbound.clone_ref(python);
+                *slot = Some(unbound);
+                handle
+            }
+        };
+        Ok(handle)
+    })?;
+
+    let bound_loop = loop_handle.bind(python);
+    tokio::task::block_in_place(|| {
+        bound_loop.call_method1("run_until_complete", (coroutine,))
+    })?;
     Ok(())
 }
 
@@ -1589,5 +1629,143 @@ assert probe_ns.answer() == 42
         });
 
         crate::script::api::clear_user_namespaces();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async runner regression tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod async_runner_tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use pyo3::prelude::*;
+    use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods};
+
+    /// Tokio-backed coroutine bridged to Python via
+    /// `pyo3_async_runtimes::tokio::future_into_py` — the same mechanism used
+    /// by `cache.fetch`, `registrar.aor_count`, etc.  When the runner created
+    /// a fresh asyncio loop per handler invocation, the Tokio worker that
+    /// resolves this future raced with `asyncio.run()`'s loop teardown and
+    /// hit `RuntimeError: Event loop is closed`.
+    #[pyfunction]
+    fn _ra_async_op(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            Ok(42i64)
+        })
+    }
+
+    /// Install the test module exposing `_ra_async_op` into `sys.modules` so
+    /// scripts can `import _siphon_run_coroutine_test`.
+    fn install_test_module(python: Python<'_>) {
+        let module = PyModule::new(python, "_siphon_run_coroutine_test").unwrap();
+        module
+            .add_function(pyo3::wrap_pyfunction!(_ra_async_op, &module).unwrap())
+            .unwrap();
+        let sys = python.import("sys").unwrap();
+        sys.getattr("modules")
+            .unwrap()
+            .set_item("_siphon_run_coroutine_test", &module)
+            .unwrap();
+    }
+
+    /// Build a coroutine factory that, when called, returns a fresh coroutine
+    /// awaiting the bridged Tokio future.
+    fn build_factory(python: Python<'_>) -> Py<PyAny> {
+        let code = CString::new(
+            "import _siphon_run_coroutine_test\n\
+             async def factory():\n\
+             \x20\x20\x20\x20return await _siphon_run_coroutine_test._ra_async_op()\n",
+        )
+        .unwrap();
+        let globals = PyDict::new(python);
+        python.run(code.as_c_str(), Some(&globals), None).unwrap();
+        globals.get_item("factory").unwrap().unwrap().unbind()
+    }
+
+    /// Drive many `run_coroutine` invocations in parallel across multiple
+    /// Tokio worker threads, each awaiting a `future_into_py`-backed call.
+    /// With per-call `asyncio.run(coro)` this surfaces `RuntimeError: Event
+    /// loop is closed` because the wake-up `call_soon_threadsafe` from the
+    /// Tokio side races the loop teardown.  With a per-thread persistent
+    /// loop the wake target is always alive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_coroutine_drives_future_into_py_across_threads() {
+        Python::initialize();
+        Python::attach(install_test_module);
+        let factory: Arc<Py<PyAny>> = Arc::new(Python::attach(build_factory));
+
+        let total: usize = 60;
+        let success = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..total {
+            let factory = Arc::clone(&factory);
+            let success = Arc::clone(&success);
+            handles.push(tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
+                    Python::attach(|python| {
+                        let coro = factory.bind(python).call0().unwrap();
+                        run_coroutine(python, &coro)
+                            .expect("coroutine must complete without closed-loop error");
+                    });
+                    success.fetch_add(1, Ordering::Relaxed);
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(success.load(Ordering::Relaxed), total);
+    }
+
+    /// A second `run_coroutine` call from the same thread must reuse the
+    /// already-cached event loop; tearing the loop down between calls is
+    /// exactly what creates the closed-loop race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_coroutine_reuses_thread_local_loop() {
+        Python::initialize();
+        Python::attach(install_test_module);
+        let factory: Arc<Py<PyAny>> = Arc::new(Python::attach(build_factory));
+
+        // Pin both invocations to the same Tokio blocking-pool thread so we
+        // are exercising the per-thread loop cache, not two distinct ones.
+        tokio::task::spawn_blocking(move || {
+            let first_loop_id = Python::attach(|python| {
+                let coro = factory.bind(python).call0().unwrap();
+                run_coroutine(python, &coro).expect("first run");
+                PYTHON_LOOP.with(|cell| {
+                    cell.borrow()
+                        .as_ref()
+                        .map(|handle| handle.bind(python).as_ptr() as usize)
+                        .expect("loop cached after first run")
+                })
+            });
+
+            let second_loop_id = Python::attach(|python| {
+                let coro = factory.bind(python).call0().unwrap();
+                run_coroutine(python, &coro).expect("second run");
+                PYTHON_LOOP.with(|cell| {
+                    cell.borrow()
+                        .as_ref()
+                        .map(|handle| handle.bind(python).as_ptr() as usize)
+                        .expect("loop still cached after second run")
+                })
+            });
+
+            assert_eq!(
+                first_loop_id, second_loop_id,
+                "the same per-thread asyncio loop must be reused across calls"
+            );
+        })
+        .await
+        .unwrap();
     }
 }
