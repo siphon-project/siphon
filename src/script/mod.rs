@@ -3,3 +3,6 @@
 
 pub mod api;
 pub mod engine;
+pub mod handle;
+
+pub use handle::{HandlerHandle, ScriptHandle};

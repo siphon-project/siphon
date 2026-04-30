@@ -1,0 +1,34 @@
+# Minimal config for examples/audit_log_extension.rs.
+#
+# The `extensions:` section is opaque to siphon-core — each entry's value
+# is whatever shape the named extension wants. Extensions read their
+# entry via Config::extension_path("name") for a path-form scalar, or
+# Config::extension_config("name") for any inline value.
+
+listen:
+  udp:
+    - "127.0.0.1:5060"
+
+domain:
+  local:
+    - "127.0.0.1"
+
+script:
+  path: "examples/audit_log_extension.py"
+  reload: sighup
+
+registrar:
+  backend: memory
+
+auth:
+  realm: "example.com"
+
+log:
+  level: info
+  format: pretty
+
+# Extension-owned configuration — siphon-core just passes this through.
+extensions:
+  audit:
+    output_path: "/tmp/siphon-audit.log"
+    rotate_size_mb: 10

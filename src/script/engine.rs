@@ -92,6 +92,11 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// Open extension point for handler kinds owned by host extensions.
+    /// The string is the registry key the extension wrote (e.g.
+    /// `"audit.sink"`); siphon-core does not interpret it. Per-handler
+    /// metadata travels alongside on [`HandlerEntry::options`].
+    Custom { kind: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +111,13 @@ pub struct HandlerEntry {
     pub callable: Py<PyAny>,
     /// `true` when `asyncio.iscoroutinefunction(callable)` returned `True`.
     pub is_async: bool,
+    /// Optional per-handler metadata dict carried through from the
+    /// Python registry. Populated for [`HandlerKind::Custom`] handlers
+    /// so extensions can ship arbitrary options alongside the kind name
+    /// (e.g. HTTP route methods, audit-sink filters). Built-in kinds
+    /// that carry their own typed fields inside the variant leave this
+    /// `None`.
+    pub options: Option<Py<PyDict>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +171,15 @@ impl ScriptState {
                 }
                 _ => false,
             })
+            .collect()
+    }
+
+    /// Return all [`HandlerKind::Custom`] handlers whose registry key
+    /// equals `kind`. The lookup is exact — no globbing or prefix match.
+    pub fn handlers_for_custom(&self, kind: &str) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| matches!(&h.kind, HandlerKind::Custom { kind: k } if k == kind))
             .collect()
     }
 
@@ -303,6 +324,13 @@ impl ScriptEngine {
     /// This is cheap — just an `Arc` clone.
     pub fn state(&self) -> arc_swap::Guard<Arc<ScriptState>> {
         self.state.load()
+    }
+
+    /// Clone of the atomically-swappable state pointer. Used by host
+    /// extensions (via [`crate::script::ScriptHandle`]) to read the live
+    /// handler set without taking a guard borrow.
+    pub fn state_arc(&self) -> Arc<ArcSwap<ScriptState>> {
+        Arc::clone(&self.state)
     }
 
     /// Reload the script from disk and atomically swap the state.
@@ -728,7 +756,7 @@ fn extract_handlers(
             "diameter.on_pnr" => HandlerKind::DiameterOnPnr,
             "sbi.on_event" => HandlerKind::SbiOnEvent,
             "timer.every" => {
-                let meta = metadata.ok_or_else(|| {
+                let meta = metadata.as_ref().ok_or_else(|| {
                     SiphonError::Script("timer.every handler missing metadata".into())
                 })?;
                 let interval_secs: u64 = meta
@@ -758,16 +786,26 @@ fn extract_handlers(
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnDtmf { call_id, from_tag }
             }
-            other => {
-                warn!(kind = other, "unknown handler kind, skipping");
-                continue;
-            }
+            other => HandlerKind::Custom { kind: other.to_owned() },
+        };
+
+        // Custom handlers carry their metadata dict through verbatim so
+        // extensions can read whatever options the script registered.
+        // Built-in kinds embed their typed fields inside the variant and
+        // don't need the dict copied out.
+        let options = match &kind {
+            HandlerKind::Custom { .. } => metadata
+                .as_ref()
+                .and_then(|m| m.downcast::<PyDict>().ok())
+                .map(|d| d.clone().unbind()),
+            _ => None,
         };
 
         handlers.push(HandlerEntry {
             kind,
             callable,
             is_async,
+            options,
         });
     }
 
@@ -869,6 +907,19 @@ pub(crate) fn run_coroutine(
     python: Python<'_>,
     coroutine: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<()> {
+    run_coroutine_value(python, coroutine).map(|_| ())
+}
+
+/// Run a Python coroutine to completion on this thread's persistent asyncio
+/// event loop and return its resolved value.
+///
+/// Same scheduling semantics as [`run_coroutine`] — exposed separately so
+/// callers that need the coroutine's return value (e.g. host extensions
+/// dispatching to script handlers) don't have to re-drive the loop.
+pub(crate) fn run_coroutine_value(
+    python: Python<'_>,
+    coroutine: &Bound<'_, pyo3::PyAny>,
+) -> PyResult<Py<PyAny>> {
     let loop_handle = PYTHON_LOOP.with(|cell| -> PyResult<Py<PyAny>> {
         let mut slot = cell.borrow_mut();
         let handle = match slot.as_ref() {
@@ -891,10 +942,10 @@ pub(crate) fn run_coroutine(
     })?;
 
     let bound_loop = loop_handle.bind(python);
-    tokio::task::block_in_place(|| {
+    let result = tokio::task::block_in_place(|| {
         bound_loop.call_method1("run_until_complete", (coroutine,))
     })?;
-    Ok(())
+    Ok(result.unbind())
 }
 
 // ---------------------------------------------------------------------------
@@ -1433,6 +1484,123 @@ def route(request):
         let state = compile_temp_script(source).unwrap();
         assert!(state.timer_handlers().is_empty());
         assert!(!state.has_timer_handlers());
+    }
+
+    // -----------------------------------------------------------------
+    // Custom (extension) handler kind
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn custom_kind_is_captured_with_options() {
+        let source = r#"
+import _siphon_registry as _r
+
+def my_handler(event):
+    pass
+
+_r.register("audit.sink", None, my_handler, False, {"path": "/var/log/audit", "level": "info"})
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert!(matches!(
+            state.handlers[0].kind,
+            HandlerKind::Custom { ref kind } if kind == "audit.sink"
+        ));
+        assert!(!state.handlers[0].is_async);
+
+        let options = state.handlers[0]
+            .options
+            .as_ref()
+            .expect("custom handler should carry its metadata dict");
+        Python::attach(|python| {
+            let bound = options.bind(python);
+            let path: String = bound
+                .get_item("path")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(path, "/var/log/audit");
+            let level: String = bound
+                .get_item("level")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(level, "info");
+        });
+    }
+
+    #[test]
+    fn custom_kind_async_handler_detected() {
+        let source = r#"
+import _siphon_registry as _r
+
+async def handle(event):
+    pass
+
+_r.register("custom.thing", None, handle, True, None)
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert!(state.handlers[0].is_async);
+        assert!(matches!(
+            state.handlers[0].kind,
+            HandlerKind::Custom { ref kind } if kind == "custom.thing"
+        ));
+        // No metadata dict registered → options is None.
+        assert!(state.handlers[0].options.is_none());
+    }
+
+    #[test]
+    fn custom_kind_filter_by_name() {
+        let source = r#"
+import _siphon_registry as _r
+
+def a(_): pass
+def b(_): pass
+def c(_): pass
+
+_r.register("alpha.kind", None, a, False, None)
+_r.register("beta.kind",  None, b, False, None)
+_r.register("alpha.kind", None, c, False, None)
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 3);
+        assert_eq!(state.handlers_for_custom("alpha.kind").len(), 2);
+        assert_eq!(state.handlers_for_custom("beta.kind").len(), 1);
+        assert_eq!(state.handlers_for_custom("missing").len(), 0);
+    }
+
+    #[test]
+    fn custom_kind_does_not_collide_with_builtin_kinds() {
+        // A script using both built-ins and a custom kind: built-ins must
+        // still parse to their typed variants, and the custom entry must
+        // remain separate.
+        let source = r#"
+from siphon import proxy
+import _siphon_registry as _r
+
+@proxy.on_request
+def route(request):
+    pass
+
+def custom_fn(event):
+    pass
+
+_r.register("ext.thing", None, custom_fn, False, {"k": "v"})
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+        assert_eq!(state.proxy_request_handlers("INVITE").len(), 1);
+        assert_eq!(state.handlers_for_custom("ext.thing").len(), 1);
+        // The built-in proxy.on_request handler did not pick up an options dict.
+        let proxy_handler = state
+            .proxy_request_handlers("INVITE")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(proxy_handler.options.is_none());
     }
 
     /// Helper: compile Python source to .pyc bytes using py_compile + marshal.

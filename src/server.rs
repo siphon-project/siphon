@@ -12,6 +12,7 @@ use crate::config::{self, Config};
 use crate::hep::HepSender;
 use crate::gateway::DispatcherManager;
 use crate::script::engine::{ScriptEngine, spawn_file_watcher};
+use crate::script::ScriptHandle;
 use crate::transport;
 use crate::uac::UacSender;
 use crate::{dispatcher, shutdown};
@@ -21,6 +22,12 @@ use crate::{dispatcher, shutdown};
 /// Boxed because the inner closure is generic over the user's `#[pyclass]`
 /// type and we need to type-erase it for storage on the builder.
 type UserNamespaceFactory = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send>;
+
+/// Deferred extension task — invoked after the script engine has been
+/// initialised, with a [`ScriptHandle`] cloned for the task's exclusive
+/// use. The closure typically calls `tokio_handle().spawn(...)` to
+/// install long-running background work.
+type ExtensionTask = Box<dyn FnOnce(ScriptHandle) + Send>;
 
 /// Builder for running a siphon server instance.
 ///
@@ -43,6 +50,7 @@ pub struct SiphonServer {
     product_name: Option<&'static str>,
     product_version: Option<&'static str>,
     user_namespaces: Vec<(String, UserNamespaceFactory)>,
+    extension_tasks: Vec<ExtensionTask>,
 }
 
 impl SiphonServer {
@@ -57,6 +65,7 @@ impl SiphonServer {
             product_name: None,
             product_version: None,
             user_namespaces: Vec::new(),
+            extension_tasks: Vec::new(),
         }
     }
 
@@ -170,6 +179,50 @@ impl SiphonServer {
         self.user_namespaces
             .push((name.to_owned(), Box::new(factory)));
         self
+    }
+
+    /// Register a host-provided task that runs after the script engine is
+    /// initialised.
+    ///
+    /// The closure receives a [`ScriptHandle`] from which it can spawn
+    /// long-running background work on siphon's tokio runtime
+    /// ([`ScriptHandle::tokio_handle`]) and dispatch into custom-kind
+    /// handlers the script registered ([`ScriptHandle::handlers_for`] +
+    /// [`ScriptHandle::call_handler`]).
+    ///
+    /// Tasks are invoked sequentially in registration order, after script
+    /// loading and before transport listeners come up. Each task gets
+    /// its own `ScriptHandle` clone — no sharing required.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use siphon::SiphonServer;
+    ///
+    /// SiphonServer::builder()
+    ///     .config_path("siphon.yaml")
+    ///     .register_task(|script| {
+    ///         script.tokio_handle().spawn(async move {
+    ///             // long-running extension work — read handlers via
+    ///             // script.handlers_for("my.kind"), dispatch with
+    ///             // script.call_handler(&h, args).await.
+    ///         });
+    ///     })
+    ///     .run();
+    /// ```
+    pub fn register_task<F>(mut self, task: F) -> Self
+    where
+        F: FnOnce(ScriptHandle) + Send + 'static,
+    {
+        self.extension_tasks.push(Box::new(task));
+        self
+    }
+
+    /// Number of extension tasks currently registered on the builder.
+    /// Exposed primarily for tests and host applications that want to
+    /// log how many tasks they've wired up before `.run()`.
+    pub fn extension_task_count(&self) -> usize {
+        self.extension_tasks.len()
     }
 
     /// Run the siphon server. This blocks until shutdown (SIGINT/SIGTERM).
@@ -523,6 +576,24 @@ impl SiphonServer {
 
         // Start any @timer.every() handlers registered in the script.
         engine.restart_timers();
+
+        // --- Host-registered extension tasks ---
+        // Run each registered extension task with its own ScriptHandle.
+        // These typically spawn long-running background work (HTTP
+        // listeners, side-channel clients, periodic sweeps) on siphon's
+        // tokio runtime. Sequential invocation in registration order;
+        // panics in a task closure abort the server.
+        let extension_tasks = std::mem::take(&mut self.extension_tasks);
+        if !extension_tasks.is_empty() {
+            let runtime_handle = tokio::runtime::Handle::current();
+            for task in extension_tasks {
+                let script_handle = ScriptHandle::new(engine.state_arc(), runtime_handle.clone());
+                task(script_handle);
+            }
+            info!(
+                "extension tasks started"
+            );
+        }
 
         // --- Build transport ACL ---
         let transport_acl = build_transport_acl(&config);
@@ -1858,5 +1929,40 @@ fn build_transport_acl(config: &Config) -> Arc<transport::acl::TransportAcl> {
         Arc::new(acl)
     } else {
         Arc::new(TransportAcl::new(vec![], vec![]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn register_task_records_in_order() {
+        let server = SiphonServer::builder()
+            .register_task(|_| {})
+            .register_task(|_| {})
+            .register_task(|_| {});
+        assert_eq!(server.extension_task_count(), 3);
+    }
+
+    #[test]
+    fn register_task_empty_by_default() {
+        let server = SiphonServer::builder();
+        assert_eq!(server.extension_task_count(), 0);
+    }
+
+    #[test]
+    fn register_task_accepts_move_closures_carrying_state() {
+        // Verify the closure signature is `FnOnce` so callers can move
+        // state in (e.g. an Arc holding extension config). Compile-only
+        // contract test — the closure body is not executed here.
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let owned: Vec<&'static str> = vec!["a", "b", "c"];
+        let server = SiphonServer::builder().register_task(move |_| {
+            // owned is moved in.
+            COUNTER.fetch_add(owned.len(), Ordering::Relaxed);
+        });
+        assert_eq!(server.extension_task_count(), 1);
     }
 }

@@ -195,6 +195,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Custom metrics API | **Production** | `metrics.counter/gauge/histogram` | Script-defined Prometheus metrics |
 | Timer routes | Implemented | `@timer.every()`, `timer.set()`/`cancel()` | Periodic callbacks via Tokio; one-shot cancellable timers keyed by string |
 | Mock SDK for testing | Implemented | `siphon-sdk` | Test scripts without Rust binary |
+| Extension API (host namespaces, tasks, custom handler kinds) | Implemented | `extensions:`, `register_namespace`/`register_task`, `_siphon_registry.register("custom.kind", …)` | Open extension surface for custom transports / sinks; `ScriptHandle::handlers_for` + `call_handler` dispatch into script handlers from host extensions |
 
 ## Dialog Management
 
