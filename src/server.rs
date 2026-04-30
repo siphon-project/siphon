@@ -624,17 +624,25 @@ impl SiphonServer {
                 .entry(addr)
                 .or_insert_with(flume::unbounded);
         }
-        // Build the OutboundRouter's `udp_by_local` map (sender side
-        // only) and pick a default sender from the first listener.  If
-        // no UDP listeners are configured (rare — TCP/WS-only deploy),
-        // synthesize a placeholder channel that just discards.
+        // Per-listener routing is only needed for the IPsec sec-agree
+        // path (TS 33.203 §7.4 — replies must egress on the same SA's
+        // local socket).  For non-P-CSCF deployments the per-listener
+        // map adds a HashMap lookup to every UDP response (~15-20 % CPU
+        // bump at 10 kcps in the README scale baseline), so leave it
+        // empty unless `ipsec` is configured.  All listeners then share
+        // the `udp_default` sender — the legacy shared-receiver
+        // behaviour of the original design, which the no-ipsec scale
+        // baseline was tuned against.
         let mut udp_by_local: std::collections::HashMap<
             std::net::SocketAddr,
             flume::Sender<transport::OutboundMessage>,
         > = std::collections::HashMap::new();
         let mut udp_default: Option<flume::Sender<transport::OutboundMessage>> = None;
+        let ipsec_enabled = config.ipsec.is_some();
         for (addr, (tx, _)) in udp_listener_channels.iter() {
-            udp_by_local.insert(*addr, tx.clone());
+            if ipsec_enabled {
+                udp_by_local.insert(*addr, tx.clone());
+            }
             if udp_default.is_none() {
                 udp_default = Some(tx.clone());
             }
