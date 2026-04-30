@@ -92,6 +92,14 @@ pub struct ForkAggregator {
     pub strategy: ForkStrategy,
     /// Whether we already forwarded a 100 Trying upstream.
     sent_100: bool,
+    /// Whether a 2xx (or 6xx) has already been forwarded — guards
+    /// against the parallel-fork race where a CANCELled branch's
+    /// already-in-flight 200 OK arrives after another branch's 200
+    /// already won.  Without this flag the aggregator would happily
+    /// say `Forward2xx` for every 2xx received, the proxy would
+    /// forward both copies, and the UAC would see two 200s for one
+    /// INVITE (the documented Proxy/TCP ~0.025 % FailedCall rate).
+    final_forwarded: bool,
 }
 
 impl ForkAggregator {
@@ -109,6 +117,7 @@ impl ForkAggregator {
             branches,
             strategy,
             sent_100: false,
+            final_forwarded: false,
         }
     }
 
@@ -166,20 +175,39 @@ impl ForkAggregator {
         // Final response
         self.branches[index].state = BranchState::Completed(status_code);
 
-        // 2xx — immediate win
+        // 2xx — immediate win.  If a final has already been forwarded
+        // upstream, drop this duplicate (race: branch B's 200 was in
+        // flight when branch A's 200 won and CANCELs were sent; on TCP
+        // both 200s reach the proxy intact).
         if (200..300).contains(&status_code) {
+            if self.final_forwarded {
+                return ForkAction::ContinueWaiting;
+            }
+            self.final_forwarded = true;
             return ForkAction::Forward2xx;
         }
 
-        // 6xx — immediate termination
+        // 6xx — immediate termination.  Same dedup as 2xx.
         if status_code >= 600 {
+            if self.final_forwarded {
+                return ForkAction::ContinueWaiting;
+            }
+            self.final_forwarded = true;
             return ForkAction::Forward6xx;
         }
 
-        // 3xx–5xx — depends on strategy
+        // 3xx–5xx — depends on strategy.  In all cases, if a final
+        // response was already forwarded upstream (e.g. a 2xx won
+        // earlier and other branches are completing with errors after
+        // the CANCEL races), drop the late one to avoid the duplicate-
+        // 2xx-or-error problem upstream.
+        if self.final_forwarded {
+            return ForkAction::ContinueWaiting;
+        }
         match self.strategy {
             ForkStrategy::Parallel => {
                 if self.is_complete() {
+                    self.final_forwarded = true;
                     ForkAction::ForwardBestError(self.best_error())
                 } else {
                     ForkAction::ContinueWaiting
@@ -190,6 +218,7 @@ impl ForkAggregator {
                 if let Some(next) = self.next_pending_branch() {
                     ForkAction::TryNext(next)
                 } else {
+                    self.final_forwarded = true;
                     ForkAction::ForwardBestError(self.best_error())
                 }
             }

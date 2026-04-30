@@ -47,6 +47,53 @@ fn test_parallel_first_2xx_wins() {
     assert!(!aggregator.is_complete());
 }
 
+/// Regression: parallel fork where two branches both return 200 OK
+/// (CANCEL races with branch B's already-in-flight 200 on TCP).  The
+/// aggregator must Forward2xx for the first 200 and `ContinueWaiting`
+/// for the second, otherwise the proxy emits two copies of the 200 to
+/// the UAC and sipp's UAC scenario classifies the late ACK as
+/// `FailedUnexpectedMessage` (the documented Proxy/TCP ~0.025 % rate).
+#[test]
+fn test_parallel_late_2xx_from_cancelled_branch_is_dropped() {
+    let mut aggregator = make_aggregator(3, ForkStrategy::Parallel);
+    for index in 0..3 {
+        aggregator.mark_trying(index);
+    }
+
+    // First 200 — wins, gets forwarded.
+    let action = aggregator.on_branch_response(1, 200);
+    assert_eq!(action, ForkAction::Forward2xx);
+
+    // Second 200 — branch 2's in-flight 200 racing with the CANCEL.
+    // Must NOT be Forward2xx; must be silently absorbed.
+    let action = aggregator.on_branch_response(2, 200);
+    assert_eq!(action, ForkAction::ContinueWaiting);
+
+    // And a third — defensive, e.g. branch 0 also raced.
+    let action = aggregator.on_branch_response(0, 200);
+    assert_eq!(action, ForkAction::ContinueWaiting);
+}
+
+/// Regression: a late error after a 2xx already won must not be
+/// upgraded to ForwardBestError — the UAC has already been told the
+/// call succeeded.
+#[test]
+fn test_parallel_late_error_after_2xx_won_is_dropped() {
+    let mut aggregator = make_aggregator(3, ForkStrategy::Parallel);
+    for index in 0..3 {
+        aggregator.mark_trying(index);
+    }
+
+    let action = aggregator.on_branch_response(1, 200);
+    assert_eq!(action, ForkAction::Forward2xx);
+
+    // Other branches complete with errors after the CANCEL — must be absorbed.
+    let action = aggregator.on_branch_response(0, 487);
+    assert_eq!(action, ForkAction::ContinueWaiting);
+    let action = aggregator.on_branch_response(2, 503);
+    assert_eq!(action, ForkAction::ContinueWaiting);
+}
+
 #[test]
 fn test_parallel_6xx_terminates_immediately() {
     let mut aggregator = make_aggregator(3, ForkStrategy::Parallel);
