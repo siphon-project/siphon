@@ -616,6 +616,10 @@ pub enum DiameterApplication {
     Ro,
     Rf,
     Rx,
+    /// S6c (TS 29.336) — SMSC ↔ HSS for SMS-over-Diameter.
+    S6c,
+    /// SGd (TS 29.338) — SMSC ↔ MME/SGSN for SMS-over-NAS delivery.
+    Sgd,
 }
 
 impl DiameterApplication {
@@ -628,6 +632,8 @@ impl DiameterApplication {
             Self::Rx => (dictionary::VENDOR_3GPP, dictionary::RX_APP_ID),
             Self::Ro => (0, dictionary::RO_APP_ID),
             Self::Rf => (0, dictionary::RF_APP_ID),
+            Self::S6c => (dictionary::VENDOR_3GPP, dictionary::S6C_APP_ID),
+            Self::Sgd => (dictionary::VENDOR_3GPP, dictionary::SGD_APP_ID),
         }
     }
 }

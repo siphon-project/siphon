@@ -17,6 +17,8 @@ pub mod peer;
 pub mod rf;
 pub mod ro;
 pub mod rx;
+pub mod s6c;
+pub mod sgd;
 pub mod sh;
 pub mod transport;
 
@@ -284,6 +286,76 @@ impl DiameterClient {
             data_references,
             subs_req_type,
             service_indication,
+            self.peer.next_hbh(),
+            self.peer.next_e2e(),
+        );
+        self.peer.send_request(wire).await
+    }
+
+    /// Send an S6c Send-Routing-Info-for-SM-Request (SMSC → HSS) and
+    /// return the SRA. Used to discover the served-node (MME or SGSN)
+    /// for an MT-SMS delivery.
+    pub async fn send_srr(
+        &self,
+        msisdn: &str,
+        sc_address: &str,
+        sm_rp_mti: Option<u32>,
+    ) -> Result<codec::DiameterMessage, String> {
+        let session_id = self.peer.new_session_id();
+        let wire = s6c::build_send_routing_info_request(
+            self.peer.config(),
+            &session_id,
+            msisdn,
+            sc_address,
+            sm_rp_mti,
+            self.peer.next_hbh(),
+            self.peer.next_e2e(),
+        );
+        self.peer.send_request(wire).await
+    }
+
+    /// Send an S6c Report-SM-Delivery-Status-Request (SMSC → HSS) and
+    /// return the RSA. Used after delivery to inform the HSS of the
+    /// final outcome.
+    pub async fn send_rsr(
+        &self,
+        user_name: &str,
+        sc_address: &str,
+        delivery_outcome: u32,
+    ) -> Result<codec::DiameterMessage, String> {
+        let session_id = self.peer.new_session_id();
+        let wire = s6c::build_report_sm_delivery_status_request(
+            self.peer.config(),
+            &session_id,
+            user_name,
+            sc_address,
+            delivery_outcome,
+            self.peer.next_hbh(),
+            self.peer.next_e2e(),
+        );
+        self.peer.send_request(wire).await
+    }
+
+    /// Send an SGd MT-Forward-Short-Message-Request (SMSC → MME) and
+    /// return the TFA. `sm_rp_ui` is the SMS-DELIVER TPDU.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_tfr(
+        &self,
+        user_name: &str,
+        sc_address: &str,
+        sm_rp_ui: &[u8],
+        smsmi_correlation_id_ref: Option<&str>,
+        sm_rp_mti: Option<u32>,
+    ) -> Result<codec::DiameterMessage, String> {
+        let session_id = self.peer.new_session_id();
+        let wire = sgd::build_mt_forward_short_message_request(
+            self.peer.config(),
+            &session_id,
+            user_name,
+            sc_address,
+            sm_rp_ui,
+            smsmi_correlation_id_ref,
+            sm_rp_mti,
             self.peer.next_hbh(),
             self.peer.next_e2e(),
         );

@@ -1034,6 +1034,198 @@ pub async fn run(
                         .await
                         .ok();
                     }
+                    crate::diameter::dictionary::CMD_ALERT_SERVICE_CENTRE => {
+                        // S6c ALR from HSS — UE is now reachable; drain pending MT-SMS.
+                        let parsed = crate::diameter::s6c::parse_alr(&incoming);
+                        let config = peer.config();
+
+                        if engine_state
+                            .handlers_for(&HandlerKind::DiameterOnAlr)
+                            .is_empty()
+                        {
+                            let session_id = incoming
+                                .avps
+                                .get("Session-Id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let ala = crate::diameter::s6c::build_ala_success(
+                                &config.origin_host,
+                                &config.origin_realm,
+                                &session_id,
+                                incoming.hop_by_hop,
+                                incoming.end_to_end,
+                            );
+                            if let Err(error) = peer.send_response(ala).await {
+                                tracing::warn!(%error, "failed to send ALA (no handler)");
+                            }
+                            continue;
+                        }
+
+                        let state_ref = Arc::clone(&state_for_diameter);
+                        let peer_for_ala = Arc::clone(&peer);
+
+                        tokio::task::spawn_blocking(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state.handlers_for(&HandlerKind::DiameterOnAlr);
+
+                            let (session_id, public_identity, msisdn) = match parsed {
+                                Some(alr) => (
+                                    alr.session_id,
+                                    alr.user_name.unwrap_or_default(),
+                                    alr.msisdn.unwrap_or_default(),
+                                ),
+                                None => {
+                                    tracing::warn!("failed to parse incoming ALR");
+                                    return;
+                                }
+                            };
+
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        public_identity.as_str(),
+                                        msisdn.as_str(),
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async diameter.on_alr handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "diameter.on_alr handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+
+                            let config = peer_for_ala.config();
+                            let ala = crate::diameter::s6c::build_ala_success(
+                                &config.origin_host,
+                                &config.origin_realm,
+                                &session_id,
+                                incoming.hop_by_hop,
+                                incoming.end_to_end,
+                            );
+                            let runtime = tokio::runtime::Handle::current();
+                            runtime.block_on(async {
+                                if let Err(error) = peer_for_ala.send_response(ala).await {
+                                    tracing::warn!(%error, "failed to send ALA");
+                                }
+                            });
+                        })
+                        .await
+                        .ok();
+                    }
+                    crate::diameter::dictionary::CMD_MO_FORWARD_SHORT_MESSAGE => {
+                        // SGd OFR from MME — UE-originated SMS into the SMSC.
+                        let parsed = crate::diameter::sgd::parse_ofr(&incoming);
+                        let config = peer.config();
+
+                        if engine_state
+                            .handlers_for(&HandlerKind::DiameterOnOfr)
+                            .is_empty()
+                        {
+                            let session_id = incoming
+                                .avps
+                                .get("Session-Id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let ofa = crate::diameter::sgd::build_ofa_success(
+                                &config.origin_host,
+                                &config.origin_realm,
+                                &session_id,
+                                incoming.hop_by_hop,
+                                incoming.end_to_end,
+                            );
+                            if let Err(error) = peer.send_response(ofa).await {
+                                tracing::warn!(%error, "failed to send OFA (no handler)");
+                            }
+                            continue;
+                        }
+
+                        let state_ref = Arc::clone(&state_for_diameter);
+                        let peer_for_ofa = Arc::clone(&peer);
+
+                        tokio::task::spawn_blocking(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state.handlers_for(&HandlerKind::DiameterOnOfr);
+
+                            let (session_id, user_name, sc_address, sm_rp_ui) = match parsed {
+                                Some(ofr) => (
+                                    ofr.session_id,
+                                    ofr.user_name.unwrap_or_default(),
+                                    ofr.sc_address.unwrap_or_default(),
+                                    ofr.sm_rp_ui.unwrap_or_default(),
+                                ),
+                                None => {
+                                    tracing::warn!("failed to parse incoming OFR");
+                                    return;
+                                }
+                            };
+
+                            pyo3::Python::attach(|python| {
+                                let py_pdu: pyo3::Py<pyo3::PyAny> =
+                                    pyo3::types::PyBytes::new(python, &sm_rp_ui)
+                                        .into_any()
+                                        .unbind();
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        user_name.as_str(),
+                                        sc_address.as_str(),
+                                        py_pdu.bind(python),
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async diameter.on_ofr handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "diameter.on_ofr handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+
+                            let config = peer_for_ofa.config();
+                            let ofa = crate::diameter::sgd::build_ofa_success(
+                                &config.origin_host,
+                                &config.origin_realm,
+                                &session_id,
+                                incoming.hop_by_hop,
+                                incoming.end_to_end,
+                            );
+                            let runtime = tokio::runtime::Handle::current();
+                            runtime.block_on(async {
+                                if let Err(error) = peer_for_ofa.send_response(ofa).await {
+                                    tracing::warn!(%error, "failed to send OFA");
+                                }
+                            });
+                        })
+                        .await
+                        .ok();
+                    }
                     _ => {
                         tracing::debug!(
                             command_code = incoming.command_code,

@@ -248,8 +248,18 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 1048, vendor_id: TGPP, name: "Pre-emption-Vulnerability",          data_type: AvpType::Enumerated },
     AvpDef { code: 1049, vendor_id: TGPP, name: "Default-EPS-Bearer-QoS",             data_type: AvpType::Grouped },
     AvpDef { code: 1050, vendor_id: TGPP, name: "AN-GW-Address",                      data_type: AvpType::Address },
+    // S6c served-node identifiers (TS 29.336 / 29.272)
+    AvpDef { code: 1489, vendor_id: TGPP, name: "SGSN-Number",                        data_type: AvpType::OctetString },
+    AvpDef { code: 1645, vendor_id: TGPP, name: "MME-Number-for-MT-SMS",              data_type: AvpType::OctetString },
     // Gy (TS 32.299)
     AvpDef { code: 2006, vendor_id: TGPP, name: "Multiple-Services-Credit-Control",   data_type: AvpType::Grouped },
+    // S6c (TS 29.336) and SGd (TS 29.338) — SMS over Diameter
+    AvpDef { code: 3300, vendor_id: TGPP, name: "SC-Address",                         data_type: AvpType::OctetString },
+    AvpDef { code: 3301, vendor_id: TGPP, name: "SM-RP-UI",                           data_type: AvpType::OctetString },
+    AvpDef { code: 3308, vendor_id: TGPP, name: "SM-RP-MTI",                          data_type: AvpType::Enumerated },
+    AvpDef { code: 3316, vendor_id: TGPP, name: "SM-Delivery-Outcome",                data_type: AvpType::Grouped },
+    AvpDef { code: 3324, vendor_id: TGPP, name: "SMSMI-Correlation-ID",               data_type: AvpType::Grouped },
+    AvpDef { code: 3332, vendor_id: TGPP, name: "SMS-GMSC-Address",                   data_type: AvpType::Address },
 ];
 
 /// Look up an AVP definition by (code, vendor_id).
@@ -295,6 +305,10 @@ pub const RX_APP_ID: u32 = 16777236;
 pub const RO_APP_ID: u32 = 4;
 /// Rf Application-Id (TS 32.299) — Offline Charging (base accounting)
 pub const RF_APP_ID: u32 = 3;
+/// S6c Application-Id (TS 29.336) — SMS-over-Diameter, SMSC ↔ HSS
+pub const S6C_APP_ID: u32 = 16777312;
+/// SGd Application-Id (TS 29.338) — SMS-over-Diameter, SMSC ↔ MME/SGSN
+pub const SGD_APP_ID: u32 = 16777313;
 /// 3GPP Vendor-Id
 pub const VENDOR_3GPP: u32 = 10415;
 
@@ -344,6 +358,22 @@ pub const CMD_SESSION_TERMINATION: u32 = 275;
 
 /// Accounting-Request/Answer (Rf offline charging)
 pub const CMD_ACCOUNTING: u32 = 271;
+
+// ── SGd Command Codes (TS 29.338) ────────────────────────────────────────
+
+/// MO-Forward-Short-Message-Request/Answer (OFR/OFA) — MME → SMSC.
+pub const CMD_MO_FORWARD_SHORT_MESSAGE: u32 = 8388645;
+/// MT-Forward-Short-Message-Request/Answer (TFR/TFA) — SMSC → MME.
+pub const CMD_MT_FORWARD_SHORT_MESSAGE: u32 = 8388646;
+
+// ── S6c Command Codes (TS 29.336) ────────────────────────────────────────
+
+/// Send-Routing-Info-for-SM-Request/Answer (SRR/SRA) — SMSC → HSS.
+pub const CMD_SEND_ROUTING_INFO_FOR_SM: u32 = 8388647;
+/// Alert-Service-Centre-Request/Answer (ALR/ALA) — HSS → SMSC.
+pub const CMD_ALERT_SERVICE_CENTRE: u32 = 8388648;
+/// Report-SM-Delivery-Status-Request/Answer (RSR/RSA) — SMSC → HSS.
+pub const CMD_REPORT_SM_DELIVERY_STATUS: u32 = 8388649;
 
 // ── Base Diameter Command Codes ──────────────────────────────────────────
 
@@ -525,6 +555,18 @@ pub mod avp {
 
     // 3GPP Gy (TS 32.299)
     pub const MULTIPLE_SERVICES_CREDIT_CONTROL: u32 = 2006;
+
+    // 3GPP S6c served-node identifiers
+    pub const SGSN_NUMBER: u32 = 1489;
+    pub const MME_NUMBER_FOR_MT_SMS: u32 = 1645;
+
+    // 3GPP S6c (TS 29.336) and SGd (TS 29.338) — SMS over Diameter
+    pub const SC_ADDRESS: u32 = 3300;
+    pub const SM_RP_UI: u32 = 3301;
+    pub const SM_RP_MTI: u32 = 3308;
+    pub const SM_DELIVERY_OUTCOME: u32 = 3316;
+    pub const SMSMI_CORRELATION_ID: u32 = 3324;
+    pub const SMS_GMSC_ADDRESS: u32 = 3332;
 }
 
 #[cfg(test)]

@@ -680,6 +680,235 @@ impl PyDiameter {
             }
         }
     }
+
+    /// Send an S6c Send-Routing-Info-for-SM request to the HSS.
+    ///
+    /// Used by the SMSC role (e.g. ip-sm-gw) to discover the served-node
+    /// (MME or SGSN) for an MT-SMS delivery. The HSS answer carries the
+    /// served-node identity which the SMSC then uses on SGd as the
+    /// destination for the actual MT-Forward-Short-Message (TFR).
+    ///
+    /// Args:
+    ///     msisdn: E.164 number of the called party (no leading ``+``).
+    ///     sc_address: GT of the originating SMSC.
+    ///     sm_rp_mti: SM-RP Message Type Indicator —
+    ///         0 = SMS Deliver (typical MT delivery),
+    ///         1 = SMS Status Report.
+    ///
+    /// Returns:
+    ///     Dict with ``result_code`` (int), ``user_name`` (IMSI, optional),
+    ///     ``sgsn_number`` (str, set when 2G/3G delivery), and
+    ///     ``mme_number_for_mt_sms`` (str, set when LTE delivery).
+    ///     ``None`` when no Diameter peer is connected.
+    #[pyo3(signature = (msisdn, sc_address, sm_rp_mti=None))]
+    fn s6c_srr<'py>(
+        &self,
+        python: Python<'py>,
+        msisdn: &str,
+        sc_address: &str,
+        sm_rp_mti: Option<u32>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.manager.any_client() {
+            Some(client) => client,
+            None => {
+                warn!("s6c_srr: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(client.send_srr(msisdn, sc_address, sm_rp_mti))
+        });
+        match answer {
+            Ok(message) => match crate::diameter::s6c::parse_sra(&message) {
+                Some(sra) => {
+                    let dict = PyDict::new(python);
+                    dict.set_item("result_code", sra.result_code)?;
+                    dict.set_item("experimental_result_code", sra.experimental_result_code)?;
+                    dict.set_item("user_name", sra.user_name)?;
+                    dict.set_item("sgsn_number", sra.sgsn_number)?;
+                    dict.set_item("mme_number_for_mt_sms", sra.mme_number_for_mt_sms)?;
+                    Ok(Some(dict))
+                }
+                None => {
+                    warn!("s6c_srr: HSS answer was not parseable as SRA");
+                    Ok(None)
+                }
+            },
+            Err(error) => {
+                warn!(error = %error, "s6c_srr failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send an S6c Report-SM-Delivery-Status request to the HSS.
+    ///
+    /// Used after delivery to inform the HSS of the final outcome so it
+    /// can release any held queueing state.
+    ///
+    /// Args:
+    ///     user_name: IMSI of the served subscriber.
+    ///     sc_address: GT of the originating SMSC.
+    ///     delivery_outcome: TS 29.336 outcome enum —
+    ///         0 = SUCCESSFUL_TRANSFER,
+    ///         1 = ABSENT_USER,
+    ///         2 = UE_MEMORY_CAPACITY_EXCEEDED,
+    ///         3 = SUCCESSFUL_TRANSFER_NOT_LAST,
+    ///         4 = TEMPORARY_ERROR.
+    #[pyo3(signature = (user_name, sc_address, delivery_outcome))]
+    fn s6c_rsr<'py>(
+        &self,
+        python: Python<'py>,
+        user_name: &str,
+        sc_address: &str,
+        delivery_outcome: u32,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.manager.any_client() {
+            Some(client) => client,
+            None => {
+                warn!("s6c_rsr: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                client.send_rsr(user_name, sc_address, delivery_outcome),
+            )
+        });
+        match answer {
+            Ok(message) => match crate::diameter::s6c::parse_rsa(&message) {
+                Some(rsa) => {
+                    let dict = PyDict::new(python);
+                    dict.set_item("result_code", rsa.result_code)?;
+                    dict.set_item("experimental_result_code", rsa.experimental_result_code)?;
+                    dict.set_item("user_name", rsa.user_name)?;
+                    Ok(Some(dict))
+                }
+                None => {
+                    warn!("s6c_rsr: HSS answer was not parseable as RSA");
+                    Ok(None)
+                }
+            },
+            Err(error) => {
+                warn!(error = %error, "s6c_rsr failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send an SGd MT-Forward-Short-Message request to the served node
+    /// (MME for LTE, SGSN for 2G/3G). Carries the SMS-DELIVER TPDU in
+    /// the SM-RP-UI AVP.
+    ///
+    /// Args:
+    ///     user_name: IMSI of the recipient UE.
+    ///     sc_address: GT of the originating SMSC.
+    ///     sm_rp_ui: SMS-DELIVER TPDU bytes (TS 23.040).
+    ///     smsmi_correlation_id: Optional opaque correlation reference
+    ///         the SMSC uses to bind the TFR to its own queueing state.
+    ///     sm_rp_mti: SM-RP MTI — 0 = SMS Deliver, 1 = Status Report.
+    ///
+    /// Returns:
+    ///     Dict with ``result_code`` (int) and ``absent_user_diagnostic``
+    ///     (int or None — set when the UE was unreachable).
+    #[pyo3(signature = (user_name, sc_address, sm_rp_ui, smsmi_correlation_id=None, sm_rp_mti=None))]
+    fn sgd_tfr<'py>(
+        &self,
+        python: Python<'py>,
+        user_name: &str,
+        sc_address: &str,
+        sm_rp_ui: &[u8],
+        smsmi_correlation_id: Option<&str>,
+        sm_rp_mti: Option<u32>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.manager.any_client() {
+            Some(client) => client,
+            None => {
+                warn!("sgd_tfr: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.send_tfr(
+                user_name,
+                sc_address,
+                sm_rp_ui,
+                smsmi_correlation_id,
+                sm_rp_mti,
+            ))
+        });
+        match answer {
+            Ok(message) => match crate::diameter::sgd::parse_tfa(&message) {
+                Some(tfa) => {
+                    let dict = PyDict::new(python);
+                    dict.set_item("result_code", tfa.result_code)?;
+                    dict.set_item("experimental_result_code", tfa.experimental_result_code)?;
+                    dict.set_item("absent_user_diagnostic", tfa.absent_user_diagnostic)?;
+                    Ok(Some(dict))
+                }
+                None => {
+                    warn!("sgd_tfr: peer answer was not parseable as TFA");
+                    Ok(None)
+                }
+            },
+            Err(error) => {
+                warn!(error = %error, "sgd_tfr failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Register a handler for incoming S6c Alert-Service-Centre-Request
+    /// (ALR) from the HSS.
+    ///
+    /// The HSS sends ALR (command 8388648) when a previously-unreachable
+    /// UE has registered or moved into coverage — a signal to the SMSC
+    /// to drain any pending MT-SMS queue. Siphon automatically sends
+    /// ALA (result 2001) after the handler returns.
+    ///
+    /// Args:
+    ///     func: Callback ``fn(public_identity, msisdn)``.
+    ///         ``public_identity`` is the IMSI from User-Name; ``msisdn``
+    ///         is the UE's E.164 number when the ALR carried it
+    ///         (otherwise an empty string).
+    #[staticmethod]
+    fn on_alr(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let asyncio = python.import("asyncio")?;
+        let is_async = asyncio
+            .call_method1("iscoroutinefunction", (func.bind(python),))?
+            .is_truthy()?;
+        let registry = python.import("_siphon_registry")?;
+        registry.call_method1(
+            "register",
+            ("diameter.on_alr", python.None(), func.bind(python), is_async),
+        )?;
+        Ok(func)
+    }
+
+    /// Register a handler for incoming SGd MO-Forward-Short-Message-Request
+    /// (OFR) from the MME (or SGSN/MSC).
+    ///
+    /// The MME sends OFR (command 8388645) carrying a UE-originated SMS
+    /// (SMS-SUBMIT TPDU). Siphon automatically sends OFA (result 2001)
+    /// after the handler returns.
+    ///
+    /// Args:
+    ///     func: Callback ``fn(user_name, sc_address, sm_rp_ui)``.
+    ///         ``sm_rp_ui`` is the raw SMS-SUBMIT TPDU bytes (`bytes`).
+    #[staticmethod]
+    fn on_ofr(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let asyncio = python.import("asyncio")?;
+        let is_async = asyncio
+            .call_method1("iscoroutinefunction", (func.bind(python),))?
+            .is_truthy()?;
+        let registry = python.import("_siphon_registry")?;
+        registry.call_method1(
+            "register",
+            ("diameter.on_ofr", python.None(), func.bind(python), is_async),
+        )?;
+        Ok(func)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2439,6 +2439,116 @@ class MockDiameter:
         """
         return fn
 
+    @staticmethod
+    def on_alr(fn: Any) -> Any:
+        """Register a handler for incoming S6c ALR (Alert-Service-Centre).
+
+        Handler receives ``(public_identity, msisdn)``. Siphon auto-sends
+        ALA (result 2001) after the handler returns. The HSS sends ALR
+        when a previously-unreachable UE has registered or moved into
+        coverage — drain pending MT-SMS here.
+        """
+        return fn
+
+    @staticmethod
+    def on_ofr(fn: Any) -> Any:
+        """Register a handler for incoming SGd OFR (MO-Forward-Short-Message).
+
+        Handler receives ``(user_name, sc_address, sm_rp_ui)``. ``sm_rp_ui``
+        is the raw SMS-SUBMIT TPDU bytes (`bytes`). Siphon auto-sends OFA
+        (result 2001) after the handler returns.
+        """
+        return fn
+
+    # -- S6c (TS 29.336) --
+
+    def s6c_srr(self, msisdn: str, sc_address: str,
+                sm_rp_mti: Optional[int] = None) -> Optional[dict]:
+        """Mock Send-Routing-Info-for-SM. Configure responses via
+        :meth:`set_srr_response`; default is a successful answer with
+        an empty served-node (test scripts can detect the unset case)."""
+        if not hasattr(self, "_srr_responses"):
+            self._srr_responses = {}
+        if msisdn in self._srr_responses:
+            return dict(self._srr_responses[msisdn])
+        return {
+            "result_code": 2001,
+            "experimental_result_code": None,
+            "user_name": None,
+            "sgsn_number": None,
+            "mme_number_for_mt_sms": None,
+        }
+
+    def set_srr_response(self, msisdn: str, *, result_code: int = 2001,
+                          user_name: Optional[str] = None,
+                          sgsn_number: Optional[str] = None,
+                          mme_number_for_mt_sms: Optional[str] = None,
+                          experimental_result_code: Optional[int] = None) -> None:
+        if not hasattr(self, "_srr_responses"):
+            self._srr_responses = {}
+        self._srr_responses[msisdn] = {
+            "result_code": result_code,
+            "experimental_result_code": experimental_result_code,
+            "user_name": user_name,
+            "sgsn_number": sgsn_number,
+            "mme_number_for_mt_sms": mme_number_for_mt_sms,
+        }
+
+    def s6c_rsr(self, user_name: str, sc_address: str,
+                delivery_outcome: int) -> Optional[dict]:
+        """Mock Report-SM-Delivery-Status. Records the call on
+        ``self.rsrs`` for assertions and returns a 2001."""
+        if not hasattr(self, "rsrs"):
+            self.rsrs = []
+        self.rsrs.append({
+            "user_name": user_name,
+            "sc_address": sc_address,
+            "delivery_outcome": delivery_outcome,
+        })
+        return {
+            "result_code": 2001,
+            "experimental_result_code": None,
+            "user_name": user_name,
+        }
+
+    # -- SGd (TS 29.338) --
+
+    def sgd_tfr(self, user_name: str, sc_address: str, sm_rp_ui: bytes,
+                smsmi_correlation_id: Optional[str] = None,
+                sm_rp_mti: Optional[int] = None) -> Optional[dict]:
+        """Mock MT-Forward-Short-Message. Records the TPDU on ``self.tfrs``
+        for assertions; returns 2001 unless overridden via
+        :meth:`set_tfr_response`."""
+        if not hasattr(self, "tfrs"):
+            self.tfrs = []
+        self.tfrs.append({
+            "user_name": user_name,
+            "sc_address": sc_address,
+            "sm_rp_ui": bytes(sm_rp_ui),
+            "smsmi_correlation_id": smsmi_correlation_id,
+            "sm_rp_mti": sm_rp_mti,
+        })
+        if not hasattr(self, "_tfr_responses"):
+            self._tfr_responses = {}
+        if user_name in self._tfr_responses:
+            return dict(self._tfr_responses[user_name])
+        return {
+            "result_code": 2001,
+            "experimental_result_code": None,
+            "absent_user_diagnostic": None,
+        }
+
+    def set_tfr_response(self, user_name: str, *, result_code: int = 2001,
+                         absent_user_diagnostic: Optional[int] = None,
+                         experimental_result_code: Optional[int] = None) -> None:
+        if not hasattr(self, "_tfr_responses"):
+            self._tfr_responses = {}
+        self._tfr_responses[user_name] = {
+            "result_code": result_code,
+            "experimental_result_code": experimental_result_code,
+            "absent_user_diagnostic": absent_user_diagnostic,
+        }
+
     def set_udr_response(self, public_identity: str,
                          result_code: int = 2001,
                          user_data: Optional[str] = None) -> None:

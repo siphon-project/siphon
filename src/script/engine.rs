@@ -82,6 +82,10 @@ pub enum HandlerKind {
     DiameterOnAsr,
     /// `@diameter.on_pnr` — incoming Sh Push-Notification-Request from HSS.
     DiameterOnPnr,
+    /// `@diameter.on_alr` — incoming S6c Alert-Service-Centre-Request from HSS.
+    DiameterOnAlr,
+    /// `@diameter.on_ofr` — incoming SGd MO-Forward-Short-Message-Request from MME.
+    DiameterOnOfr,
     /// `@sbi.on_event` — incoming PCF event notification (N5).
     SbiOnEvent,
     /// `@rtpengine.on_dtmf` — inbound DTMF event from rtpengine.
@@ -754,6 +758,8 @@ fn extract_handlers(
             "diameter.on_rar" => HandlerKind::DiameterOnRar,
             "diameter.on_asr" => HandlerKind::DiameterOnAsr,
             "diameter.on_pnr" => HandlerKind::DiameterOnPnr,
+            "diameter.on_alr" => HandlerKind::DiameterOnAlr,
+            "diameter.on_ofr" => HandlerKind::DiameterOnOfr,
             "sbi.on_event" => HandlerKind::SbiOnEvent,
             "timer.every" => {
                 let meta = metadata.as_ref().ok_or_else(|| {

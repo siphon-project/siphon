@@ -256,6 +256,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Diameter Ro (online charging) | Implemented | `diameter` | CCR/CCA |
 | Diameter Rf (offline charging) | Implemented | `diameter` | ACR/ACA |
 | Diameter Rx (policy/QoS) | **Production** | `diameter` | AAR/AAA, STR/STA, `@on_rar` + `@on_asr` |
+| Diameter S6c (SMS-over-Diameter, SMSC↔HSS) | Implemented | `diameter` | `s6c_srr` to discover served-node, `s6c_rsr` for delivery status, `@on_alr` for HSS reachability alerts (TS 29.336) |
+| Diameter SGd (SMS-over-NAS, SMSC↔MME) | Implemented | `diameter` | `sgd_tfr` to deliver SMS-DELIVER TPDU to UE, `@on_ofr` for incoming MO-SMS (TS 29.338) |
 | Diameter peer management | **Production** | `diameter.peers` | Failover + round-robin across HSS/DRA peers |
 | AKA authentication (Milenage, local) | Implemented | `auth.aka_credentials` | 3GPP TS 35.206 — local key derivation without HSS |
 | AKA authentication (HSS-backed) | **Production** | `auth.require_ims_digest()` | 3GPP TS 33.203 via Cx MAR/MAA |
