@@ -1,5 +1,6 @@
 //! YAML configuration — `siphon.yaml` deserialization via serde_yml.
 
+use indexmap::IndexMap;
 use regex::Regex;
 use serde::{Deserialize, Deserializer};
 use std::path::Path;
@@ -118,6 +119,26 @@ pub struct Config {
     /// persisted through it so they survive restarts and are visible to
     /// other replicas.
     pub subscribe_state: Option<SubscribeStateConfig>,
+
+    /// Free-form per-extension configuration. Each entry's value is opaque
+    /// to siphon-core and is interpreted by the extension that owns the
+    /// name. A scalar string is conventionally treated as a path to a
+    /// further configuration file; any other YAML form (mapping, sequence,
+    /// number, bool) is passed through verbatim.
+    ///
+    /// ```yaml
+    /// extensions:
+    ///   foo: /etc/siphon/foo.yaml          # path form
+    ///   bar:                                # inline form
+    ///     listen: "0.0.0.0:8080"
+    ///     workers: 4
+    /// ```
+    ///
+    /// Extensions read their entry via [`Config::extension_path`] (when
+    /// they expect an external file) or [`Config::extension_config`]
+    /// (when they consume the value directly).
+    #[serde(default)]
+    pub extensions: Option<IndexMap<String, serde_yml::Value>>,
 }
 
 /// Configuration for ``proxy.subscribe_state`` — generic SUBSCRIBE
@@ -1818,6 +1839,29 @@ impl Config {
     pub fn is_local(&self, host: &str) -> bool {
         self.domain.local.iter().any(|d| d == host)
     }
+
+    /// Path-form accessor for an extension entry.
+    ///
+    /// Returns `Some(path)` when the entry exists and its value is a YAML
+    /// scalar string (the conventional form for "load my config from this
+    /// file"). Returns `None` when the entry is absent or its value is an
+    /// inline mapping/sequence — extensions that accept inline config
+    /// should call [`Config::extension_config`] instead and walk the
+    /// `serde_yml::Value` themselves.
+    pub fn extension_path(&self, name: &str) -> Option<&Path> {
+        self.extensions
+            .as_ref()?
+            .get(name)?
+            .as_str()
+            .map(Path::new)
+    }
+
+    /// Raw-value accessor for an extension entry. Returns the entry's
+    /// YAML value (any shape) for the extension to interpret. Returns
+    /// `None` when the entry is absent.
+    pub fn extension_config(&self, name: &str) -> Option<&serde_yml::Value> {
+        self.extensions.as_ref()?.get(name)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3355,5 +3399,137 @@ script:
     fn effective_transport_defaults_to_udp() {
         let dest = gateway_dest("sip:gw.example.com:5060", None);
         assert_eq!(dest.effective_transport(), "udp");
+    }
+
+    // -----------------------------------------------------------------------
+    // extensions: section
+    // -----------------------------------------------------------------------
+
+    fn extensions_yaml(extensions_block: &str) -> String {
+        format!(
+            r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+registrar:
+  backend: memory
+auth:
+  realm: "example.com"
+log:
+  level: info
+  format: pretty
+{extensions_block}
+"#
+        )
+    }
+
+    #[test]
+    fn extensions_absent_when_unset() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert!(config.extensions.is_none());
+        assert!(config.extension_path("anything").is_none());
+        assert!(config.extension_config("anything").is_none());
+    }
+
+    #[test]
+    fn extensions_path_form() {
+        let yaml = extensions_yaml(
+            r#"extensions:
+  foo: /etc/siphon/foo.yaml
+"#,
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let path = config
+            .extension_path("foo")
+            .expect("foo extension should resolve to a path");
+        assert_eq!(path, Path::new("/etc/siphon/foo.yaml"));
+    }
+
+    #[test]
+    fn extensions_inline_form() {
+        let yaml = extensions_yaml(
+            r#"extensions:
+  bar:
+    listen: "0.0.0.0:8080"
+    workers: 4
+"#,
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        // The path accessor returns None for non-string entries.
+        assert!(config.extension_path("bar").is_none());
+
+        let value = config
+            .extension_config("bar")
+            .expect("bar extension should resolve to a value");
+        let mapping = value.as_mapping().expect("bar should be a mapping");
+        let listen = mapping
+            .get(serde_yml::Value::String("listen".to_owned()))
+            .and_then(|v| v.as_str())
+            .expect("listen key");
+        assert_eq!(listen, "0.0.0.0:8080");
+        let workers = mapping
+            .get(serde_yml::Value::String("workers".to_owned()))
+            .and_then(|v| v.as_u64())
+            .expect("workers key");
+        assert_eq!(workers, 4);
+    }
+
+    #[test]
+    fn extensions_mixed_forms_coexist() {
+        let yaml = extensions_yaml(
+            r#"extensions:
+  foo: /etc/siphon/foo.yaml
+  bar:
+    key: value
+  baz: 42
+"#,
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        assert_eq!(
+            config.extension_path("foo"),
+            Some(Path::new("/etc/siphon/foo.yaml")),
+        );
+        assert!(config.extension_path("bar").is_none());
+        assert!(config.extension_config("bar").is_some());
+        // Numeric scalar — neither a path nor an inline mapping.
+        assert!(config.extension_path("baz").is_none());
+        assert_eq!(
+            config
+                .extension_config("baz")
+                .and_then(|v| v.as_u64()),
+            Some(42),
+        );
+    }
+
+    #[test]
+    fn extensions_unknown_name_returns_none() {
+        let yaml = extensions_yaml(
+            r#"extensions:
+  foo: /etc/siphon/foo.yaml
+"#,
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        assert!(config.extension_path("missing").is_none());
+        assert!(config.extension_config("missing").is_none());
+    }
+
+    #[test]
+    fn extensions_preserve_yaml_order() {
+        let yaml = extensions_yaml(
+            r#"extensions:
+  zeta: /a
+  alpha: /b
+  middle: /c
+"#,
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let extensions = config.extensions.expect("extensions present");
+        let names: Vec<&str> = extensions.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["zeta", "alpha", "middle"]);
     }
 }

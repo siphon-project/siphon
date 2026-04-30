@@ -41,7 +41,7 @@ num_cpus = "1"
 # SIP parsing
 nom = "8"
 bytes = "1.11"
-indexmap = "2.13"
+indexmap = { version = "2.13", features = ["serde"] }
 
 # Concurrency
 dashmap = "6"
