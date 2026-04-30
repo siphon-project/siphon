@@ -279,6 +279,29 @@ class MockSubscribeHandle:
         self._parent._dialogs.pop(self._id, None)
         return True
 
+    def refresh(self, expires: Optional[int] = None,
+                timeout_ms: int = 2000) -> bool:
+        """Mock refresh — records the call and updates the dialog's expiry.
+
+        Tests can assert on the parent's ``refreshes`` list. Raises if
+        the dialog wasn't created via ``send()`` (consistent with the
+        Rust contract that refresh is only valid on outbound dialogs).
+        """
+        if not self._dialog.get("is_outbound"):
+            raise RuntimeError(
+                "refresh() is only valid on outbound dialogs (created via send())"
+            )
+        if not hasattr(self._parent, "refreshes"):
+            self._parent.refreshes = []
+        new_expires = expires if expires is not None else self.expires
+        self._dialog["expires_secs"] = new_expires
+        self._parent.refreshes.append({
+            "id": self._id,
+            "expires": new_expires,
+            "timeout_ms": timeout_ms,
+        })
+        return True
+
     def __repr__(self) -> str:
         return f"MockSubscribeHandle(id={self._id!r})"
 
@@ -318,6 +341,68 @@ class MockSubscribeState:
             return None
         return MockSubscribeHandle(self, id, dialog)
 
+    def send(
+        self,
+        ruri: str,
+        event: str,
+        expires: int,
+        accept: Optional[str] = None,
+        target_uri: Optional[str] = None,
+        headers: Optional[dict] = None,
+        timeout_ms: int = 2000,
+    ) -> MockSubscribeHandle:
+        """Mock outbound SUBSCRIBE — records the call and synthesises a dialog.
+
+        Tests can assert on the recorded ``self.sends`` list to verify a
+        script originated a SUBSCRIBE with the expected parameters.
+        """
+        import uuid
+        if not hasattr(self, "sends"):
+            self.sends = []
+        handle_id = uuid.uuid4().hex
+        local_tag = uuid.uuid4().hex
+        remote_tag = uuid.uuid4().hex
+        dialog = {
+            "id": handle_id,
+            "event": event,
+            "expires_secs": expires,
+            "call_id": f"py-sub-{uuid.uuid4().hex}",
+            "local_tag": local_tag,
+            "remote_tag": remote_tag,
+            "event_version": 0,
+            "is_outbound": True,
+        }
+        self._dialogs[handle_id] = dialog
+        self.sends.append({
+            "ruri": ruri,
+            "event": event,
+            "expires": expires,
+            "accept": accept,
+            "target_uri": target_uri,
+            "headers": dict(headers or {}),
+            "timeout_ms": timeout_ms,
+        })
+        return MockSubscribeHandle(self, handle_id, dialog)
+
+    def find(
+        self,
+        call_id: str,
+        local_tag: str,
+        remote_tag: str,
+    ) -> Optional[MockSubscribeHandle]:
+        """Mock dialog lookup by tags. Returns the first live dialog
+        matching all three identity fields, or ``None``."""
+        for dialog_id, dialog in self._dialogs.items():
+            if dialog.get("terminated"):
+                continue
+            if (
+                dialog.get("call_id") == call_id
+                and dialog.get("local_tag") == local_tag
+                and dialog.get("remote_tag") == remote_tag
+            ):
+                return MockSubscribeHandle(self, dialog_id, dialog)
+        return None
+
     @property
     def local_count(self) -> int:
         return len(self._dialogs)
@@ -326,6 +411,8 @@ class MockSubscribeState:
         self._dialogs.clear()
         self.notifies.clear()
         self.terminates.clear()
+        if hasattr(self, "sends"):
+            self.sends.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -2626,6 +2713,74 @@ class MockPresence:
     def notifications(self) -> list:
         """List of NOTIFY messages sent (for test assertions)."""
         return self._notifications
+
+    def parse_reginfo(self, xml: str) -> dict:
+        """Parse an RFC 3680 ``application/reginfo+xml`` body for tests.
+
+        Mirrors the Rust ``presence.parse_reginfo`` shape — returns a
+        dict ``{"version": int, "state": "full"|"partial",
+        "registrations": [...]}`` so tests asserting against script logic
+        can use the same dict layout the production binary returns.
+        """
+        import xml.etree.ElementTree as ET
+
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError as error:
+            raise ValueError(f"invalid reginfo: {error}") from error
+
+        # Strip {namespace} from the tag for comparison.
+        def local_name(tag: str) -> str:
+            return tag.split("}")[-1] if "}" in tag else tag
+
+        if local_name(root.tag) != "reginfo":
+            raise ValueError("invalid reginfo: missing root <reginfo>")
+
+        try:
+            version = int(root.get("version", ""))
+        except ValueError as error:
+            raise ValueError(f"invalid reginfo version: {error}") from error
+        state = root.get("state", "full")
+        if state not in ("full", "partial"):
+            raise ValueError(f"invalid reginfo state: {state!r}")
+
+        registrations = []
+        for reg in root:
+            if local_name(reg.tag) != "registration":
+                continue
+            reg_state = reg.get("state", "active")
+            contacts = []
+            for contact in reg:
+                if local_name(contact.tag) != "contact":
+                    continue
+                # URI may be on the <contact> directly, or inside <uri>.
+                uri = contact.get("uri")
+                if uri is None:
+                    for child in contact:
+                        if local_name(child.tag) == "uri":
+                            uri = (child.text or "").strip()
+                            break
+                expires = contact.get("expires")
+                q = contact.get("q")
+                contacts.append({
+                    "uri": uri or "",
+                    "state": contact.get("state", "active"),
+                    "event": contact.get("event", "registered"),
+                    "expires": int(expires) if expires else None,
+                    "q": float(q) if q else None,
+                })
+            registrations.append({
+                "aor": reg.get("aor", ""),
+                "id": reg.get("id", ""),
+                "state": reg_state,
+                "contacts": contacts,
+            })
+
+        return {
+            "version": version,
+            "state": state,
+            "registrations": registrations,
+        }
 
     def clear(self) -> None:
         """Reset all documents, subscriptions, and notifications (test helper)."""

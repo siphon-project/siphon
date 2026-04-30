@@ -159,6 +159,7 @@ impl PySubscribeState {
             cseq: 0,
             event_version: 0,
             terminated: false,
+            is_outbound: false,
         };
 
         drop(message);
@@ -191,6 +192,304 @@ impl PySubscribeState {
     #[getter]
     fn local_count(&self) -> usize {
         self.store.local_count()
+    }
+
+    /// Originate an outbound SUBSCRIBE and capture the resulting dialog.
+    ///
+    /// Sends a SUBSCRIBE to ``ruri`` (or to ``target_uri`` if given as a
+    /// pre-loaded Route — see RFC 3261 §16.4) and blocks until the
+    /// notifier responds. On a 2xx response the dialog state is captured
+    /// from the From/To/Contact/Record-Route headers and a
+    /// :class:`SubscribeHandle` is returned for later
+    /// :meth:`SubscribeHandle.refresh` / :meth:`SubscribeHandle.terminate`
+    /// or in-dialog NOTIFY correlation via :meth:`find`.
+    ///
+    /// Args:
+    ///     ruri: SUBSCRIBE Request-URI (the watched resource).
+    ///     event: Event package name written to the ``Event`` header
+    ///            (e.g. ``"reg"`` for RFC 3680, ``"presence"`` for RFC 3856).
+    ///     expires: Subscription duration in seconds (Expires header).
+    ///     accept: Optional ``Accept`` header value (e.g.
+    ///             ``"application/reginfo+xml"``).
+    ///     target_uri: Optional pre-loaded Route — when set, the SUBSCRIBE
+    ///                 is routed to this URI but ``ruri`` stays as the
+    ///                 Request-URI. Useful for IMS where the watcher knows
+    ///                 the next-hop S-CSCF.
+    ///     headers: Optional dict of extra header name → value pairs to add
+    ///              (e.g. ``P-Asserted-Identity``).
+    ///     timeout_ms: Response timeout in milliseconds (default 2000).
+    ///
+    /// Raises ``RuntimeError`` on non-2xx response, timeout, malformed
+    /// 200 OK (missing tag/Contact), or transport failure.
+    #[pyo3(signature = (
+        ruri,
+        event,
+        expires,
+        accept=None,
+        target_uri=None,
+        headers=None,
+        timeout_ms=2000,
+    ))]
+    fn send(
+        &self,
+        ruri: &str,
+        event: &str,
+        expires: u64,
+        accept: Option<&str>,
+        target_uri: Option<&str>,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
+        timeout_ms: u64,
+    ) -> PyResult<PySubscribeHandle> {
+        let uac_sender = UAC_SENDER.get().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "subscribe_state.send() unavailable: UAC sender not initialized",
+            )
+        })?;
+        let resolver = SEND_RESOLVER.get().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "subscribe_state.send() unavailable: DNS resolver not initialized",
+            )
+        })?;
+
+        let ruri_parsed = parse_uri_standalone(ruri).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid request URI '{ruri}': {error}"
+            ))
+        })?;
+
+        // Resolve the next-hop: explicit target_uri (pre-loaded Route)
+        // wins, else the Request-URI.
+        let resolve_target = target_uri.unwrap_or(ruri);
+        let resolve_uri = parse_uri_standalone(resolve_target).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid target URI '{resolve_target}': {error}"
+            ))
+        })?;
+
+        let transport_hint = resolve_uri.get_param("transport").map(|s: &str| s.to_string());
+        let resolver_clone = Arc::clone(resolver);
+        let host = resolve_uri.host.clone();
+        let port = resolve_uri.port;
+        let scheme = resolve_uri.scheme.clone();
+
+        let destination = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(resolver_clone.resolve(
+                &host,
+                port,
+                &scheme,
+                transport_hint.as_deref(),
+            ))
+        });
+        let target = destination.into_iter().next().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "cannot resolve destination for '{resolve_target}'"
+            ))
+        })?;
+
+        let transport = match target
+            .transport
+            .as_deref()
+            .or(transport_hint.as_deref())
+        {
+            Some(hint) => match hint.to_lowercase().as_str() {
+                "tcp" => Transport::Tcp,
+                "tls" => Transport::Tls,
+                "ws" => Transport::WebSocket,
+                "wss" => Transport::WebSocketSecure,
+                "sctp" => Transport::Sctp,
+                _ => Transport::Udp,
+            },
+            None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
+        };
+
+        // Mint dialog identity on our side.
+        let call_id = format!("py-sub-{}", Uuid::new_v4());
+        let local_tag = short_uuid();
+        let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
+        let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
+        let cseq_value: u32 = 1;
+        let cseq_str = format!("{cseq_value} SUBSCRIBE");
+
+        // From/To URIs:
+        //   From = us (subscriber). We use the R-URI as a stand-in identity
+        //          unless the script overrides via headers={"From": ...}.
+        //   To   = the watched resource (R-URI bareform).
+        let local_uri_default = strip_uri_params(ruri);
+        let remote_uri_default = strip_uri_params(ruri);
+        let from_header_default = format!("<{}>;tag={}", local_uri_default, local_tag);
+        let to_header_default = format!("<{}>", remote_uri_default);
+
+        let mut builder = SipMessageBuilder::new()
+            .request(Method::Subscribe, ruri_parsed)
+            .via(via)
+            .call_id(call_id.clone())
+            .cseq(cseq_str)
+            .max_forwards(70)
+            .from(from_header_default.clone())
+            .to(to_header_default)
+            .header("Event", event.to_string())
+            .header("Expires", expires.to_string());
+
+        if let Some(accept_val) = accept {
+            builder = builder.header("Accept", accept_val.to_string());
+        }
+        if let Some(loose_route) = target_uri {
+            builder = builder.header("Route", format!("<{loose_route}>"));
+        }
+
+        // Apply caller-supplied extra headers; allow them to override
+        // the From line if needed (some IMS flows want a specific
+        // P-Preferred-Identity-style URI in From).
+        let mut from_override: Option<String> = None;
+        if let Some(header_dict) = headers {
+            for (key, value) in header_dict.iter() {
+                let name: String = key.extract().map_err(|error| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "header name must be str: {error}"
+                    ))
+                })?;
+                let val: String = value.extract().map_err(|error| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "header value must be str: {error}"
+                    ))
+                })?;
+                if name.eq_ignore_ascii_case("from") {
+                    from_override = Some(val);
+                    continue;
+                }
+                builder = builder.header(&name, val);
+            }
+        }
+        if let Some(custom_from) = from_override.as_ref() {
+            builder = builder.from(ensure_tag(custom_from, &local_tag));
+        }
+        builder = builder.content_length(0);
+
+        let message = builder.build().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to build SUBSCRIBE: {error}"
+            ))
+        })?;
+
+        let receiver = uac_sender.send_request_with_response(
+            message,
+            target.address,
+            transport,
+        );
+
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                tokio::time::timeout(timeout, receiver).await
+            })
+        });
+
+        let response = match result {
+            Ok(Ok(crate::uac::UacResult::Response(message))) => *message,
+            Ok(Ok(crate::uac::UacResult::Timeout)) | Ok(Err(_)) | Err(_) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "subscribe_state.send() timed out waiting for 2xx",
+                ));
+            }
+        };
+
+        let status = response.status_code().unwrap_or(0);
+        if !(200..300).contains(&status) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "subscribe_state.send() got non-2xx response: {status}"
+            )));
+        }
+
+        // Extract dialog state from the 2xx.
+        let to_raw = response
+            .headers
+            .get("To")
+            .or_else(|| response.headers.get("t"))
+            .cloned()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("2xx missing To header")
+            })?;
+        let remote_tag = extract_tag(&to_raw).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "2xx response To header missing tag — peer did not establish dialog",
+            )
+        })?;
+        let remote_uri = strip_nameaddr(&to_raw);
+
+        // Contact in 2xx is the notifier's remote target. Per RFC 3265,
+        // it's mandatory for SUBSCRIBE 2xx; tolerate absence by falling
+        // back to the original R-URI (some buggy peers omit it for
+        // already-established dialogs).
+        let remote_target = response
+            .headers
+            .get("Contact")
+            .or_else(|| response.headers.get("m"))
+            .map(|c| strip_nameaddr(c))
+            .unwrap_or_else(|| local_uri_default.clone());
+
+        // Reverse Record-Route per RFC 3261 §12.1.2 — we reverse here
+        // because the same field on inbound dialogs is reversed at
+        // create() time, so all storage holds Route in the order needed
+        // for outgoing in-dialog traffic.
+        let route_set: Vec<String> = response
+            .headers
+            .get_all("Record-Route")
+            .map(|entries| entries.iter().rev().cloned().collect())
+            .unwrap_or_default();
+
+        let local_uri = match from_override.as_ref() {
+            Some(val) => strip_nameaddr(val),
+            None => local_uri_default,
+        };
+
+        let id = short_uuid();
+        let dialog = SubscribeDialog {
+            id: id.clone(),
+            call_id,
+            local_tag,
+            remote_tag,
+            local_uri,
+            remote_uri,
+            remote_target,
+            route_set,
+            event: event.to_string(),
+            expires_secs: expires,
+            created_at_unix: now_unix(),
+            cseq: cseq_value,
+            event_version: 0,
+            terminated: false,
+            is_outbound: true,
+        };
+        self.store.put(dialog);
+        debug!(id, "subscribe_state: outbound dialog established");
+
+        Ok(PySubscribeHandle {
+            store: Arc::clone(&self.store),
+            id,
+        })
+    }
+
+    /// Look up a live dialog by its three identity tags. Used to
+    /// correlate an in-dialog NOTIFY (received via
+    /// ``@proxy.on_request("NOTIFY")``) to the outbound SUBSCRIBE that
+    /// established the dialog.
+    ///
+    /// On NOTIFY, the From-tag is the notifier's tag (our remote_tag)
+    /// and the To-tag is ours (our local_tag). Returns ``None`` if the
+    /// dialog is unknown or terminated.
+    #[pyo3(signature = (call_id, local_tag, remote_tag))]
+    fn find(
+        &self,
+        call_id: &str,
+        local_tag: &str,
+        remote_tag: &str,
+    ) -> Option<PySubscribeHandle> {
+        self.store
+            .find_by_tags(call_id, local_tag, remote_tag)
+            .map(|dialog| PySubscribeHandle {
+                store: Arc::clone(&self.store),
+                id: dialog.id,
+            })
     }
 }
 
@@ -299,10 +598,19 @@ impl PySubscribeHandle {
         Ok(true)
     }
 
-    /// Send a terminating NOTIFY with ``Subscription-State:
-    /// terminated;reason=<reason>`` and remove the dialog from the store.
+    /// Terminate the subscription dialog.
     ///
-    /// ``reason`` defaults to ``"noresource"`` (RFC 6665 §4.2.2).
+    /// For dialogs we received as the notifier (the original
+    /// ``create()`` flow), this sends a final NOTIFY with
+    /// ``Subscription-State: terminated;reason=<reason>`` (RFC 6665
+    /// §4.2.2). For dialogs we originated as the watcher (the
+    /// :meth:`SubscribeStateNamespace.send` flow), this sends a
+    /// SUBSCRIBE Expires:0 instead — the notifier owes us the final
+    /// terminating NOTIFY, which arrives via ``@proxy.on_request("NOTIFY")``.
+    ///
+    /// In both cases the dialog is marked terminated and removed from
+    /// the store. ``reason`` defaults to ``"noresource"`` and is only
+    /// used for the notifier path.
     #[pyo3(signature = (reason=None, body=None, content_type=None))]
     fn terminate(
         &self,
@@ -310,26 +618,73 @@ impl PySubscribeHandle {
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
     ) -> PyResult<bool> {
-        let reason_str = reason.unwrap_or("noresource");
-        let subscription_state = format!("terminated;reason={reason_str}");
-
         let dialog = match self.bump_cseq()? {
             Some(dialog) => dialog,
             None => return Ok(false),
         };
 
-        let body_bytes = match body {
-            Some(obj) => Some(super::request::extract_body_bytes(obj)?),
-            None => None,
-        };
-
-        send_notify(&dialog, &subscription_state, content_type, body_bytes.as_deref())?;
+        if dialog.is_outbound {
+            // Watcher role — terminate by sending SUBSCRIBE Expires:0.
+            send_in_dialog_subscribe(&dialog, 0)?;
+        } else {
+            // Notifier role — send the final NOTIFY.
+            let reason_str = reason.unwrap_or("noresource");
+            let subscription_state = format!("terminated;reason={reason_str}");
+            let body_bytes = match body {
+                Some(obj) => Some(super::request::extract_body_bytes(obj)?),
+                None => None,
+            };
+            send_notify(&dialog, &subscription_state, content_type, body_bytes.as_deref())?;
+        }
 
         // Mark terminated + remove.  Mark-then-remove gives a brief
         // window where get() returns None even if the cache still has
         // the entry (race-safe for cross-instance lookups).
         self.store.update(&self.id, |dialog| dialog.terminated = true);
         self.store.remove(&self.id);
+        Ok(true)
+    }
+
+    /// Re-SUBSCRIBE to refresh the dialog. Only valid on dialogs
+    /// originated via :meth:`SubscribeStateNamespace.send` (watcher
+    /// role) — refreshing a notifier-side dialog is a no-op since the
+    /// peer drives refresh by sending us another SUBSCRIBE.
+    ///
+    /// ``expires`` defaults to the original Expires value the dialog
+    /// was created with. Increments CSeq, updates the dialog's expiry
+    /// anchor on success, and persists to L2 if configured. Raises on
+    /// non-2xx, timeout, or transport failure (existing dialog is
+    /// kept; the script can decide to retry or terminate).
+    #[pyo3(signature = (expires=None, timeout_ms=2000))]
+    fn refresh(&self, expires: Option<u64>, timeout_ms: u64) -> PyResult<bool> {
+        let dialog = self.load_sync()?;
+        if !dialog.is_outbound {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "refresh() is only valid on outbound dialogs (created via send())",
+            ));
+        }
+        let new_expires = expires.unwrap_or(dialog.expires_secs);
+
+        // Bump CSeq before sending so retransmits (handled by transport
+        // layer) carry the same value we'll commit on success.
+        let bumped = self
+            .store
+            .update(&self.id, |dialog| {
+                dialog.next_cseq();
+            })
+            .ok_or_else(|| {
+                pyo3::exceptions::PyLookupError::new_err(format!(
+                    "subscribe_state dialog '{}' not found",
+                    self.id
+                ))
+            })?;
+
+        send_in_dialog_subscribe_with_timeout(&bumped, new_expires, timeout_ms)?;
+
+        // Commit the new expiry anchor.
+        self.store.update(&self.id, |dialog| {
+            dialog.refresh(new_expires);
+        });
         Ok(true)
     }
 
@@ -500,6 +855,184 @@ fn send_notify(
     }
     debug!(id = %dialog.id, "subscribe_state: NOTIFY sent");
     Ok(())
+}
+
+/// Send an in-dialog SUBSCRIBE (refresh or Expires:0 termination)
+/// without waiting for a response. Used by `terminate()` on outbound
+/// dialogs — the response carries no information we need.
+fn send_in_dialog_subscribe(dialog: &SubscribeDialog, expires_secs: u64) -> PyResult<()> {
+    let (message, target_addr, transport) = build_in_dialog_subscribe(dialog, expires_secs)?;
+    let uac_sender = UAC_SENDER.get().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "subscribe_state outbound unavailable: UAC sender not initialized",
+        )
+    })?;
+    uac_sender.send_request(message, target_addr, transport);
+    Ok(())
+}
+
+/// Send an in-dialog SUBSCRIBE and block until the peer responds.
+/// Used by `refresh()` so the script learns about a non-2xx refresh
+/// failure synchronously.
+fn send_in_dialog_subscribe_with_timeout(
+    dialog: &SubscribeDialog,
+    expires_secs: u64,
+    timeout_ms: u64,
+) -> PyResult<()> {
+    let (message, target_addr, transport) = build_in_dialog_subscribe(dialog, expires_secs)?;
+    let uac_sender = UAC_SENDER.get().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "subscribe_state refresh unavailable: UAC sender not initialized",
+        )
+    })?;
+    let receiver = uac_sender.send_request_with_response(message, target_addr, transport);
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            tokio::time::timeout(timeout, receiver).await
+        })
+    });
+    match result {
+        Ok(Ok(crate::uac::UacResult::Response(message))) => {
+            let status = message.status_code().unwrap_or(0);
+            if (200..300).contains(&status) {
+                Ok(())
+            } else {
+                Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "subscribe refresh got non-2xx response: {status}"
+                )))
+            }
+        }
+        _ => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "subscribe refresh timed out waiting for 2xx",
+        )),
+    }
+}
+
+/// Build a SUBSCRIBE message inside an established dialog. Used for
+/// both refresh (`Expires: <new>`) and termination (`Expires: 0`).
+fn build_in_dialog_subscribe(
+    dialog: &SubscribeDialog,
+    expires_secs: u64,
+) -> PyResult<(crate::sip::message::SipMessage, std::net::SocketAddr, Transport)> {
+    let resolver = SEND_RESOLVER.get().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "subscribe_state outbound unavailable: DNS resolver not initialized",
+        )
+    })?;
+
+    // Same routing rules as send_notify() — first Route URI if present,
+    // otherwise the remote target.
+    let resolve_target: String = dialog
+        .route_set
+        .first()
+        .map(|route| route.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+        .unwrap_or_else(|| dialog.remote_target.clone());
+
+    let resolve_uri = parse_uri_standalone(&resolve_target).map_err(|error| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid route/target URI '{resolve_target}': {error}"
+        ))
+    })?;
+    let ruri = parse_uri_standalone(&dialog.remote_target).map_err(|error| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid remote_target URI '{}': {error}",
+            dialog.remote_target
+        ))
+    })?;
+
+    let transport_hint = resolve_uri.get_param("transport").map(|s: &str| s.to_string());
+    let resolver_clone = Arc::clone(resolver);
+    let host = resolve_uri.host.clone();
+    let port = resolve_uri.port;
+    let scheme = resolve_uri.scheme.clone();
+
+    let destination = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(resolver_clone.resolve(
+            &host,
+            port,
+            &scheme,
+            transport_hint.as_deref(),
+        ))
+    });
+    let target = destination.into_iter().next().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "cannot resolve destination for '{resolve_target}'"
+        ))
+    })?;
+
+    let transport = match target
+        .transport
+        .as_deref()
+        .or(transport_hint.as_deref())
+    {
+        Some(hint) => match hint.to_lowercase().as_str() {
+            "tcp" => Transport::Tcp,
+            "tls" => Transport::Tls,
+            "ws" => Transport::WebSocket,
+            "wss" => Transport::WebSocketSecure,
+            "sctp" => Transport::Sctp,
+            _ => Transport::Udp,
+        },
+        None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
+    };
+
+    let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
+    let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
+    let cseq_str = format!("{} SUBSCRIBE", dialog.cseq);
+
+    // Outbound watcher orientation: From = us (subscriber), To = peer.
+    let from_header = format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag);
+    let to_header = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
+
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Subscribe, ruri)
+        .via(via)
+        .call_id(dialog.call_id.clone())
+        .cseq(cseq_str)
+        .max_forwards(70)
+        .from(from_header)
+        .to(to_header)
+        .header("Event", dialog.event.clone())
+        .header("Expires", expires_secs.to_string());
+
+    for route in &dialog.route_set {
+        builder = builder.header("Route", route.clone());
+    }
+    builder = builder.content_length(0);
+
+    let message = builder.build().map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to build SUBSCRIBE: {error}"
+        ))
+    })?;
+
+    Ok((message, target.address, transport))
+}
+
+/// Strip parameters (`;param=val`) from a SIP URI string, returning
+/// only the bare `scheme:user@host[:port]` portion. Used to derive a
+/// stable identity URI for the From/To lines on an originated
+/// SUBSCRIBE — refresh / terminate must use the *same* URI string the
+/// peer's 200 OK echoed back.
+fn strip_uri_params(uri: &str) -> String {
+    let trimmed = uri.trim();
+    match trimmed.find(';') {
+        Some(idx) => trimmed[..idx].to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Append `;tag=<tag>` to a name-addr value if it does not already
+/// carry one. Used when the script supplies a `From` override that
+/// already specifies a custom URI but should still carry our minted
+/// dialog tag.
+fn ensure_tag(value: &str, tag: &str) -> String {
+    if extract_tag(value).is_some() {
+        value.to_string()
+    } else {
+        format!("{};tag={}", value.trim(), tag)
+    }
 }
 
 fn short_uuid() -> String {

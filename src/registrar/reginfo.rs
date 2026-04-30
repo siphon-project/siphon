@@ -244,6 +244,301 @@ fn hash_aor(aor: &str) -> u64 {
     hash
 }
 
+// ---------------------------------------------------------------------------
+// Parsing — RFC 3680 reginfo+xml → ReginfoBody
+// ---------------------------------------------------------------------------
+
+/// Errors produced by [`parse_reginfo`].
+#[derive(Debug, thiserror::Error)]
+pub enum ReginfoParseError {
+    #[error("reginfo XML is malformed: {0}")]
+    Xml(String),
+    #[error("reginfo missing required attribute: {0}")]
+    MissingAttr(&'static str),
+    #[error("reginfo attribute has invalid value: {attr}={value:?}")]
+    InvalidAttr { attr: &'static str, value: String },
+    #[error("reginfo XML missing root <reginfo> element")]
+    MissingRoot,
+}
+
+/// Parse an RFC 3680 `application/reginfo+xml` body into a structured
+/// [`ReginfoBody`]. Tolerant of inbound NOTIFY bodies — accepts the
+/// document with or without the optional XML declaration, ignores
+/// unknown elements/attributes for forward compatibility, and treats
+/// missing optional attributes (expires, q, contact event) as absent.
+///
+/// Used on the watcher side: a NOTIFY arrives via
+/// `@proxy.on_request("NOTIFY")`, the script extracts the body, and
+/// calls `presence.parse_reginfo(body)` to walk the registration data.
+pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut body: Option<ReginfoBody> = None;
+    let mut current_registration: Option<Registration> = None;
+    let mut current_contact: Option<ReginfoContact> = None;
+    // The <uri> child element wraps a text node; we accumulate text
+    // events between <uri>...</uri> and apply on close so the contact's
+    // declared URI matches the inner text rather than the contact id.
+    let mut in_uri_text: bool = false;
+    let mut uri_text_buffer = String::new();
+
+    let mut buf = Vec::new();
+    loop {
+        let event = reader
+            .read_event_into(&mut buf)
+            .map_err(|error| ReginfoParseError::Xml(error.to_string()))?;
+        let is_empty = matches!(event, Event::Empty(_));
+        match event {
+            Event::Start(element) | Event::Empty(element) => {
+                let _ = is_empty; // captured above; used in branches below
+                let local_name = element.local_name();
+                let name_bytes = local_name.as_ref();
+                match name_bytes {
+                    b"reginfo" => {
+                        let version = attr_required_u32(&element, "version")?;
+                        let state = attr_required_str(&element, "state")?;
+                        let parsed_state = match state.as_str() {
+                            "full" => ReginfoState::Full,
+                            "partial" => ReginfoState::Partial,
+                            _ => {
+                                return Err(ReginfoParseError::InvalidAttr {
+                                    attr: "state",
+                                    value: state,
+                                });
+                            }
+                        };
+                        body = Some(ReginfoBody {
+                            version,
+                            state: parsed_state,
+                            registrations: Vec::new(),
+                        });
+                    }
+                    b"registration" => {
+                        if body.is_none() {
+                            return Err(ReginfoParseError::MissingRoot);
+                        }
+                        let aor = attr_required_str(&element, "aor")?;
+                        let id = attr_optional_str(&element, "id")?
+                            .unwrap_or_else(|| format!("reg-{:x}", hash_aor(&aor)));
+                        let state = attr_required_str(&element, "state")?;
+                        let parsed_state = match state.as_str() {
+                            "init" => RegistrationState::Init,
+                            "active" => RegistrationState::Active,
+                            "terminated" => RegistrationState::Terminated,
+                            _ => {
+                                return Err(ReginfoParseError::InvalidAttr {
+                                    attr: "state",
+                                    value: state,
+                                });
+                            }
+                        };
+                        current_registration = Some(Registration {
+                            aor,
+                            id,
+                            state: parsed_state,
+                            contacts: Vec::new(),
+                        });
+                        if is_empty {
+                            if let Some(reg) = current_registration.take() {
+                                if let Some(reginfo) = body.as_mut() {
+                                    reginfo.registrations.push(reg);
+                                }
+                            }
+                        }
+                    }
+                    b"contact" => {
+                        if current_registration.is_none() {
+                            // Stray <contact> outside <registration> — skip.
+                            continue;
+                        }
+                        let state = attr_required_str(&element, "state")?;
+                        let parsed_state = match state.as_str() {
+                            "active" => ContactState::Active,
+                            "terminated" => ContactState::Terminated,
+                            _ => {
+                                return Err(ReginfoParseError::InvalidAttr {
+                                    attr: "state",
+                                    value: state,
+                                });
+                            }
+                        };
+                        let event_attr = attr_optional_str(&element, "event")?;
+                        let parsed_event = match event_attr.as_deref() {
+                            Some("registered") | None => ContactEvent::Registered,
+                            Some("created") => ContactEvent::Created,
+                            Some("refreshed") => ContactEvent::Refreshed,
+                            Some("shortened") => ContactEvent::Shortened,
+                            Some("deactivated") => ContactEvent::Deactivated,
+                            Some("expired") => ContactEvent::Expired,
+                            Some("unregistered") => ContactEvent::Unregistered,
+                            Some("rejected") => ContactEvent::Rejected,
+                            Some("probation") => ContactEvent::Probation,
+                            Some(other) => {
+                                return Err(ReginfoParseError::InvalidAttr {
+                                    attr: "event",
+                                    value: other.to_string(),
+                                });
+                            }
+                        };
+                        let expires = attr_optional_u64(&element, "expires")?;
+                        let q = attr_optional_f32(&element, "q")?;
+                        // The contact's URI may live as an attribute on
+                        // <contact> directly (some implementations emit
+                        // it that way) or as the inner <uri> element
+                        // text — fall back to the id attribute, which
+                        // siphon's own builder uses as `c-<uri>`.
+                        let direct_uri = attr_optional_str(&element, "uri")?;
+                        let placeholder_uri = direct_uri
+                            .clone()
+                            .or_else(|| {
+                                attr_optional_str(&element, "id")
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|id| id.strip_prefix("c-").map(str::to_string))
+                            })
+                            .unwrap_or_default();
+                        current_contact = Some(ReginfoContact {
+                            uri: placeholder_uri,
+                            state: parsed_state,
+                            event: parsed_event,
+                            expires,
+                            q,
+                        });
+                        if is_empty {
+                            if let Some(contact) = current_contact.take() {
+                                if let Some(reg) = current_registration.as_mut() {
+                                    reg.contacts.push(contact);
+                                }
+                            }
+                        }
+                    }
+                    b"uri" => {
+                        in_uri_text = true;
+                        uri_text_buffer.clear();
+                    }
+                    _ => {
+                        // Unknown element — ignored for forward compat.
+                    }
+                }
+            }
+            Event::Text(text) => {
+                if in_uri_text {
+                    let s = text
+                        .unescape()
+                        .map_err(|error| ReginfoParseError::Xml(error.to_string()))?;
+                    uri_text_buffer.push_str(s.as_ref());
+                }
+            }
+            Event::End(element) => {
+                let local_name = element.local_name();
+                let name_bytes = local_name.as_ref();
+                match name_bytes {
+                    b"uri" => {
+                        if let Some(contact) = current_contact.as_mut() {
+                            let trimmed = uri_text_buffer.trim();
+                            if !trimmed.is_empty() {
+                                contact.uri = trimmed.to_string();
+                            }
+                        }
+                        in_uri_text = false;
+                        uri_text_buffer.clear();
+                    }
+                    b"contact" => {
+                        if let Some(contact) = current_contact.take() {
+                            if let Some(reg) = current_registration.as_mut() {
+                                reg.contacts.push(contact);
+                            }
+                        }
+                    }
+                    b"registration" => {
+                        if let Some(reg) = current_registration.take() {
+                            if let Some(reginfo) = body.as_mut() {
+                                reginfo.registrations.push(reg);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    body.ok_or(ReginfoParseError::MissingRoot)
+}
+
+fn attr_required_str(
+    element: &quick_xml::events::BytesStart<'_>,
+    name: &'static str,
+) -> Result<String, ReginfoParseError> {
+    attr_optional_str(element, name)?.ok_or(ReginfoParseError::MissingAttr(name))
+}
+
+fn attr_optional_str(
+    element: &quick_xml::events::BytesStart<'_>,
+    name: &str,
+) -> Result<Option<String>, ReginfoParseError> {
+    for attr in element.attributes().with_checks(false) {
+        let attr = attr.map_err(|error| ReginfoParseError::Xml(error.to_string()))?;
+        if attr.key.local_name().as_ref() == name.as_bytes() {
+            let value = attr
+                .unescape_value()
+                .map_err(|error| ReginfoParseError::Xml(error.to_string()))?;
+            return Ok(Some(value.into_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn attr_required_u32(
+    element: &quick_xml::events::BytesStart<'_>,
+    name: &'static str,
+) -> Result<u32, ReginfoParseError> {
+    let value = attr_required_str(element, name)?;
+    value.parse::<u32>().map_err(|_| ReginfoParseError::InvalidAttr {
+        attr: name,
+        value,
+    })
+}
+
+fn attr_optional_u64(
+    element: &quick_xml::events::BytesStart<'_>,
+    name: &'static str,
+) -> Result<Option<u64>, ReginfoParseError> {
+    match attr_optional_str(element, name)? {
+        None => Ok(None),
+        Some(raw) => raw
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| ReginfoParseError::InvalidAttr {
+                attr: name,
+                value: raw,
+            }),
+    }
+}
+
+fn attr_optional_f32(
+    element: &quick_xml::events::BytesStart<'_>,
+    name: &'static str,
+) -> Result<Option<f32>, ReginfoParseError> {
+    match attr_optional_str(element, name)? {
+        None => Ok(None),
+        Some(raw) => raw
+            .parse::<f32>()
+            .map(Some)
+            .map_err(|_| ReginfoParseError::InvalidAttr {
+                attr: name,
+                value: raw,
+            }),
+    }
+}
+
 /// Escape XML special characters.
 fn xml_escape(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
@@ -400,5 +695,139 @@ mod tests {
         assert!(xml.contains("q=\"0.5\""));
         assert!(xml.contains("event=\"refreshed\""));
         assert!(xml.contains("state=\"partial\""));
+    }
+
+    // -----------------------------------------------------------------
+    // Parser tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_full_state_single_registration() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="3" state="full">
+  <registration aor="sip:alice@ims.example.com" id="reg-1" state="active">
+    <contact id="c-1" state="active" event="registered" expires="1800" q="1.0">
+      <uri>sip:alice@10.0.0.1:5060</uri>
+    </contact>
+  </registration>
+</reginfo>"#;
+        let body = parse_reginfo(xml).unwrap();
+        assert_eq!(body.version, 3);
+        assert_eq!(body.state, ReginfoState::Full);
+        assert_eq!(body.registrations.len(), 1);
+        let reg = &body.registrations[0];
+        assert_eq!(reg.aor, "sip:alice@ims.example.com");
+        assert_eq!(reg.id, "reg-1");
+        assert_eq!(reg.state, RegistrationState::Active);
+        assert_eq!(reg.contacts.len(), 1);
+        let contact = &reg.contacts[0];
+        assert_eq!(contact.uri, "sip:alice@10.0.0.1:5060");
+        assert_eq!(contact.state, ContactState::Active);
+        assert_eq!(contact.event, ContactEvent::Registered);
+        assert_eq!(contact.expires, Some(1800));
+        assert_eq!(contact.q, Some(1.0));
+    }
+
+    #[test]
+    fn parse_partial_state_terminated_contact() {
+        let xml = r#"<?xml version="1.0"?>
+<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="7" state="partial">
+  <registration aor="sip:bob@ims.example.com" id="reg-bob" state="terminated">
+    <contact id="c-old" state="terminated" event="expired"><uri>sip:bob@10.0.0.2</uri></contact>
+  </registration>
+</reginfo>"#;
+        let body = parse_reginfo(xml).unwrap();
+        assert_eq!(body.state, ReginfoState::Partial);
+        assert_eq!(body.registrations.len(), 1);
+        assert_eq!(body.registrations[0].state, RegistrationState::Terminated);
+        assert_eq!(body.registrations[0].contacts.len(), 1);
+        assert_eq!(body.registrations[0].contacts[0].state, ContactState::Terminated);
+        assert_eq!(body.registrations[0].contacts[0].event, ContactEvent::Expired);
+        assert!(body.registrations[0].contacts[0].expires.is_none());
+        assert!(body.registrations[0].contacts[0].q.is_none());
+    }
+
+    #[test]
+    fn parse_multi_registration_multi_contact() {
+        let xml = r#"<reginfo version="0" state="full">
+  <registration aor="sip:a@ex" id="r-a" state="active">
+    <contact id="c-a1" state="active" event="registered"><uri>sip:a@1.1.1.1</uri></contact>
+    <contact id="c-a2" state="active" event="created"><uri>sip:a@2.2.2.2</uri></contact>
+  </registration>
+  <registration aor="sip:b@ex" id="r-b" state="init">
+  </registration>
+</reginfo>"#;
+        let body = parse_reginfo(xml).unwrap();
+        assert_eq!(body.registrations.len(), 2);
+        assert_eq!(body.registrations[0].contacts.len(), 2);
+        assert_eq!(body.registrations[0].contacts[0].uri, "sip:a@1.1.1.1");
+        assert_eq!(body.registrations[0].contacts[1].uri, "sip:a@2.2.2.2");
+        assert_eq!(body.registrations[1].state, RegistrationState::Init);
+        assert!(body.registrations[1].contacts.is_empty());
+    }
+
+    #[test]
+    fn parse_roundtrips_through_to_xml() {
+        // Build a body, serialize it, parse it back, verify equivalence.
+        let original = build_full_reginfo("sip:alice@ims.example.com", &[], 5);
+        let xml = original.to_xml();
+        let parsed = parse_reginfo(&xml).unwrap();
+        assert_eq!(parsed.version, 5);
+        assert_eq!(parsed.state, ReginfoState::Full);
+        assert_eq!(parsed.registrations.len(), 1);
+        assert_eq!(
+            parsed.registrations[0].state,
+            RegistrationState::Terminated
+        );
+    }
+
+    #[test]
+    fn parse_rejects_missing_root() {
+        let result = parse_reginfo("<not-reginfo/>");
+        assert!(matches!(result, Err(ReginfoParseError::MissingRoot)));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_state_attribute() {
+        let xml = r#"<reginfo version="1" state="bogus"></reginfo>"#;
+        let result = parse_reginfo(xml);
+        assert!(matches!(
+            result,
+            Err(ReginfoParseError::InvalidAttr { attr: "state", .. })
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_missing_required_attribute() {
+        // Missing version on <reginfo>.
+        let xml = r#"<reginfo state="full"></reginfo>"#;
+        let result = parse_reginfo(xml);
+        assert!(matches!(result, Err(ReginfoParseError::MissingAttr("version"))));
+    }
+
+    #[test]
+    fn parse_ignores_unknown_elements() {
+        // Forward-compat: unknown <foo> element under reginfo or
+        // registration must not break parsing.
+        let xml = r#"<reginfo version="1" state="full">
+  <foo>bar</foo>
+  <registration aor="sip:x@ex" id="rx" state="active">
+    <baz/>
+    <contact id="c-x" state="active"><uri>sip:x@1.1.1.1</uri></contact>
+  </registration>
+</reginfo>"#;
+        let body = parse_reginfo(xml).unwrap();
+        assert_eq!(body.registrations[0].contacts[0].uri, "sip:x@1.1.1.1");
+    }
+
+    #[test]
+    fn parse_empty_contact_event_defaults_to_registered() {
+        let xml = r#"<reginfo version="1" state="full">
+  <registration aor="sip:x@ex" id="rx" state="active">
+    <contact id="c-x" state="active"><uri>sip:x@1.1.1.1</uri></contact>
+  </registration>
+</reginfo>"#;
+        let body = parse_reginfo(xml).unwrap();
+        assert_eq!(body.registrations[0].contacts[0].event, ContactEvent::Registered);
     }
 }

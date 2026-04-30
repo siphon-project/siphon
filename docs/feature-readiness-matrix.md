@@ -189,6 +189,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Gateway API | **Production** | `gateway.select()` etc. | |
 | Cache API | **Production** | `cache.fetch()` | Redis-backed |
 | Presence API | **Production** | `presence.*` | Used for reg-event SUBSCRIBE/NOTIFY |
+| Outbound SUBSCRIBE (RFC 6665 watcher) | Implemented | `proxy.subscribe_state.send/find/refresh` | Originate SUBSCRIBE, capture dialog state from 200 OK, correlate inbound NOTIFY by tags |
+| Reginfo XML parser (RFC 3680) | Implemented | `presence.parse_reginfo(xml)` | Watcher-side parser for `application/reginfo+xml` NOTIFY bodies |
 | Lawful intercept API | Implemented | `li.*` | |
 | Logging API | **Production** | `log.*` | |
 | Async handler support | **Production** | | Auto-detected by runtime |

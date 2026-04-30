@@ -241,6 +241,38 @@ impl PyPresence {
         self.store.expire_stale();
     }
 
+    /// Parse an RFC 3680 ``application/reginfo+xml`` body.
+    ///
+    /// Used on the watcher side: a NOTIFY arrives via
+    /// ``@proxy.on_request("NOTIFY")``, the script extracts the body, and
+    /// calls this to walk the registration data without rolling its own
+    /// XML parser.
+    ///
+    /// Args:
+    ///     xml: The reginfo XML body (str).
+    ///
+    /// Returns:
+    ///     Dict ``{"version": int, "state": "full"|"partial",
+    ///             "registrations": [{"aor": str, "id": str,
+    ///                                "state": "active"|"terminated"|"init",
+    ///                                "contacts": [{"uri": str,
+    ///                                              "state": "active"|"terminated",
+    ///                                              "event": str,
+    ///                                              "expires": int|None,
+    ///                                              "q": float|None}]}]}``.
+    ///
+    /// Raises ``ValueError`` on malformed XML or unknown attribute values.
+    fn parse_reginfo<'py>(
+        &self,
+        python: Python<'py>,
+        xml: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let body = crate::registrar::reginfo::parse_reginfo(xml).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid reginfo: {error}"))
+        })?;
+        reginfo_to_pydict(python, &body)
+    }
+
     /// Send an in-dialog NOTIFY for a subscription (RFC 3265 §3.2.2).
     ///
     /// Uses the stored dialog state (Call-ID, From/To tags, Route set, CSeq)
@@ -445,6 +477,47 @@ impl PyPresence {
         self.notify(subscription_id, body, content_type, &subscription_state)?;
         Ok(true)
     }
+}
+
+/// Convert a parsed [`crate::registrar::reginfo::ReginfoBody`] to a Python
+/// dict shaped for script consumption (snake-case keys, all-string enum
+/// values, optional fields surfaced as `None` when absent).
+fn reginfo_to_pydict<'py>(
+    python: Python<'py>,
+    body: &crate::registrar::reginfo::ReginfoBody,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(python);
+    dict.set_item("version", body.version)?;
+    dict.set_item("state", body.state.to_string())?;
+
+    let registrations = pyo3::types::PyList::empty(python);
+    for reg in &body.registrations {
+        let reg_dict = PyDict::new(python);
+        reg_dict.set_item("aor", &reg.aor)?;
+        reg_dict.set_item("id", &reg.id)?;
+        reg_dict.set_item("state", reg.state.to_string())?;
+
+        let contacts = pyo3::types::PyList::empty(python);
+        for contact in &reg.contacts {
+            let contact_dict = PyDict::new(python);
+            contact_dict.set_item("uri", &contact.uri)?;
+            contact_dict.set_item("state", contact.state.to_string())?;
+            contact_dict.set_item("event", contact.event.to_string())?;
+            match contact.expires {
+                Some(secs) => contact_dict.set_item("expires", secs)?,
+                None => contact_dict.set_item("expires", python.None())?,
+            }
+            match contact.q {
+                Some(q) => contact_dict.set_item("q", q)?,
+                None => contact_dict.set_item("q", python.None())?,
+            }
+            contacts.append(contact_dict)?;
+        }
+        reg_dict.set_item("contacts", contacts)?;
+        registrations.append(reg_dict)?;
+    }
+    dict.set_item("registrations", registrations)?;
+    Ok(dict)
 }
 
 #[cfg(test)]

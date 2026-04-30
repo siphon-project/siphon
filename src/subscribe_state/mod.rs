@@ -76,6 +76,16 @@ pub struct SubscribeDialog {
     /// be sent.  Kept in the store briefly so late cross-instance
     /// lookups don't see a revived dialog.
     pub terminated: bool,
+    /// `true` when this dialog was created by an outbound SUBSCRIBE we
+    /// originated (we are the *subscriber*).  `false` for the original
+    /// `create()` flow where we received a SUBSCRIBE and act as the
+    /// *notifier*.  Drives termination semantics — outbound subscribers
+    /// terminate by sending SUBSCRIBE Expires:0; notifiers terminate by
+    /// sending a final NOTIFY with Subscription-State: terminated.
+    /// Defaults to `false` so older cached payloads deserialise as the
+    /// notifier role.
+    #[serde(default)]
+    pub is_outbound: bool,
 }
 
 impl SubscribeDialog {
@@ -226,6 +236,37 @@ impl SubscribeStore {
     pub fn local_count(&self) -> usize {
         self.dialogs.len()
     }
+
+    /// Find a dialog by its three identity tags. Used to correlate an
+    /// in-dialog NOTIFY (received via `@proxy.on_request("NOTIFY")`)
+    /// back to the outbound SUBSCRIBE we sent that established the
+    /// dialog. Returns `None` when no live dialog matches — including
+    /// when the dialog has been terminated.
+    ///
+    /// Linear scan over the local DashMap. Subscribe dialog counts in
+    /// scripted flows are small (10²–10³) so the cost is negligible;
+    /// graduate to an index keyed by `(call_id, local_tag, remote_tag)`
+    /// only when there's measured contention.
+    pub fn find_by_tags(
+        &self,
+        call_id: &str,
+        local_tag: &str,
+        remote_tag: &str,
+    ) -> Option<SubscribeDialog> {
+        for entry in self.dialogs.iter() {
+            let dialog = entry.value();
+            if dialog.terminated {
+                continue;
+            }
+            if dialog.call_id == call_id
+                && dialog.local_tag == local_tag
+                && dialog.remote_tag == remote_tag
+            {
+                return Some(dialog.clone());
+            }
+        }
+        None
+    }
 }
 
 impl Default for SubscribeStore {
@@ -254,6 +295,7 @@ mod tests {
             cseq: 0,
             event_version: 0,
             terminated: false,
+            is_outbound: false,
         }
     }
 
@@ -350,5 +392,51 @@ mod tests {
         let parsed: SubscribeDialog = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, dialog.id);
         assert_eq!(parsed.route_set, dialog.route_set);
+        assert_eq!(parsed.is_outbound, dialog.is_outbound);
+    }
+
+    #[test]
+    fn is_outbound_serde_default_for_legacy_payloads() {
+        // Pre-existing cached dialogs predating is_outbound deserialise
+        // with the field defaulted to false (notifier role) — same
+        // discipline as event_version_serde_default_for_legacy_payloads.
+        let legacy_json = r#"{
+            "id":"abc","call_id":"c1","local_tag":"l","remote_tag":"r",
+            "local_uri":"sip:s@example","remote_uri":"sip:c@example",
+            "remote_target":"sip:c@10.0.0.1","route_set":[],
+            "event":"reg","expires_secs":3600,"created_at_unix":1000,
+            "cseq":3,"event_version":2,"terminated":false
+        }"#;
+        let dialog: SubscribeDialog =
+            serde_json::from_str(legacy_json).expect("legacy json parses");
+        assert!(!dialog.is_outbound);
+    }
+
+    #[test]
+    fn find_by_tags_matches_live_dialog() {
+        let store = SubscribeStore::new();
+        store.put(sample_dialog("abc"));
+        let found = store
+            .find_by_tags("c1", "ltag", "rtag")
+            .expect("dialog should match");
+        assert_eq!(found.id, "abc");
+    }
+
+    #[test]
+    fn find_by_tags_misses_on_any_field_difference() {
+        let store = SubscribeStore::new();
+        store.put(sample_dialog("abc"));
+        assert!(store.find_by_tags("other", "ltag", "rtag").is_none());
+        assert!(store.find_by_tags("c1", "other", "rtag").is_none());
+        assert!(store.find_by_tags("c1", "ltag", "other").is_none());
+    }
+
+    #[test]
+    fn find_by_tags_skips_terminated() {
+        let store = SubscribeStore::new();
+        let mut dialog = sample_dialog("abc");
+        dialog.terminated = true;
+        store.put(dialog);
+        assert!(store.find_by_tags("c1", "ltag", "rtag").is_none());
     }
 }
