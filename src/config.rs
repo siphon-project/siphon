@@ -1078,6 +1078,17 @@ pub struct MediaConfig {
     /// (DTMF, etc.).  Configure rtpengine with `dtmf-log-ng-tcp-uri=tcp://<this>`
     /// to make it deliver bencode-framed events here.
     pub events: Option<RtpEngineEventsConfig>,
+    /// Interval in seconds between rtpengine NG `ping` health probes.
+    /// The result is published as `siphon_rtpengine_instances_up` (count of
+    /// healthy instances) and `siphon_rtpengine_instance_up{address}` (per
+    /// instance 0/1).  Set to `0` to disable probing entirely.
+    /// Default: 5.
+    #[serde(default = "default_rtpengine_health_check_interval_secs")]
+    pub health_check_interval_secs: u64,
+}
+
+fn default_rtpengine_health_check_interval_secs() -> u64 {
+    5
 }
 
 /// Configuration for siphon's inbound listener that accepts rtpengine's

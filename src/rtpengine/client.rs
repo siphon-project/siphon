@@ -68,6 +68,11 @@ impl RtpEngineClient {
         })
     }
 
+    /// Address of the RTPEngine NG control endpoint this client talks to.
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
     /// Send an `offer` command with SDP, returning the rewritten SDP.
     pub async fn offer(
         &self,
@@ -908,6 +913,20 @@ impl RtpEngineSet {
         Ok(())
     }
 
+    /// Ping every instance in parallel and return per-instance health status.
+    ///
+    /// Returns one `(address, healthy)` tuple per configured instance, in the
+    /// same order they were registered.  `healthy` is `true` when the
+    /// instance answered with `pong` within its configured timeout, and
+    /// `false` for a timeout, transport error, or unexpected response.
+    pub async fn health_check(&self) -> Vec<(SocketAddr, bool)> {
+        let probes = self.clients.iter().map(|client| async move {
+            let healthy = client.ping().await.is_ok();
+            (client.address(), healthy)
+        });
+        futures_util::future::join_all(probes).await
+    }
+
     /// Ping any one instance (the first healthy one). For quick health checks.
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
         if let Some(client) = self.clients.first() {
@@ -925,6 +944,11 @@ impl RtpEngineSet {
     /// Number of configured instances.
     pub fn instance_count(&self) -> usize {
         self.clients.len()
+    }
+
+    /// Addresses of every configured instance, in registration order.
+    pub fn instance_addresses(&self) -> Vec<SocketAddr> {
+        self.clients.iter().map(|client| client.address()).collect()
     }
 }
 
@@ -1613,6 +1637,59 @@ mod tests {
             .await;
         assert!(matches!(result, Err(RtpEngineError::EngineError(_))));
         assert!(result.unwrap_err().to_string().contains("audio player"));
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_mixed_up_and_down() {
+        // Live mock — answers ping with pong.
+        let live_addr = spawn_mock_rtpengine().await;
+
+        // Dead address: bind a socket to grab a free port, then drop it so
+        // packets sent there get no response. UDP "connection refused" is
+        // best-effort; either way our 100 ms timeout catches it.
+        let dead_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_socket.local_addr().unwrap();
+        drop(dead_socket);
+
+        let set = RtpEngineSet::new(vec![
+            (live_addr, 2000, 1),
+            (dead_addr, 100, 1),
+        ])
+        .await
+        .unwrap();
+
+        let results = set.health_check().await;
+        assert_eq!(results.len(), 2);
+
+        // Order matches registration order.
+        assert_eq!(results[0].0, live_addr);
+        assert!(results[0].1, "live instance should be healthy");
+        assert_eq!(results[1].0, dead_addr);
+        assert!(!results[1].1, "dead instance should be unhealthy");
+    }
+
+    #[tokio::test]
+    async fn instance_addresses_preserves_registration_order() {
+        let addr1 = spawn_mock_rtpengine().await;
+        let addr2 = spawn_mock_rtpengine().await;
+        let addr3 = spawn_mock_rtpengine().await;
+        let set = RtpEngineSet::new(vec![
+            (addr1, 2000, 1),
+            (addr2, 2000, 1),
+            (addr3, 2000, 1),
+        ])
+        .await
+        .unwrap();
+
+        let addresses = set.instance_addresses();
+        assert_eq!(addresses, vec![addr1, addr2, addr3]);
+    }
+
+    #[tokio::test]
+    async fn client_address_accessor_returns_configured_address() {
+        let addr = spawn_mock_rtpengine().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+        assert_eq!(client.address(), addr);
     }
 
     #[tokio::test]

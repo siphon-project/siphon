@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 
 use prometheus::{
     Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, Opts, Registry, TextEncoder,
+    IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use tracing::error;
 
@@ -90,6 +90,11 @@ pub struct SiphonMetrics {
     pub diameter_request_errors_total: IntCounterVec,
     pub diameter_request_duration_seconds: HistogramVec,
     pub diameter_watchdog_failures_total: IntCounter,
+
+    // --- RTPEngine health ---
+    pub rtpengine_instances_up: IntGauge,
+    pub rtpengine_instances_total: IntGauge,
+    pub rtpengine_instance_up: IntGaugeVec,
 }
 
 impl SiphonMetrics {
@@ -191,6 +196,24 @@ impl SiphonMetrics {
             "Total Diameter watchdog (DWR/DWA) failures indicating dead peers",
         )?;
 
+        let rtpengine_instances_up = IntGauge::new(
+            "siphon_rtpengine_instances_up",
+            "Number of RTPEngine instances responding to ping",
+        )?;
+
+        let rtpengine_instances_total = IntGauge::new(
+            "siphon_rtpengine_instances_total",
+            "Total number of configured RTPEngine instances",
+        )?;
+
+        let rtpengine_instance_up = IntGaugeVec::new(
+            Opts::new(
+                "siphon_rtpengine_instance_up",
+                "Per-instance RTPEngine health (1=responding to ping, 0=not responding)",
+            ),
+            &["address"],
+        )?;
+
         // Register all metrics
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(responses_total.clone()))?;
@@ -208,6 +231,9 @@ impl SiphonMetrics {
         registry.register(Box::new(diameter_request_errors_total.clone()))?;
         registry.register(Box::new(diameter_request_duration_seconds.clone()))?;
         registry.register(Box::new(diameter_watchdog_failures_total.clone()))?;
+        registry.register(Box::new(rtpengine_instances_up.clone()))?;
+        registry.register(Box::new(rtpengine_instances_total.clone()))?;
+        registry.register(Box::new(rtpengine_instance_up.clone()))?;
 
         Ok(Self {
             registry,
@@ -227,6 +253,9 @@ impl SiphonMetrics {
             diameter_request_errors_total,
             diameter_request_duration_seconds,
             diameter_watchdog_failures_total,
+            rtpengine_instances_up,
+            rtpengine_instances_total,
+            rtpengine_instance_up,
         })
     }
 }

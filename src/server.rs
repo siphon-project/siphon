@@ -371,6 +371,21 @@ impl SiphonServer {
             error!("Failed to initialize metrics: {error}");
         }
 
+        // --- Spawn RTPEngine health-check task ---
+        // Must run after metrics::init so the gauges exist when the task
+        // publishes its first probe result.
+        if let Some(rtpengine_set) = pre_rtpengine.0.as_ref() {
+            let interval_secs = config
+                .media
+                .as_ref()
+                .map(|m| m.health_check_interval_secs)
+                .unwrap_or(0);
+            dispatcher::spawn_rtpengine_health_check(
+                Arc::clone(rtpengine_set),
+                interval_secs,
+            );
+        }
+
         // --- Initialize custom metrics namespace for Python scripts ---
         // Must happen before script engine so `from siphon import metrics` works.
         if let Some(custom) = crate::metrics::custom_metrics() {

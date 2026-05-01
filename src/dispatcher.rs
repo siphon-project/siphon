@@ -3704,6 +3704,78 @@ pub fn init_rtpengine(
     }
 }
 
+/// Spawn a background task that pings every RTPEngine instance on a fixed
+/// interval and exports per-instance health to Prometheus.
+///
+/// The first probe runs immediately so the gauges reflect reality from the
+/// moment the task starts; subsequent probes run every `interval_secs`
+/// seconds.  Pass `interval_secs == 0` to disable health probing entirely.
+///
+/// Updates these metrics:
+/// - `siphon_rtpengine_instances_total` — number of configured instances
+/// - `siphon_rtpengine_instances_up` — number that answered the last ping
+/// - `siphon_rtpengine_instance_up{address}` — 0/1 for each instance
+pub fn spawn_rtpengine_health_check(
+    rtpengine_set: Arc<crate::rtpengine::client::RtpEngineSet>,
+    interval_secs: u64,
+) {
+    if interval_secs == 0 {
+        info!("RTPEngine health probing disabled (interval_secs=0)");
+        return;
+    }
+
+    let total_instances = rtpengine_set.instance_count();
+    let addresses = rtpengine_set.instance_addresses();
+
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics.rtpengine_instances_total.set(total_instances as i64);
+        // Pre-create the per-instance label series so they appear at zero
+        // before the first probe completes.
+        for address in &addresses {
+            metrics
+                .rtpengine_instance_up
+                .with_label_values(&[&address.to_string()])
+                .set(0);
+        }
+    }
+
+    info!(
+        instances = total_instances,
+        interval_secs,
+        "starting RTPEngine health probe"
+    );
+
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let results = rtpengine_set.health_check().await;
+            let healthy_count = results.iter().filter(|(_, healthy)| *healthy).count();
+
+            for (address, healthy) in &results {
+                if !healthy {
+                    warn!(
+                        address = %address,
+                        "RTPEngine instance failed health probe"
+                    );
+                }
+            }
+
+            if let Some(metrics) = crate::metrics::try_metrics() {
+                metrics.rtpengine_instances_up.set(healthy_count as i64);
+                for (address, healthy) in &results {
+                    metrics
+                        .rtpengine_instance_up
+                        .with_label_values(&[&address.to_string()])
+                        .set(if *healthy { 1 } else { 0 });
+                }
+            }
+        }
+    });
+}
+
 /// Run a Python coroutine to completion.
 /// Check if a Python object is a coroutine (awaitable).
 fn is_coroutine(python: Python<'_>, obj: &Bound<'_, pyo3::PyAny>) -> PyResult<bool> {

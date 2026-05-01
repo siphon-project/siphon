@@ -314,6 +314,10 @@ auth:
 #     timeout_ms: 1000              # NG protocol response timeout
 #   sdp_name: "SIPhon"             # Name used in SDP o= and s= lines
 #                                   # (masks remote endpoint identity, default: "SIPhon")
+#   health_check_interval_secs: 5  # NG `ping` probe interval per instance (default 5).
+#                                   # Set 0 to disable.  Results are exported as
+#                                   # siphon_rtpengine_instances_up (count) and
+#                                   # siphon_rtpengine_instance_up{address} (per instance).
 #
 # Multiple instances (weighted round-robin):
 # media:
