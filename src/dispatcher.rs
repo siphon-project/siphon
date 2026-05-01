@@ -4027,6 +4027,22 @@ fn sanitize_b2bua_response(
 /// When `addr` is `Some(ip)`, the address field in the `o=` line is also
 /// rewritten to `ip` (topology hiding).  When `None`, only the username is
 /// replaced (backward-compatible behaviour).
+/// Collapse whitespace runs to `-` so a value can be safely placed in the
+/// SDP `o=` line's `<username>` field (RFC 4566 §5.2 — no whitespace).
+fn sanitize_o_username(name: &str) -> String {
+    if !name.contains(|c: char| c.is_whitespace()) {
+        return name.to_string();
+    }
+    let collapsed = name.split_whitespace().collect::<Vec<_>>().join("-");
+    if collapsed.is_empty() {
+        // Pure-whitespace input — fall back to RFC 4566's "no concept of
+        // user IDs" sentinel rather than emitting an empty token.
+        "-".to_string()
+    } else {
+        collapsed
+    }
+}
+
 fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
     if body.is_empty() {
         return;
@@ -4034,6 +4050,12 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
     let Ok(text) = std::str::from_utf8(body) else {
         return;
     };
+    // RFC 4566 §5.2: the `o=` <username> field MUST NOT contain whitespace
+    // (the line is space-delimited and parsers tokenise on space). Collapse
+    // any whitespace runs in the configured name into `-` for the o= line.
+    // The s= session-name field permits whitespace (§5.3), so we leave that
+    // path using the raw `name`.
+    let o_line_name = sanitize_o_username(name);
     let mut changed = false;
     let mut result = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
@@ -4050,18 +4072,18 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
                         if let Some(last_space) = trimmed.rfind(' ') {
                             let line_ending = &after_username[trimmed.len()..];
                             result.push_str("o=");
-                            result.push_str(name);
+                            result.push_str(&o_line_name);
                             result.push_str(&trimmed[..last_space + 1]);
                             result.push_str(sdp_addr);
                             result.push_str(line_ending);
                         } else {
                             result.push_str("o=");
-                            result.push_str(name);
+                            result.push_str(&o_line_name);
                             result.push_str(after_username);
                         }
                     } else {
                         result.push_str("o=");
-                        result.push_str(name);
+                        result.push_str(&o_line_name);
                         result.push_str(after_username);
                     }
                     changed = true;
@@ -9132,10 +9154,13 @@ a=rtpmap:8 PCMA/8000\r\n";
     fn sanitize_sdp_identity_rewrites_o_and_s_lines() {
         let sdp = "v=0\r\no=FreeSWITCH 123 456 IN IP4 10.0.0.1\r\ns=FreeSWITCH\r\nt=0 0\r\nm=audio 8000 RTP/AVP 0\r\n";
         let mut body = sdp.as_bytes().to_vec();
-        sanitize_sdp_identity(&mut body, "Invenio SBC", None);
+        sanitize_sdp_identity(&mut body, "Test SBC", None);
         let result = std::str::from_utf8(&body).unwrap();
-        assert!(result.contains("o=Invenio SBC 123 456 IN IP4 10.0.0.1\r\n"));
-        assert!(result.contains("s=Invenio SBC\r\n"));
+        // o= username is space-delimited (RFC 4566 §5.2) — whitespace in the
+        // configured name MUST collapse to `-`.
+        assert!(result.contains("o=Test-SBC 123 456 IN IP4 10.0.0.1\r\n"));
+        // s= permits whitespace (§5.3) — preserved verbatim.
+        assert!(result.contains("s=Test SBC\r\n"));
         assert!(!result.contains("FreeSWITCH"));
         // Other lines unchanged
         assert!(result.contains("v=0\r\n"));
@@ -9159,6 +9184,46 @@ a=rtpmap:8 PCMA/8000\r\n";
         let mut body = Vec::new();
         sanitize_sdp_identity(&mut body, "SIPhon", None);
         assert!(body.is_empty());
+    }
+
+    /// Regression: an `sdp_name` configured with internal whitespace
+    /// (multi-word product / role name) was being written verbatim into the
+    /// SDP `o=` line. RFC 4566 §5.2 splits o= on spaces, so a value like
+    /// `o=Foo Bar 123 456 IN IP4 ...` has a malformed username token and
+    /// downstream parsers (FreeSWITCH, kamailio) reject the whole SDP body.
+    #[test]
+    fn sanitize_sdp_identity_collapses_whitespace_in_o_username() {
+        let sdp = "v=0\r\no=- 1 2 IN IP4 10.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 8000 RTP/AVP 0\r\n";
+        let mut body = sdp.as_bytes().to_vec();
+        sanitize_sdp_identity(&mut body, "Foo Bar", Some("203.0.113.5"));
+        let result = std::str::from_utf8(&body).unwrap();
+        assert!(
+            result.contains("o=Foo-Bar 1 2 IN IP4 203.0.113.5\r\n"),
+            "o= username must collapse whitespace; got: {result}",
+        );
+        // RFC 4566 token count check: o= line must have exactly 6 fields.
+        let o_line = result.lines().find(|l| l.starts_with("o=")).unwrap();
+        assert_eq!(
+            o_line.split(' ').count(),
+            6,
+            "o= line must have exactly 6 space-separated fields; got: {o_line}",
+        );
+    }
+
+    #[test]
+    fn sanitize_o_username_collapses_internal_whitespace() {
+        assert_eq!(sanitize_o_username("Foo Bar"), "Foo-Bar");
+        assert_eq!(sanitize_o_username("Foo  Bar"), "Foo-Bar");
+        assert_eq!(sanitize_o_username("a b c"), "a-b-c");
+        assert_eq!(sanitize_o_username("siphon"), "siphon");
+        assert_eq!(sanitize_o_username("SIPhon\tProxy"), "SIPhon-Proxy");
+    }
+
+    #[test]
+    fn sanitize_o_username_handles_pure_whitespace() {
+        // "All whitespace" → fall back to the RFC 4566 "no user ID" sentinel.
+        assert_eq!(sanitize_o_username("   "), "-");
+        assert_eq!(sanitize_o_username(""), "");
     }
 
     /// Verify that fork targets DO update the R-URI (each branch gets its Contact).
