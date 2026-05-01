@@ -137,6 +137,10 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite rm -sf sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas 2>/dev/null || true
 
+  echo "=== B2BUA UPDATE test (RFC 3311 in-dialog UPDATE bridging) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-update up --abort-on-container-exit --exit-code-from sipp-b2bua-update-uac sipp-b2bua-update-uac sipp-b2bua-update-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-update rm -sf sipp-b2bua-update-uac sipp-b2bua-update-uas 2>/dev/null || true
+
   echo "=== B2BUA CANCEL test (INVITE → CANCEL → 487) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel up --abort-on-container-exit --exit-code-from sipp-b2bua-cancel-uac sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel rm -sf sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas 2>/dev/null || true

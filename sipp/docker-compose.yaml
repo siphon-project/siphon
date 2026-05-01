@@ -623,6 +623,7 @@ services:
       - b2bua-reinvite-bleg
       - b2bua-reinvite-reject
       - b2bua-reinvite-breject
+      - b2bua-update
       - b2bua-cancel
       - b2bua-early-media
       - b2bua-topology
@@ -660,6 +661,7 @@ services:
       - b2bua-reinvite-bleg
       - b2bua-reinvite-reject
       - b2bua-reinvite-breject
+      - b2bua-update
       - b2bua-cancel
       - b2bua-early-media
       - b2bua-topology
@@ -822,6 +824,59 @@ services:
       - -trace_err
     profiles:
       - b2bua-session-timer
+
+  # --- B2BUA UPDATE test (RFC 3311 in-dialog UPDATE bridging) ---
+
+  sipp-b2bua-update-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_update_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-update
+
+  sipp-b2bua-update-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-update-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_update_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-update
 
   # --- B2BUA failure test ---
 

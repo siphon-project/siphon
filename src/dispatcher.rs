@@ -1850,6 +1850,20 @@ fn handle_request(
             }
         }
     }
+    if method == "UPDATE" && engine_state.has_b2bua_handlers() {
+        // RFC 3311 in-dialog UPDATE belonging to a B2BUA call: bridge it
+        // across like a re-INVITE. Calls that don't match a tracked B2BUA
+        // dialog fall through to proxy mode (correct for stateless UPDATE
+        // forwarding by non-B2BUA scripts).
+        let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
+        if let Some(ref sip_call_id) = sip_call_id {
+            if state.call_actors.find_by_sip_call_id(sip_call_id).is_some() {
+                drop(engine_state);
+                handle_b2bua_update(inbound, message, state);
+                return;
+            }
+        }
+    }
     if method == "PRACK" {
         // RFC 3262 §3 — does this PRACK acknowledge a reliable provisional we
         // sent ourselves (script called reply(reliable=True))? If so: cancel
@@ -5938,6 +5952,18 @@ fn handle_b2bua_response(
         return;
     }
 
+    // Handle retransmitted responses for already-completed UPDATEs.
+    // Per RFC 3311 §5.4 there is no ACK for UPDATE — just absorb the dup
+    // and let the responder's non-INVITE server transaction stop on its own.
+    if b_leg_target.as_deref().is_some_and(|t| t.starts_with("update_done:")) {
+        debug!(
+            call_id = %call_id,
+            status = status_code,
+            "B2BUA: absorbing retransmitted response for completed UPDATE"
+        );
+        return;
+    }
+
     // Detect re-INVITE responses: target_uri starts with "reinvite:".
     // Re-INVITE tracking legs don't have actors — handled directly below.
     let reinvite_direction = b_leg_target.as_deref().and_then(|t| t.strip_prefix("reinvite:"));
@@ -6158,6 +6184,124 @@ fn handle_b2bua_response(
             status = status_code,
             direction = direction,
             "B2BUA: forwarded re-INVITE response"
+        );
+        return;
+    }
+
+    // Detect UPDATE responses: target_uri starts with "update:".
+    // Mirrors the re-INVITE response routing — but no ACK is sent (RFC 3311
+    // §5.4: UPDATE is a non-INVITE transaction). Body-aware media handling
+    // matches the request side: SDP rewrite via rtpengine.answer only when
+    // the response carries SDP (session-timer refresh has empty body).
+    let update_direction = b_leg_target.as_deref().and_then(|t| t.strip_prefix("update:"));
+
+    if let Some(direction) = update_direction {
+        let is_a2b = direction == "a2b";
+
+        let (resp_dest, resp_transport, resp_conn_id) = if is_a2b {
+            (a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.connection_id)
+        } else {
+            match state.call_actors.get_call(call_id) {
+                Some(call) => {
+                    let winner = call.winner.and_then(|i| call.b_legs.get(i));
+                    if let Some(b) = winner {
+                        (b.transport.remote_addr, b.transport.transport, ConnectionId::default())
+                    } else {
+                        warn!(call_id = %call_id, "B2BUA UPDATE response: no winning B-leg");
+                        return;
+                    }
+                }
+                None => return,
+            }
+        };
+
+        if is_a2b {
+            if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
+                crate::b2bua::actor::Dialog::rewrite_headers(
+                    message, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                );
+            }
+        } else {
+            if let Some(call) = state.call_actors.get_call(call_id) {
+                if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
+                    crate::b2bua::actor::Dialog::rewrite_headers(
+                        message, &winner.dialog.call_id, a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &winner.dialog.local_tag,
+                    );
+                }
+            }
+        }
+
+        // Restore originator's Via and CSeq (RFC 3261 §8.2.6.2).
+        message.headers.set_all("Via", b_leg_stored_vias.clone());
+        if let Some(ref cseq) = b_leg_stored_cseq {
+            message.headers.set("CSeq", cseq.clone());
+        }
+
+        sanitize_b2bua_response(message, state, resp_transport);
+
+        // RTPEngine answer for UPDATE 2xx with SDP body (codec/precondition
+        // re-negotiation). Empty-body 2xx (session-timer refresh) bypasses.
+        if (200..300).contains(&status_code) && !message.body.is_empty() {
+            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) =
+                (&state.rtpengine_set, &state.rtpengine_sessions, &state.rtpengine_profiles)
+            {
+                let a_sip_call_id = &a_leg.dialog.call_id;
+                if let Some(session) = media_sessions.get(a_sip_call_id) {
+                    if let Some(profile) = profiles.get(&session.profile) {
+                        let (answer_from, answer_to) = if is_a2b {
+                            (session.from_tag.as_str(), session.to_tag.as_deref().unwrap_or(""))
+                        } else {
+                            (session.to_tag.as_deref().unwrap_or(session.from_tag.as_str()), session.from_tag.as_str())
+                        };
+                        let answer_flags = profile.answer.clone();
+                        match tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(
+                                rtpengine_set.answer(&session.call_id, answer_from, answer_to, &message.body, &answer_flags)
+                            )
+                        }) {
+                            Ok(rewritten_sdp) => {
+                                message.body = rewritten_sdp;
+                                message.headers.set("Content-Length", message.body.len().to_string());
+                                debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE response SDP (answer)");
+                            }
+                            Err(error) => {
+                                warn!(call_id = %call_id, "RTPEngine answer for UPDATE failed: {error}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (200..300).contains(&status_code) {
+            // Session timer refresh on successful UPDATE (RFC 4028 §10).
+            state.call_actors.reset_session_timer(call_id);
+
+            // Mark the UPDATE entry done so retransmitted 2xx can be absorbed.
+            if let Some(idx) = b_leg_index {
+                state.call_actors.set_b_leg_target_uri(call_id, idx, format!("update_done:{}", direction));
+            }
+        } else if status_code >= 300 {
+            // Non-2xx UPDATE — no ACK (UPDATE is non-INVITE), just remove the
+            // tracking entry. The responder's non-INVITE server transaction
+            // self-terminates (RFC 3261 §17.2.2).
+            if let Some(idx) = b_leg_index {
+                state.call_actors.remove_b_leg(call_id, idx);
+            }
+        }
+
+        // Forward response to the originator.
+        if is_a2b {
+            send_message(message.clone(), resp_transport, resp_dest, resp_conn_id, state);
+        } else {
+            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, state);
+        }
+
+        debug!(
+            call_id = %call_id,
+            status = status_code,
+            direction = direction,
+            "B2BUA: forwarded UPDATE response"
         );
         return;
     }
@@ -8004,6 +8148,255 @@ fn handle_b2bua_reinvite(
 
     // Reset session timer on successful re-INVITE (timer reset happens on 200 OK
     // via handle_b2bua_response which calls set_state — we reset the timer there)
+}
+
+/// Bridge an in-dialog UPDATE (RFC 3311) across the B2BUA.
+///
+/// Mirrors `handle_b2bua_reinvite` minus the INVITE-specific bits:
+///   * no 491 glare gate — RFC 3311 §5.2 explicitly permits UPDATE before
+///     the initial INVITE is ACKed, and §5.1 places no analogue of RFC 3261
+///     §14.1's pending-offer rule on UPDATE
+///   * no ACK on 2xx — RFC 3311 §5.4: UPDATE is a normal non-INVITE
+///     transaction; the 2xx ACK rule applies to INVITE only
+///   * SDP / RTPEngine path is conditional on a non-empty body — empty-body
+///     UPDATEs (RFC 4028 session-timer refresh — the common case) bridge
+///     headers only
+///
+/// Tracking uses the `update:` / `update_done:` target_uri prefixes so that
+/// concurrent re-INVITE and UPDATE on the same dialog don't collide on a
+/// single B-leg slot.
+fn handle_b2bua_update(
+    inbound: InboundMessage,
+    message: SipMessage,
+    state: &DispatcherState,
+) {
+    let sip_call_id = message.headers.get("Call-ID")
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
+        Some(id) => id,
+        None => {
+            warn!(sip_call_id = %sip_call_id, "B2BUA UPDATE: no matching call");
+            return;
+        }
+    };
+
+    let (from_a_leg, a_leg, winner_b_leg) = match state.call_actors.get_call(&call_id) {
+        Some(call) => {
+            let from_a = inbound.remote_addr == call.a_leg.transport.remote_addr;
+            let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
+            (from_a, call.a_leg.clone(), b_leg)
+        }
+        None => return,
+    };
+
+    let (target_remote_contact, target_local_contact) = if from_a_leg {
+        winner_b_leg.as_ref()
+            .map(|b| (b.dialog.remote_contact.clone(), b.dialog.local_contact.clone()))
+            .unwrap_or((None, None))
+    } else {
+        (a_leg.dialog.remote_contact.clone(), a_leg.dialog.local_contact.clone())
+    };
+
+    debug!(
+        call_id = %call_id,
+        from_a_leg = from_a_leg,
+        has_body = !message.body.is_empty(),
+        "B2BUA: forwarding UPDATE"
+    );
+
+    // Send 100 Trying so the originator stops T1-backoff retransmits while we
+    // forward. UPDATE responses are usually fast, but the 100 keeps the
+    // request-side UAC quiet over UDP if the far end stalls.
+    let trying = build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
+    send_message(
+        trying,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        state,
+    );
+
+    let branch = TransactionKey::generate_branch();
+    let mut forwarded = message.clone();
+
+    let update_target = if from_a_leg {
+        if let Some(b_leg) = &winner_b_leg {
+            crate::b2bua::actor::Dialog::rewrite_headers(
+                &mut forwarded, &b_leg.dialog.call_id, a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &b_leg.dialog.local_tag,
+            );
+            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
+        } else {
+            warn!(call_id = %call_id, "B2BUA UPDATE: no winning B-leg");
+            return;
+        }
+    } else {
+        if let Some(b_leg) = &winner_b_leg {
+            crate::b2bua::actor::Dialog::rewrite_headers(
+                &mut forwarded, &a_leg.dialog.call_id, &b_leg.dialog.local_tag, a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+            );
+        }
+        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
+    };
+
+    if let Some((destination, transport, leg_call_id, leg_from_tag)) = update_target {
+        let transport_str = format!("{}", transport).to_uppercase();
+        let via_value = format!(
+            "SIP/2.0/{} {}:{};branch={}",
+            transport_str,
+            state.via_host(&transport),
+            state.via_port(&transport),
+            branch,
+        );
+        forwarded.headers.set("Via", via_value);
+
+        // Strip cross-leg headers (same set as re-INVITE bridging).
+        if let Some(ref ua) = state.user_agent_header {
+            forwarded.headers.set("User-Agent", ua.clone());
+        } else {
+            forwarded.headers.remove("User-Agent");
+        }
+        forwarded.headers.remove("Server");
+        forwarded.headers.remove("Allow");
+        forwarded.headers.remove("Allow-Events");
+        forwarded.headers.remove("Supported");
+        forwarded.headers.remove("Require");
+        forwarded.headers.remove("Proxy-Require");
+        forwarded.headers.remove("P-Asserted-Identity");
+        forwarded.headers.remove("P-Access-Network-Info");
+        forwarded.headers.remove("Security-Verify");
+        forwarded.headers.remove("Security-Client");
+        forwarded.headers.remove("Authorization");
+        forwarded.headers.remove("Proxy-Authorization");
+        forwarded.headers.remove("Record-Route");
+        forwarded.headers.remove("Route");
+
+        let target_route_set = if from_a_leg {
+            winner_b_leg.as_ref().map(|b| b.dialog.route_set.clone()).unwrap_or_default()
+        } else {
+            a_leg.dialog.route_set.clone()
+        };
+        for route in &target_route_set {
+            forwarded.headers.add("Route", route.clone());
+        }
+
+        let (target_from, target_to) = if from_a_leg {
+            let b = winner_b_leg.as_ref();
+            (
+                b.and_then(|b| b.dialog.local_from_uri.clone()),
+                b.and_then(|b| b.dialog.remote_to_uri.clone()),
+            )
+        } else {
+            (a_leg.dialog.local_from_uri.clone(), a_leg.dialog.remote_to_uri.clone())
+        };
+        if let Some(from) = target_from {
+            forwarded.headers.set("From", from);
+        }
+        if let Some(to) = target_to {
+            forwarded.headers.set("To", to);
+        }
+
+        // CSeq: target leg's local sequence + UPDATE method. Per RFC 3311
+        // §6, UPDATE shares the dialog's CSeq sequence with INVITE/BYE.
+        let target_cseq = if from_a_leg {
+            winner_b_leg.as_ref().map(|b| b.dialog.local_cseq).unwrap_or(1)
+        } else {
+            a_leg.dialog.local_cseq
+        };
+        forwarded.headers.set("CSeq", format!("{} UPDATE", target_cseq));
+
+        let _ = crate::proxy::core::decrement_max_forwards(&mut forwarded.headers);
+
+        // Body-aware media handling: empty-body UPDATE (session-timer
+        // refresh) bypasses SDP rewrite and rtpengine entirely.
+        if !forwarded.body.is_empty() {
+            let sdp_addr = state.via_host(&transport);
+            sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
+
+            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) =
+                (&state.rtpengine_set, &state.rtpengine_sessions, &state.rtpengine_profiles)
+            {
+                let a_sip_call_id = &a_leg.dialog.call_id;
+                if let Some(session) = media_sessions.get(a_sip_call_id) {
+                    if let Some(profile) = profiles.get(&session.profile) {
+                        let offer_tag = if from_a_leg {
+                            session.from_tag.as_str()
+                        } else {
+                            session.to_tag.as_deref().unwrap_or(session.from_tag.as_str())
+                        };
+                        let offer_flags = profile.offer.clone();
+                        match tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(
+                                rtpengine_set.offer(&session.call_id, offer_tag, &forwarded.body, &offer_flags)
+                            )
+                        }) {
+                            Ok(rewritten_sdp) => {
+                                forwarded.body = rewritten_sdp;
+                                debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE SDP (offer)");
+                            }
+                            Err(error) => {
+                                warn!(call_id = %call_id, "RTPEngine offer for UPDATE failed: {error}");
+                            }
+                        }
+                    }
+                }
+            }
+            forwarded.headers.set("Content-Length", forwarded.body.len().to_string());
+        }
+
+        // RURI = target leg's remote Contact (RFC 3261 §12.2.1.1).
+        if let Some(ref uri_str) = target_remote_contact {
+            if let Ok(parsed) = parse_uri_standalone(uri_str) {
+                forwarded.start_line = StartLine::Request(crate::sip::message::RequestLine {
+                    method: crate::sip::message::Method::Update,
+                    request_uri: parsed,
+                    version: crate::sip::message::Version::sip_2_0(),
+                });
+            }
+        }
+
+        if let Some(ref contact) = target_local_contact {
+            forwarded.headers.set("Contact", contact.clone());
+        }
+
+        // Track the UPDATE branch under "update:" so the response handler
+        // routes the cross-leg response correctly without colliding with a
+        // concurrent re-INVITE on the same dialog.
+        let direction = if from_a_leg { "update:a2b" } else { "update:b2a" };
+        let originator_vias = message.headers.get_all("Via")
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
+        let mut update_leg = Leg::new_b_leg(
+            leg_call_id,
+            leg_from_tag,
+            direction.to_string(),
+            branch.clone(),
+            LegTransport {
+                remote_addr: destination,
+                connection_id: ConnectionId::default(),
+                transport,
+            },
+        );
+        update_leg.stored_vias = originator_vias;
+        update_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
+        state.call_actors.add_b_leg(&call_id, update_leg);
+
+        send_b2bua_to_bleg(forwarded, transport, destination, state);
+
+        // Bump local CSeq on the target leg after sending.
+        if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
+            if from_a_leg {
+                if let Some(winner_idx) = call.winner {
+                    if let Some(b_leg) = call.b_legs.get_mut(winner_idx) {
+                        b_leg.dialog.local_cseq += 1;
+                    }
+                }
+            } else {
+                call.a_leg.dialog.local_cseq += 1;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

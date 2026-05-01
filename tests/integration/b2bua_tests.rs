@@ -1025,6 +1025,168 @@ fn zombie_reinvite_manual_removal() {
     assert!(store.zombie_reinvites.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// B2BUA UPDATE B-leg lifecycle (RFC 3311 — bug fix: UPDATE was being silently
+// dropped, leading to T1-backoff retransmits and 408 → BYE call drop)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_b_leg_non2xx_removed() {
+    // Non-2xx UPDATE response → no ACK (RFC 3311 §5.4 — UPDATE is non-INVITE),
+    // entry removed.
+    let store = CallActorStore::new();
+
+    let call_id = store.create_call(make_a_leg("update-non2xx@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    let update_branch = TransactionKey::generate_branch();
+    let update_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "update:a2b".to_string(),
+        update_branch.clone(),
+        TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    store.add_b_leg(&call_id, update_leg);
+
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.b_legs.len(), 2);
+        assert_eq!(call.b_legs[1].dialog.target_uri.as_deref(), Some("update:a2b"));
+    }
+
+    store.remove_b_leg(&call_id, 1);
+
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.b_legs.len(), 1);
+        assert_eq!(call.winner, Some(0));
+    }
+    assert!(store.call_id_for_branch(&update_branch).is_none());
+}
+
+#[test]
+fn update_b_leg_2xx_marked_done() {
+    // 2xx UPDATE response → entry is marked "update_done:" so retransmitted
+    // 2xx are absorbed (no ACK is ever sent for UPDATE).
+    let store = CallActorStore::new();
+
+    let call_id = store.create_call(make_a_leg("update-2xx@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    let update_branch = TransactionKey::generate_branch();
+    let update_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "update:b2a".to_string(),
+        update_branch.clone(),
+        TransportInfo {
+            remote_addr: "10.0.0.1:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    store.add_b_leg(&call_id, update_leg);
+
+    store.set_b_leg_target_uri(&call_id, 1, "update_done:b2a".to_string());
+
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.b_legs.len(), 2);
+        assert_eq!(call.b_legs[1].dialog.target_uri.as_deref(), Some("update_done:b2a"));
+        assert_eq!(call.b_legs[1].branch, update_branch);
+    }
+    assert_eq!(store.call_id_for_branch(&update_branch), Some(call_id.clone()));
+}
+
+#[test]
+fn update_concurrent_with_reinvite_distinct_slots() {
+    // RFC 3311 allows UPDATE concurrent with a re-INVITE on the same dialog.
+    // The "update:" / "reinvite:" prefixes occupy distinct b_legs slots so
+    // their branches resolve independently.
+    let store = CallActorStore::new();
+
+    let call_id = store.create_call(make_a_leg("update-concurrent@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    let reinvite_branch = TransactionKey::generate_branch();
+    let reinvite_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "reinvite:a2b".to_string(),
+        reinvite_branch.clone(),
+        TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    store.add_b_leg(&call_id, reinvite_leg);
+
+    let update_branch = TransactionKey::generate_branch();
+    let update_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "update:b2a".to_string(),
+        update_branch.clone(),
+        TransportInfo {
+            remote_addr: "10.0.0.1:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    store.add_b_leg(&call_id, update_leg);
+
+    // Branches resolve independently
+    assert_eq!(store.call_id_for_branch(&reinvite_branch), Some(call_id.clone()));
+    assert_eq!(store.call_id_for_branch(&update_branch), Some(call_id.clone()));
+
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.b_legs.len(), 3);
+        assert_eq!(call.b_legs[1].dialog.target_uri.as_deref(), Some("reinvite:a2b"));
+        assert_eq!(call.b_legs[2].dialog.target_uri.as_deref(), Some("update:b2a"));
+    }
+}
+
+#[test]
+fn update_done_entry_cleaned_on_call_removal() {
+    // "update_done:" entries must not linger in the registry when the call
+    // ends. UPDATE has no ACK to retransmit, so unlike re-INVITE the leg
+    // doesn't need a zombie placeholder — late dups are simply dropped.
+    let store = CallActorStore::new();
+
+    let call_id = store.create_call(make_a_leg("update-cleanup@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    let update_branch = TransactionKey::generate_branch();
+    let update_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "update:a2b".to_string(),
+        update_branch.clone(),
+        TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    store.add_b_leg(&call_id, update_leg);
+    store.set_b_leg_target_uri(&call_id, 1, "update_done:a2b".to_string());
+
+    store.remove_call(&call_id);
+    assert_eq!(store.count(), 0);
+    assert!(store.call_id_for_branch(&update_branch).is_none());
+}
+
 #[test]
 fn set_b_leg_target_uri_no_panic_on_invalid_index() {
     // Setting target_uri on a non-existent index should be a no-op.
