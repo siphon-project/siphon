@@ -1231,6 +1231,41 @@ fn rewrite_uri_host_hides_private_ip_in_pai() {
     assert!(!rewritten.contains("172.31.47.238"), "private IP must not leak");
 }
 
+// ---------------------------------------------------------------------------
+// ensure_tag — From/To tag-stitching for in-dialog request bridges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ensure_tag_combines_dialog_uri_and_tag_for_bridged_update() {
+    // Models the state captured at outbound INVITE-send time: remote_to_uri
+    // has no tag yet (the trunk hasn't answered), but local_tag is the
+    // B2BUA's own tag toward the trunk. The 2xx splice fills in remote_tag.
+    // ensure_tag is what the UPDATE/re-INVITE/BYE bridges then call to
+    // assemble the From/To headers.
+    use siphon::b2bua::actor::ensure_tag;
+
+    let untagged_to_uri = "<sip:bob@trunk.example.com:5061>";
+    let remote_tag = "trunk-side-tag-abc123";
+    assert_eq!(
+        ensure_tag(untagged_to_uri, Some(remote_tag)),
+        "<sip:bob@trunk.example.com:5061>;tag=trunk-side-tag-abc123",
+        "untagged To URI must have the trunk's remote tag appended"
+    );
+
+    // Idempotent — if the splice path already ran, the URI carries the tag.
+    let already_tagged = "<sip:bob@trunk.example.com:5061>;tag=trunk-side-tag-abc123";
+    assert_eq!(
+        ensure_tag(already_tagged, Some("different-tag")),
+        already_tagged,
+        "ensure_tag must not double-append a tag"
+    );
+
+    // Early-dialog UPDATE before 2xx: remote_tag is None — no tag added.
+    // RFC 3311 §5.2 explicitly permits this (precondition negotiation).
+    let bare = "<sip:bob@trunk.example.com:5061>";
+    assert_eq!(ensure_tag(bare, None), bare);
+}
+
 #[test]
 fn b2bua_cseq_independent_per_leg() {
     // Verify that Dialog tracks independent CSeq counters

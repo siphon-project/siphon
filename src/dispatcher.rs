@@ -4355,20 +4355,29 @@ fn build_b2bua_bye(
         branch,
     );
 
-    // From/To: use stored values from the dialog-creating INVITE.
-    // These must match exactly (same URI, same tags) for the remote
-    // endpoint to match the BYE to the dialog (RFC 3261 §12.2.1.1).
-    let from_header = dialog.local_from_uri.clone()
-        .unwrap_or_else(|| format!("<{}>;tag={}", dialog.local_contact.as_deref().unwrap_or("sip:invalid"), dialog.local_tag));
-    let to_header = dialog.remote_to_uri.clone()
-        .unwrap_or_else(|| {
+    // From/To: use stored URI strings from the dialog-creating INVITE
+    // and stitch in the dialog tags via ensure_tag. Tags are stored
+    // separately (local_tag / remote_tag) and must be present for the
+    // remote endpoint to match BYE to the dialog (RFC 3261 §12.2.1.1).
+    let from_header = match &dialog.local_from_uri {
+        Some(uri) => crate::b2bua::actor::ensure_tag(uri, Some(&dialog.local_tag)),
+        None => format!(
+            "<{}>;tag={}",
+            dialog.local_contact.as_deref().unwrap_or("sip:invalid"),
+            dialog.local_tag,
+        ),
+    };
+    let to_header = match &dialog.remote_to_uri {
+        Some(uri) => crate::b2bua::actor::ensure_tag(uri, dialog.remote_tag.as_deref()),
+        None => {
             let to_uri = dialog.remote_contact.as_deref()
                 .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"));
             match &dialog.remote_tag {
                 Some(tag) => format!("<{}>;tag={}", to_uri, tag),
                 None => format!("<{}>", to_uri),
             }
-        });
+        }
+    };
 
     let mut builder = SipMessageBuilder::new()
         .request(Method::Bye, ruri)
@@ -4442,21 +4451,25 @@ fn build_b2bua_prack(
         branch,
     );
 
-    let from_header = dialog.local_from_uri.clone()
-        .unwrap_or_else(|| format!(
+    let from_header = match &dialog.local_from_uri {
+        Some(uri) => crate::b2bua::actor::ensure_tag(uri, Some(&dialog.local_tag)),
+        None => format!(
             "<{}>;tag={}",
             dialog.local_contact.as_deref().unwrap_or("sip:invalid"),
             dialog.local_tag,
-        ));
-    let to_header = dialog.remote_to_uri.clone()
-        .unwrap_or_else(|| {
+        ),
+    };
+    let to_header = match &dialog.remote_to_uri {
+        Some(uri) => crate::b2bua::actor::ensure_tag(uri, dialog.remote_tag.as_deref()),
+        None => {
             let to_uri = dialog.remote_contact.as_deref()
                 .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"));
             match &dialog.remote_tag {
                 Some(tag) => format!("<{}>;tag={}", to_uri, tag),
                 None => format!("<{}>", to_uri),
             }
-        });
+        }
+    };
 
     let mut builder = SipMessageBuilder::new()
         .request(Method::Prack, ruri)
@@ -6354,6 +6367,17 @@ fn handle_b2bua_response(
             if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
                 if let Some(b_leg) = call.b_legs.get_mut(idx) {
                     if let Some(to_tag) = crate::b2bua::actor::extract_to_tag(message) {
+                        // Splice the to-tag into remote_to_uri so in-dialog
+                        // requests (UPDATE, re-INVITE, BYE) toward this leg
+                        // can build a proper tagged To: header (RFC 3261
+                        // §12.1.1). remote_to_uri was captured from the
+                        // outbound INVITE which had no tag yet.
+                        if let Some(ref to_uri) = b_leg.dialog.remote_to_uri {
+                            if !to_uri.contains(";tag=") {
+                                b_leg.dialog.remote_to_uri =
+                                    Some(format!("{};tag={}", to_uri.trim_end(), to_tag));
+                            }
+                        }
                         b_leg.dialog.remote_tag = Some(to_tag);
                     }
                     // Capture B-leg's remote Contact (RFC 3261 §12.1.2: remote target from 2xx)
@@ -8018,21 +8042,38 @@ fn handle_b2bua_reinvite(
             forwarded.headers.add("Route", route.clone());
         }
 
-        // Set From/To from stored dialog state (must match the dialog-creating INVITE).
-        let (target_from, target_to) = if from_a_leg {
+        // From/To: stitch URI string with dialog tag (RFC 3261 §12.2 —
+        // dialog identity requires the tag). The URIs are captured at
+        // INVITE-send time without tags; tags arrive in the 2xx and are
+        // stored separately. ensure_tag survives the URI being reset by
+        // a 401/407 retry path (which re-captures the bare URI).
+        let (target_from_uri, target_from_tag, target_to_uri, target_to_tag) = if from_a_leg {
             let b = winner_b_leg.as_ref();
             (
                 b.and_then(|b| b.dialog.local_from_uri.clone()),
+                b.map(|b| b.dialog.local_tag.clone()),
                 b.and_then(|b| b.dialog.remote_to_uri.clone()),
+                b.and_then(|b| b.dialog.remote_tag.clone()),
             )
         } else {
-            (a_leg.dialog.local_from_uri.clone(), a_leg.dialog.remote_to_uri.clone())
+            (
+                a_leg.dialog.local_from_uri.clone(),
+                Some(a_leg.dialog.local_tag.clone()),
+                a_leg.dialog.remote_to_uri.clone(),
+                a_leg.dialog.remote_tag.clone(),
+            )
         };
-        if let Some(from) = target_from {
-            forwarded.headers.set("From", from);
+        if let Some(uri) = target_from_uri {
+            forwarded.headers.set(
+                "From",
+                crate::b2bua::actor::ensure_tag(&uri, target_from_tag.as_deref()),
+            );
         }
-        if let Some(to) = target_to {
-            forwarded.headers.set("To", to);
+        if let Some(uri) = target_to_uri {
+            forwarded.headers.set(
+                "To",
+                crate::b2bua::actor::ensure_tag(&uri, target_to_tag.as_deref()),
+            );
         }
 
         // Regenerate CSeq for the target leg's dialog (RFC 3261 — independent CSeq per dialog)
@@ -8281,20 +8322,40 @@ fn handle_b2bua_update(
             forwarded.headers.add("Route", route.clone());
         }
 
-        let (target_from, target_to) = if from_a_leg {
+        // From/To: stitch the target leg's URI string with the dialog tag.
+        // The URI strings are captured at INVITE-send time without tags;
+        // the tags arrive in the 2xx response and are stored separately
+        // (see the splice at the 2xx capture path). Use ensure_tag so
+        // we're robust to the splice not having run (e.g. a 401/407
+        // retry path that resets remote_to_uri after the original 2xx,
+        // or an early-dialog UPDATE before the 2xx — RFC 3311 §5.2).
+        let (target_from_uri, target_from_tag, target_to_uri, target_to_tag) = if from_a_leg {
             let b = winner_b_leg.as_ref();
             (
                 b.and_then(|b| b.dialog.local_from_uri.clone()),
+                b.map(|b| b.dialog.local_tag.clone()),
                 b.and_then(|b| b.dialog.remote_to_uri.clone()),
+                b.and_then(|b| b.dialog.remote_tag.clone()),
             )
         } else {
-            (a_leg.dialog.local_from_uri.clone(), a_leg.dialog.remote_to_uri.clone())
+            (
+                a_leg.dialog.local_from_uri.clone(),
+                Some(a_leg.dialog.local_tag.clone()),
+                a_leg.dialog.remote_to_uri.clone(),
+                a_leg.dialog.remote_tag.clone(),
+            )
         };
-        if let Some(from) = target_from {
-            forwarded.headers.set("From", from);
+        if let Some(uri) = target_from_uri {
+            forwarded.headers.set(
+                "From",
+                crate::b2bua::actor::ensure_tag(&uri, target_from_tag.as_deref()),
+            );
         }
-        if let Some(to) = target_to {
-            forwarded.headers.set("To", to);
+        if let Some(uri) = target_to_uri {
+            forwarded.headers.set(
+                "To",
+                crate::b2bua::actor::ensure_tag(&uri, target_to_tag.as_deref()),
+            );
         }
 
         // CSeq: target leg's local sequence + UPDATE method. Per RFC 3311

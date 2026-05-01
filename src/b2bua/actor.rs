@@ -205,6 +205,28 @@ pub fn extract_contact_uri(header_value: &str) -> String {
     trimmed.to_string()
 }
 
+/// Ensure a SIP From/To header value carries a `;tag=<tag>` parameter.
+///
+/// `local_from_uri` and `remote_to_uri` are captured from the outbound
+/// INVITE before the dialog's far end answers, so they don't yet contain
+/// the dialog tag. The tag arrives separately in the 2xx response and is
+/// stored as `local_tag` / `remote_tag`. In-dialog request builders must
+/// reunite them so peers can match the dialog (RFC 3261 §12.2).
+///
+/// Idempotent: if the value already contains `;tag=` it is returned
+/// unchanged. If `tag` is `None` or empty (early-dialog requests, where
+/// no remote tag is established yet — RFC 3311 §5.2), the value is also
+/// unchanged.
+pub fn ensure_tag(header_value: &str, tag: Option<&str>) -> String {
+    if header_value.contains(";tag=") {
+        return header_value.to_string();
+    }
+    match tag {
+        Some(t) if !t.is_empty() => format!("{};tag={}", header_value.trim_end(), t),
+        _ => header_value.to_string(),
+    }
+}
+
 /// Rewrite the host part of a SIP URI in a From/To header value.
 ///
 /// Given a header value like `<sip:user@old-host:5060;params>;tag=...`,
@@ -1959,6 +1981,53 @@ mod tests {
         let pai = "\"Outbound Call\" <sip:W5LeMb7O@172.31.47.238>";
         let result = rewrite_uri_host(pai, "63.176.27.178");
         assert_eq!(result, "\"Outbound Call\" <sip:W5LeMb7O@63.176.27.178>");
+    }
+
+    // --- ensure_tag tests ---
+
+    #[test]
+    fn ensure_tag_appends_when_missing() {
+        let to = "<sip:bob@example.com:5060>";
+        assert_eq!(
+            ensure_tag(to, Some("xyz123")),
+            "<sip:bob@example.com:5060>;tag=xyz123"
+        );
+    }
+
+    #[test]
+    fn ensure_tag_idempotent_when_already_tagged() {
+        let to = "<sip:bob@example.com>;tag=existing";
+        assert_eq!(ensure_tag(to, Some("xyz123")), to);
+    }
+
+    #[test]
+    fn ensure_tag_no_op_on_none() {
+        let to = "<sip:bob@example.com>";
+        assert_eq!(ensure_tag(to, None), to);
+    }
+
+    #[test]
+    fn ensure_tag_no_op_on_empty() {
+        let to = "<sip:bob@example.com>";
+        assert_eq!(ensure_tag(to, Some("")), to);
+    }
+
+    #[test]
+    fn ensure_tag_trims_trailing_whitespace_before_appending() {
+        let to = "<sip:bob@example.com>  ";
+        assert_eq!(
+            ensure_tag(to, Some("abc")),
+            "<sip:bob@example.com>;tag=abc"
+        );
+    }
+
+    #[test]
+    fn ensure_tag_with_display_name() {
+        let to = "\"Bob\" <sip:bob@example.com>";
+        assert_eq!(
+            ensure_tag(to, Some("xyz")),
+            "\"Bob\" <sip:bob@example.com>;tag=xyz"
+        );
     }
 
     #[tokio::test]
