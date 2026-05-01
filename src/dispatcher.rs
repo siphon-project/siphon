@@ -1227,10 +1227,122 @@ pub async fn run(
                         .ok();
                     }
                     _ => {
-                        tracing::debug!(
-                            command_code = incoming.command_code,
-                            "unhandled incoming Diameter request"
-                        );
+                        // Generic @diameter.on_command(...) fallback. Lets
+                        // scripts/addons handle apps that aren't covered by
+                        // the typed match arms above (cx/sh/rx/s6c/sgd today,
+                        // anything else tomorrow) without per-command
+                        // dispatcher edits.
+                        let kind = match crate::script::api::diameter::custom_handler_kind(
+                            incoming.application_id,
+                            incoming.command_code,
+                        ) {
+                            Some(k) => k,
+                            None => {
+                                tracing::debug!(
+                                    command_code = incoming.command_code,
+                                    application_id = incoming.application_id,
+                                    "unhandled incoming Diameter request (unknown app/cmd)"
+                                );
+                                continue;
+                            }
+                        };
+                        let custom_handlers = engine_state.handlers_for_custom(&kind);
+                        if custom_handlers.is_empty() {
+                            tracing::debug!(
+                                command_code = incoming.command_code,
+                                application_id = incoming.application_id,
+                                kind = %kind,
+                                "no @on_command handler registered for incoming request"
+                            );
+                            continue;
+                        }
+                        // Snapshot the bits the spawn_blocking task needs.
+                        let session_id = incoming
+                            .avps
+                            .get("Session-Id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let avps_json = incoming.avps.clone();
+                        let app_id = incoming.application_id;
+                        let cmd_code = incoming.command_code;
+                        let hbh = incoming.hop_by_hop;
+                        let e2e = incoming.end_to_end;
+                        let state_ref = Arc::clone(&state_for_diameter);
+                        let peer_for_answer = Arc::clone(&peer);
+                        let kind_clone = kind.clone();
+
+                        tokio::task::spawn_blocking(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state.handlers_for_custom(&kind_clone);
+
+                            pyo3::Python::attach(|python| {
+                                // Build the kwargs dict from the parsed AVPs.
+                                let kwargs = match crate::script::api::diameter::avps_json_to_pydict(
+                                    python,
+                                    &avps_json,
+                                ) {
+                                    Ok(dict) => dict,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            %error,
+                                            "failed to convert AVPs to kwargs for on_command"
+                                        );
+                                        return;
+                                    }
+                                };
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let args = pyo3::types::PyTuple::empty(python);
+                                    let result = callable.call(&args, Some(&kwargs));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        kind = %kind_clone,
+                                                        "async @diameter.on_command handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                kind = %kind_clone,
+                                                "@diameter.on_command handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+
+                            // Auto-send a generic 2001-success answer.
+                            let config = peer_for_answer.config();
+                            let answer = crate::diameter::codec::encode_generic_answer(
+                                &config.origin_host,
+                                &config.origin_realm,
+                                &session_id,
+                                cmd_code,
+                                app_id,
+                                crate::diameter::dictionary::DIAMETER_SUCCESS,
+                                hbh,
+                                e2e,
+                            );
+                            let runtime = tokio::runtime::Handle::current();
+                            runtime.block_on(async {
+                                if let Err(error) = peer_for_answer.send_response(answer).await {
+                                    tracing::warn!(
+                                        %error,
+                                        kind = %kind_clone,
+                                        "failed to send generic answer"
+                                    );
+                                }
+                            });
+                        })
+                        .await
+                        .ok();
                     }
                 }
             }

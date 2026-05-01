@@ -37,7 +37,14 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tracing::warn;
 
+use crate::diameter::codec::{
+    self, encode_avp_address_ipv4, encode_avp_grouped, encode_avp_grouped_3gpp, encode_avp_octet,
+    encode_avp_octet_3gpp, encode_avp_u32, encode_avp_u32_3gpp, encode_avp_u64, encode_avp_utf8,
+    encode_avp_utf8_3gpp, encode_diameter_message, encode_vendor_specific_app_id, FLAG_PROXIABLE,
+    FLAG_REQUEST,
+};
 use crate::diameter::cx::{octet_string_as_utf8, required_str};
+use crate::diameter::dictionary::{self, avp, AvpDef, AvpType};
 use crate::diameter::rx::extract_result_code;
 use crate::diameter::DiameterManager;
 
@@ -909,6 +916,450 @@ impl PyDiameter {
         )?;
         Ok(func)
     }
+
+    /// Originate a Diameter request by spec name + application name +
+    /// AVP kwargs. Generic counterpart of the typed helpers (`cx_uar`,
+    /// `s6c_srr`, etc.) — useful for addons that need to drive
+    /// applications whose full helper coverage isn't in siphon-core, or
+    /// for scripts that prefer working in the spec's vocabulary.
+    ///
+    /// Args:
+    ///     command: Diameter command name. Accepts the long form
+    ///         (e.g. ``"Send-Routing-Info-for-SM-Request"``), the long
+    ///         form without the ``-Request`` suffix, or the 3-letter
+    ///         acronym (``"SRR"``). Case-insensitive.
+    ///     application: Application short name (``"Cx"``, ``"S6c"``,
+    ///         ``"SGd"``, …). Case-insensitive.
+    ///     avps: Per-AVP keyword arguments. Keys are ``snake_case``
+    ///         translations of the dictionary's Title-Kebab-Case names
+    ///         (``msisdn`` → ``MSISDN``, ``sc_address`` → ``SC-Address``,
+    ///         ``sm_rp_ui`` → ``SM-RP-UI``, …). Values are encoded by
+    ///         the AVP's declared type:
+    ///           UTF8String / DiameterIdentity → ``str``
+    ///           OctetString                   → ``bytes`` or ``str``
+    ///           Unsigned32 / Enumerated       → ``int``
+    ///           Unsigned64                    → ``int``
+    ///           Address (IPv4)                → ``str`` (dotted-quad)
+    ///         Grouped AVPs are not supported via kwargs — use the
+    ///         typed helper for those commands.
+    ///     peer: Optional peer name override (defaults to any
+    ///         connected peer for the application).
+    ///     timeout_ms: Per-request timeout (default 10000ms — the same
+    ///         default the underlying peer applies).
+    ///
+    /// Returns:
+    ///     Dict with all answer AVPs (snake_case keys) plus
+    ///     ``result_code``, or ``None`` when no peer is connected /
+    ///     the peer rejected the message / the answer was malformed.
+    ///
+    /// Raises ``ValueError`` for unknown command/application names or
+    /// unrecognised AVP kwargs.
+    #[pyo3(signature = (
+        command,
+        application,
+        peer=None,
+        timeout_ms=10_000,
+        **avps,
+    ))]
+    fn send_request<'py>(
+        &self,
+        python: Python<'py>,
+        command: &str,
+        application: &str,
+        peer: Option<&str>,
+        timeout_ms: u64,
+        avps: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let _ = timeout_ms; // forwarded peer applies its own timeout today
+
+        let command_code = dictionary::command_code_by_name(command).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown Diameter command name: {command}"
+            ))
+        })?;
+        let (app_vendor, app_id) = dictionary::app_id_by_name(application).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown Diameter application name: {application}"
+            ))
+        })?;
+
+        let client = match peer {
+            Some(name) => self.manager.client(name),
+            None => self.manager.any_client(),
+        };
+        let client = match client {
+            Some(client) => client,
+            None => {
+                warn!(
+                    command = command,
+                    application = application,
+                    "diameter.send_request: no peer connected"
+                );
+                return Ok(None);
+            }
+        };
+
+        let session_id = client.peer().new_session_id();
+        let hbh = client.peer().next_hbh();
+        let e2e = client.peer().next_e2e();
+        let config = client.peer().config().clone();
+
+        let mut avp_bytes = Vec::with_capacity(256);
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session_id));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(
+            avp::DESTINATION_REALM,
+            &config.destination_realm,
+        ));
+        if let Some(dest_host) = &config.destination_host {
+            avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, dest_host));
+        }
+        avp_bytes.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
+        avp_bytes.extend_from_slice(&encode_vendor_specific_app_id(app_vendor, app_id));
+
+        if let Some(kwargs) = avps {
+            for (key, value) in kwargs.iter() {
+                let key_str: String = key.extract().map_err(|error| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "AVP kwarg name must be str: {error}"
+                    ))
+                })?;
+                // Reserved kwargs siphon consumes itself — never travel
+                // on the wire.
+                if matches!(key_str.as_str(), "peer" | "timeout_ms" | "command" | "application")
+                {
+                    continue;
+                }
+                let avp_def = dictionary::lookup_avp_by_python_name(&key_str).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "unknown AVP kwarg: {key_str}"
+                    ))
+                })?;
+                let encoded = encode_kwarg_avp(avp_def, &value)?;
+                avp_bytes.extend_from_slice(&encoded);
+            }
+        }
+
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            command_code,
+            app_id,
+            hbh,
+            e2e,
+            &avp_bytes,
+        );
+
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(client.peer().send_request(wire))
+        });
+        let message = match answer {
+            Ok(message) => message,
+            Err(error) => {
+                warn!(error = %error, command = command, "diameter.send_request failed");
+                return Ok(None);
+            }
+        };
+
+        let dict = decode_avps_to_pydict(python, &message.avps)?;
+        Ok(Some(dict))
+    }
+
+    /// Register a generic handler for an incoming Diameter command.
+    ///
+    /// Companion to `send_request` — accepts the same flexible naming
+    /// for ``command`` and ``application``. Resolves both at decoration
+    /// time and stores the handler under a canonical key so that all
+    /// of ``"Alert-SC-Request"``, ``"Alert-Service-Centre-Request"``,
+    /// and ``"ALR"`` end up in the same handler list when the dispatcher
+    /// matches an incoming ALR.
+    ///
+    /// Siphon auto-sends a generic 2001-Success answer for the same
+    /// command code after the handler returns. Custom result codes are
+    /// not yet wired through — typed helpers (`@on_alr`, `@on_ofr`)
+    /// remain the path for those flows.
+    ///
+    /// Args:
+    ///     command: Diameter command name (long form, suffix-stripped,
+    ///         or 3-letter acronym).
+    ///     application: Application short name.
+    ///
+    /// Usage:
+    ///
+    /// ```python,ignore
+    /// @diameter.on_command("Alert-SC-Request", application="S6c")
+    /// def drain_pending(public_identity, msisdn, **other_avps):
+    ///     ...
+    /// ```
+    #[staticmethod]
+    #[pyo3(signature = (command, application))]
+    fn on_command<'py>(
+        python: Python<'py>,
+        command: &str,
+        application: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let command_code = dictionary::command_code_by_name(command).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown Diameter command name: {command}"
+            ))
+        })?;
+        let (_vendor, app_id) = dictionary::app_id_by_name(application).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown Diameter application name: {application}"
+            ))
+        })?;
+        let canonical_command = dictionary::command_name_by_code(command_code)
+            .unwrap_or(command)
+            .to_owned();
+        let canonical_app = dictionary::app_name_by_id(app_id)
+            .unwrap_or(application)
+            .to_owned();
+        let kind = format!("diameter.on_command:{canonical_app}:{canonical_command}");
+
+        // Closure decorator — captures the canonical kind and writes
+        // the registered function into _siphon_registry on first call.
+        let kind_for_closure = kind.clone();
+        let closure = pyo3::types::PyCFunction::new_closure(
+            python,
+            None,
+            None,
+            move |args: &Bound<'_, pyo3::types::PyTuple>,
+                  _kwargs: Option<&Bound<'_, PyDict>>|
+                  -> PyResult<Py<PyAny>> {
+                let py = args.py();
+                let func = args.get_item(0)?;
+                let asyncio = py.import("asyncio")?;
+                let is_async = asyncio
+                    .call_method1("iscoroutinefunction", (&func,))?
+                    .is_truthy()?;
+                let registry = py.import("_siphon_registry")?;
+                let metadata = PyDict::new(py);
+                metadata.set_item("command", &kind_for_closure)?;
+                registry.call_method1(
+                    "register",
+                    (
+                        kind_for_closure.as_str(),
+                        py.None(),
+                        &func,
+                        is_async,
+                        &metadata,
+                    ),
+                )?;
+                Ok(func.unbind())
+            },
+        )?;
+        Ok(closure.into_any())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic AVP encoding from Python kwargs
+// ---------------------------------------------------------------------------
+
+/// Encode a single AVP value (Python object → wire bytes) using the
+/// AVP's declared type from the dictionary. Picks the 3GPP-flagged
+/// encoder when the AVP is vendor-specific, the base encoder otherwise.
+fn encode_kwarg_avp(def: &AvpDef, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let is_vendor = def.is_vendor_specific();
+    match def.data_type {
+        AvpType::UTF8String | AvpType::DiameterIdentity => {
+            let s: String = value.extract().map_err(|error| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{} expects str, got {error}",
+                    def.name
+                ))
+            })?;
+            Ok(if is_vendor {
+                encode_avp_utf8_3gpp(def.code, &s)
+            } else {
+                encode_avp_utf8(def.code, &s)
+            })
+        }
+        AvpType::OctetString => {
+            // Accept bytes directly (raw payload, e.g. SM-RP-UI TPDU)
+            // or str (encoded as UTF-8, e.g. MSISDN, SC-Address).
+            let bytes: Vec<u8> = if let Ok(b) = value.extract::<Vec<u8>>() {
+                b
+            } else if let Ok(s) = value.extract::<String>() {
+                s.into_bytes()
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{} expects bytes or str",
+                    def.name
+                )));
+            };
+            Ok(if is_vendor {
+                encode_avp_octet_3gpp(def.code, &bytes)
+            } else {
+                encode_avp_octet(def.code, &bytes)
+            })
+        }
+        AvpType::Unsigned32 | AvpType::Enumerated => {
+            let n: u32 = value.extract().map_err(|error| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{} expects int (u32 range), got {error}",
+                    def.name
+                ))
+            })?;
+            Ok(if is_vendor {
+                encode_avp_u32_3gpp(def.code, n)
+            } else {
+                encode_avp_u32(def.code, n)
+            })
+        }
+        AvpType::Unsigned64 => {
+            let n: u64 = value.extract().map_err(|error| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{} expects int (u64 range), got {error}",
+                    def.name
+                ))
+            })?;
+            // No vendor variant in the codec for u64 — only one Unsigned64
+            // 3GPP AVP exists in the dictionary today (CC-Sub-Session-Id).
+            // Treat as plain u64 with vendor flag handled by encode_avp.
+            Ok(encode_avp_u64(def.code, n))
+        }
+        AvpType::Integer32 => {
+            let n: i32 = value.extract().map_err(|error| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{} expects int (i32 range), got {error}",
+                    def.name
+                ))
+            })?;
+            Ok(crate::diameter::codec::encode_avp_i32_3gpp(def.code, n))
+        }
+        AvpType::Address => {
+            let s: String = value.extract().map_err(|error| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{} expects str (IPv4 dotted-quad), got {error}",
+                    def.name
+                ))
+            })?;
+            let ip: std::net::Ipv4Addr = s.parse().map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "{} invalid IPv4 address {s:?}: {error}",
+                    def.name
+                ))
+            })?;
+            Ok(encode_avp_address_ipv4(def.code, ip))
+        }
+        AvpType::Time => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "{} (Time AVPs) is not supported via kwargs — use a typed helper",
+            def.name
+        ))),
+        AvpType::Grouped => {
+            // Allow an empty grouped marker by passing None — useful for
+            // a few AVPs that act as flags. Real grouped encoding (sub-AVPs
+            // from a nested dict) is deferred until an actual use case
+            // shows up; today scripts that need grouped AVPs use the
+            // typed helpers.
+            if value.is_none() {
+                Ok(if is_vendor {
+                    encode_avp_grouped_3gpp(def.code, &[])
+                } else {
+                    encode_avp_grouped(def.code, &[])
+                })
+            } else {
+                Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{} (Grouped AVP) requires a typed helper — \
+                     scripted nested-AVP construction is not yet supported",
+                    def.name
+                )))
+            }
+        }
+    }
+}
+
+/// Convert a `serde_json::Value` of decoded AVPs to a Python dict with
+/// snake_case keys. Used to surface the answer AVPs to the script.
+/// Public to the dispatcher so the `@on_command` fallback can build
+/// kwargs without re-implementing the conversion.
+pub(crate) fn avps_json_to_pydict<'py>(
+    python: Python<'py>,
+    value: &serde_json::Value,
+) -> PyResult<Bound<'py, PyDict>> {
+    decode_avps_to_pydict(python, value)
+}
+
+fn decode_avps_to_pydict<'py>(
+    python: Python<'py>,
+    value: &serde_json::Value,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(python);
+    if let Some(map) = value.as_object() {
+        for (name, child) in map {
+            let key = avp_name_to_snake(name);
+            let py_value = json_to_py(python, child)?;
+            dict.set_item(key, py_value)?;
+        }
+    }
+    Ok(dict)
+}
+
+/// Translate a Title-Kebab AVP name to snake_case for Python.
+fn avp_name_to_snake(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '-' => '_',
+            ch => ch.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+fn json_to_py<'py>(
+    python: Python<'py>,
+    value: &serde_json::Value,
+) -> PyResult<Py<PyAny>> {
+    Ok(match value {
+        serde_json::Value::Null => python.None(),
+        serde_json::Value::Bool(b) => b
+            .into_pyobject(python)
+            .map(|v| v.to_owned().into_any().unbind())
+            .unwrap_or_else(|_| python.None()),
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                u.into_pyobject(python)
+                    .map(|v| v.into_any().unbind())
+                    .unwrap_or_else(|_| python.None())
+            } else if let Some(i) = n.as_i64() {
+                i.into_pyobject(python)
+                    .map(|v| v.into_any().unbind())
+                    .unwrap_or_else(|_| python.None())
+            } else if let Some(f) = n.as_f64() {
+                f.into_pyobject(python)
+                    .map(|v| v.into_any().unbind())
+                    .unwrap_or_else(|_| python.None())
+            } else {
+                python.None()
+            }
+        }
+        serde_json::Value::String(s) => s
+            .as_str()
+            .into_pyobject(python)
+            .map(|v| v.into_any().unbind())
+            .unwrap_or_else(|_| python.None()),
+        serde_json::Value::Array(items) => {
+            let list = pyo3::types::PyList::empty(python);
+            for item in items {
+                list.append(json_to_py(python, item)?)?;
+            }
+            list.into_any().unbind()
+        }
+        serde_json::Value::Object(_) => {
+            decode_avps_to_pydict(python, value)?.into_any().unbind()
+        }
+    })
+}
+
+/// Build the canonical dispatch key that
+/// `dispatcher.rs` uses to look up custom Diameter handlers from a
+/// `(command_code, app_id)` pair. Returned `None` if either side has
+/// no canonical name in the dictionary.
+pub(crate) fn custom_handler_kind(app_id: u32, command_code: u32) -> Option<String> {
+    let app = dictionary::app_name_by_id(app_id)?;
+    let command = dictionary::command_name_by_code(command_code)?;
+    Some(format!("diameter.on_command:{app}:{command}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,6 +1554,184 @@ mod tests {
 
             let list = vec![0u32, 11u32].into_pyobject(python).unwrap();
             assert_eq!(extract_references(list.as_any()).unwrap(), vec![0, 11]);
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Generic API surface — send_request / on_command
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn custom_handler_kind_round_trips_canonical() {
+        let kind = custom_handler_kind(
+            crate::diameter::dictionary::S6C_APP_ID,
+            crate::diameter::dictionary::CMD_ALERT_SERVICE_CENTRE,
+        )
+        .expect("known app/cmd must produce a kind");
+        assert_eq!(kind, "diameter.on_command:S6c:Alert-Service-Centre");
+
+        let kind = custom_handler_kind(
+            crate::diameter::dictionary::SGD_APP_ID,
+            crate::diameter::dictionary::CMD_MO_FORWARD_SHORT_MESSAGE,
+        )
+        .expect("known app/cmd must produce a kind");
+        assert_eq!(kind, "diameter.on_command:SGd:MO-Forward-Short-Message");
+    }
+
+    #[test]
+    fn custom_handler_kind_returns_none_for_unknown() {
+        // Bogus app id 99999 — not in the dictionary.
+        assert!(custom_handler_kind(99_999, 1).is_none());
+    }
+
+    #[test]
+    fn send_request_rejects_unknown_command() {
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        let py_diameter = PyDiameter::new(manager);
+        pyo3::Python::attach(|python| {
+            let result = py_diameter.send_request(
+                python,
+                "Bogus-Command-Request",
+                "S6c",
+                None,
+                10_000,
+                None,
+            );
+            let error = result.expect_err("unknown command must error");
+            let msg = format!("{error}");
+            assert!(msg.contains("unknown Diameter command"), "msg: {msg}");
+        });
+    }
+
+    #[test]
+    fn send_request_rejects_unknown_application() {
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        let py_diameter = PyDiameter::new(manager);
+        pyo3::Python::attach(|python| {
+            let result = py_diameter.send_request(
+                python,
+                "Send-Routing-Info-for-SM-Request",
+                "BogusApp",
+                None,
+                10_000,
+                None,
+            );
+            let error = result.expect_err("unknown app must error");
+            let msg = format!("{error}");
+            assert!(msg.contains("unknown Diameter application"), "msg: {msg}");
+        });
+    }
+
+    #[test]
+    fn send_request_returns_none_without_peer() {
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        let py_diameter = PyDiameter::new(manager);
+        pyo3::Python::attach(|python| {
+            let result = py_diameter
+                .send_request(
+                    python,
+                    "Send-Routing-Info-for-SM-Request",
+                    "S6c",
+                    None,
+                    10_000,
+                    None,
+                )
+                .unwrap();
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn encode_kwarg_avp_encodes_string_octet() {
+        pyo3::Python::initialize();
+        let avp_def = crate::diameter::dictionary::lookup_avp_by_python_name("sc_address")
+            .expect("sc_address must resolve");
+        pyo3::Python::attach(|python| {
+            let value = "31611111111".into_pyobject(python).unwrap();
+            let encoded = encode_kwarg_avp(avp_def, value.as_any()).unwrap();
+            assert!(!encoded.is_empty(), "OctetString AVP must produce bytes");
+        });
+    }
+
+    #[test]
+    fn encode_kwarg_avp_encodes_bytes_octet() {
+        pyo3::Python::initialize();
+        let avp_def = crate::diameter::dictionary::lookup_avp_by_python_name("sm_rp_ui")
+            .expect("sm_rp_ui must resolve");
+        pyo3::Python::attach(|python| {
+            let value = pyo3::types::PyBytes::new(python, &[0xDE, 0xAD, 0xBE, 0xEF]);
+            let encoded = encode_kwarg_avp(avp_def, value.as_any()).unwrap();
+            assert!(!encoded.is_empty());
+        });
+    }
+
+    #[test]
+    fn encode_kwarg_avp_rejects_grouped_with_value() {
+        pyo3::Python::initialize();
+        let avp_def = crate::diameter::dictionary::lookup_avp_by_python_name(
+            "smsmi_correlation_id",
+        )
+        .expect("smsmi_correlation_id must resolve");
+        pyo3::Python::attach(|python| {
+            let value = "anything".into_pyobject(python).unwrap();
+            let result = encode_kwarg_avp(avp_def, value.as_any());
+            let error = result.expect_err("grouped AVP must reject scalar value");
+            let msg = format!("{error}");
+            assert!(msg.contains("Grouped AVP"), "msg: {msg}");
+        });
+    }
+
+    #[test]
+    fn avp_name_to_snake_handles_acronyms() {
+        assert_eq!(avp_name_to_snake("Session-Id"), "session_id");
+        assert_eq!(avp_name_to_snake("MSISDN"), "msisdn");
+        assert_eq!(avp_name_to_snake("SC-Address"), "sc_address");
+        assert_eq!(avp_name_to_snake("SM-RP-UI"), "sm_rp_ui");
+        assert_eq!(avp_name_to_snake("SMSMI-Correlation-ID"), "smsmi_correlation_id");
+    }
+
+    #[test]
+    fn on_command_resolves_canonical_kind() {
+        // Multiple input forms must produce the same canonical kind so
+        // the dispatcher can dispatch deterministically.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            // Use a no-op function to register; we then peek into the
+            // registry to verify the canonical kind string.
+            let registry_mod = match python.import("_siphon_registry") {
+                Ok(m) => m,
+                Err(_) => {
+                    // Module isn't preloaded in this isolated test —
+                    // build it on the fly the way engine.rs does.
+                    crate::script::api::ensure_registry(python).unwrap();
+                    python.import("_siphon_registry").unwrap()
+                }
+            };
+            registry_mod.call_method0("clear").unwrap();
+
+            let func = python
+                .eval(c"lambda **kw: None", None, None)
+                .unwrap()
+                .unbind();
+
+            // Three name forms — all must resolve to the same kind.
+            for name in ["Alert-SC-Request", "Alert-Service-Centre-Request", "ALR"] {
+                let decorator = PyDiameter::on_command(python, name, "S6c").unwrap();
+                let _ = decorator.call1((&func,)).unwrap();
+            }
+
+            let entries = registry_mod.call_method0("entries").unwrap();
+            let entries: Vec<(String, Option<String>, Py<PyAny>, bool, Py<PyAny>)> =
+                entries.extract().unwrap();
+            assert_eq!(entries.len(), 3);
+            for entry in &entries {
+                assert_eq!(entry.0, "diameter.on_command:S6c:Alert-Service-Centre");
+            }
+
+            registry_mod.call_method0("clear").unwrap();
         });
     }
 }

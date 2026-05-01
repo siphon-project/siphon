@@ -2549,6 +2549,56 @@ class MockDiameter:
             "absent_user_diagnostic": absent_user_diagnostic,
         }
 
+    # -- Generic spec-name API (matches Rust `diameter.send_request` /
+    # `@diameter.on_command`) --
+
+    def send_request(self, command: str, application: str,
+                     peer: Optional[str] = None,
+                     timeout_ms: int = 10_000,
+                     **avps: Any) -> Optional[dict]:
+        """Generic Diameter request by spec name.
+
+        Records every call on ``self.generic_requests`` for assertions.
+        Returns a default 2001-success answer unless overridden via
+        :meth:`set_generic_response`.
+        """
+        if not hasattr(self, "generic_requests"):
+            self.generic_requests = []
+        self.generic_requests.append({
+            "command": command,
+            "application": application,
+            "peer": peer,
+            "timeout_ms": timeout_ms,
+            "avps": dict(avps),
+        })
+        if not hasattr(self, "_generic_responses"):
+            self._generic_responses = {}
+        key = (command, application)
+        if key in self._generic_responses:
+            return dict(self._generic_responses[key])
+        return {"result_code": 2001}
+
+    def set_generic_response(self, command: str, application: str,
+                              **answer: Any) -> None:
+        """Configure a mock answer for ``send_request(command, application, ...)``."""
+        if not hasattr(self, "_generic_responses"):
+            self._generic_responses = {}
+        self._generic_responses[(command, application)] = answer
+
+    @staticmethod
+    def on_command(command: str, application: str) -> Any:
+        """Decorator factory matching Rust ``@diameter.on_command``.
+
+        In tests, scripts can use this to mark a handler — the mock
+        treats it as an identity decorator (returns the function
+        unmodified). Test code can then dispatch by calling the function
+        directly.
+        """
+        del command, application
+        def _decorator(fn: Any) -> Any:
+            return fn
+        return _decorator
+
     def set_udr_response(self, public_identity: str,
                          result_code: int = 2001,
                          user_data: Optional[str] = None) -> None:

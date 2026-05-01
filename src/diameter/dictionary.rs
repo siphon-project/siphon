@@ -279,6 +279,24 @@ pub fn lookup_by_name(name: &str) -> Option<&'static AvpDef> {
     AVP_TABLE.iter().find(|entry| entry.name == name)
 }
 
+/// Look up an AVP definition by a Python-style kwarg name. Translates
+/// snake_case to kebab-Case (preserving the dictionary's exact casing
+/// of acronyms like `MSISDN` or `SM-RP-UI`) and matches
+/// case-insensitively. Used by the generic `diameter.send_request`
+/// kwarg encoder.
+///
+/// Examples:
+///   "msisdn"                → "MSISDN"
+///   "sc_address"            → "SC-Address"
+///   "sm_rp_ui"              → "SM-RP-UI"
+///   "user_name"             → "User-Name"
+pub fn lookup_avp_by_python_name(name: &str) -> Option<&'static AvpDef> {
+    let kebab = name.replace('_', "-");
+    AVP_TABLE
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(&kebab))
+}
+
 /// Look up an AVP name by code (tries vendor=0, then vendor=10415).
 pub fn avp_name(code: u32) -> Option<&'static str> {
     lookup_avp(code, 0)
@@ -311,6 +329,122 @@ pub const S6C_APP_ID: u32 = 16777312;
 pub const SGD_APP_ID: u32 = 16777313;
 /// 3GPP Vendor-Id
 pub const VENDOR_3GPP: u32 = 10415;
+
+/// Resolve an application name (case-insensitive) to its
+/// `(vendor_id, app_id)` tuple. Accepts the canonical short form
+/// (`"Cx"`, `"Sh"`, `"Rx"`, `"Ro"`, `"Rf"`, `"S6c"`, `"SGd"`).
+pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "cx" => Some((VENDOR_3GPP, CX_APP_ID)),
+        "sh" => Some((VENDOR_3GPP, SH_APP_ID)),
+        "rx" => Some((VENDOR_3GPP, RX_APP_ID)),
+        "ro" => Some((0, RO_APP_ID)),
+        "rf" => Some((0, RF_APP_ID)),
+        "s6c" => Some((VENDOR_3GPP, S6C_APP_ID)),
+        "sgd" => Some((VENDOR_3GPP, SGD_APP_ID)),
+        _ => None,
+    }
+}
+
+/// Reverse of [`app_id_by_name`] — returns the canonical short name
+/// for an `app_id`. Used when building the dispatch key for inbound
+/// `@diameter.on_command(name, application=...)` handlers.
+pub fn app_name_by_id(app_id: u32) -> Option<&'static str> {
+    match app_id {
+        CX_APP_ID => Some("Cx"),
+        SH_APP_ID => Some("Sh"),
+        RX_APP_ID => Some("Rx"),
+        RO_APP_ID => Some("Ro"),
+        RF_APP_ID => Some("Rf"),
+        S6C_APP_ID => Some("S6c"),
+        SGD_APP_ID => Some("SGd"),
+        _ => None,
+    }
+}
+
+/// Resolve a Diameter command name (case-insensitive, with or without
+/// the `-Request` suffix) to its command code. Examples:
+///   "Send-Routing-Info-for-SM-Request"   → 8388647
+///   "Send-Routing-Info-for-SM"           → 8388647
+///   "send-routing-info-for-sm-request"   → 8388647
+///   "Multimedia-Auth-Request"            → 303
+///   "MAR"                                → 303 (3-letter acronym alias)
+pub fn command_code_by_name(name: &str) -> Option<u32> {
+    let lower = name.to_ascii_lowercase();
+    let stripped = lower
+        .strip_suffix("-request")
+        .or_else(|| lower.strip_suffix("-answer"))
+        .unwrap_or(lower.as_str());
+    match stripped {
+        // Cx
+        "user-authorization" | "uar" | "uaa" => Some(CMD_USER_AUTHORIZATION),
+        "server-assignment" | "sar" | "saa" => Some(CMD_SERVER_ASSIGNMENT),
+        "location-info" | "lir" | "lia" => Some(CMD_LOCATION_INFO),
+        "multimedia-auth" | "mar" | "maa" => Some(CMD_MULTIMEDIA_AUTH),
+        "registration-termination" | "rtr" | "rta" => Some(CMD_REGISTRATION_TERMINATION),
+        "push-profile" | "ppr" | "ppa" => Some(CMD_PUSH_PROFILE),
+        // Sh
+        "user-data" | "udr" | "uda" => Some(CMD_SH_USER_DATA),
+        "profile-update" | "pur" | "pua" => Some(CMD_SH_PROFILE_UPDATE),
+        "subscribe-notifications" | "snr" | "sna" => Some(CMD_SH_SUBSCRIBE_NOTIFICATIONS),
+        "push-notification" | "pnr" | "pna" => Some(CMD_SH_PUSH_NOTIFICATION),
+        // Gx / Rx / charging
+        "credit-control" | "ccr" | "cca" => Some(CMD_CREDIT_CONTROL),
+        "re-auth" | "rar" | "raa" => Some(CMD_RE_AUTH),
+        "abort-session" | "asr" | "asa" => Some(CMD_ABORT_SESSION),
+        "aa" | "aar" | "aaa" => Some(CMD_AA),
+        "session-termination" | "str" | "sta" => Some(CMD_SESSION_TERMINATION),
+        "accounting" | "acr" | "aca" => Some(CMD_ACCOUNTING),
+        // S6c
+        "send-routing-info-for-sm" | "srr" | "sra" => Some(CMD_SEND_ROUTING_INFO_FOR_SM),
+        "alert-service-centre" | "alert-sc" | "alr" | "ala" => Some(CMD_ALERT_SERVICE_CENTRE),
+        "report-sm-delivery-status" | "rsr" | "rsa" => {
+            Some(CMD_REPORT_SM_DELIVERY_STATUS)
+        }
+        // SGd
+        "mo-forward-short-message" | "ofr" | "ofa" => Some(CMD_MO_FORWARD_SHORT_MESSAGE),
+        "mt-forward-short-message" | "tfr" | "tfa" => Some(CMD_MT_FORWARD_SHORT_MESSAGE),
+        // Base
+        "capabilities-exchange" | "cer" | "cea" => Some(CMD_CAPABILITIES_EXCHANGE),
+        "device-watchdog" | "dwr" | "dwa" => Some(CMD_DEVICE_WATCHDOG),
+        "disconnect-peer" | "dpr" | "dpa" => Some(CMD_DISCONNECT_PEER),
+        _ => None,
+    }
+}
+
+/// Reverse of [`command_code_by_name`] — returns the canonical
+/// long-form name (without suffix) for a command code. Used when
+/// building the dispatch key for inbound `@diameter.on_command`.
+pub fn command_name_by_code(code: u32) -> Option<&'static str> {
+    Some(match code {
+        CMD_USER_AUTHORIZATION => "User-Authorization",
+        CMD_SERVER_ASSIGNMENT => "Server-Assignment",
+        CMD_LOCATION_INFO => "Location-Info",
+        CMD_MULTIMEDIA_AUTH => "Multimedia-Auth",
+        CMD_REGISTRATION_TERMINATION => "Registration-Termination",
+        CMD_PUSH_PROFILE => "Push-Profile",
+        CMD_SH_USER_DATA => "User-Data",
+        CMD_SH_PROFILE_UPDATE => "Profile-Update",
+        CMD_SH_SUBSCRIBE_NOTIFICATIONS => "Subscribe-Notifications",
+        CMD_SH_PUSH_NOTIFICATION => "Push-Notification",
+        CMD_CREDIT_CONTROL => "Credit-Control",
+        CMD_RE_AUTH => "Re-Auth",
+        CMD_ABORT_SESSION => "Abort-Session",
+        CMD_AA => "AA",
+        CMD_SESSION_TERMINATION => "Session-Termination",
+        CMD_ACCOUNTING => "Accounting",
+        CMD_SEND_ROUTING_INFO_FOR_SM => "Send-Routing-Info-for-SM",
+        CMD_ALERT_SERVICE_CENTRE => "Alert-Service-Centre",
+        CMD_REPORT_SM_DELIVERY_STATUS => "Report-SM-Delivery-Status",
+        CMD_MO_FORWARD_SHORT_MESSAGE => "MO-Forward-Short-Message",
+        CMD_MT_FORWARD_SHORT_MESSAGE => "MT-Forward-Short-Message",
+        CMD_CAPABILITIES_EXCHANGE => "Capabilities-Exchange",
+        CMD_DEVICE_WATCHDOG => "Device-Watchdog",
+        CMD_DISCONNECT_PEER => "Disconnect-Peer",
+        _ => return None,
+    })
+}
 
 // ── Cx/Dx Command Codes (TS 29.228) ────────────────────────────────────
 
@@ -648,5 +782,108 @@ mod tests {
         assert!(AvpType::UTF8String.is_text());
         assert!(AvpType::DiameterIdentity.is_text());
         assert!(!AvpType::OctetString.is_text());
+    }
+
+    // -----------------------------------------------------------------
+    // Generic-API resolution helpers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn lookup_avp_by_python_name_handles_acronyms() {
+        // Python kwargs in snake_case translate to the dictionary's
+        // Title-Kebab convention with case-insensitive match — covers
+        // acronym-heavy AVP names that don't title-case cleanly.
+        assert_eq!(lookup_avp_by_python_name("msisdn").unwrap().code, 701);
+        assert_eq!(lookup_avp_by_python_name("sc_address").unwrap().code, 3300);
+        assert_eq!(lookup_avp_by_python_name("sm_rp_ui").unwrap().code, 3301);
+        assert_eq!(lookup_avp_by_python_name("user_name").unwrap().code, 1);
+        assert_eq!(
+            lookup_avp_by_python_name("visited_network_identifier").unwrap().code,
+            600
+        );
+        assert!(lookup_avp_by_python_name("not_a_real_avp").is_none());
+    }
+
+    #[test]
+    fn app_id_by_name_round_trips() {
+        for app in &["Cx", "Sh", "Rx", "Ro", "Rf", "S6c", "SGd"] {
+            let (vendor, app_id) = app_id_by_name(app).expect("app must resolve");
+            let _ = vendor;
+            let resolved = app_name_by_id(app_id).expect("app id must resolve");
+            // Case-insensitive comparison — `S6c` vs `s6c` both round-trip.
+            assert!(resolved.eq_ignore_ascii_case(app));
+        }
+    }
+
+    #[test]
+    fn app_id_by_name_is_case_insensitive() {
+        assert_eq!(app_id_by_name("s6c"), app_id_by_name("S6c"));
+        assert_eq!(app_id_by_name("SGD"), app_id_by_name("sgd"));
+        assert!(app_id_by_name("not-an-app").is_none());
+    }
+
+    #[test]
+    fn command_code_by_name_handles_long_form_with_request_suffix() {
+        assert_eq!(
+            command_code_by_name("Send-Routing-Info-for-SM-Request"),
+            Some(CMD_SEND_ROUTING_INFO_FOR_SM)
+        );
+        assert_eq!(
+            command_code_by_name("Send-Routing-Info-for-SM"),
+            Some(CMD_SEND_ROUTING_INFO_FOR_SM)
+        );
+        assert_eq!(
+            command_code_by_name("Alert-Service-Centre-Request"),
+            Some(CMD_ALERT_SERVICE_CENTRE)
+        );
+        assert_eq!(
+            command_code_by_name("MT-Forward-Short-Message-Request"),
+            Some(CMD_MT_FORWARD_SHORT_MESSAGE)
+        );
+        assert_eq!(
+            command_code_by_name("Multimedia-Auth-Request"),
+            Some(CMD_MULTIMEDIA_AUTH)
+        );
+    }
+
+    #[test]
+    fn command_code_by_name_handles_acronym_aliases() {
+        assert_eq!(command_code_by_name("SRR"), Some(CMD_SEND_ROUTING_INFO_FOR_SM));
+        assert_eq!(command_code_by_name("ALR"), Some(CMD_ALERT_SERVICE_CENTRE));
+        assert_eq!(command_code_by_name("TFR"), Some(CMD_MT_FORWARD_SHORT_MESSAGE));
+        assert_eq!(command_code_by_name("OFR"), Some(CMD_MO_FORWARD_SHORT_MESSAGE));
+        assert_eq!(command_code_by_name("MAR"), Some(CMD_MULTIMEDIA_AUTH));
+    }
+
+    #[test]
+    fn command_name_by_code_round_trip_for_known_apps() {
+        for code in [
+            CMD_SEND_ROUTING_INFO_FOR_SM,
+            CMD_ALERT_SERVICE_CENTRE,
+            CMD_MT_FORWARD_SHORT_MESSAGE,
+            CMD_MO_FORWARD_SHORT_MESSAGE,
+            CMD_USER_AUTHORIZATION,
+        ] {
+            let name = command_name_by_code(code).expect("code must resolve");
+            let resolved = command_code_by_name(name).expect("name must resolve");
+            assert_eq!(resolved, code);
+        }
+    }
+
+    #[test]
+    fn command_code_by_name_is_case_insensitive() {
+        assert_eq!(
+            command_code_by_name("send-routing-info-for-sm-request"),
+            command_code_by_name("Send-Routing-Info-for-SM-Request")
+        );
+        assert_eq!(
+            command_code_by_name("alr"),
+            command_code_by_name("ALR"),
+        );
+    }
+
+    #[test]
+    fn command_code_by_name_returns_none_for_unknown() {
+        assert!(command_code_by_name("Bogus-Request").is_none());
     }
 }

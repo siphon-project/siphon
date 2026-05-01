@@ -362,6 +362,54 @@ pub fn encode_vendor_specific_app_id(vendor_id: u32, auth_app_id: u32) -> Vec<u8
 
 // ── Full message encoding ──────────────────────────────────────────────────
 
+/// Build a generic Diameter answer carrying the standard mandatory AVPs
+/// (Session-Id, Origin-Host, Origin-Realm, Auth-Session-State,
+/// Vendor-Specific-Application-Id when applicable, Result-Code).
+///
+/// Used by the dispatcher's `@diameter.on_command(...)` fallback to
+/// auto-ack incoming requests with a 2001-Success once the script
+/// handler returns. Per-app typed answers stay in their own modules
+/// (`cx::build_uaa_*`, `s6c::build_ala_*`, etc.) — this builder is only
+/// for the open-extension path.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_generic_answer(
+    origin_host: &str,
+    origin_realm: &str,
+    session_id: &str,
+    command_code: u32,
+    application_id: u32,
+    result_code: u32,
+    hop_by_hop: u32,
+    end_to_end: u32,
+) -> Vec<u8> {
+    let mut avp_buf = Vec::with_capacity(160);
+    avp_buf.extend_from_slice(&encode_avp_utf8(dictionary::avp::SESSION_ID, session_id));
+    avp_buf.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_HOST, origin_host));
+    avp_buf.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_REALM, origin_realm));
+    avp_buf.extend_from_slice(&encode_avp_u32(dictionary::avp::AUTH_SESSION_STATE, 1));
+    // Apps with a 3GPP-vendor application-id (Cx, Sh, Rx, S6c, SGd) need
+    // Vendor-Specific-Application-Id; base apps (Ro, Rf) don't. Match
+    // dictionary::app_name_by_id to detect the vendor side.
+    if let Some(name) = dictionary::app_name_by_id(application_id) {
+        if let Some((vendor, _)) = dictionary::app_id_by_name(name) {
+            if vendor != 0 {
+                avp_buf
+                    .extend_from_slice(&encode_vendor_specific_app_id(vendor, application_id));
+            }
+        }
+    }
+    avp_buf.extend_from_slice(&encode_avp_u32(dictionary::avp::RESULT_CODE, result_code));
+
+    encode_diameter_message(
+        FLAG_PROXIABLE,
+        command_code,
+        application_id,
+        hop_by_hop,
+        end_to_end,
+        &avp_buf,
+    )
+}
+
 /// Encode a complete Diameter message.
 pub fn encode_diameter_message(
     flags: u8,
@@ -632,5 +680,47 @@ mod tests {
         assert_eq!(encoded, "010203ff");
         let decoded = hex::decode(&encoded).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn generic_answer_3gpp_app_carries_vendor_specific_app_id() {
+        let wire = encode_generic_answer(
+            "siphon.example.com",
+            "example.com",
+            "test;1;1",
+            dictionary::CMD_ALERT_SERVICE_CENTRE,
+            dictionary::S6C_APP_ID,
+            dictionary::DIAMETER_SUCCESS,
+            10,
+            20,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(!decoded.is_request);
+        assert_eq!(decoded.command_code, dictionary::CMD_ALERT_SERVICE_CENTRE);
+        assert_eq!(decoded.application_id, dictionary::S6C_APP_ID);
+        assert_eq!(
+            decoded.avps.get("Result-Code").and_then(|v| v.as_u64()),
+            Some(2001)
+        );
+        // 3GPP-vendor app must carry Vendor-Specific-Application-Id.
+        assert!(decoded.avps.get("Vendor-Specific-Application-Id").is_some());
+    }
+
+    #[test]
+    fn generic_answer_base_app_omits_vendor_specific_app_id() {
+        // Rf is a base (vendor 0) application — VSA is unnecessary.
+        let wire = encode_generic_answer(
+            "siphon.example.com",
+            "example.com",
+            "test;1;1",
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            dictionary::DIAMETER_SUCCESS,
+            5,
+            6,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(decoded.avps.get("Vendor-Specific-Application-Id").is_none());
+        assert_eq!(decoded.application_id, dictionary::RF_APP_ID);
     }
 }
