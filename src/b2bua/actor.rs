@@ -514,6 +514,10 @@ pub struct CallActor {
     pub transfer: Option<super::transfer::TransferContext>,
     /// Outbound digest credentials for B-leg 401/407 retry.
     pub outbound_credentials: Option<(String, String)>,
+    /// Per-call digest nonce-count tracker (RFC 7616 §3.3). Resets to 1 when
+    /// the trunk challenges with a fresh nonce; increments when the same
+    /// nonce is reused (e.g. authenticated re-INVITE inside the dialog).
+    pub digest_nc: crate::auth::NonceCounter,
     /// Whether li.record() was called — SIPREC recording via config SRS URI.
     pub li_record: bool,
     /// When true, copy the A-leg Call-ID to B-leg(s).
@@ -541,6 +545,7 @@ impl CallActor {
             session_timer_override: None,
             transfer: None,
             outbound_credentials: None,
+            digest_nc: crate::auth::NonceCounter::new(),
             li_record: false,
             preserve_call_id: false,
             pending_b_leg_ack: None,

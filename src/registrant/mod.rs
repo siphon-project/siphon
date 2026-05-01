@@ -409,7 +409,7 @@ impl RegistrantManager {
             entry.transport, effective_addr, branch
         );
 
-        let nc = entry.nonce_counter.next();
+        let nc = entry.nonce_counter.next_for(&challenge.nonce);
         let cnonce = format!("{:08x}", rand_u32());
 
         let digest_uri = format!("sip:{request_uri_str}");

@@ -8,7 +8,7 @@
 //! `crate::script::api::auth`.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 /// Parsed WWW-Authenticate or Proxy-Authenticate challenge.
 #[derive(Debug, Clone)]
@@ -88,28 +88,56 @@ pub struct DigestCredentials {
     pub password: String,
 }
 
-/// Tracks the nonce count for a given nonce value.
-#[derive(Debug)]
+/// Tracks the nonce-count (`nc`) value for digest authentication.
+///
+/// Per RFC 7616 §3.3, `nc` MUST start at 1 for each fresh server nonce and
+/// increment by 1 for every subsequent request that reuses the same nonce.
+/// When the server returns a new nonce (e.g. after `stale=true`, or simply a
+/// fresh challenge on a different transaction), `nc` resets to 1.
+///
+/// This tracker holds the most recent `(nonce, count)` pair so that
+/// [`next_for`](Self::next_for) returns the correct value for the requested
+/// nonce: 1 if the nonce is new (or unseen), or `count + 1` if it matches
+/// the previously seen nonce.
+#[derive(Debug, Default)]
 pub struct NonceCounter {
-    count: AtomicU32,
+    state: Mutex<Option<(String, u32)>>,
 }
 
 impl NonceCounter {
     pub fn new() -> Self {
         Self {
-            count: AtomicU32::new(0),
+            state: Mutex::new(None),
         }
     }
 
-    /// Increment and return the next nc value (1-based).
-    pub fn next(&self) -> u32 {
-        self.count.fetch_add(1, Ordering::Relaxed) + 1
+    /// Return the next `nc` value to use for `nonce`.
+    ///
+    /// Resets to 1 when `nonce` differs from the last-seen nonce (RFC 7616
+    /// §3.3); otherwise increments and returns the new count.
+    pub fn next_for(&self, nonce: &str) -> u32 {
+        let mut guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.as_mut() {
+            Some((last, count)) if last == nonce => {
+                *count = count.saturating_add(1);
+                *count
+            }
+            _ => {
+                *guard = Some((nonce.to_string(), 1));
+                1
+            }
+        }
     }
-}
 
-impl Default for NonceCounter {
-    fn default() -> Self {
-        Self::new()
+    /// Forget the last-seen nonce. The next call to [`Self::next_for`] will
+    /// return 1 regardless of which nonce is passed.
+    pub fn reset(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            *guard = None;
+        }
     }
 }
 
@@ -869,11 +897,34 @@ mod tests {
     }
 
     #[test]
-    fn nonce_counter_increments() {
+    fn nonce_counter_increments_for_same_nonce() {
         let counter = NonceCounter::new();
-        assert_eq!(counter.next(), 1);
-        assert_eq!(counter.next(), 2);
-        assert_eq!(counter.next(), 3);
+        assert_eq!(counter.next_for("nonce-A"), 1);
+        assert_eq!(counter.next_for("nonce-A"), 2);
+        assert_eq!(counter.next_for("nonce-A"), 3);
+    }
+
+    #[test]
+    fn nonce_counter_resets_on_new_nonce() {
+        let counter = NonceCounter::new();
+        assert_eq!(counter.next_for("nonce-A"), 1);
+        assert_eq!(counter.next_for("nonce-A"), 2);
+        // RFC 7616 §3.3: a fresh nonce restarts the count at 1.
+        assert_eq!(counter.next_for("nonce-B"), 1);
+        assert_eq!(counter.next_for("nonce-B"), 2);
+        // Switching back to the old nonce also resets — the tracker only
+        // keeps the most recently seen nonce, which is correct: the server
+        // doesn't accept old-nonce nc values out of order.
+        assert_eq!(counter.next_for("nonce-A"), 1);
+    }
+
+    #[test]
+    fn nonce_counter_reset_clears_state() {
+        let counter = NonceCounter::new();
+        assert_eq!(counter.next_for("nonce-A"), 1);
+        assert_eq!(counter.next_for("nonce-A"), 2);
+        counter.reset();
+        assert_eq!(counter.next_for("nonce-A"), 1);
     }
 
     #[test]

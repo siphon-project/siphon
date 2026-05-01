@@ -6924,10 +6924,23 @@ fn handle_b2bua_response(
                 if let Some(challenge_value) = challenge_header {
                     if let Some(challenge) = crate::auth::parse_challenge(challenge_value) {
                         if let (Some(target_uri), Some(stored_invite_arc)) = (&b_leg_target, &b_leg_stored_invite) {
+                            // RFC 7616 §3.3: nc starts at 1 for a fresh server
+                            // nonce and increments on every reuse. The
+                                // per-call NonceCounter resets internally when
+                            // the nonce changes, so this is correct for both
+                            // first challenge and same-nonce re-challenge
+                            // (e.g. authenticated re-INVITE in the dialog).
+                            let nc = state
+                                .call_actors
+                                .get_call(call_id)
+                                .map(|call| call.digest_nc.next_for(&challenge.nonce))
+                                .unwrap_or(1);
+
                             info!(
                                 call_id = %call_id,
                                 status = status_code,
                                 realm = %challenge.realm,
+                                nc = nc,
                                 "B2BUA: {status_code} received, retrying with credentials"
                             );
 
@@ -6947,7 +6960,7 @@ fn handle_b2bua_response(
                                 &credentials,
                                 "INVITE",
                                 target_uri,
-                                Some(1),
+                                Some(nc),
                                 None,
                             );
 
