@@ -1110,6 +1110,60 @@ class MockCache:
         """Check if a named cache exists."""
         return name in self._stores
 
+    async def delete(self, name: str, key: str) -> bool:
+        """Delete a key. Returns ``True`` if the cache exists."""
+        if name not in self._stores:
+            return False
+        self._stores[name].pop(key, None)
+        return True
+
+    async def exists(self, name: str, key: str) -> bool:
+        """Check if ``key`` is present in the named cache."""
+        return key in self._stores.get(name, {})
+
+    async def list_push(self, name: str, key: str, item: str) -> Optional[int]:
+        """Append ``item`` to a list under ``key``. Returns the new
+        length, or ``None`` if the cache name is unknown.
+
+        The mock stores lists as Python ``list[str]`` under the same
+        keyspace as scalars — fine for tests, but a real script would
+        not mix scalar and list values on the same key.
+        """
+        if name not in self._stores:
+            return None
+        existing = self._stores[name].get(key)
+        if existing is None:
+            new_list: list[str] = []
+        elif isinstance(existing, list):
+            new_list = existing
+        else:
+            new_list = []
+        new_list.append(item)
+        self._stores[name][key] = new_list  # type: ignore[assignment]
+        return len(new_list)
+
+    async def list_pop_all(self, name: str, key: str) -> list[str]:
+        """Atomically read and clear a list. Returns the items in FIFO
+        order, empty list when the key was absent or the cache is
+        unknown."""
+        store = self._stores.get(name)
+        if store is None:
+            return []
+        existing = store.pop(key, None)
+        if isinstance(existing, list):
+            return list(existing)
+        return []
+
+    async def expire(self, name: str, key: str, ttl: int) -> bool:
+        """Mock TTL — records the call on ``self.expirations`` for
+        assertions and returns ``True`` when the key currently exists
+        in the cache. The mock does not actually time out entries."""
+        if not hasattr(self, "expirations"):
+            self.expirations = []
+        self.expirations.append({"name": name, "key": key, "ttl": ttl})
+        store = self._stores.get(name)
+        return store is not None and key in store
+
     # -- Test helpers ----------------------------------------------------------
 
     def set_data(self, name: str, data: Optional[dict[str, str]] = None) -> None:
@@ -1124,6 +1178,8 @@ class MockCache:
     def clear(self) -> None:
         """Remove all caches (test helper)."""
         self._stores.clear()
+        if hasattr(self, "expirations"):
+            self.expirations.clear()
 
 
 # ---------------------------------------------------------------------------

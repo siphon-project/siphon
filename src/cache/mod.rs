@@ -245,6 +245,138 @@ impl NamedCache {
             }
         }
     }
+
+    /// Append `item` to the right of a Redis list. Returns the new
+    /// length on success, `None` when the Redis backend is unavailable
+    /// or the operation failed. Local LRU is never touched — list
+    /// values have no concurrent-update semantics there.
+    async fn list_push(&self, key: &str, item: &str) -> Option<u64> {
+        #[cfg(feature = "redis-backend")]
+        {
+            let mut connection = self.get_redis_connection().await?;
+            match redis::cmd("RPUSH")
+                .arg(key)
+                .arg(item)
+                .query_async::<u64>(&mut connection)
+                .await
+            {
+                Ok(len) => return Some(len),
+                Err(error) => {
+                    warn!(key = key, "Redis RPUSH failed: {error}");
+                    return None;
+                }
+            }
+        }
+        #[cfg(not(feature = "redis-backend"))]
+        {
+            let _ = (key, item);
+            debug!(key = key, "list_push: no Redis backend; dropping");
+            None
+        }
+    }
+
+    /// Atomically read and clear a Redis list. Returns the items in
+    /// FIFO order (left-to-right), or an empty vec when the key was
+    /// absent or the operation failed. Implemented via a MULTI/EXEC
+    /// transaction so concurrent producers don't lose items between
+    /// the `LRANGE` and the `DEL`.
+    async fn list_pop_all(&self, key: &str) -> Vec<String> {
+        #[cfg(feature = "redis-backend")]
+        {
+            let Some(mut connection) = self.get_redis_connection().await else {
+                return Vec::new();
+            };
+            // Pipeline: LRANGE key 0 -1 ; DEL key — atomic via MULTI/EXEC.
+            let result: Result<(Vec<String>, ()), _> = redis::pipe()
+                .atomic()
+                .cmd("LRANGE")
+                .arg(key)
+                .arg(0)
+                .arg(-1)
+                .cmd("DEL")
+                .arg(key)
+                .query_async(&mut connection)
+                .await;
+            match result {
+                Ok((items, _)) => return items,
+                Err(error) => {
+                    warn!(key = key, "Redis list_pop_all failed: {error}");
+                    return Vec::new();
+                }
+            }
+        }
+        #[cfg(not(feature = "redis-backend"))]
+        {
+            let _ = key;
+            debug!(key = key, "list_pop_all: no Redis backend; returning empty");
+            Vec::new()
+        }
+    }
+
+    /// Set a TTL (seconds) on an existing key. Returns `true` if the
+    /// timeout was set, `false` when the key did not exist or the
+    /// backend rejected the command.
+    async fn expire(&self, key: &str, ttl_secs: u64) -> bool {
+        #[cfg(feature = "redis-backend")]
+        {
+            let Some(mut connection) = self.get_redis_connection().await else {
+                return false;
+            };
+            // Redis EXPIRE returns 1 when the timeout was set, 0 when
+            // the key did not exist.
+            match redis::cmd("EXPIRE")
+                .arg(key)
+                .arg(ttl_secs)
+                .query_async::<i64>(&mut connection)
+                .await
+            {
+                Ok(set) => return set == 1,
+                Err(error) => {
+                    warn!(key = key, "Redis EXPIRE failed: {error}");
+                    return false;
+                }
+            }
+        }
+        #[cfg(not(feature = "redis-backend"))]
+        {
+            let _ = (key, ttl_secs);
+            false
+        }
+    }
+
+    /// Check if `key` exists in this cache. Considers the local LRU
+    /// first (cheap, in-process), then Redis. Local-only caches answer
+    /// from the LRU alone.
+    async fn exists(&self, key: &str) -> bool {
+        if let Some(local) = &self.local {
+            if let Ok(lru) = local.lock() {
+                if lru.get(key).is_some() {
+                    return true;
+                }
+            }
+        }
+        #[cfg(feature = "redis-backend")]
+        {
+            let Some(mut connection) = self.get_redis_connection().await else {
+                return false;
+            };
+            match redis::cmd("EXISTS")
+                .arg(key)
+                .query_async::<i64>(&mut connection)
+                .await
+            {
+                Ok(present) => return present > 0,
+                Err(error) => {
+                    warn!(key = key, "Redis EXISTS failed: {error}");
+                    return false;
+                }
+            }
+        }
+        #[cfg(not(feature = "redis-backend"))]
+        {
+            false
+        }
+    }
 }
 
 /// Manages all named caches configured in `siphon.yaml`.
@@ -298,6 +430,41 @@ impl CacheManager {
     /// Check if a named cache exists.
     pub fn has_cache(&self, name: &str) -> bool {
         self.caches.contains_key(name)
+    }
+
+    /// Append `item` to a Redis list under `key`. Returns the list's
+    /// new length on success; `None` if the named cache is unknown,
+    /// the Redis backend is unavailable, or the command failed.
+    pub async fn list_push(&self, name: &str, key: &str, item: &str) -> Option<u64> {
+        self.caches.get(name)?.list_push(key, item).await
+    }
+
+    /// Atomically drain a Redis list — returns all items in FIFO order
+    /// and deletes the key. Empty vec when the cache is unknown, the
+    /// key is absent, or Redis is unavailable.
+    pub async fn list_pop_all(&self, name: &str, key: &str) -> Vec<String> {
+        match self.caches.get(name) {
+            Some(cache) => cache.list_pop_all(key).await,
+            None => Vec::new(),
+        }
+    }
+
+    /// Set a TTL (seconds) on an existing key. Returns `true` if the
+    /// timeout was set, `false` if the cache is unknown, the key did
+    /// not exist, or the backend rejected the command.
+    pub async fn expire(&self, name: &str, key: &str, ttl_secs: u64) -> bool {
+        match self.caches.get(name) {
+            Some(cache) => cache.expire(key, ttl_secs).await,
+            None => false,
+        }
+    }
+
+    /// Check if `key` exists in the named cache (local LRU or Redis).
+    pub async fn exists(&self, name: &str, key: &str) -> bool {
+        match self.caches.get(name) {
+            Some(cache) => cache.exists(key).await,
+            None => false,
+        }
     }
 }
 
@@ -383,5 +550,69 @@ mod tests {
         let manager = CacheManager::new(&[make_config("cnam", Some(60), None)]);
         assert!(manager.has_cache("cnam"));
         assert!(!manager.has_cache("other"));
+    }
+
+    // -----------------------------------------------------------------
+    // List ops + expire + exists
+    // -----------------------------------------------------------------
+    //
+    // The integration tests use a bogus Redis URL on port 1 — the
+    // backend is unreachable. These tests therefore exercise the
+    // graceful-degradation path, not the happy path. End-to-end
+    // happy-path coverage lives in the production deployment with a
+    // real Redis instance available; the unit tests verify that the
+    // surface stays sane when Redis isn't.
+
+    #[tokio::test]
+    async fn exists_finds_value_in_local_lru_without_redis() {
+        let manager = CacheManager::new(&[make_config("hot", Some(60), Some(100))]);
+        manager.store("hot", "key1", "v1", None).await;
+        assert!(manager.exists("hot", "key1").await);
+        assert!(!manager.exists("hot", "key_missing").await);
+    }
+
+    #[tokio::test]
+    async fn exists_returns_false_for_unknown_cache_name() {
+        let manager = CacheManager::empty();
+        assert!(!manager.exists("nope", "key").await);
+    }
+
+    #[tokio::test]
+    async fn list_push_returns_none_when_redis_unreachable() {
+        let manager = CacheManager::new(&[make_config("queue", None, None)]);
+        // Bogus Redis URL — backend is unreachable, op degrades.
+        assert!(manager.list_push("queue", "ims_queue_abc", "msg-1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_push_returns_none_for_unknown_cache_name() {
+        let manager = CacheManager::empty();
+        assert!(manager.list_push("nope", "key", "item").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_pop_all_returns_empty_when_redis_unreachable() {
+        let manager = CacheManager::new(&[make_config("queue", None, None)]);
+        let drained = manager.list_pop_all("queue", "ims_queue_abc").await;
+        assert!(drained.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_pop_all_returns_empty_for_unknown_cache_name() {
+        let manager = CacheManager::empty();
+        let drained = manager.list_pop_all("nope", "key").await;
+        assert!(drained.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expire_returns_false_when_redis_unreachable() {
+        let manager = CacheManager::new(&[make_config("queue", None, None)]);
+        assert!(!manager.expire("queue", "key", 60).await);
+    }
+
+    #[tokio::test]
+    async fn expire_returns_false_for_unknown_cache_name() {
+        let manager = CacheManager::empty();
+        assert!(!manager.expire("nope", "key", 60).await);
     }
 }

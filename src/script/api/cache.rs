@@ -97,4 +97,85 @@ impl PyCacheNamespace {
     fn has_cache(&self, name: &str) -> bool {
         self.manager.has_cache(name)
     }
+
+    /// Push an item onto the right of a Redis list (FIFO when paired
+    /// with :meth:`list_pop_all`).
+    ///
+    /// Args:
+    ///     name: Cache name (must reference a Redis-backed entry —
+    ///         local-LRU-only caches don't have list semantics).
+    ///     key: List key. Reserved keys (``siphon:`` prefix) are rejected.
+    ///     item: String value to append.
+    ///
+    /// Returns the list's new length on success, ``None`` when the
+    /// cache is unknown or Redis is unavailable / the command failed.
+    fn list_push<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        key: String,
+        item: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        validate_key(&key)?;
+        let manager = Arc::clone(&self.manager);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(manager.list_push(&name, &key, &item).await)
+        })
+    }
+
+    /// Atomically read and clear a Redis list. Returns the items in
+    /// FIFO order; empty list when the key was absent, the cache is
+    /// unknown, or Redis is unavailable.
+    ///
+    /// Implementation uses a MULTI/EXEC pipeline so concurrent
+    /// producers don't lose items between the read and the delete.
+    fn list_pop_all<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        key: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        validate_key(&key)?;
+        let manager = Arc::clone(&self.manager);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(manager.list_pop_all(&name, &key).await)
+        })
+    }
+
+    /// Set a TTL (seconds) on an existing key.
+    ///
+    /// Returns ``True`` when the timeout was set, ``False`` when the
+    /// key did not exist, the cache is unknown, or the backend
+    /// rejected the command. Useful after :meth:`list_push` to bound
+    /// queue lifetime.
+    fn expire<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        key: String,
+        ttl: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        validate_key(&key)?;
+        let manager = Arc::clone(&self.manager);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(manager.expire(&name, &key, ttl).await)
+        })
+    }
+
+    /// Check whether ``key`` exists in the named cache.
+    ///
+    /// Considers the local LRU first (in-process), then Redis. Returns
+    /// ``False`` for unknown cache names.
+    fn exists<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        key: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        validate_key(&key)?;
+        let manager = Arc::clone(&self.manager);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(manager.exists(&name, &key).await)
+        })
+    }
 }
