@@ -5,7 +5,7 @@
 //! Implements stateless proxy relay with Via-based response routing.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -5543,13 +5543,52 @@ fn b2bua_send_b_leg_invite(
     // Send via pool for TCP/TLS, direct channel for UDP
     send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
 
-    // Increment B-leg local CSeq after sending initial INVITE (CSeq 1 is now used).
-    // Subsequent requests (re-INVITE, BYE) on this leg will use CSeq >= 2.
+    // Persist the fully hygiene-processed B-leg INVITE on the leg.
+    // The 401/407 auto-retry path rebuilds the retry from this — rebuilding
+    // from the A-leg INVITE would leak A-leg headers (Record-Route, Route,
+    // Authorization), the original Call-ID/CSeq/From-host, and the un-anchored
+    // SDP back to the B-leg. Increment B-leg local CSeq after sending the
+    // initial INVITE (CSeq 1 is now used); subsequent requests (re-INVITE,
+    // BYE, 401/407 retry) use CSeq >= 2.
+    let stored_invite = Arc::new(Mutex::new(b_leg_invite));
     if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
         if let Some(b_leg) = call.b_legs.last_mut() {
             b_leg.dialog.local_cseq += 1;
+            b_leg.b_leg_invite = Some(stored_invite);
         }
     }
+}
+
+/// Apply 401/407 digest-retry edits to a previously sent B-leg INVITE.
+///
+/// Clones `original` and returns a copy with:
+///   - `Via` replaced (carries the new client-transaction branch).
+///   - `CSeq` bumped to `cseq` (RFC 3261 §22.2 — retry uses an incremented
+///     sequence number within the same dialog).
+///   - Both `Authorization` and `Proxy-Authorization` removed, then
+///     `auth_header` (one of those two) added with `auth_value`.
+///
+/// Every other header — `Contact`, `Call-ID`, `From`, `To`, the Request-URI,
+/// `User-Agent`, `P-Asserted-Identity`, the absence of `Record-Route`/`Route`,
+/// and the (possibly rtpengine-anchored) SDP body — is preserved verbatim
+/// from the prior B-leg INVITE. This is the core fix for the 401/407 retry
+/// leak: the prior INVITE was already fully hygiene-processed by
+/// [`b2bua_send_b_leg_invite`], so we must not rebuild from the raw A-leg
+/// INVITE.
+fn build_digest_retry_invite(
+    original: &SipMessage,
+    new_via: String,
+    cseq: u32,
+    auth_header: &str,
+    auth_value: String,
+) -> SipMessage {
+    let mut retry = original.clone();
+    retry.headers.set("Via", new_via);
+    retry.headers.set("CSeq", format!("{cseq} INVITE"));
+    retry.headers.remove("Authorization");
+    retry.headers.remove("Proxy-Authorization");
+    retry.headers.add(auth_header, auth_value);
+    retry
 }
 
 /// Spawn a [`LegActor`] for a B-leg and store its handle in the call.
@@ -5691,7 +5730,7 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, call_state, outbound_credentials, li_record, b_leg_handle_tx) = match state.call_actors.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, call_state, outbound_credentials, li_record, b_leg_handle_tx, b_leg_stored_invite, b_leg_local_cseq) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
@@ -5706,7 +5745,9 @@ fn handle_b2bua_response(
                 .and_then(|i| call.b_leg_handles.get(i))
                 .and_then(|h| h.as_ref())
                 .map(|h| h.tx.clone());
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, stored_cseq, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx)
+            let stored_invite = matching_b.and_then(|b| b.b_leg_invite.clone());
+            let local_cseq = matching_b.map(|b| b.dialog.local_cseq).unwrap_or(2);
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, stored_cseq, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx, stored_invite, local_cseq)
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -6861,7 +6902,17 @@ fn handle_b2bua_response(
             }
         }
 
-        // 401/407 — auto-retry with digest credentials if available
+        // 401/407 — auto-retry with digest credentials if available.
+        //
+        // The retry MUST be built from the B-leg's last-sent INVITE, NOT the
+        // raw A-leg INVITE. The first B-leg INVITE went through the full
+        // hygiene chain in `b2bua_send_b_leg_invite` (strip Record-Route /
+        // Route / Authorization, replace Via / Contact / User-Agent, rewrite
+        // From / To / P-Asserted-Identity host, regenerate Call-ID, set
+        // CSeq=1, decrement Max-Forwards, sanitize SDP origin), plus any
+        // script-side mutations applied before send. Cloning the A-leg INVITE
+        // and only patching Via / RURI / Authorization (the old behaviour)
+        // leaks every other A-leg header back to the B-leg.
         if status_code == 401 || status_code == 407 {
             if let Some((username, password)) = &outbound_credentials {
                 let challenge_header = if status_code == 401 {
@@ -6872,7 +6923,7 @@ fn handle_b2bua_response(
 
                 if let Some(challenge_value) = challenge_header {
                     if let Some(challenge) = crate::auth::parse_challenge(challenge_value) {
-                        if let (Some(target_uri), Some(invite_arc)) = (&b_leg_target, &a_leg_invite) {
+                        if let (Some(target_uri), Some(stored_invite_arc)) = (&b_leg_target, &b_leg_stored_invite) {
                             info!(
                                 call_id = %call_id,
                                 status = status_code,
@@ -6906,15 +6957,10 @@ fn handle_b2bua_response(
                                 let b_leg_transport = b_leg_dest.map(|(_, t)| t).unwrap_or(Transport::Udp);
                                 let transport = relay_target.transport.unwrap_or(b_leg_transport);
 
-                                // Build retry INVITE from stored A-leg INVITE
-                                let Ok(original) = invite_arc.lock() else {
-                                    error!(call_id = %call_id, "invite_arc lock poisoned during fork retry");
-                                    return;
-                                };
-                                let mut retry = original.clone();
-                                drop(original);
-
-                                // Replace Via with new branch
+                                // Build retry from the stored, hygiene-processed B-leg INVITE.
+                                // Call-ID, From-tag, From-host, To, RURI, Contact, User-Agent,
+                                // P-Asserted-Identity, Record-Route stripping, and the SDP body
+                                // (anchored by rtpengine if applicable) are all already correct.
                                 let new_branch = TransactionKey::generate_branch();
                                 let via_value = format!(
                                     "SIP/2.0/{} {}:{};branch={}",
@@ -6923,31 +6969,29 @@ fn handle_b2bua_response(
                                     state.via_port(&transport),
                                     new_branch,
                                 );
-                                retry.headers.set("Via", via_value);
+                                let retry = {
+                                    let Ok(original) = stored_invite_arc.lock() else {
+                                        error!(call_id = %call_id, "b_leg_invite lock poisoned during 401/407 retry");
+                                        return;
+                                    };
+                                    // RFC 3261 §22.2: incremented CSeq for the retried request.
+                                    // local_cseq was bumped past the original after first send,
+                                    // so it now points at the next number to use.
+                                    build_digest_retry_invite(
+                                        &original,
+                                        via_value,
+                                        b_leg_local_cseq,
+                                        auth_header_name,
+                                        auth_value,
+                                    )
+                                };
 
-                                // Update Request-URI
-                                if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
-                                    retry.start_line = StartLine::Request(
-                                        crate::sip::message::RequestLine {
-                                            method: crate::sip::message::Method::Invite,
-                                            request_uri: target_parsed,
-                                            version: crate::sip::message::Version::sip_2_0(),
-                                        },
-                                    );
-                                }
-
-                                // Add authorization header
-                                retry.headers.remove(auth_header_name);
-                                retry.headers.add(auth_header_name, auth_value);
-
-                                // Reuse B-leg dialog identifiers from the failed attempt
+                                // Reuse the failed B-leg's dialog identity (Call-ID +
+                                // From-tag); the stored INVITE already carries them.
                                 let (retry_call_id, retry_from_tag) = b_leg_dialog.clone()
                                     .unwrap_or_else(|| (a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()));
-                                crate::b2bua::actor::Dialog::rewrite_headers(
-                                    &mut retry, &retry_call_id, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &retry_from_tag,
-                                );
 
-                                let b_leg = Leg::new_b_leg(
+                                let mut b_leg = Leg::new_b_leg(
                                     retry_call_id,
                                     retry_from_tag,
                                     target_uri.clone(),
@@ -6958,6 +7002,25 @@ fn handle_b2bua_response(
                                         transport,
                                     },
                                 );
+                                // Preserve dialog state from the failed attempt:
+                                //  - local_cseq advances past the retry CSeq.
+                                //  - local_contact / from_uri / to_uri stay so mid-dialog
+                                //    requests on this leg work.
+                                b_leg.dialog.local_cseq = b_leg_local_cseq.saturating_add(1);
+                                b_leg.dialog.local_contact = retry.headers.get("Contact").cloned();
+                                b_leg.dialog.local_from_uri = retry.headers.from().cloned();
+                                b_leg.dialog.remote_to_uri = retry.headers.to().cloned();
+                                if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
+                                    b_leg.dialog.remote_aor_host = Some(if let Some(port) = target_parsed.port {
+                                        format!("{}:{}", target_parsed.host, port)
+                                    } else {
+                                        target_parsed.host.clone()
+                                    });
+                                }
+                                // Persist the retry INVITE so a chained re-challenge
+                                // (e.g. nonce stale) rebuilds from the right snapshot.
+                                b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
+
                                 state.call_actors.add_b_leg(call_id, b_leg.clone());
                                 spawn_b_leg_actor(call_id, &b_leg, state);
 
@@ -8519,6 +8582,164 @@ mod tests {
 
         // Content-Length: 0
         assert_eq!(ack.headers.content_length(), Some(0));
+    }
+
+    /// Build a representative B-leg INVITE — i.e. one that has already been
+    /// through the hygiene chain in `b2bua_send_b_leg_invite`: stripped
+    /// Record-Route/Route/Authorization, our own Via and Contact, rewritten
+    /// From host, fresh Call-ID, CSeq=1, decremented Max-Forwards, and an
+    /// SDP body with the o= line rewritten to our advertised address.
+    fn hygiene_processed_b_leg_invite() -> SipMessage {
+        let sdp = "v=0\r\n\
+o=siphon 0 0 IN IP4 192.0.2.10\r\n\
+s=siphon\r\n\
+c=IN IP4 192.0.2.10\r\n\
+t=0 0\r\n\
+m=audio 30054 RTP/SAVPF 8\r\n\
+a=rtpmap:8 PCMA/8000\r\n";
+        let mut msg = SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("biloxi.com".to_string()).with_user("bob".to_string()),
+            )
+            .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-old".to_string())
+            .to("Bob <sip:bob@biloxi.com>".to_string())
+            .from("Alice <sip:alice@siphon.example.org>;tag=b-leg-tag-99".to_string())
+            .call_id("b2b-bbbbbbbb-cccc-dddd-eeee-ffffffffffff".to_string())
+            .cseq("1 INVITE".to_string())
+            .max_forwards(69)
+            .content_length(sdp.len())
+            .build()
+            .unwrap();
+        msg.headers.set("Contact", "<sip:192.0.2.10:5060;transport=udp>".to_string());
+        msg.headers.set("User-Agent", "SIPhon/test".to_string());
+        msg.headers.set(
+            "P-Asserted-Identity",
+            "<sip:alice@siphon.example.org>".to_string(),
+        );
+        msg.body = sdp.as_bytes().to_vec();
+        msg
+    }
+
+    #[test]
+    fn build_digest_retry_invite_replaces_via() {
+        let original = hygiene_processed_b_leg_invite();
+        let retry = build_digest_retry_invite(
+            &original,
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-new".to_string(),
+            2,
+            "Proxy-Authorization",
+            "Digest username=\"alice\", realm=\"realm\"".to_string(),
+        );
+        assert_eq!(
+            retry.headers.via().unwrap(),
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-new"
+        );
+    }
+
+    #[test]
+    fn build_digest_retry_invite_bumps_cseq() {
+        let original = hygiene_processed_b_leg_invite();
+        let retry = build_digest_retry_invite(
+            &original,
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-new".to_string(),
+            2,
+            "Proxy-Authorization",
+            "Digest x".to_string(),
+        );
+        assert_eq!(retry.headers.cseq().unwrap(), "2 INVITE");
+    }
+
+    #[test]
+    fn build_digest_retry_invite_sets_proxy_auth_header() {
+        let original = hygiene_processed_b_leg_invite();
+        let retry = build_digest_retry_invite(
+            &original,
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-new".to_string(),
+            2,
+            "Proxy-Authorization",
+            "Digest username=\"alice\"".to_string(),
+        );
+        assert!(retry.headers.get("Proxy-Authorization").is_some());
+        assert!(retry.headers.get("Authorization").is_none());
+    }
+
+    #[test]
+    fn build_digest_retry_invite_replaces_existing_auth() {
+        // A previous 401 added Authorization with stale credentials — the
+        // helper must drop both Authorization and Proxy-Authorization before
+        // adding the fresh challenge response.
+        let mut original = hygiene_processed_b_leg_invite();
+        original.headers.add("Authorization", "Digest stale".to_string());
+        original
+            .headers
+            .add("Proxy-Authorization", "Digest also-stale".to_string());
+
+        let retry = build_digest_retry_invite(
+            &original,
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-new".to_string(),
+            3,
+            "Authorization",
+            "Digest fresh".to_string(),
+        );
+
+        let auths = retry.headers.get_all("Authorization").expect("Authorization present");
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0], "Digest fresh");
+        assert!(retry.headers.get("Proxy-Authorization").is_none());
+    }
+
+    /// This is the regression test for the leak fix: every header we expect
+    /// the prior B-leg INVITE to carry (post-hygiene) MUST be preserved.
+    #[test]
+    fn build_digest_retry_invite_preserves_all_other_headers() {
+        let original = hygiene_processed_b_leg_invite();
+        let retry = build_digest_retry_invite(
+            &original,
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-new".to_string(),
+            2,
+            "Proxy-Authorization",
+            "Digest x".to_string(),
+        );
+
+        // Identity / dialog headers
+        assert_eq!(retry.headers.from(), original.headers.from());
+        assert_eq!(retry.headers.to(), original.headers.to());
+        assert_eq!(retry.headers.call_id(), original.headers.call_id());
+
+        // Topology + UA hygiene must survive
+        assert_eq!(
+            retry.headers.get("Contact"),
+            original.headers.get("Contact"),
+        );
+        assert_eq!(
+            retry.headers.get("User-Agent"),
+            original.headers.get("User-Agent"),
+        );
+        assert_eq!(
+            retry.headers.get("P-Asserted-Identity"),
+            original.headers.get("P-Asserted-Identity"),
+        );
+
+        // Max-Forwards must NOT silently increment back up.
+        assert_eq!(retry.headers.get("Max-Forwards").map(|s| s.as_str()), Some("69"));
+
+        // Record-Route and Route must remain absent (they were stripped by
+        // hygiene; the retry must not bring them back).
+        assert!(retry.headers.get("Record-Route").is_none());
+        assert!(retry.headers.get("Route").is_none());
+
+        // RURI is the dial target — unchanged.
+        match (&retry.start_line, &original.start_line) {
+            (StartLine::Request(rl_retry), StartLine::Request(rl_orig)) => {
+                assert_eq!(rl_retry.request_uri.user, rl_orig.request_uri.user);
+                assert_eq!(rl_retry.request_uri.host, rl_orig.request_uri.host);
+            }
+            _ => panic!("expected Request start lines"),
+        }
+
+        // SDP body untouched (rtpengine had already anchored ports/crypto).
+        assert_eq!(retry.body, original.body);
     }
 
     fn test_resolver() -> SipResolver {

@@ -291,6 +291,12 @@ pub struct Leg {
     /// — without this guard we would emit a fresh PRACK for every
     /// retransmit, racking up CSeq numbers and confusing the peer.
     pub prack_acked_rseq: Option<u32>,
+    /// Last-sent outbound INVITE for this leg (B-leg only).
+    /// Persisted at the end of [`b2bua_send_b_leg_invite`] so that the
+    /// 401/407 auto-retry path can rebuild the retry from the fully
+    /// hygiene-processed B-leg INVITE rather than the raw A-leg INVITE
+    /// (which would leak A-leg headers, identity, and Record-Routes).
+    pub b_leg_invite: Option<Arc<Mutex<SipMessage>>>,
 }
 
 impl Leg {
@@ -312,6 +318,7 @@ impl Leg {
             initial_acked: false,
             pending_reinvite: false,
             prack_acked_rseq: None,
+            b_leg_invite: None,
         }
     }
 
@@ -334,6 +341,7 @@ impl Leg {
             initial_acked: false,
             pending_reinvite: false,
             prack_acked_rseq: None,
+            b_leg_invite: None,
         }
     }
 }
