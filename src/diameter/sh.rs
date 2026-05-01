@@ -466,6 +466,7 @@ pub fn build_profile_update_request(
     public_identity: &str,
     data_reference: u32,
     xml_payload: &str,
+    service_indication: Option<&str>,
     hbh: u32,
     e2e: u32,
 ) -> Vec<u8> {
@@ -473,6 +474,12 @@ pub fn build_profile_update_request(
     append_common_request_headers(&mut avp_bytes, config, session_id);
     avp_bytes.extend_from_slice(&encode_user_identity(public_identity));
     avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::DATA_REFERENCE, data_reference));
+    if let Some(indication) = service_indication {
+        avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
+            avp::SERVICE_INDICATION,
+            indication.as_bytes(),
+        ));
+    }
     avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
         avp::USER_DATA_SH,
         xml_payload.as_bytes(),
@@ -731,6 +738,7 @@ mod tests {
             "sip:alice@ims.example.com",
             data_reference::REPOSITORY_DATA,
             xml,
+            Some("simservs"),
             301,
             402,
         );
@@ -749,6 +757,14 @@ mod tests {
             .expect("User-Data-Sh present");
         let xml_bytes = crate::diameter::codec::hex::decode(xml_hex).unwrap();
         assert_eq!(String::from_utf8(xml_bytes).unwrap(), xml);
+
+        let service_indication_hex = decoded
+            .avps
+            .get("Service-Indication")
+            .and_then(|v| v.as_str())
+            .expect("Service-Indication present");
+        let decoded_bytes = crate::diameter::codec::hex::decode(service_indication_hex).unwrap();
+        assert_eq!(String::from_utf8(decoded_bytes).unwrap(), "simservs");
     }
 
     #[test]

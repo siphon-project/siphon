@@ -256,6 +256,7 @@ impl DiameterClient {
         public_identity: &str,
         data_reference: u32,
         xml_payload: &str,
+        service_indication: Option<&str>,
     ) -> Result<codec::DiameterMessage, String> {
         let session_id = self.peer.new_session_id();
         let wire = sh::build_profile_update_request(
@@ -264,6 +265,7 @@ impl DiameterClient {
             public_identity,
             data_reference,
             xml_payload,
+            service_indication,
             self.peer.next_hbh(),
             self.peer.next_e2e(),
         );

@@ -565,16 +565,21 @@ impl PyDiameter {
     ///     public_identity: Target user's public identity.
     ///     data_reference: Data-Reference value (usually ``0`` for Repository-Data).
     ///     xml: UTF-8 XML payload for the User-Data-Sh AVP.
+    ///     service_indication: Service indication (e.g. ``"simservs"``),
+    ///         required by the HSS when Data-Reference is Repository-Data
+    ///         (TS 29.328 §6.1.3 — Repository-Data is keyed on
+    ///         ``(Public-Identity, Service-Indication)``).
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int), or ``None`` if no peer is connected.
-    #[pyo3(signature = (public_identity, data_reference, xml))]
+    #[pyo3(signature = (public_identity, data_reference, xml, service_indication=None))]
     fn sh_pur<'py>(
         &self,
         python: Python<'py>,
         public_identity: &str,
         data_reference: u32,
         xml: &str,
+        service_indication: Option<&str>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let client = match self.manager.any_client() {
             Some(client) => client,
@@ -589,6 +594,7 @@ impl PyDiameter {
                 public_identity,
                 data_reference,
                 xml,
+                service_indication,
             ))
         });
 
@@ -1520,6 +1526,7 @@ mod tests {
                     "sip:alice@ims.example.com",
                     0,
                     "<simservs/>",
+                    Some("simservs"),
                 )
                 .unwrap();
             assert!(result.is_none());

@@ -2324,13 +2324,16 @@ class MockDiameter:
 
     def sh_pur(self, public_identity: str,
                data_reference: int,
-               xml: str) -> Optional[dict]:
+               xml: str,
+               service_indication: Optional[str] = None) -> Optional[dict]:
         """Send a Sh Profile-Update-Request to push user profile data to the HSS.
 
         Args:
             public_identity: Target user's public identity.
             data_reference: Data-Reference (e.g. ``0`` = Repository-Data).
             xml: UTF-8 XML payload.
+            service_indication: e.g. ``"simservs"``; required by the HSS when
+                Data-Reference is Repository-Data (TS 29.328 §6.1.3).
 
         Returns:
             Dict with ``result_code``, or ``None``.
