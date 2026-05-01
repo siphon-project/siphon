@@ -622,16 +622,21 @@ impl PyDiameter {
     ///     public_identity: Target user's public identity.
     ///     data_reference: Data-Reference (int) or list of references to subscribe to.
     ///     subs_req_type: ``0`` = SUBSCRIBE, ``1`` = UNSUBSCRIBE.
+    ///     service_indication: Service indication (e.g. ``"simservs"``),
+    ///         required by the HSS when Data-Reference is Repository-Data
+    ///         (TS 29.328 §6.1.4 — Repository-Data is keyed on
+    ///         ``(Public-Identity, Service-Indication)``).
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int), or ``None`` if no peer is connected.
-    #[pyo3(signature = (public_identity, data_reference, subs_req_type))]
+    #[pyo3(signature = (public_identity, data_reference, subs_req_type, service_indication=None))]
     fn sh_snr<'py>(
         &self,
         python: Python<'py>,
         public_identity: &str,
         data_reference: &Bound<'_, PyAny>,
         subs_req_type: u32,
+        service_indication: Option<&str>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let client = match self.manager.any_client() {
             Some(client) => client,
@@ -648,7 +653,7 @@ impl PyDiameter {
                 public_identity,
                 &references,
                 subs_req_type,
-                None,
+                service_indication,
             ))
         });
 
@@ -1546,6 +1551,7 @@ mod tests {
                     "sip:alice@ims.example.com",
                     data_reference.as_any(),
                     0,
+                    Some("simservs"),
                 )
                 .unwrap();
             assert!(result.is_none());

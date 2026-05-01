@@ -2344,13 +2344,16 @@ class MockDiameter:
 
     def sh_snr(self, public_identity: str,
                data_reference,
-               subs_req_type: int) -> Optional[dict]:
+               subs_req_type: int,
+               service_indication: Optional[str] = None) -> Optional[dict]:
         """Send a Sh Subscribe-Notifications-Request to the HSS.
 
         Args:
             public_identity: Target user's public identity.
             data_reference: Data-Reference int or list[int] to subscribe to.
             subs_req_type: ``0`` = SUBSCRIBE, ``1`` = UNSUBSCRIBE.
+            service_indication: e.g. ``"simservs"``; required by the HSS when
+                Data-Reference is Repository-Data (TS 29.328 §6.1.4).
 
         Returns:
             Dict with ``result_code``, or ``None``.

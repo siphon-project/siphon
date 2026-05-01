@@ -790,6 +790,52 @@ mod tests {
     }
 
     #[test]
+    fn sh_snr_emits_service_indication_avp_when_provided() {
+        let config = as_peer_config();
+        let wire = build_subscribe_notifications_request(
+            &config,
+            "sh;snr;si;1",
+            "sip:alice@ims.example.com",
+            &[data_reference::REPOSITORY_DATA],
+            subscription_type::SUBSCRIBE,
+            Some("simservs"),
+            701,
+            802,
+        );
+
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(decoded.is_request);
+        assert_eq!(decoded.command_code, dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS);
+
+        let service_indication_hex = decoded
+            .avps
+            .get("Service-Indication")
+            .and_then(|v| v.as_str())
+            .expect("Service-Indication present");
+        let decoded_bytes = crate::diameter::codec::hex::decode(service_indication_hex).unwrap();
+        assert_eq!(String::from_utf8(decoded_bytes).unwrap(), "simservs");
+    }
+
+    #[test]
+    fn sh_snr_omits_service_indication_avp_when_absent() {
+        let config = as_peer_config();
+        let wire = build_subscribe_notifications_request(
+            &config,
+            "sh;snr;si;2",
+            "sip:alice@ims.example.com",
+            &[data_reference::IMS_USER_STATE],
+            subscription_type::SUBSCRIBE,
+            None,
+            703,
+            804,
+        );
+
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(decoded.is_request);
+        assert!(decoded.avps.get("Service-Indication").is_none());
+    }
+
+    #[test]
     fn parse_push_notification_roundtrip() {
         let xml = "<simservs><incoming-communication-barring/></simservs>";
         let wire = build_push_notification(
