@@ -451,22 +451,21 @@ fn build_send_request_message(
     body: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<(SipMessage, String)> {
     let sip_method = Method::from_str(method);
-    // The z9hG4bK-uac- prefix is what UacSender::match_response keys on
-    // when correlating the eventual response with the pending entry.
-    let branch = format!("z9hG4bK-uac-py-{}", uuid::Uuid::new_v4());
-    let via = format!("SIP/2.0/{} {};branch={}", transport, destination, branch);
-    let call_id = format!("py-{}", uuid::Uuid::new_v4());
-    let cseq_str = format!("1 {}", sip_method.as_str());
 
-    let mut builder = SipMessageBuilder::new()
-        .request(sip_method, uri)
-        .via(via)
-        .call_id(call_id)
-        .cseq(cseq_str)
-        .max_forwards(70);
+    // Pre-extract user headers so that single-value auto-set headers
+    // (Call-ID, CSeq, Max-Forwards, Via — RFC 3261 §7.3.1) get *replaced*
+    // when the script supplies them, not duplicated.  Without this split,
+    // builder.header() appends every user value on top of our auto-set
+    // one and the resulting message has two Call-IDs / CSeqs / etc.;
+    // strict UAS implementations pick the first (auto-generated) header
+    // and discard the script-intended value.  Same root cause as the
+    // set_reply_header dual-To bug fixed in b1b2d55.
+    let mut user_call_id: Option<String> = None;
+    let mut user_cseq: Option<String> = None;
+    let mut user_max_forwards: Option<String> = None;
+    let mut user_via: Option<String> = None;
+    let mut other_headers: Vec<(String, String)> = Vec::new();
 
-    // Merge user-provided headers first so that body_str() / body() can
-    // overwrite Content-Length authoritatively after.
     if let Some(header_dict) = headers {
         for (key, value) in header_dict.iter() {
             let name: String = key.extract().map_err(|error| {
@@ -479,8 +478,64 @@ fn build_send_request_message(
                     "header value must be str: {error}"
                 ))
             })?;
-            builder = builder.header(&name, val);
+            // Case-insensitive match — RFC 3261 §7.3 makes header names
+            // case-insensitive, and Call-ID has the compact form "i".
+            if name.eq_ignore_ascii_case("Call-ID") || name.eq_ignore_ascii_case("i") {
+                user_call_id = Some(val);
+            } else if name.eq_ignore_ascii_case("CSeq") {
+                user_cseq = Some(val);
+            } else if name.eq_ignore_ascii_case("Max-Forwards") {
+                user_max_forwards = Some(val);
+            } else if name.eq_ignore_ascii_case("Via") || name.eq_ignore_ascii_case("v") {
+                user_via = Some(val);
+            } else {
+                other_headers.push((name, val));
+            }
         }
+    }
+
+    // Branch returned to the caller so it can register / expire the
+    // pending UAC entry.  When the script supplies its own Via, prefer
+    // the branch parsed from that value so response correlation still
+    // works — falling back to a fresh UAC-shaped branch if the parse
+    // fails or the supplied Via has no branch param.
+    let auto_branch = format!("z9hG4bK-uac-py-{}", uuid::Uuid::new_v4());
+    let via_value = match user_via {
+        Some(via_str) => via_str,
+        None => format!("SIP/2.0/{} {};branch={}", transport, destination, auto_branch),
+    };
+    let branch = crate::sip::headers::via::Via::parse(&via_value)
+        .ok()
+        .and_then(|v| v.branch)
+        .unwrap_or_else(|| auto_branch.clone());
+
+    let call_id = user_call_id.unwrap_or_else(|| format!("py-{}", uuid::Uuid::new_v4()));
+    let cseq_str = user_cseq.unwrap_or_else(|| format!("1 {}", sip_method.as_str()));
+
+    let mut builder = SipMessageBuilder::new()
+        .request(sip_method, uri)
+        .via(via_value)
+        .call_id(call_id)
+        .cseq(cseq_str);
+
+    // Max-Forwards is u8 in the builder; if the script supplied a
+    // non-numeric value, fall through to the default rather than
+    // erroring — header() preserves the raw string for parsers that
+    // accept extension forms.
+    builder = match user_max_forwards
+        .as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<u8>().ok())
+    {
+        Some(max) => builder.max_forwards(max),
+        None => match user_max_forwards {
+            Some(raw) => builder.set_header("Max-Forwards", raw),
+            None => builder.max_forwards(70),
+        },
+    };
+
+    for (name, val) in other_headers {
+        builder = builder.header(&name, val);
     }
 
     // Set body if provided — accept str or bytes.  body_str() / body() each
@@ -884,6 +939,140 @@ mod tests {
 
             assert_eq!(message.headers.content_length(), Some(body.len()));
             assert_eq!(message.body, body.as_bytes());
+        });
+    }
+
+    /// USSD-AS / TS 24.390 §5.3 reuses the original SUBSCRIBE Call-ID on
+    /// the response NOTIFY so the UE can correlate.  When the script
+    /// supplies `headers={"Call-ID": "<original>"}`, the wire output must
+    /// carry exactly one Call-ID — duplicate Call-IDs cause SIPp / strict
+    /// UAS impls to keep the first (auto-generated `py-…`) and discard
+    /// the script value, breaking dialog correlation.
+    #[test]
+    fn send_request_user_call_id_replaces_auto_value() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("Call-ID", "ussd-original-call-id").unwrap();
+
+            let (message, _branch) = build_send_request_message(
+                "MESSAGE",
+                target_uri(),
+                Transport::Udp,
+                destination(),
+                Some(&headers),
+                None,
+            )
+            .expect("build_send_request_message");
+
+            let call_ids = message
+                .headers
+                .get_all("Call-ID")
+                .expect("Call-ID must be present");
+            assert_eq!(
+                call_ids.len(),
+                1,
+                "user-supplied Call-ID must replace auto-generated, got {call_ids:?}"
+            );
+            assert_eq!(call_ids[0], "ussd-original-call-id");
+            // No stale auto-generated Call-ID anywhere on the wire.
+            let wire = String::from_utf8_lossy(&message.to_bytes()).into_owned();
+            assert!(
+                !wire.contains("Call-ID: py-"),
+                "wire output must not carry auto-generated py- Call-ID alongside user value:\n{wire}"
+            );
+        });
+    }
+
+    /// CSeq is single-value (RFC 3261 §7.3.1).  A script-supplied CSeq
+    /// must replace the auto-generated `1 <method>` value, not stack on
+    /// top of it.
+    #[test]
+    fn send_request_user_cseq_replaces_auto_value() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("CSeq", "42 MESSAGE").unwrap();
+
+            let (message, _branch) = build_send_request_message(
+                "MESSAGE",
+                target_uri(),
+                Transport::Udp,
+                destination(),
+                Some(&headers),
+                None,
+            )
+            .expect("build_send_request_message");
+
+            let cseqs = message.headers.get_all("CSeq").expect("CSeq must be present");
+            assert_eq!(cseqs.len(), 1, "CSeq must be unique, got {cseqs:?}");
+            assert_eq!(cseqs[0], "42 MESSAGE");
+        });
+    }
+
+    /// Max-Forwards is single-value.  Script override must replace, not
+    /// duplicate, the default 70.
+    #[test]
+    fn send_request_user_max_forwards_replaces_auto_value() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("Max-Forwards", "5").unwrap();
+
+            let (message, _branch) = build_send_request_message(
+                "OPTIONS",
+                target_uri(),
+                Transport::Udp,
+                destination(),
+                Some(&headers),
+                None,
+            )
+            .expect("build_send_request_message");
+
+            let mf = message
+                .headers
+                .get_all("Max-Forwards")
+                .expect("Max-Forwards must be present");
+            assert_eq!(mf.len(), 1, "Max-Forwards must be unique, got {mf:?}");
+            assert_eq!(mf[0], "5");
+        });
+    }
+
+    /// Script-supplied Via must replace the auto-generated UAC Via, and
+    /// the branch returned to the caller must be parsed from the user
+    /// value so response correlation can still be wired up by the UAC.
+    #[test]
+    fn send_request_user_via_replaces_auto_and_branch_is_extracted() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers
+                .set_item(
+                    "Via",
+                    "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-uac-script-supplied",
+                )
+                .unwrap();
+
+            let (message, branch) = build_send_request_message(
+                "MESSAGE",
+                target_uri(),
+                Transport::Udp,
+                destination(),
+                Some(&headers),
+                None,
+            )
+            .expect("build_send_request_message");
+
+            let vias = message.headers.get_all("Via").expect("Via must be present");
+            assert_eq!(vias.len(), 1, "Via must be a single value, got {vias:?}");
+            assert!(
+                vias[0].contains("branch=z9hG4bK-uac-script-supplied"),
+                "Via must carry script-supplied branch, got {vias:?}"
+            );
+            assert_eq!(
+                branch, "z9hG4bK-uac-script-supplied",
+                "returned branch must come from the user-supplied Via"
+            );
         });
     }
 
