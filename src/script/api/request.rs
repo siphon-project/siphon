@@ -362,6 +362,51 @@ impl PyRequest {
         self.transport_name.clone()
     }
 
+    /// Candidate dialog keys for the Rf CDR auto-stamp lookup.
+    ///
+    /// Returns up to two `<Call-ID>\0<tag>` strings — first the
+    /// caller's tag (matches the originating S-CSCF / proxy
+    /// ACR-START), then the callee's tag (matches the callee-initiated
+    /// BYE).  Empty when the message has no Call-ID.  The CDR API
+    /// stamps the first match.
+    pub fn cdr_rf_dialog_key_candidates(&self) -> Vec<String> {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "lock poisoned in cdr_rf_dialog_key_candidates, using poisoned guard"
+                );
+                poisoned.into_inner()
+            }
+        };
+        let Some(call_id) = message.headers.call_id() else {
+            return Vec::new();
+        };
+        let from_tag = message
+            .headers
+            .from()
+            .and_then(|v| NameAddr::parse(v).ok())
+            .and_then(|na| na.tag);
+        let to_tag = message
+            .headers
+            .to()
+            .and_then(|v| NameAddr::parse(v).ok())
+            .and_then(|na| na.tag);
+
+        let mut keys = Vec::with_capacity(2);
+        if let Some(tag) = from_tag.as_deref() {
+            keys.push(format!("{}\0{}", call_id, tag));
+        }
+        if let Some(tag) = to_tag.as_deref() {
+            // Skip the duplicate when From-tag == To-tag (rare but
+            // possible on early-dialog edge cases).
+            if from_tag.as_deref() != Some(tag) {
+                keys.push(format!("{}\0{}", call_id, tag));
+            }
+        }
+        keys
+    }
+
     // --- LI helper accessors (Rust-side, no PyResult) ---
 
     /// SIP method for LI.

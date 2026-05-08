@@ -37,6 +37,13 @@ impl PyCdrNamespace {
     ///
     /// Returns:
     ///     True if the CDR was queued, False if CDR system is not enabled or channel is full.
+    ///
+    /// **Rf auto-stamp:** when an Rf accounting session is currently
+    /// tracked for this SIP dialog (proxy or B2BUA auto-emit hooks),
+    /// the resulting CDR is automatically annotated with
+    /// `rf_session_id` and `rf_result_code` so operators can correlate
+    /// billing with the corresponding Diameter accounting record.
+    /// Manual `extra={"rf_session_id": ...}` values take precedence.
     #[pyo3(signature = (request, extra=None))]
     fn write(&self, request: &super::request::PyRequest, extra: Option<&Bound<'_, PyDict>>) -> bool {
         if !cdr::is_enabled() {
@@ -52,6 +59,24 @@ impl PyCdrNamespace {
             request.cdr_source_ip(),
             request.cdr_transport(),
         );
+
+        // Auto-stamp Rf correlation when a session is tracked for this
+        // dialog.  Tries the caller's tag first (proxy ACR-START stored
+        // it under <Call-ID>\0<From-tag>); falls back to the callee's
+        // tag for callee-initiated BYE flows.  Manual `extra` overrides
+        // below, so scripts can still set explicit values.
+        let dialog_keys = request.cdr_rf_dialog_key_candidates();
+        for key in &dialog_keys {
+            if let Some((session_id, result_code)) =
+                crate::diameter::rf_service::lookup_rf_for_dialog(key)
+            {
+                record = record.with_rf_session_id(session_id);
+                if let Some(rc) = result_code {
+                    record = record.with_rf_result_code(rc);
+                }
+                break;
+            }
+        }
 
         if let Some(extra_dict) = extra {
             for (key, value) in extra_dict.iter() {

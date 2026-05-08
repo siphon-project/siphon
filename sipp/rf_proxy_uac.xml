@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Rf offline-charging proxy-mode UAC scenario (3GPP TS 32.299 / TS 32.260).
+
+  Drives siphon's proxy-mode Rf auto-emit pipeline end-to-end:
+    INVITE → 100/180 → 200 OK → ACK → BYE → 200 OK
+
+  When `rf:` is enabled in siphon.yaml and a Diameter peer is connected,
+  this scenario causes siphon to emit:
+    ACR-START on the 2xx-forward of the INVITE
+    ACR-INTERIM if rf.interim_interval_secs > 0 and the call is held long
+                enough to tick (default scenario only holds 1s — bump
+                pause if you want to exercise INTERIM)
+    ACR-STOP   on inbound BYE, with Termination-Cause = DIAMETER_LOGOUT(1)
+
+  Pair this with a UAS (e.g. invite_uas.xml) and a Diameter CDF.  The
+  expected ACR AVP set for an originating INVITE on an S-CSCF:
+    - Session-Id
+    - Origin-Host / Origin-Realm / Destination-Realm
+    - Acct-Application-Id = 3
+    - Service-Context-Id  = "32260@3gpp.org"
+    - Accounting-Record-Type / -Number
+    - Event-Timestamp
+    - User-Name (calling party SIP URI)
+    - Service-Information → IMS-Information:
+        Role-of-Node              (0 = ORIGINATING_ROLE)
+        Node-Functionality        (per rf.node_functionality, 0 = S-CSCF)
+        User-Session-Id           (= SIP Call-ID)
+        Calling-Party-Address     (P-Asserted-Identity / From URI)
+        Called-Party-Address      (To URI)
+        Time-Stamps               (SIP-Request-Timestamp + Response)
+        Inter-Operator-Identifier (when P-Charging-Vector carries IOIs)
+        IMS-Charging-Identifier   (P-Charging-Vector ICID)
+        IMS-Visited-Network-Identifier (when roaming, from P-Visited-Network-ID)
+
+  Verify with: `tshark -i lo -d tcp.port==3868,diameter`.
+-->
+<scenario name="Rf proxy-mode UAC (TS 32.299)">
+
+  <!-- Send INVITE with full IMS charging headers so siphon has data
+       to populate every IMS-Information sub-AVP. -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+P-Asserted-Identity: <sip:alice@[remote_ip]>
+P-Charging-Vector: icid-value=icid-rf-test-[call_number];orig-ioi=home1.net;icid-generated-at=[local_ip]
+P-Visited-Network-ID: visited.example.com
+User-Agent: SIPp/siphon-rf-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <label id="1" />
+  <recv response="180" optional="true" next="1" />
+
+  <!-- 200 OK on this branch triggers ACR-START in siphon's proxy hook. -->
+  <recv response="200" rtd="true" crlf="true" rrs="true" />
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Hold the call for 2 seconds.  Bump to >= rf.interim_interval_secs
+       to exercise ACR-INTERIM ticking. -->
+  <pause milliseconds="2000" />
+
+  <!-- BYE triggers ACR-STOP in siphon's proxy hook with
+       Termination-Cause = DIAMETER_LOGOUT(1) and Cause-Code = 0. -->
+  <send retrans="500">
+    <![CDATA[
+BYE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

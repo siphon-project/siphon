@@ -1,0 +1,77 @@
+# siphon.rf-test.yaml — Rf offline-charging functional-test config
+#
+# Pair with: sipp/rf_proxy_uac.xml + invite_uas.xml + a Diameter CDF
+#            listening on 127.0.0.1:3868.
+#
+# What this exercises end-to-end:
+#   - INVITE → 200 OK forwarding triggers ACR-START
+#   - In-dialog BYE triggers ACR-STOP (Termination-Cause = DIAMETER_LOGOUT)
+#   - When `interim_interval_secs > 0` and the call is held longer than
+#     one tick, ACR-INTERIM fires periodically
+#   - CDR records emitted by `cdr.write(request)` from a script handler
+#     are auto-stamped with `rf_session_id` and `rf_result_code`
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/proxy_default.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+# Diameter CDF peer.  Replace `host:` / `port:` with your CDF's address.
+# The mock used during local development can be any RFC 6733 listener
+# that responds 2001 to ACR.
+diameter:
+  origin_host: "scscf.siphon.test"
+  origin_realm: "siphon.test"
+  peers:
+    - name: "cdf1"
+      host: "127.0.0.1"
+      port: 3868
+      destination_realm: "siphon.test"
+  routes:
+    - application: rf
+      peers: ["cdf1"]
+
+# Rf offline charging (3GPP TS 32.299).
+rf:
+  enabled: true
+  auto_emit_proxy: true
+  auto_emit_b2bua: true
+  auto_emit_register: true
+  interim_interval_secs: 0           # set to e.g. 60 to exercise ACR-INTERIM
+  node_functionality: scscf
+  service_context_id: "32260@3gpp.org"
+  peer: cdf1
+
+# Optional CDR pipeline so the auto-stamped rf_session_id / rf_result_code
+# are observable in the file/syslog/HTTP backends.
+cdr:
+  enabled: true
+  backend: file
+  file:
+    path: "/tmp/siphon-rf-test-cdr.jsonl"
+    rotate_size_mb: 100
+
+log:
+  level: debug
+  format: pretty

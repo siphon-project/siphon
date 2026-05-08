@@ -441,6 +441,19 @@ pub async fn run(
     let _ = drain.transaction_manager.set(Arc::clone(&state.transaction_manager));
     let _ = drain.call_actors.set(Arc::clone(&state.call_actors));
 
+    // Install the rf_sessions lookup so the CDR Python API can
+    // auto-stamp `rf_session_id` / `rf_result_code` on every CDR
+    // emitted while an Rf session is active for the SIP dialog.
+    {
+        let rf_sessions = Arc::clone(&state.rf_sessions);
+        crate::diameter::rf_service::install_rf_lookup(Arc::new(move |dialog_key: &str| {
+            rf_sessions.get(dialog_key).map(|entry| {
+                let session = entry.value().rf_session();
+                (session.session_id().to_string(), session.last_result_code())
+            })
+        }));
+    }
+
     // Spawn background task: fire transaction timers + sweep stale entries
     {
         let state = Arc::clone(&state);
@@ -4692,6 +4705,14 @@ fn rf_local_uri_predicate(local_domains: &Arc<Vec<String>>) -> impl Fn(&str) -> 
 /// the original method wasn't INVITE.  The handle returned by the CDF
 /// is stored in `state.rf_sessions` keyed by dialog key so the
 /// matching BYE can find and STOP it.
+///
+/// **Intra-S-CSCF dual-ACR (TS 32.260 §5.1):** when both the calling
+/// and called parties are locally-served identities, the S-CSCF emits
+/// two independent ACR sequences — one with `ORIGINATING_ROLE` on
+/// behalf of the calling user, one with `TERMINATING_ROLE` on behalf
+/// of the called user.  Each sequence has its own Session-Id and
+/// Record-Number; they're stored under disjoint keys
+/// (`<dialog>` and `term:<dialog>`) so the BYE handler can stop both.
 fn spawn_rf_proxy_start_if_invite(
     state: &DispatcherState,
     server_key: &TransactionKey,
@@ -4717,12 +4738,68 @@ fn spawn_rf_proxy_start_if_invite(
     let ims_data = crate::diameter::rf_service::ims_data_from_request(
         original_request,
         charger.node_functionality(),
-        local_predicate,
+        &local_predicate,
     );
+
+    // Intra-S-CSCF detection: is the called party also locally served?
+    // When yes (and node is configured as S-CSCF), TS 32.260 §5.1 says
+    // we must emit a second ACR with TERMINATING_ROLE on behalf of the
+    // called user.  For other node roles (P-CSCF / AS / BGCF / …) only
+    // the originating record is generated — those nodes don't take on
+    // dual-role even when both users happen to be in the same realm.
+    let term_user_name = ims_data
+        .called_party
+        .as_deref()
+        .filter(|uri| local_predicate(uri))
+        .filter(|_| {
+            charger.node_functionality()
+                == Some(crate::diameter::ro::NodeFunctionality::SCscf)
+        })
+        .map(str::to_owned);
+
     let user_name = ims_data.calling_party.clone();
     let rf_sessions = Arc::clone(&state.rf_sessions);
+
+    if let Some(term_user) = term_user_name {
+        // Dual-ACR: spawn the originating record with the existing
+        // ims_data (Role=ORIGINATING) AND a parallel terminating
+        // record with Role=TERMINATING and User-Name = called party.
+        let term_dialog_key = format!("term:{}", dialog_key);
+        let mut ims_term = ims_data.clone();
+        ims_term.role_of_node = Some(crate::diameter::ro::NodeRole::TerminatingRole);
+        let charger_term = Arc::clone(&charger);
+        let rf_sessions_term = Arc::clone(&rf_sessions);
+        let term_user_for_record = term_user.clone();
+        tokio::spawn(async move {
+            let session = match charger_term
+                .acr_start(ims_term.clone(), Some(term_user_for_record.clone()))
+                .await
+            {
+                Some(s) => s,
+                None => return,
+            };
+            rf_sessions_term.insert(
+                term_dialog_key,
+                ProxyRfState {
+                    session,
+                    ims_data: ims_term,
+                    user_name: Some(term_user_for_record),
+                },
+            );
+        });
+    }
+
+    // Originating record (single-ACR mode emits this only; dual-ACR
+    // mode emits this in addition to the terminating record above).
+    let mut ims_orig = ims_data;
+    if ims_orig.role_of_node.is_none() {
+        ims_orig.role_of_node = Some(crate::diameter::ro::NodeRole::OriginatingRole);
+    }
     tokio::spawn(async move {
-        let session = match charger.acr_start(ims_data.clone(), user_name.clone()).await {
+        let session = match charger
+            .acr_start(ims_orig.clone(), user_name.clone())
+            .await
+        {
             Some(s) => s,
             None => return,
         };
@@ -4730,7 +4807,7 @@ fn spawn_rf_proxy_start_if_invite(
             dialog_key,
             ProxyRfState {
                 session,
-                ims_data,
+                ims_data: ims_orig,
                 user_name,
             },
         );
@@ -4739,6 +4816,19 @@ fn spawn_rf_proxy_start_if_invite(
 
 /// Spawn ACR-STOP for the dialog this BYE belongs to.  No-op when no
 /// matching Rf session is tracked.
+///
+/// Also handles intra-S-CSCF dual-ACR (TS 32.260 §5.1): when an
+/// ORIGINATING record is present, the matching TERMINATING record is
+/// stopped in parallel.
+///
+/// Entries are removed from `rf_sessions` **after** ACR-STOP completes
+/// rather than at BYE arrival.  This keeps the entry visible to
+/// `cdr.write()` calls from the script's `@proxy.on_request` handler
+/// for the BYE so the CDR can be auto-stamped with `rf_session_id` /
+/// `rf_result_code` (see `crate::diameter::rf_service::lookup_rf_for_dialog`).
+/// Idempotency is enforced inside [`RfChargingService::acr_stop`] —
+/// duplicate BYE retransmits short-circuit without re-emitting on the
+/// wire.
 fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
     let charger = match state.rf_charger.as_ref() {
         Some(c) if c.auto_emit_proxy() => Arc::clone(c),
@@ -4751,23 +4841,31 @@ fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
     // BYE may flow in either direction — try the dialog key as-is
     // first (caller-initiated BYE matches our INVITE's From-tag) and
     // fall back to swapping From/To tags (callee-initiated BYE).
-    let removed = state
-        .rf_sessions
-        .remove(&direct_key)
-        .or_else(|| {
-            let to_tag = bye
-                .typed_to()
-                .ok()
-                .flatten()
-                .and_then(|na| na.tag)?;
-            let call_id = bye.headers.get("Call-ID")?;
-            let swapped = format!("{}\0{}", call_id, to_tag);
-            state.rf_sessions.remove(&swapped)
-        });
-    let entry = match removed {
-        Some((_, e)) => e,
-        None => return,
+    // Use `get` instead of `remove` so the script's CDR write that
+    // follows can still see the rf_session for auto-stamping.
+    let (orig_key, found) = if state.rf_sessions.contains_key(&direct_key) {
+        (direct_key, true)
+    } else {
+        let swapped_key = bye
+            .typed_to()
+            .ok()
+            .flatten()
+            .and_then(|na| na.tag)
+            .and_then(|to_tag| {
+                let call_id = bye.headers.get("Call-ID")?;
+                Some(format!("{}\0{}", call_id, to_tag))
+            });
+        match swapped_key {
+            Some(k) => {
+                let exists = state.rf_sessions.contains_key(&k);
+                (k, exists)
+            }
+            None => return,
+        }
     };
+    if !found {
+        return;
+    }
 
     // Pick up the Reason header if present (RFC 3326) — maps SIP cause
     // through to IMS-Information Cause-Code per TS 32.299 §5.2.5.
@@ -4783,27 +4881,46 @@ fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
                 .and_then(|v| v.parse::<u16>().ok())
         })
         .and_then(crate::diameter::rf::sip_status_to_cause_code);
+    let response_timestamp = std::time::SystemTime::now();
 
-    let mut ims_data = entry.ims_data;
-    ims_data.sip_method = Some("BYE".to_string());
-    if cause_code.is_some() {
-        ims_data.cause_code = cause_code;
-    } else {
-        // Default: clean termination.  TS 32.299 §5.2.5: 0 == success.
-        ims_data.cause_code = Some(0);
+    let stop_one =
+        |key: String, charger: Arc<crate::diameter::rf_service::RfChargingService>| {
+            let rf_sessions = Arc::clone(&state.rf_sessions);
+            tokio::spawn(async move {
+                // Snapshot the entry without removing it so concurrent
+                // CDR-stamp lookups still resolve while we await the
+                // ACR-STOP round-trip.
+                let snapshot = rf_sessions.get(&key).map(|entry| {
+                    let v = entry.value();
+                    (v.session.clone(), v.ims_data.clone(), v.user_name.clone())
+                });
+                let Some((session, mut ims_data, user_name)) = snapshot else {
+                    return;
+                };
+                ims_data.sip_method = Some("BYE".to_string());
+                ims_data.cause_code = cause_code.or(Some(0));
+                ims_data.response_timestamp = Some(response_timestamp);
+                charger
+                    .acr_stop(
+                        &session,
+                        ims_data,
+                        user_name,
+                        crate::diameter::rf::termination_cause::DIAMETER_LOGOUT,
+                    )
+                    .await;
+                // ACR-STOP is committed; the CDR-correlation window is
+                // now closed.  Drop the entry.
+                rf_sessions.remove(&key);
+            });
+        };
+
+    stop_one(orig_key.clone(), Arc::clone(&charger));
+
+    // Intra-S-CSCF dual-ACR teardown.
+    let term_key = format!("term:{}", orig_key);
+    if state.rf_sessions.contains_key(&term_key) {
+        stop_one(term_key, charger);
     }
-    ims_data.response_timestamp = Some(std::time::SystemTime::now());
-
-    tokio::spawn(async move {
-        charger
-            .acr_stop(
-                &entry.session,
-                ims_data,
-                entry.user_name,
-                crate::diameter::rf::termination_cause::DIAMETER_LOGOUT,
-            )
-            .await;
-    });
 }
 
 /// Spawn ACR-START for a B2BUA call when the A-leg INVITE has been
@@ -4864,6 +4981,11 @@ fn spawn_rf_b2bua_start(
 /// Spawn ACR-STOP for a B2BUA call when its BYE arrives.  Picks up an
 /// optional RFC 3326 `Reason:` header for IMS Cause-Code mapping.
 /// Termination-Cause defaults to `DIAMETER_LOGOUT(1)`.
+///
+/// Removal from `rf_sessions` is deferred until after ACR-STOP
+/// completes so script-driven `cdr.write()` calls still see the
+/// rf_session for auto-stamping.  See [`spawn_rf_proxy_stop_if_tracked`]
+/// for the full rationale.
 fn spawn_rf_b2bua_stop(
     state: &DispatcherState,
     internal_call_id: &str,
@@ -4874,10 +4996,9 @@ fn spawn_rf_b2bua_stop(
         _ => return,
     };
     let key = rf_b2bua_key(internal_call_id);
-    let entry = match state.rf_sessions.remove(&key) {
-        Some((_, e)) => e,
-        None => return,
-    };
+    if !state.rf_sessions.contains_key(&key) {
+        return;
+    }
 
     let cause_code = bye
         .headers
@@ -4890,21 +5011,29 @@ fn spawn_rf_b2bua_stop(
                 .and_then(|v| v.parse::<u16>().ok())
         })
         .and_then(crate::diameter::rf::sip_status_to_cause_code);
+    let response_timestamp = std::time::SystemTime::now();
 
-    let mut ims_data = entry.ims_data;
-    ims_data.sip_method = Some("BYE".to_string());
-    ims_data.cause_code = cause_code.or(Some(0));
-    ims_data.response_timestamp = Some(std::time::SystemTime::now());
-
+    let rf_sessions = Arc::clone(&state.rf_sessions);
     tokio::spawn(async move {
+        let snapshot = rf_sessions.get(&key).map(|entry| {
+            let v = entry.value();
+            (v.session.clone(), v.ims_data.clone(), v.user_name.clone())
+        });
+        let Some((session, mut ims_data, user_name)) = snapshot else {
+            return;
+        };
+        ims_data.sip_method = Some("BYE".to_string());
+        ims_data.cause_code = cause_code.or(Some(0));
+        ims_data.response_timestamp = Some(response_timestamp);
         charger
             .acr_stop(
-                &entry.session,
+                &session,
                 ims_data,
-                entry.user_name,
+                user_name,
                 crate::diameter::rf::termination_cause::DIAMETER_LOGOUT,
             )
             .await;
+        rf_sessions.remove(&key);
     });
 }
 

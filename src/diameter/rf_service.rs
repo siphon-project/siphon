@@ -16,7 +16,7 @@
 //!   negotiates an `Acct-Interim-Interval` in ACA-START.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use tokio::sync::Mutex;
@@ -389,6 +389,44 @@ impl RfChargingService {
         });
         *session.inner.interim_handle.lock().await = Some(handle);
     }
+}
+
+// ── CDR auto-stamp registry ──────────────────────────────────────────
+//
+// The proxy/B2BUA auto-emit hooks live in src/dispatcher.rs and own
+// the per-dialog rf_sessions DashMap.  The CDR Python API
+// (src/script/api/cdr.rs) needs to read from that map to stamp
+// `rf_session_id` / `rf_result_code` onto CDRs at write time.  Rather
+// than threading the dispatcher state into the CDR module (which
+// would create a cycle), the dispatcher installs a closure here at
+// startup; the CDR module calls [`lookup_rf_for_dialog`] without
+// caring how the lookup is implemented.
+
+type RfLookup =
+    Arc<dyn Fn(&str) -> Option<(String, Option<u32>)> + Send + Sync + 'static>;
+
+static RF_LOOKUP: OnceLock<RfLookup> = OnceLock::new();
+
+/// Install the dispatcher's per-dialog rf_session lookup.  Idempotent
+/// (subsequent calls are silently ignored — the dispatcher only runs
+/// once per process).
+pub fn install_rf_lookup(lookup: RfLookup) {
+    let _ = RF_LOOKUP.set(lookup);
+}
+
+/// Look up a tracked Rf session by SIP dialog key.  Returns
+/// `(session_id, last_result_code)` when a session is present,
+/// otherwise `None`.  Used by the CDR Python API to auto-stamp
+/// records with the corresponding Rf accounting Session-Id +
+/// Result-Code so operators can correlate billing with their existing
+/// CDR pipeline.
+///
+/// `dialog_key` matches the format used by `ProxySessionStore`:
+/// `<Call-ID>\0<From-tag>` for proxy mode.  The CDR API tries the
+/// caller's tag first and falls back to the callee's tag for
+/// callee-initiated BYEs.
+pub fn lookup_rf_for_dialog(dialog_key: &str) -> Option<(String, Option<u32>)> {
+    RF_LOOKUP.get().and_then(|f| f(dialog_key))
 }
 
 /// Convenience: derive the [`Termination-Cause`](termination_cause)
