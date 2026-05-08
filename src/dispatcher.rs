@@ -5811,14 +5811,33 @@ fn handle_b2bua_invite(
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
         }
-        CallAction::Dial { target, timeout: _ } => {
-            debug!(call_id = %call_id, target = %target, "B2BUA: dialling B-leg");
-            b2bua_send_b_leg_invite(&call_id, &target, &message_guard, &inbound, state);
+        CallAction::Dial { target, next_hop, timeout: _ } => {
+            debug!(
+                call_id = %call_id,
+                target = %target,
+                next_hop = ?next_hop,
+                "B2BUA: dialling B-leg",
+            );
+            b2bua_send_b_leg_invite(
+                &call_id,
+                &target,
+                next_hop.as_deref(),
+                &message_guard,
+                &inbound,
+                state,
+            );
         }
         CallAction::Fork { targets, strategy: _, timeout: _ } => {
             debug!(call_id = %call_id, targets = ?targets, "B2BUA: forking B-legs");
             for target in &targets {
-                b2bua_send_b_leg_invite(&call_id, target, &message_guard, &inbound, state);
+                b2bua_send_b_leg_invite(
+                    &call_id,
+                    target,
+                    None,
+                    &message_guard,
+                    &inbound,
+                    state,
+                );
             }
         }
         CallAction::Terminate => {
@@ -5852,17 +5871,33 @@ fn handle_b2bua_invite(
 }
 
 /// Send a B-leg INVITE for a B2BUA call.
+///
+/// `target_uri` drives the new INVITE's R-URI (so the called party's IMPU
+/// shape is preserved on the wire).  `next_hop`, when set, is used for the
+/// wire destination instead of `target_uri` — IMS edge use-case where the
+/// R-URI must carry the canonical home-domain IMPU but the message has to
+/// be routed via a fixed next-hop (BGCF, I-CSCF, outbound proxy, …).
 fn b2bua_send_b_leg_invite(
     call_id: &str,
     target_uri: &str,
+    next_hop: Option<&str>,
     original_request: &SipMessage,
     _inbound: &InboundMessage,
     state: &DispatcherState,
 ) {
-    let relay_target = match resolve_target(target_uri, &state.dns_resolver) {
+    // Resolve the wire destination from next_hop when set, else from target.
+    // R-URI construction below still uses target_uri unconditionally — this
+    // is the whole point of the split.
+    let routing_uri = next_hop.unwrap_or(target_uri);
+    let relay_target = match resolve_target(routing_uri, &state.dns_resolver) {
         Some(t) => t,
         None => {
-            warn!(call_id = %call_id, target = %target_uri, "B2BUA: cannot resolve target");
+            warn!(
+                call_id = %call_id,
+                target = %target_uri,
+                next_hop = ?next_hop,
+                "B2BUA: cannot resolve destination",
+            );
             return;
         }
     };

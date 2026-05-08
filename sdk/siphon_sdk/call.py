@@ -197,21 +197,37 @@ class Call:
             extras={"body": body, "content_type": content_type},
         ))
 
-    def dial(self, uri: str, timeout: int = 30) -> None:
+    def dial(
+        self,
+        uri: str,
+        timeout: int = 30,
+        next_hop: Optional[str] = None,
+    ) -> None:
         """Dial a single B-leg target.
 
         Args:
-            uri: Destination SIP URI.
+            uri: Destination SIP URI — drives the B-leg R-URI.
             timeout: INVITE timeout in seconds.
+            next_hop: Optional routing destination.  When set, the new
+                INVITE's R-URI is still built from ``uri`` (so the called
+                party / IMPU shape is preserved), but the message is sent
+                to ``next_hop``.  Mirrors ``proxy.send_request(next_hop=...)``.
 
         Example::
 
             call.dial("sip:bob@10.0.0.2:5060", timeout=30)
+
+            # IMS edge: stamp canonical IMPU on R-URI, route via I-CSCF.
+            call.dial(
+                "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
+                next_hop="sip:172.16.0.111:4060",
+            )
         """
         self._actions.append(Action(
             kind="dial",
             targets=[uri],
             timeout=timeout,
+            next_hop=next_hop,
         ))
 
     def fork(

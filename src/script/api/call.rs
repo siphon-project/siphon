@@ -28,6 +28,11 @@ pub enum CallAction {
     /// Dial a single B-leg target.
     Dial {
         target: String,
+        /// When set, used as the routing destination instead of `target`.
+        /// `target` continues to drive the B-leg R-URI (so scripts can keep
+        /// the IMPU shape on R-URI while routing through a fixed next-hop —
+        /// IMS BGCF/I-CSCF, outbound proxy, edge-NAT bridge, etc.).
+        next_hop: Option<String>,
         timeout: u32,
     },
     /// Fork to multiple targets.
@@ -508,10 +513,23 @@ impl PyCall {
     }
 
     /// Dial a single target (simple B-leg).
-    #[pyo3(signature = (uri, timeout=30))]
-    fn dial(&mut self, uri: &str, timeout: u32) {
+    ///
+    /// `next_hop` (optional) decouples R-URI construction from routing:
+    /// the new INVITE's R-URI is still built from `uri` (so the IMPU shape
+    /// is preserved), but the message is sent to `next_hop`.  Mirrors the
+    /// `next_hop` parameter on `proxy.send_request`.
+    ///
+    /// Example:
+    ///     # IMS edge: stamp canonical IMPU on R-URI, route via I-CSCF.
+    ///     call.dial(
+    ///         f"sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
+    ///         next_hop="sip:172.16.0.111:4060",
+    ///     )
+    #[pyo3(signature = (uri, timeout=30, next_hop=None))]
+    fn dial(&mut self, uri: &str, timeout: u32, next_hop: Option<&str>) {
         self.action = CallAction::Dial {
             target: uri.to_string(),
+            next_hop: next_hop.map(String::from),
             timeout,
         };
     }
@@ -705,11 +723,31 @@ mod tests {
     fn call_dial() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
-        call.dial("sip:bob@10.0.0.2:5060", 30);
+        call.dial("sip:bob@10.0.0.2:5060", 30, None);
         assert_eq!(
             call.action(),
             &CallAction::Dial {
                 target: "sip:bob@10.0.0.2:5060".to_string(),
+                next_hop: None,
+                timeout: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn call_dial_next_hop() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.dial(
+            "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
+            30,
+            Some("sip:172.16.0.111:4060"),
+        );
+        assert_eq!(
+            call.action(),
+            &CallAction::Dial {
+                target: "sip:5112@ims.mnc088.mcc204.3gppnetwork.org".to_string(),
+                next_hop: Some("sip:172.16.0.111:4060".to_string()),
                 timeout: 30,
             }
         );

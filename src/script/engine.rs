@@ -1317,9 +1317,89 @@ def new_call(call):
                 action,
                 &crate::script::api::call::CallAction::Dial {
                     target: "sip:bob@10.0.0.2:5060".to_string(),
+                    next_hop: None,
                     timeout: 30,
                 }
             );
+        });
+    }
+
+    #[test]
+    fn b2bua_dial_next_hop_decouples_ruri_from_routing() {
+        // IMS BGCF use case: stamp the canonical home-domain IMPU on the
+        // R-URI of the B-leg INVITE (so the receiving S-CSCF's alias-chain
+        // lookup hits), but route the message to a fixed I-CSCF next-hop.
+        // Pre-fix: the wire destination was always derived from `target`,
+        // so scripts had to put the I-CSCF host in the R-URI and lose the
+        // IMPU shape — registrar.lookup() then missed.
+        use crate::script::api::call::{CallAction, PyCall};
+        use crate::sip::builder::SipMessageBuilder;
+        use crate::sip::message::Method;
+        use crate::sip::parser::parse_uri_standalone;
+        use crate::sip::uri::SipUri;
+        use std::sync::{Arc, Mutex};
+
+        let source = r#"
+from siphon import b2bua
+
+@b2bua.on_invite
+def new_call(call):
+    call.dial(
+        "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
+        next_hop="sip:172.16.0.111:4060",
+    )
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+
+        let invite = SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("ims.mnc088.mcc204.3gppnetwork.org".to_string())
+                    .with_user("5112".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-bgcf-test".to_string())
+            .from("<sip:caller@pstn.example>;tag=bgcf-test".to_string())
+            .to("<sip:5112@ims.mnc088.mcc204.3gppnetwork.org>".to_string())
+            .call_id("bgcf-next-hop@test".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let py_call = PyCall::new(
+            "bgcf-test-001".to_string(),
+            Arc::new(Mutex::new(invite)),
+            "10.0.0.1".to_string(),
+        );
+
+        Python::attach(|python| {
+            let call_obj = Py::new(python, py_call).expect("failed to create PyCall");
+            let callable = state.handlers[0].callable.bind(python);
+            callable.call1((call_obj.bind(python),)).expect("handler invocation failed");
+
+            let borrowed = call_obj.borrow(python);
+            let action = borrowed.action();
+            let CallAction::Dial { target, next_hop, .. } = action else {
+                panic!("expected Dial action, got {action:?}");
+            };
+
+            // Contract 1: target drives the B-leg R-URI host (preserves IMPU shape).
+            let target_parsed = parse_uri_standalone(target)
+                .expect("target_uri must parse");
+            assert_eq!(target_parsed.host, "ims.mnc088.mcc204.3gppnetwork.org");
+            assert_eq!(target_parsed.user.as_deref(), Some("5112"));
+
+            // Contract 2: next_hop is what the dispatcher resolves for the wire
+            // destination — host = 172.16.0.111, port = 4060.
+            let next_hop_str = next_hop.as_deref()
+                .expect("next_hop must be set");
+            let next_hop_parsed = parse_uri_standalone(next_hop_str)
+                .expect("next_hop_uri must parse");
+            assert_eq!(next_hop_parsed.host, "172.16.0.111");
+            assert_eq!(next_hop_parsed.port, Some(4060));
+            assert!(next_hop_parsed.user.is_none(),
+                "next_hop is a routing destination, not a called party");
         });
     }
 
