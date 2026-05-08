@@ -15,9 +15,14 @@
 //!    ``ck=``/``ik=`` from any auth header and **strip them in place** so
 //!    they don't leak to the access side.  Returns an opaque
 //!    :class:`AuthVectorHandle`.
-//! 3. ``ipsec.allocate(av, offer, transform)`` — consume the AV, allocate
-//!    SPIs, install the four XFRM SAs and policies, return a
-//!    :class:`PendingSA`.
+//! 3. ``ipsec.allocate(av, offer, transform, protocol=…)`` — consume the
+//!    AV, allocate SPIs, install the four XFRM SAs and policies, return
+//!    a :class:`PendingSA`.  ``protocol`` selects the inner transport
+//!    pinned into the XFRM selector — ``"udp"`` (default, ESP-over-UDP)
+//!    or ``"tcp"`` (ESP-over-TCP, TS 33.203 §7.2).  Must match the
+//!    transport the UE used for the initial REGISTER, otherwise the
+//!    kernel selectors won't match the UE's protected frames and every
+//!    subsequent REGISTER arrives unprotected.
 //! 4. ``pending.security_server_params()`` — produce the
 //!    ``Security-Server`` parameters; the script formats and injects the
 //!    header on the relayed 401.
@@ -50,7 +55,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::IpsecConfig;
 use crate::ipsec::{
-    EncryptionAlgorithm, IntegrityAlgorithm, IpsecError, IpsecManager,
+    EncryptionAlgorithm, IntegrityAlgorithm, IpsecError, IpsecManager, SaProtocol,
     SecurityAssociationPair, SecurityClient,
 };
 
@@ -376,6 +381,9 @@ pub struct PySAHandle {
     alg: String,
     #[pyo3(get)]
     ealg: String,
+    /// Lower-case transport carrying ESP — ``"udp"`` or ``"tcp"``.
+    #[pyo3(get)]
+    protocol: String,
 }
 
 impl PySAHandle {
@@ -393,6 +401,7 @@ impl PySAHandle {
             spi_ps: sa.spi_ps,
             alg: format!("{}", sa.aalg),
             ealg: format!("{}", sa.ealg),
+            protocol: sa.protocol.as_str().to_string(),
         }
     }
 }
@@ -401,7 +410,7 @@ impl PySAHandle {
 impl PySAHandle {
     fn __repr__(&self) -> String {
         format!(
-            "SAHandle(ue={}:{}, pcscf={}:{}, spi_pc={}, spi_ps={}, alg={:?}, ealg={:?})",
+            "SAHandle(ue={}:{}, pcscf={}:{}, spi_pc={}, spi_ps={}, alg={:?}, ealg={:?}, protocol={:?})",
             self.ue_addr,
             self.ue_port_c,
             self.pcscf_addr,
@@ -410,6 +419,7 @@ impl PySAHandle {
             self.spi_ps,
             self.alg,
             self.ealg,
+            self.protocol,
         )
     }
 }
@@ -446,13 +456,20 @@ pub struct PySecurityServerParams {
     /// P-CSCF protected server port.
     #[pyo3(get)]
     pub port_s: u16,
+    /// Lower-case transport carrying ESP — ``"udp"`` or ``"tcp"``.
+    /// Mirrors the value passed to :func:`siphon.ipsec.allocate`.  When
+    /// non-default (``"tcp"``), append ``protocol=tcp`` to the
+    /// ``Security-Server`` header per RFC 3329 §2.2; UDP stays
+    /// parameterless to match the wire format every existing UE expects.
+    #[pyo3(get)]
+    pub protocol: String,
 }
 
 #[pymethods]
 impl PySecurityServerParams {
     fn __repr__(&self) -> String {
         format!(
-            "SecurityServerParams(mechanism={:?}, alg={:?}, ealg={:?}, spi_c={}, spi_s={}, port_c={}, port_s={})",
+            "SecurityServerParams(mechanism={:?}, alg={:?}, ealg={:?}, spi_c={}, spi_s={}, port_c={}, port_s={}, protocol={:?})",
             self.mechanism,
             self.alg,
             self.ealg,
@@ -460,6 +477,7 @@ impl PySecurityServerParams {
             self.spi_s,
             self.port_c,
             self.port_s,
+            self.protocol,
         )
     }
 }
@@ -766,11 +784,20 @@ impl PyIpsec {
     /// the script must allocate fresh SAs on re-REGISTER.  Default is
     /// ``None`` (no kernel-enforced expiry).
     ///
+    /// ``protocol`` selects the upper-layer transport carrying ESP —
+    /// ``"udp"`` (default, ESP-over-UDP, the common IMS deployment) or
+    /// ``"tcp"`` (ESP-over-TCP, TS 33.203 §7.2 — required for UEs that
+    /// performed initial REGISTER over TCP).  The XFRM selectors are
+    /// pinned to this protocol; a mismatch with the UE's actual transport
+    /// silently drops every protected frame.  Pass ``request.transport``
+    /// when negotiating against the originating REGISTER.
+    ///
     /// Raises :class:`ValueError` when ``av`` was already consumed, when
-    /// the chosen ``transform`` is not compatible with ``offer``, or when
-    /// ``offer.ue_addr`` is not a valid IP literal.
+    /// the chosen ``transform`` is not compatible with ``offer``, when
+    /// ``offer.ue_addr`` is not a valid IP literal, or when ``protocol``
+    /// is neither ``"udp"`` nor ``"tcp"``.
     /// Raises :class:`RuntimeError` on kernel/SPI failures.
-    #[pyo3(signature = (av, offer, transform, expires_secs=None))]
+    #[pyo3(signature = (av, offer, transform, expires_secs=None, protocol="udp"))]
     fn allocate<'py>(
         &self,
         python: Python<'py>,
@@ -778,6 +805,7 @@ impl PyIpsec {
         offer: PySecurityOffer,
         transform: PyTransform,
         expires_secs: Option<u64>,
+        protocol: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         if !transform.compatible_with(&offer) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -785,6 +813,15 @@ impl PyIpsec {
                 transform, offer.alg, offer.ealg
             )));
         }
+        let sa_protocol = match protocol.to_ascii_lowercase().as_str() {
+            "udp" => SaProtocol::Udp,
+            "tcp" => SaProtocol::Tcp,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "protocol must be 'udp' or 'tcp', got {other:?}"
+                )));
+            }
+        };
         let keys = av.borrow().take().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("AuthVectorHandle already consumed")
         })?;
@@ -833,6 +870,7 @@ impl PyIpsec {
                 encryption_key,
                 integrity_key,
                 hard_lifetime_secs: expires_secs,
+                protocol: sa_protocol,
             };
             manager
                 .create_sa_pair(sa.clone())
@@ -846,6 +884,7 @@ impl PyIpsec {
                 spi_s: spi_ps,
                 port_c: pcscf_port_c,
                 port_s: pcscf_port_s,
+                protocol: sa_protocol.as_str().to_string(),
             };
             let pending = PyPendingSA::new(manager, sa, params);
             Python::attach(|python| Py::new(python, pending))
@@ -1267,5 +1306,47 @@ mod tests {
     fn hex_encode_round_trip() {
         let bytes = [0x00u8, 0x01, 0xff, 0xab];
         assert_eq!(hex_encode(&bytes), "0001ffab");
+    }
+
+    #[test]
+    fn security_server_params_carries_protocol() {
+        let params = PySecurityServerParams {
+            mechanism: "ipsec-3gpp".into(),
+            alg: "hmac-sha-1-96".into(),
+            ealg: "null".into(),
+            spi_c: 10000,
+            spi_s: 10001,
+            port_c: 5064,
+            port_s: 5066,
+            protocol: "tcp".into(),
+        };
+        assert_eq!(params.protocol, "tcp");
+        let rendered = params.__repr__();
+        assert!(rendered.contains("protocol=\"tcp\""));
+    }
+
+    #[test]
+    fn sa_handle_reflects_security_association_protocol() {
+        let sa = SecurityAssociationPair {
+            ue_addr: "10.0.0.1".parse().unwrap(),
+            pcscf_addr: "10.0.0.10".parse().unwrap(),
+            ue_port_c: 50000,
+            ue_port_s: 50001,
+            pcscf_port_c: 5064,
+            pcscf_port_s: 5066,
+            spi_uc: 1000,
+            spi_us: 1001,
+            spi_pc: 10000,
+            spi_ps: 10001,
+            ealg: EncryptionAlgorithm::Null,
+            aalg: IntegrityAlgorithm::HmacSha1,
+            encryption_key: String::new(),
+            integrity_key: "deadbeef".into(),
+            hard_lifetime_secs: None,
+            protocol: SaProtocol::Tcp,
+        };
+        let handle = PySAHandle::from_sa(&sa);
+        assert_eq!(handle.protocol, "tcp");
+        assert!(handle.__repr__().contains("protocol=\"tcp\""));
     }
 }

@@ -143,18 +143,30 @@ async def _handle_401_register(request, reply):
     # up.  +60 s grace allows a re-REGISTER round-trip before expiry.
     expires_secs = (request.contact_expires or 600) + 60
 
+    # Pin the XFRM selectors to the SIP transport the UE used for the
+    # initial REGISTER.  TS 33.203 §7.2 allows both ESP-over-UDP (the
+    # common case) and ESP-over-TCP (TCP-first UEs); a mismatch silently
+    # drops every protected frame because the kernel selector won't bind.
+    sa_protocol = "tcp" if request.transport == "tcp" else "udp"
+
     try:
-        pending = await ipsec.allocate(av, chosen, transform, expires_secs=expires_secs)
+        pending = await ipsec.allocate(
+            av, chosen, transform,
+            expires_secs=expires_secs, protocol=sa_protocol,
+        )
     except (ValueError, RuntimeError) as exc:
         log.error(f"ipsec.allocate failed for {request.call_id}: {exc}")
         return
 
     params = pending.security_server_params()
+    # RFC 3329 §2.2: only emit `protocol=` when the UE didn't use the
+    # default UDP — keeps the wire format every existing UE expects.
+    proto_param = f"; protocol={params.protocol}" if params.protocol != "udp" else ""
     reply.set_header(
         "Security-Server",
         f"{params.mechanism}; alg={params.alg}; ealg={params.ealg}; "
         f"spi-c={params.spi_c}; spi-s={params.spi_s}; "
-        f"port-c={params.port_c}; port-s={params.port_s}",
+        f"port-c={params.port_c}; port-s={params.port_s}{proto_param}",
     )
 
     ipsec.stash(request.call_id, pending)

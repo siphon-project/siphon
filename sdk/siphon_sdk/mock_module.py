@@ -4097,7 +4097,8 @@ class MockSAHandle:
                  pcscf_port_c: int = 5064, pcscf_port_s: int = 5066,
                  spi_uc: int = 1000, spi_us: int = 1001,
                  spi_pc: int = 10000, spi_ps: int = 10001,
-                 alg: str = "HMAC-SHA-1-96", ealg: str = "NULL") -> None:
+                 alg: str = "HMAC-SHA-1-96", ealg: str = "NULL",
+                 protocol: str = "udp") -> None:
         self.ue_addr = ue_addr
         self.pcscf_addr = pcscf_addr
         self.ue_port_c = ue_port_c
@@ -4110,19 +4111,22 @@ class MockSAHandle:
         self.spi_ps = spi_ps
         self.alg = alg
         self.ealg = ealg
+        self.protocol = protocol
 
     def __repr__(self) -> str:
         return (f"SAHandle(ue={self.ue_addr}:{self.ue_port_c}, "
                 f"pcscf={self.pcscf_addr}:{self.pcscf_port_c}, "
                 f"spi_pc={self.spi_pc}, spi_ps={self.spi_ps}, "
-                f"alg={self.alg!r}, ealg={self.ealg!r})")
+                f"alg={self.alg!r}, ealg={self.ealg!r}, "
+                f"protocol={self.protocol!r})")
 
 
 class MockSecurityServerParams:
     """Mock :class:`SecurityServerParams`."""
 
     def __init__(self, mechanism: str, alg: str, ealg: str,
-                 spi_c: int, spi_s: int, port_c: int, port_s: int) -> None:
+                 spi_c: int, spi_s: int, port_c: int, port_s: int,
+                 protocol: str = "udp") -> None:
         self.mechanism = mechanism
         self.alg = alg
         self.ealg = ealg
@@ -4130,12 +4134,17 @@ class MockSecurityServerParams:
         self.spi_s = spi_s
         self.port_c = port_c
         self.port_s = port_s
+        # Lower-case transport carrying ESP — "udp" or "tcp".  When non-default
+        # ("tcp"), append `protocol=tcp` to the Security-Server header per RFC
+        # 3329 §2.2.  Mirrors the value passed to ipsec.allocate(...).
+        self.protocol = protocol
 
     def __repr__(self) -> str:
         return (f"SecurityServerParams(mechanism={self.mechanism!r}, "
                 f"alg={self.alg!r}, ealg={self.ealg!r}, "
                 f"spi_c={self.spi_c}, spi_s={self.spi_s}, "
-                f"port_c={self.port_c}, port_s={self.port_s})")
+                f"port_c={self.port_c}, port_s={self.port_s}, "
+                f"protocol={self.protocol!r})")
 
 
 class MockPendingSA:
@@ -4145,7 +4154,8 @@ class MockPendingSA:
 
     def __init__(self, transform: MockTransform, offer: MockSecurityOffer,
                  pcscf_port_c: int, pcscf_port_s: int,
-                 expires_secs: Optional[int] = None) -> None:
+                 expires_secs: Optional[int] = None,
+                 protocol: str = "udp") -> None:
         cls = type(self)
         spi_pc = cls._next_spi
         cls._next_spi += 1
@@ -4159,9 +4169,11 @@ class MockPendingSA:
             spi_s=spi_ps,
             port_c=pcscf_port_c,
             port_s=pcscf_port_s,
+            protocol=protocol,
         )
         self._offer = offer
         self.expires_secs = expires_secs
+        self.protocol = protocol
         self.is_active = False
         self.is_cleaned = False
 
@@ -4210,18 +4222,28 @@ class MockIpsec:
 
     async def allocate(self, av: MockAuthVectorHandle, offer: MockSecurityOffer,
                        transform: MockTransform,
-                       expires_secs: Optional[int] = None) -> MockPendingSA:
+                       expires_secs: Optional[int] = None,
+                       protocol: str = "udp") -> MockPendingSA:
         if not transform.compatible_with(offer):
             raise ValueError(
                 f"transform {transform!r} not compatible with offer alg={offer.alg!r}"
                 f" ealg={offer.ealg!r}"
+            )
+        # Same validation as the Rust binding so scripts fail identically
+        # in unit tests.  ESP-over-UDP is the default; ESP-over-TCP is
+        # required for UEs that did the initial REGISTER over TCP
+        # (3GPP TS 33.203 §7.2).
+        proto_lower = protocol.lower()
+        if proto_lower not in ("udp", "tcp"):
+            raise ValueError(
+                f"protocol must be 'udp' or 'tcp', got {protocol!r}"
             )
         av._take()  # raises ValueError if already consumed
         if self._allocate_should_fail is not None:
             raise self._allocate_should_fail(self._allocate_failure_message)
         return MockPendingSA(
             transform, offer, self.pcscf_port_c, self.pcscf_port_s,
-            expires_secs=expires_secs,
+            expires_secs=expires_secs, protocol=proto_lower,
         )
 
     def stash(self, call_id: str, pending: MockPendingSA) -> None:

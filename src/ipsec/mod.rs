@@ -126,6 +126,49 @@ pub(crate) enum PolicyDir {
     Out,
 }
 
+/// Upper-layer protocol pinned into the XFRM selector for an SA pair —
+/// determines which inner-protocol frames the SA applies to.  IMS IPsec
+/// supports both ESP-over-UDP (the common deployment) and ESP-over-TCP
+/// (3GPP TS 33.203 §7.2 — used by UEs that prefer TCP-first SIP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaProtocol {
+    /// IPPROTO_UDP (17).
+    Udp,
+    /// IPPROTO_TCP (6).
+    Tcp,
+}
+
+impl SaProtocol {
+    /// Numeric IP protocol value as carried in the selector byte.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            SaProtocol::Udp => 17,
+            SaProtocol::Tcp => 6,
+        }
+    }
+
+    /// Lower-case wire name as used in RFC 3329 ``protocol=`` parameter
+    /// and in the ``ip xfrm`` UPSPEC grammar.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SaProtocol::Udp => "udp",
+            SaProtocol::Tcp => "tcp",
+        }
+    }
+}
+
+impl Default for SaProtocol {
+    fn default() -> Self {
+        SaProtocol::Udp
+    }
+}
+
+impl std::fmt::Display for SaProtocol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Encryption algorithm
 // ---------------------------------------------------------------------------
@@ -272,6 +315,12 @@ pub struct SecurityAssociationPair {
     /// IPsec SA lifetime to the SIP registration expiry per 3GPP
     /// TS 33.203 §7.4.
     pub hard_lifetime_secs: Option<u64>,
+    /// Upper-layer protocol pinned into the XFRM selector — UDP for
+    /// ESP-over-UDP (the common case), TCP for ESP-over-TCP (TS 33.203
+    /// §7.2).  Must match the SIP transport the UE uses for protected
+    /// traffic; a mismatched selector silently drops every protected
+    /// frame because the kernel won't bind the SA to it.
+    pub protocol: SaProtocol,
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +545,7 @@ impl IpsecManager {
         sa: SecurityAssociationPair,
     ) -> Result<(), IpsecError> {
         let key = Self::contact_key(&sa.ue_addr, sa.ue_port_c);
+        let proto = sa.protocol;
 
         // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps (inbound to P-CSCF server)
         self.add_sa(
@@ -503,7 +553,7 @@ impl IpsecManager {
             &sa.pcscf_addr, sa.pcscf_port_s,
             sa.spi_ps,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            sa.hard_lifetime_secs,
+            proto, sa.hard_lifetime_secs,
         ).await?;
 
         // SA2: PCSCF:port_ps → UE:port_uc, SPI=spi_uc (outbound from P-CSCF server)
@@ -512,7 +562,7 @@ impl IpsecManager {
             &sa.ue_addr, sa.ue_port_c,
             sa.spi_uc,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            sa.hard_lifetime_secs,
+            proto, sa.hard_lifetime_secs,
         ).await?;
 
         // SA3: PCSCF:port_pc → UE:port_us, SPI=spi_us (outbound from P-CSCF client)
@@ -521,7 +571,7 @@ impl IpsecManager {
             &sa.ue_addr, sa.ue_port_s,
             sa.spi_us,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            sa.hard_lifetime_secs,
+            proto, sa.hard_lifetime_secs,
         ).await?;
 
         // SA4: UE:port_us → PCSCF:port_pc, SPI=spi_pc (inbound to P-CSCF client)
@@ -530,35 +580,35 @@ impl IpsecManager {
             &sa.pcscf_addr, sa.pcscf_port_c,
             sa.spi_pc,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            sa.hard_lifetime_secs,
+            proto, sa.hard_lifetime_secs,
         ).await?;
 
         // Policy 1 (in): UE:port_uc → PCSCF:port_ps
         self.add_policy(
             &sa.ue_addr, sa.ue_port_c,
             &sa.pcscf_addr, sa.pcscf_port_s,
-            PolicyDir::In, sa.spi_ps,
+            PolicyDir::In, sa.spi_ps, proto,
         ).await?;
 
         // Policy 2 (out): PCSCF:port_ps → UE:port_uc
         self.add_policy(
             &sa.pcscf_addr, sa.pcscf_port_s,
             &sa.ue_addr, sa.ue_port_c,
-            PolicyDir::Out, sa.spi_uc,
+            PolicyDir::Out, sa.spi_uc, proto,
         ).await?;
 
         // Policy 3 (out): PCSCF:port_pc → UE:port_us
         self.add_policy(
             &sa.pcscf_addr, sa.pcscf_port_c,
             &sa.ue_addr, sa.ue_port_s,
-            PolicyDir::Out, sa.spi_us,
+            PolicyDir::Out, sa.spi_us, proto,
         ).await?;
 
         // Policy 4 (in): UE:port_us → PCSCF:port_pc
         self.add_policy(
             &sa.ue_addr, sa.ue_port_s,
             &sa.pcscf_addr, sa.pcscf_port_c,
-            PolicyDir::In, sa.spi_pc,
+            PolicyDir::In, sa.spi_pc, proto,
         ).await?;
 
         info!(
@@ -568,6 +618,7 @@ impl IpsecManager {
             spi_us = sa.spi_us,
             spi_pc = sa.spi_pc,
             spi_ps = sa.spi_ps,
+            protocol = %proto,
             "IPsec: SA pair created"
         );
 
@@ -583,6 +634,7 @@ impl IpsecManager {
     ) -> Result<(), IpsecError> {
         let key = Self::contact_key(ue_addr, ue_port_c);
         if let Some((_, sa)) = self.associations.remove(&key) {
+            let proto = sa.protocol;
             // Delete all 4 SAs.  Pairs mirror create_sa_pair's order so
             // src/dst align with each SA's flow direction.
             self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_ps).await?;
@@ -591,25 +643,28 @@ impl IpsecManager {
             self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_pc).await?;
 
             // Delete policies (best-effort — ignore errors on cleanup).
+            // The selector proto must match what was used at install time
+            // — kernel keys policies on the full selector including the
+            // upper-layer protocol number.
             self.del_policy(
                 &sa.ue_addr, sa.ue_port_c,
                 &sa.pcscf_addr, sa.pcscf_port_s,
-                PolicyDir::In,
+                PolicyDir::In, proto,
             ).await.ok();
             self.del_policy(
                 &sa.pcscf_addr, sa.pcscf_port_c,
                 &sa.ue_addr, sa.ue_port_s,
-                PolicyDir::Out,
+                PolicyDir::Out, proto,
             ).await.ok();
             self.del_policy(
                 &sa.ue_addr, sa.ue_port_s,
                 &sa.pcscf_addr, sa.pcscf_port_c,
-                PolicyDir::In,
+                PolicyDir::In, proto,
             ).await.ok();
             self.del_policy(
                 &sa.pcscf_addr, sa.pcscf_port_s,
                 &sa.ue_addr, sa.ue_port_c,
-                PolicyDir::Out,
+                PolicyDir::Out, proto,
             ).await.ok();
 
             info!(ue = %ue_addr, ue_port_c, "IPsec: SA pair deleted");
@@ -675,6 +730,7 @@ impl IpsecManager {
         aalg: &IntegrityAlgorithm,
         encryption_key: &str,
         integrity_key: &str,
+        protocol: SaProtocol,
         hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
         match self.backend {
@@ -696,6 +752,7 @@ impl IpsecManager {
                     *aalg,
                     &enc_key_bytes,
                     &auth_key_bytes,
+                    protocol.as_u8(),
                     hard_lifetime_secs,
                 )
                 .await
@@ -715,6 +772,7 @@ impl IpsecManager {
                     aalg,
                     encryption_key,
                     integrity_key,
+                    protocol,
                     hard_lifetime_secs,
                 )
                 .await
@@ -742,6 +800,7 @@ impl IpsecManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn add_policy(
         &self,
         source: &IpAddr,
@@ -750,6 +809,7 @@ impl IpsecManager {
         destination_port: u16,
         direction: PolicyDir,
         spi: u32,
+        protocol: SaProtocol,
     ) -> Result<(), IpsecError> {
         match self.backend {
             #[cfg(target_os = "linux")]
@@ -765,6 +825,7 @@ impl IpsecManager {
                     destination_port,
                     netlink_dir,
                     spi,
+                    protocol.as_u8(),
                 )
                 .await
             }
@@ -784,6 +845,7 @@ impl IpsecManager {
                     destination_port,
                     dir_str,
                     spi,
+                    protocol,
                 )
                 .await
             }
@@ -797,6 +859,7 @@ impl IpsecManager {
         destination: &IpAddr,
         destination_port: u16,
         direction: PolicyDir,
+        protocol: SaProtocol,
     ) -> Result<(), IpsecError> {
         match self.backend {
             #[cfg(target_os = "linux")]
@@ -811,6 +874,7 @@ impl IpsecManager {
                     destination,
                     destination_port,
                     netlink_dir,
+                    protocol.as_u8(),
                 )
                 .await
             }
@@ -829,6 +893,7 @@ impl IpsecManager {
                     destination,
                     destination_port,
                     dir_str,
+                    protocol,
                 )
                 .await
             }
@@ -850,6 +915,7 @@ impl IpsecManager {
         aalg: &IntegrityAlgorithm,
         encryption_key: &str,
         integrity_key: &str,
+        protocol: SaProtocol,
         hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
         let source_str = source.to_string();
@@ -859,6 +925,7 @@ impl IpsecManager {
         let sel_dst = format!("{}/{}", destination, host_prefix(destination));
         let sel_sport = source_port.to_string();
         let sel_dport = destination_port.to_string();
+        let proto_str = protocol.as_str();
         let lifetime_secs_str;
 
         // iproute2 UPSPEC grammar (man ip-xfrm) requires `proto X` to
@@ -875,7 +942,7 @@ impl IpsecManager {
             "sel",
             "src", &sel_src,
             "dst", &sel_dst,
-            "proto", "udp",
+            "proto", proto_str,
             "sport", &sel_sport,
             "dport", &sel_dport,
         ];
@@ -926,6 +993,7 @@ impl IpsecManager {
         Self::run_ip_command(&args).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn xfrm_policy_add(
         source: &IpAddr,
         source_port: u16,
@@ -933,6 +1001,7 @@ impl IpsecManager {
         destination_port: u16,
         direction: &str,
         spi: u32,
+        protocol: SaProtocol,
     ) -> Result<(), IpsecError> {
         let source_cidr = format!("{}/{}", source, host_prefix(source));
         let destination_cidr = format!("{}/{}", destination, host_prefix(destination));
@@ -941,6 +1010,7 @@ impl IpsecManager {
         let source_str = source.to_string();
         let destination_str = destination.to_string();
         let spi_str = format!("0x{:x}", spi);
+        let proto_str = protocol.as_str();
 
         // `proto X` must precede `sport`/`dport` per the iproute2 UPSPEC
         // grammar — see xfrm_sa_add for the same ordering constraint.
@@ -948,7 +1018,7 @@ impl IpsecManager {
             "xfrm", "policy", "add",
             "src", &source_cidr,
             "dst", &destination_cidr,
-            "proto", "udp",
+            "proto", proto_str,
             "sport", &source_port_str,
             "dport", &destination_port_str,
             "dir", direction,
@@ -968,18 +1038,20 @@ impl IpsecManager {
         destination: &IpAddr,
         destination_port: u16,
         direction: &str,
+        protocol: SaProtocol,
     ) -> Result<(), IpsecError> {
         let source_cidr = format!("{}/{}", source, host_prefix(source));
         let destination_cidr = format!("{}/{}", destination, host_prefix(destination));
         let source_port_str = source_port.to_string();
         let destination_port_str = destination_port.to_string();
+        let proto_str = protocol.as_str();
 
         // Same UPSPEC ordering as xfrm_policy_add — `proto X` first.
         let args = vec![
             "xfrm", "policy", "delete",
             "src", &source_cidr,
             "dst", &destination_cidr,
-            "proto", "udp",
+            "proto", proto_str,
             "sport", &source_port_str,
             "dport", &destination_port_str,
             "dir", direction,
@@ -1243,6 +1315,7 @@ mod tests {
             encryption_key: "deadbeef".to_string(),
             integrity_key: "cafebabe".to_string(),
             hard_lifetime_secs: None,
+            protocol: SaProtocol::Udp,
         };
         let cloned = sa.clone();
         assert_eq!(cloned.spi_uc, 10000);
@@ -1251,5 +1324,26 @@ mod tests {
         assert_eq!(cloned.spi_ps, 10003);
         assert_eq!(cloned.ealg, EncryptionAlgorithm::AesCbc128);
         assert_eq!(cloned.aalg, IntegrityAlgorithm::HmacSha1);
+        assert_eq!(cloned.protocol, SaProtocol::Udp);
+    }
+
+    #[test]
+    fn sa_protocol_numeric_values_match_iana() {
+        assert_eq!(SaProtocol::Udp.as_u8(), 17);
+        assert_eq!(SaProtocol::Tcp.as_u8(), 6);
+    }
+
+    #[test]
+    fn sa_protocol_string_form_round_trips_for_rfc3329() {
+        assert_eq!(SaProtocol::Udp.as_str(), "udp");
+        assert_eq!(SaProtocol::Tcp.as_str(), "tcp");
+        assert_eq!(format!("{}", SaProtocol::Tcp), "tcp");
+    }
+
+    #[test]
+    fn sa_protocol_default_is_udp() {
+        // Back-compat: callers that don't specify a protocol get the
+        // ESP-over-UDP behaviour that all production deployments rely on.
+        assert_eq!(SaProtocol::default(), SaProtocol::Udp);
     }
 }

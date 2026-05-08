@@ -21,6 +21,8 @@ listen:
     - "0.0.0.0:5066"        # IPsec protected server port
   tcp:
     - "0.0.0.0:5060"
+    - "0.0.0.0:5064"        # IPsec protected client port (ESP-over-TCP, TS 33.203 §7.2)
+    - "0.0.0.0:5066"        # IPsec protected server port (ESP-over-TCP)
 
 # Public IP — set to the P-CSCF's routable address
 advertised_address: "10.0.0.10"

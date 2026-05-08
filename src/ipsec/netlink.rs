@@ -63,7 +63,8 @@ const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
 // IP protocol numbers.
-const IPPROTO_UDP: u8 = 17;
+pub(crate) const IPPROTO_TCP: u8 = 6;
+pub(crate) const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ESP: u8 = 50;
 
 // Netlink message header flags (`linux/netlink.h`).
@@ -164,7 +165,7 @@ fn encode_xfrm_selector(
     out.extend_from_slice(&family_for(source).to_ne_bytes());
     out.push(host_prefix_len(destination)); // prefixlen_d
     out.push(host_prefix_len(source));      // prefixlen_s
-    out.push(proto);                         // selector proto = UDP
+    out.push(proto);                         // selector proto (UDP/TCP)
     // C struct pads 3 bytes here so `ifindex` (i32) lands on a 4-byte
     // boundary — total selector size 56 bytes.
     out.push(0);
@@ -229,10 +230,11 @@ fn encode_xfrm_usersa_info(
     destination: &IpAddr,
     destination_port: u16,
     spi: u32,
+    selector_proto: u8,
     hard_lifetime_secs: Option<u64>,
     out: &mut Vec<u8>,
 ) {
-    encode_xfrm_selector(source, source_port, destination, destination_port, IPPROTO_UDP, out);
+    encode_xfrm_selector(source, source_port, destination, destination_port, selector_proto, out);
     encode_xfrm_id(destination, spi, IPPROTO_ESP, out);
     let mut saddr = [0u8; 16];
     encode_xfrm_address(source, &mut saddr);
@@ -271,9 +273,10 @@ fn encode_xfrm_userpolicy_info(
     destination: &IpAddr,
     destination_port: u16,
     direction: u8,
+    selector_proto: u8,
     out: &mut Vec<u8>,
 ) {
-    encode_xfrm_selector(source, source_port, destination, destination_port, IPPROTO_UDP, out);
+    encode_xfrm_selector(source, source_port, destination, destination_port, selector_proto, out);
     encode_xfrm_lifetime_cfg(None, out);
     encode_xfrm_lifetime_cur(out);
     out.extend_from_slice(&0u32.to_ne_bytes()); // priority
@@ -338,9 +341,10 @@ fn encode_xfrm_userpolicy_id(
     destination: &IpAddr,
     destination_port: u16,
     direction: u8,
+    selector_proto: u8,
     out: &mut Vec<u8>,
 ) {
-    encode_xfrm_selector(source, source_port, destination, destination_port, IPPROTO_UDP, out);
+    encode_xfrm_selector(source, source_port, destination, destination_port, selector_proto, out);
     out.extend_from_slice(&0u32.to_ne_bytes()); // index
     out.push(direction);
     // pad to 4
@@ -410,6 +414,12 @@ fn xfrm_enc_name(ealg: EncryptionAlgorithm) -> &'static str {
 /// Add an IPsec SA via XFRM netlink.  Returns `Ok(())` on kernel ack,
 /// `Err(IpsecError::Command(...))` on netlink/kernel failure (parsed
 /// errno included in the error message).
+///
+/// `selector_proto` is the upper-layer protocol number stamped into the
+/// XFRM selector — typically `IPPROTO_UDP` (17) for ESP-over-UDP IMS
+/// IPsec, or `IPPROTO_TCP` (6) for ESP-over-TCP (TS 33.203 §7.2).  The
+/// kernel only applies this SA to inner-protocol frames matching the
+/// selector, so a UDP-pinned selector silently drops TCP IPsec frames.
 #[allow(clippy::too_many_arguments)]
 pub async fn add_sa(
     source: &IpAddr,
@@ -421,6 +431,7 @@ pub async fn add_sa(
     aalg: IntegrityAlgorithm,
     encryption_key: &[u8],
     integrity_key: &[u8],
+    selector_proto: u8,
     hard_lifetime_secs: Option<u64>,
 ) -> Result<(), IpsecError> {
     let mut payload = Vec::with_capacity(256);
@@ -430,6 +441,7 @@ pub async fn add_sa(
         destination,
         destination_port,
         spi,
+        selector_proto,
         hard_lifetime_secs,
         &mut payload,
     );
@@ -459,6 +471,10 @@ pub async fn del_sa(daddr: &IpAddr, spi: u32) -> Result<(), IpsecError> {
 }
 
 /// Add an IPsec policy via XFRM netlink.
+///
+/// `selector_proto` must match the corresponding SA's selector, otherwise
+/// the kernel will not bind the SA template to incoming/outgoing packets.
+#[allow(clippy::too_many_arguments)]
 pub async fn add_policy(
     source: &IpAddr,
     source_port: u16,
@@ -466,6 +482,7 @@ pub async fn add_policy(
     destination_port: u16,
     direction: PolicyDirection,
     spi: u32,
+    selector_proto: u8,
 ) -> Result<(), IpsecError> {
     let mut payload = Vec::with_capacity(256);
     encode_xfrm_userpolicy_info(
@@ -474,6 +491,7 @@ pub async fn add_policy(
         destination,
         destination_port,
         direction.as_u8(),
+        selector_proto,
         &mut payload,
     );
     let mut tmpl = Vec::with_capacity(64);
@@ -483,12 +501,17 @@ pub async fn add_policy(
 }
 
 /// Delete an IPsec policy via XFRM netlink.
+///
+/// `selector_proto` must match the value used at policy install time; the
+/// kernel keys policies on the full selector tuple including the
+/// upper-layer protocol number.
 pub async fn del_policy(
     source: &IpAddr,
     source_port: u16,
     destination: &IpAddr,
     destination_port: u16,
     direction: PolicyDirection,
+    selector_proto: u8,
 ) -> Result<(), IpsecError> {
     let mut payload = Vec::with_capacity(96);
     encode_xfrm_userpolicy_id(
@@ -497,6 +520,7 @@ pub async fn del_policy(
         destination,
         destination_port,
         direction.as_u8(),
+        selector_proto,
         &mut payload,
     );
     send_and_ack(XFRM_MSG_DELPOLICY, 0, &payload).await
@@ -743,6 +767,7 @@ mod tests {
             &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             5066,
             0xDEADBEEF,
+            IPPROTO_UDP,
             None,
             &mut out,
         );
@@ -763,9 +788,80 @@ mod tests {
             &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             5066,
             XFRM_POLICY_OUT,
+            IPPROTO_UDP,
             &mut out,
         );
         assert_eq!(out.len(), 168);
+    }
+
+    /// Selector proto byte lives at offset 44 inside the 56-byte
+    /// `xfrm_selector` (16 daddr + 16 saddr + 4*u16 ports + 2 family +
+    /// 1 prefixlen_d + 1 prefixlen_s = 44).  This is the byte that
+    /// determines whether the kernel applies the SA to inner-protocol
+    /// UDP frames or TCP frames — so we pin it down explicitly here.
+    const SELECTOR_PROTO_OFFSET: usize = 44;
+
+    #[test]
+    fn xfrm_selector_proto_byte_position_for_tcp_and_udp() {
+        let mut udp_out = Vec::new();
+        encode_xfrm_selector(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            5060,
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5066,
+            IPPROTO_UDP,
+            &mut udp_out,
+        );
+        assert_eq!(udp_out[SELECTOR_PROTO_OFFSET], 17);
+
+        let mut tcp_out = Vec::new();
+        encode_xfrm_selector(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            5060,
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5066,
+            IPPROTO_TCP,
+            &mut tcp_out,
+        );
+        assert_eq!(tcp_out[SELECTOR_PROTO_OFFSET], 6);
+    }
+
+    /// Regression test for the IPPROTO_UDP hard-pin bug: the encoded
+    /// selector inside `xfrm_usersa_info` must reflect the
+    /// `selector_proto` argument, not a hard-coded UDP.
+    #[test]
+    fn usersa_info_carries_tcp_selector_proto_when_requested() {
+        let mut out = Vec::new();
+        encode_xfrm_usersa_info(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            5060,
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5066,
+            0xDEADBEEF,
+            IPPROTO_TCP,
+            None,
+            &mut out,
+        );
+        assert_eq!(
+            out[SELECTOR_PROTO_OFFSET], 6,
+            "selector proto byte must be IPPROTO_TCP (6)"
+        );
+    }
+
+    /// Regression test for the IPPROTO_UDP hard-pin bug on policies.
+    #[test]
+    fn userpolicy_info_carries_tcp_selector_proto_when_requested() {
+        let mut out = Vec::new();
+        encode_xfrm_userpolicy_info(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            5060,
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5066,
+            XFRM_POLICY_OUT,
+            IPPROTO_TCP,
+            &mut out,
+        );
+        assert_eq!(out[SELECTOR_PROTO_OFFSET], 6);
     }
 
     /// Compile-time cross-check — mirror the kernel C ABI structs as
