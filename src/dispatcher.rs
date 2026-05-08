@@ -164,10 +164,27 @@ struct DispatcherState {
 /// Bundle held in `DispatcherState::rf_sessions` so ACR-STOP can reuse
 /// the IMS data captured at ACR-START (calling/called party, ICID, IOI,
 /// User-Session-Id, etc.) and just update the cause_code from the BYE.
-struct ProxyRfState {
+///
+/// Used by both the proxy auto-emit path (keyed by the SIP dialog
+/// `<Call-ID>\0<From-tag>`) and the B2BUA path (keyed by
+/// `b2bua:<internal-call-id>`); the disjoint key prefix prevents
+/// collision between the two storage paths.
+pub(crate) struct ProxyRfState {
     session: crate::diameter::rf_service::RfChargingSession,
     ims_data: crate::diameter::ro::ImsChargingData,
     user_name: Option<String>,
+}
+
+impl ProxyRfState {
+    /// Public accessor used by CDR auto-stamp callers.
+    pub(crate) fn rf_session(&self) -> &crate::diameter::rf_service::RfChargingSession {
+        &self.session
+    }
+}
+
+/// Format the B2BUA Rf-session key from the internal call UUID.
+fn rf_b2bua_key(internal_call_id: &str) -> String {
+    format!("b2bua:{internal_call_id}")
 }
 
 /// State for one outstanding reliable provisional response (RFC 3262 §3).
@@ -4789,6 +4806,108 @@ fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
     });
 }
 
+/// Spawn ACR-START for a B2BUA call when the A-leg INVITE has been
+/// answered.  No-op when `rf_charger` is unset or auto-emit disabled.
+/// Stores the resulting [`ProxyRfState`] in `state.rf_sessions` keyed
+/// by `b2bua:<internal_call_id>` so the BYE handler can find it.
+fn spawn_rf_b2bua_start(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    a_leg_invite: &Arc<std::sync::Mutex<SipMessage>>,
+) {
+    let charger = match state.rf_charger.as_ref() {
+        Some(c) if c.auto_emit_b2bua() => Arc::clone(c),
+        _ => return,
+    };
+    let key = rf_b2bua_key(internal_call_id);
+    if state.rf_sessions.contains_key(&key) {
+        return;
+    }
+    // Snapshot the A-leg INVITE under the script-side mutex so we
+    // build a stable IMS-Information block even if a script later
+    // mutates the message.
+    let invite_clone = match a_leg_invite.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let local_predicate = rf_local_uri_predicate(&state.local_domains);
+    let mut ims_data = crate::diameter::rf_service::ims_data_from_request(
+        &invite_clone,
+        charger.node_functionality(),
+        local_predicate,
+    );
+    // B2BUA mode → Role-of-Node = B2BUA_ROLE per TS 32.299 §7.2.149,
+    // overriding the orig/term derived from local-domain matching.
+    // Operators that need orig/term semantics (AS-as-B2BUA) can set
+    // node_functionality=as in YAML and we still emit B2BUA_ROLE; if
+    // they want the role override they can call
+    // diameter.rf_acr_* manually with role_of_node=...
+    ims_data.role_of_node = Some(crate::diameter::ro::NodeRole::B2buaRole);
+    let user_name = ims_data.calling_party.clone();
+    let rf_sessions = Arc::clone(&state.rf_sessions);
+    tokio::spawn(async move {
+        let session = match charger.acr_start(ims_data.clone(), user_name.clone()).await {
+            Some(s) => s,
+            None => return,
+        };
+        rf_sessions.insert(
+            key,
+            ProxyRfState {
+                session,
+                ims_data,
+                user_name,
+            },
+        );
+    });
+}
+
+/// Spawn ACR-STOP for a B2BUA call when its BYE arrives.  Picks up an
+/// optional RFC 3326 `Reason:` header for IMS Cause-Code mapping.
+/// Termination-Cause defaults to `DIAMETER_LOGOUT(1)`.
+fn spawn_rf_b2bua_stop(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    bye: &SipMessage,
+) {
+    let charger = match state.rf_charger.as_ref() {
+        Some(c) if c.auto_emit_b2bua() => Arc::clone(c),
+        _ => return,
+    };
+    let key = rf_b2bua_key(internal_call_id);
+    let entry = match state.rf_sessions.remove(&key) {
+        Some((_, e)) => e,
+        None => return,
+    };
+
+    let cause_code = bye
+        .headers
+        .get("Reason")
+        .and_then(|r| {
+            r.split(';')
+                .filter_map(|p| p.trim().strip_prefix("cause="))
+                .next()
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|v| v.parse::<u16>().ok())
+        })
+        .and_then(crate::diameter::rf::sip_status_to_cause_code);
+
+    let mut ims_data = entry.ims_data;
+    ims_data.sip_method = Some("BYE".to_string());
+    ims_data.cause_code = cause_code.or(Some(0));
+    ims_data.response_timestamp = Some(std::time::SystemTime::now());
+
+    tokio::spawn(async move {
+        charger
+            .acr_stop(
+                &entry.session,
+                ims_data,
+                entry.user_name,
+                crate::diameter::rf::termination_cause::DIAMETER_LOGOUT,
+            )
+            .await;
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Fork helpers
 // ---------------------------------------------------------------------------
@@ -6697,6 +6816,12 @@ fn handle_b2bua_response(
             state.call_actors.set_winner(call_id, idx);
         }
 
+        // Rf ACR-START on B2BUA call answer (TS 32.299 §6.2.2).
+        // Fire-and-forget per TS 32.299 §6.5.
+        if let Some(invite_arc) = &a_leg_invite {
+            spawn_rf_b2bua_start(state, call_id, invite_arc);
+        }
+
         // Wrap the 200 OK in Arc<Mutex<>> so Python handlers can modify SDP in-place
         let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
 
@@ -7655,6 +7780,12 @@ fn handle_b2bua_bye(
             warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_bye");
         }
     }
+
+    // Rf ACR-STOP on B2BUA BYE (TS 32.299 §6.2.2).  Fire before the
+    // 200 OK is sent so the accounting record reflects the moment the
+    // proxy committed to tearing the call down; the SIP path is
+    // unaffected (spawn is fire-and-forget per §6.5).
+    spawn_rf_b2bua_stop(state, &call_id, &message);
 
     // Re-acquire the call ref for BYE bridging
     let call = match state.call_actors.get_call(&call_id) {
