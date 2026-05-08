@@ -122,6 +122,17 @@ impl AsyncPool {
         self.drivers.len()
     }
 
+    /// Test-only accessor that hands back fresh `Py` references to each
+    /// driver's asyncio loop so leak tests can call
+    /// `asyncio.all_tasks(loop)` on them.  Caller must hold `python`.
+    #[cfg(test)]
+    pub(crate) fn driver_loops(&self, python: Python<'_>) -> Vec<Py<PyAny>> {
+        self.drivers
+            .iter()
+            .map(|d| d.loop_obj.clone_ref(python))
+            .collect()
+    }
+
     fn spawn(size: usize, tokio_handle: TokioHandle) -> Self {
         let mut drivers = Vec::with_capacity(size);
         for index in 0..size {
@@ -703,6 +714,261 @@ mod tests {
             let extracted: i64 =
                 Python::attach(|python| value.bind(python).extract().unwrap());
             assert_eq!(extracted, 42);
+        });
+    }
+
+    /// Force a Python-side gc.collect() to break any cyclic references
+    /// that asyncio leaves behind (specifically the
+    /// `destination._done_callbacks → _call_check_cancel → destination`
+    /// cycle that `asyncio.futures._chain_future` sets up between the
+    /// `concurrent.futures.Future` returned by `run_coroutine_threadsafe`
+    /// and the asyncio Task on the driver loop).  Refcount GC clears
+    /// everything else in the chain promptly.
+    fn force_python_gc() {
+        Python::attach(|python| {
+            let gc = python.import("gc").expect("gc module");
+            // Three passes covers the rare case where collecting one
+            // generation makes another collectable.
+            for _ in 0..3 {
+                gc.call_method0("collect").expect("gc.collect");
+            }
+        });
+    }
+
+    /// Submit a no-op coroutine to each driver so the loop has a chance
+    /// to drain its `_ready` queue (the asyncio Task chain takes one
+    /// extra loop iteration after `set_result` to fire its callbacks).
+    async fn flush_drivers() {
+        let pool = require_global();
+        let factory = Python::attach(|python| {
+            Arc::new(build_factory(
+                python,
+                "async def factory():\n    return None\n",
+            ))
+        });
+        // Submit pool.size() coroutines so each driver definitely sees one.
+        let mut handles = Vec::new();
+        for _ in 0..pool.size() * 2 {
+            let factory = Arc::clone(&factory);
+            handles.push(tokio::spawn(async move {
+                dispatch(factory).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    /// Count outstanding asyncio tasks across all driver loops.  Uses
+    /// `asyncio.run_coroutine_threadsafe` to query each driver from the
+    /// driver's own thread (asyncio task lists aren't thread-safe to
+    /// inspect from outside the loop thread).
+    async fn count_pending_tasks_per_driver() -> Vec<usize> {
+        let pool = require_global();
+        let factory = Python::attach(|python| {
+            Arc::new(build_factory(
+                python,
+                "import asyncio\n\
+                 async def factory():\n\
+                 \x20\x20\x20\x20me = asyncio.current_task()\n\
+                 \x20\x20\x20\x20# Don't count ourselves — we're the probe.\n\
+                 \x20\x20\x20\x20return sum(\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x201 for t in asyncio.all_tasks() if t is not me\n\
+                 \x20\x20\x20\x20)\n",
+            ))
+        });
+
+        // Submit one probe to each driver.  Round-robin in `submit`
+        // means submitting `size()` probes hits each driver exactly
+        // once, but submission ordering is racy — easier to submit
+        // (size() * K) and bucket by driver index after the fact.
+        // Simpler still: submit `size()` and accept that a single
+        // driver may see two probes while another sees zero.  For our
+        // assertion (all counts == 0) that's fine.
+        let mut counts = Vec::new();
+        for _ in 0..pool.size() {
+            let factory = Arc::clone(&factory);
+            let value = dispatch(factory).await;
+            let count: usize =
+                Python::attach(|python| value.bind(python).extract().unwrap());
+            counts.push(count);
+        }
+        counts
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_rss_kb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()?;
+                return Some(kb);
+            }
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_rss_kb() -> Option<u64> {
+        None
+    }
+
+    /// Leak test 1 — a Python object created by the handler must be
+    /// reclaimed once we drop our last reference.  If the asyncio Task
+    /// or the dispatch chain is hanging onto the coroutine frame, the
+    /// returned Marker stays alive and the weakref keeps resolving.
+    #[test]
+    fn pool_releases_python_objects_after_handler() {
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(
+                    python,
+                    "class Marker:\n\
+                     \x20\x20\x20\x20pass\n\
+                     async def factory():\n\
+                     \x20\x20\x20\x20return Marker()\n",
+                ))
+            });
+
+            // Run the handler, capture the returned Marker, then a
+            // weakref to it before dropping the strong ref.
+            let marker = dispatch(Arc::clone(&factory)).await;
+            let weak = Python::attach(|python| {
+                let weakref = python.import("weakref").unwrap();
+                weakref
+                    .call_method1("ref", (marker.bind(python),))
+                    .unwrap()
+                    .unbind()
+            });
+            drop(marker);
+
+            // Let the loop process anything left in its ready queue,
+            // then force gc to break the asyncio chain_future cycle.
+            flush_drivers().await;
+            force_python_gc();
+
+            // Weakref should resolve to None — the Marker was reclaimed.
+            let alive = Python::attach(|python| {
+                let weak_obj = weak.bind(python);
+                let result = weak_obj.call0().unwrap();
+                !result.is_none()
+            });
+            assert!(
+                !alive,
+                "handler-returned Python object leaked: weakref still resolves \
+                 (asyncio Task chain or dispatcher path is keeping the \
+                 coroutine frame alive)"
+            );
+        });
+    }
+
+    /// Leak test 2 — after a batch of handlers, every driver loop's
+    /// asyncio task table must drain back to 0 (probe task aside).
+    /// Lingering tasks indicate that the asyncio Task chain isn't
+    /// being released, which would slowly accumulate frames + locals.
+    #[test]
+    fn pool_drains_asyncio_tasks_after_batch() {
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(
+                    python,
+                    "import asyncio\n\
+                     async def child():\n\
+                     \x20\x20\x20\x20await asyncio.sleep(0)\n\
+                     async def factory():\n\
+                     \x20\x20\x20\x20await asyncio.create_task(child())\n\
+                     \x20\x20\x20\x20return None\n",
+                ))
+            });
+
+            // Submit 50 handlers, each spawning + awaiting a child task.
+            for _ in 0..50 {
+                let factory = Arc::clone(&factory);
+                dispatch(factory).await;
+            }
+
+            // Let drivers settle, then force a GC pass.
+            flush_drivers().await;
+            force_python_gc();
+            flush_drivers().await;
+
+            // Probe each driver: expected count is 0.
+            let counts = count_pending_tasks_per_driver().await;
+            for (driver, count) in counts.iter().enumerate() {
+                assert_eq!(
+                    *count, 0,
+                    "driver {} has {} pending tasks after handler batch — leak",
+                    driver, count
+                );
+            }
+        });
+    }
+
+    /// Leak test 3 — RSS must reach a steady state.  Run a warm-up
+    /// batch (allocator free-list grows), measure RSS, run an equal
+    /// batch, measure RSS again.  The delta amortised per handler
+    /// should be tiny.  10k handlers × <0.5KB/req gives plenty of
+    /// signal-to-noise on Linux glibc malloc.
+    ///
+    /// Skipped on non-Linux because we can't read VmRSS without it.
+    #[test]
+    fn pool_steady_state_rss_does_not_grow() {
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(
+                    python,
+                    // Allocate a small dict on each call so any
+                    // per-handler retention shows up.
+                    "async def factory():\n\
+                     \x20\x20\x20\x20d = {'k': 'v' * 32}\n\
+                     \x20\x20\x20\x20return None\n",
+                ))
+            });
+
+            let Some(_) = read_rss_kb() else {
+                eprintln!("[pool_steady_state_rss_does_not_grow] no /proc/self/status — skipping");
+                return;
+            };
+
+            const BATCH: usize = 10_000;
+            const PER_HANDLER_BUDGET_BYTES: u64 = 512;
+
+            // Warm-up batch (allocator free lists, Python interp caches, ...).
+            for _ in 0..BATCH {
+                let factory = Arc::clone(&factory);
+                dispatch(factory).await;
+            }
+            flush_drivers().await;
+            force_python_gc();
+            flush_drivers().await;
+
+            let rss_baseline = read_rss_kb().unwrap();
+
+            for _ in 0..BATCH {
+                let factory = Arc::clone(&factory);
+                dispatch(factory).await;
+            }
+            flush_drivers().await;
+            force_python_gc();
+            flush_drivers().await;
+
+            let rss_after = read_rss_kb().unwrap();
+            let delta_kb = rss_after.saturating_sub(rss_baseline);
+            let budget_kb = (BATCH as u64 * PER_HANDLER_BUDGET_BYTES) / 1024;
+
+            assert!(
+                delta_kb < budget_kb,
+                "RSS grew {} KB across {} steady-state handlers \
+                 (budget {} KB ≈ {} bytes/handler) — likely a leak",
+                delta_kb, BATCH, budget_kb, PER_HANDLER_BUDGET_BYTES,
+            );
         });
     }
 
