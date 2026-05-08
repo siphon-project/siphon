@@ -120,6 +120,14 @@ pub struct Config {
     /// other replicas.
     pub subscribe_state: Option<SubscribeStateConfig>,
 
+    /// Rf offline-charging configuration (3GPP TS 32.299).  Drives
+    /// automatic ACR-START / ACR-INTERIM / ACR-STOP on B2BUA and proxy
+    /// call lifecycle events, plus ACR-EVENT for REGISTER.  When
+    /// ``None`` (default), Rf is fully off — scripts can still call
+    /// ``diameter.rf_acr_*`` manually as long as a Diameter peer is
+    /// connected.
+    pub rf: Option<RfConfig>,
+
     /// Free-form per-extension configuration. Each entry's value is opaque
     /// to siphon-core and is interpreted by the extension that owns the
     /// name. A scalar string is conventionally treated as a path to a
@@ -1383,6 +1391,79 @@ fn default_min_se() -> u32 {
 fn default_refresher() -> SessionRefresher {
     SessionRefresher::Uac
 }
+
+// ---------------------------------------------------------------------------
+// Rf offline charging (3GPP TS 32.299)
+// ---------------------------------------------------------------------------
+
+/// Top-level `rf:` configuration.
+///
+/// ```yaml
+/// rf:
+///   enabled: true
+///   auto_emit_proxy: true        # ACR-START on 2xx-forward, ACR-STOP on in-dialog BYE
+///   auto_emit_b2bua: true        # ACR-START on Answered, ACR-STOP on Bye/Terminated
+///   auto_emit_register: true     # ACR-EVENT from registrar on_change
+///   interim_interval_secs: 300   # 0 = disabled; CDF ACA-START Acct-Interim-Interval overrides
+///   node_functionality: scscf    # scscf | pcscf | icscf | mrfc | mgcf | bgcf | as | ibcf
+///   service_context_id: "32260@3gpp.org"   # TS 32.260 IMS = 32260, MMTel SC = 32274
+///   peer: cdf1                   # optional explicit peer; default = first 'rf' route, else any peer
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct RfConfig {
+    /// Master switch.  Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Emit ACR-START / ACR-INTERIM / ACR-STOP automatically from the
+    /// proxy 2xx-forward and in-dialog-BYE paths.  Default: true.
+    #[serde(default = "default_true")]
+    pub auto_emit_proxy: bool,
+    /// Emit ACR-START / ACR-INTERIM / ACR-STOP automatically from B2BUA
+    /// `CallEvent::Answered` / `Bye` / `Terminated`.  Default: true.
+    #[serde(default = "default_true")]
+    pub auto_emit_b2bua: bool,
+    /// Emit ACR-EVENT for every registration state change observed on
+    /// the registrar's on-change broadcast channel.  Default: true.
+    #[serde(default = "default_true")]
+    pub auto_emit_register: bool,
+    /// Default ACR-INTERIM cadence in seconds when the CDF does not
+    /// return an ``Acct-Interim-Interval`` AVP in ACA-START.  Set to 0
+    /// to disable periodic INTERIM.  Default: 0 (disabled).
+    #[serde(default)]
+    pub interim_interval_secs: u32,
+    /// Node-Functionality value baked into auto-emitted records
+    /// (TS 32.299 §7.2.111 — `scscf`, `pcscf`, `icscf`, `mrfc`, `mgcf`,
+    /// `bgcf`, `as`, `ibcf`, `ecscf`, `atcf`, `mmtel`, `tpf`, `atgw`).
+    /// Default: ``"scscf"``.
+    #[serde(default = "default_rf_node_functionality")]
+    pub node_functionality: String,
+    /// Service-Context-Id (TS 32.299 §7.2.91).  Default:
+    /// ``"32260@3gpp.org"`` (TS 32.260 IMS).
+    #[serde(default = "default_rf_service_context_id")]
+    pub service_context_id: String,
+    /// Explicit Diameter peer name to send ACRs to.  When unset, the
+    /// first peer registered with the manager is used (`any_client`).
+    pub peer: Option<String>,
+}
+
+impl Default for RfConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_emit_proxy: true,
+            auto_emit_b2bua: true,
+            auto_emit_register: true,
+            interim_interval_secs: 0,
+            node_functionality: default_rf_node_functionality(),
+            service_context_id: default_rf_service_context_id(),
+            peer: None,
+        }
+    }
+}
+
+fn default_true() -> bool { true }
+fn default_rf_node_functionality() -> String { "scscf".to_string() }
+fn default_rf_service_context_id() -> String { "32260@3gpp.org".to_string() }
 
 // ---------------------------------------------------------------------------
 // CDR (Call Detail Records)

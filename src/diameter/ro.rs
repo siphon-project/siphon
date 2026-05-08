@@ -61,27 +61,40 @@ impl SubscriberIdKind {
     }
 }
 
-// ── Role-of-Node (TS 32.299 §7.2.174) ──────────────────────────────────
+// ── Role-of-Node (TS 32.299 §7.2.149) ──────────────────────────────────
 
-/// IMS node role for charging purposes.
+/// IMS node role for charging purposes per TS 32.299 §7.2.149.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum NodeRole {
     OriginatingRole = 0,
     TerminatingRole = 1,
     ProxyRole = 2,
-    BcfRole = 3,
+    B2buaRole = 3,
 }
 
 impl NodeRole {
-    fn as_u32(self) -> u32 {
+    pub fn as_u32(self) -> u32 {
         self as u32
+    }
+
+    /// Parse a Python-style role string (`"originating"`, `"terminating"`,
+    /// `"proxy"`, `"b2bua"`).  Case-insensitive.  Returns `None` for
+    /// unknown values so the caller can emit a structured error.
+    pub fn from_str_ci(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "originating" | "orig" => Some(NodeRole::OriginatingRole),
+            "terminating" | "term" => Some(NodeRole::TerminatingRole),
+            "proxy" => Some(NodeRole::ProxyRole),
+            "b2bua" | "b2b-ua" => Some(NodeRole::B2buaRole),
+            _ => None,
+        }
     }
 }
 
-// ── Node-Functionality (TS 32.299 §7.2.126) ────────────────────────────
+// ── Node-Functionality (TS 32.299 §7.2.111) ────────────────────────────
 
-/// IMS node functionality for charging correlation.
+/// IMS node functionality for charging correlation per TS 32.299 §7.2.111.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum NodeFunctionality {
@@ -96,11 +109,39 @@ pub enum NodeFunctionality {
     SCscfRestore = 8,
     Ecscf = 9,
     Atcf = 10,
+    Mmtel = 11,
+    Tpf = 12,
+    Atgw = 13,
 }
 
 impl NodeFunctionality {
-    fn as_u32(self) -> u32 {
+    pub fn as_u32(self) -> u32 {
         self as u32
+    }
+
+    /// Parse a Python-style functionality string.  Accepts the role
+    /// short-names commonly used by operators (`"scscf"`, `"pcscf"`,
+    /// `"as"`, `"mmtel"`, …).  Case-insensitive.
+    pub fn from_str_ci(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "scscf" | "s-cscf" => Some(NodeFunctionality::SCscf),
+            "pcscf" | "p-cscf" => Some(NodeFunctionality::PCscf),
+            "icscf" | "i-cscf" => Some(NodeFunctionality::ICscf),
+            "mrfc" => Some(NodeFunctionality::Mrfc),
+            "mgcf" => Some(NodeFunctionality::Mgcf),
+            "bgcf" => Some(NodeFunctionality::Bgcf),
+            "as" | "applicationserver" | "application-server" => {
+                Some(NodeFunctionality::ApplicationServer)
+            }
+            "ibcf" => Some(NodeFunctionality::Ibcf),
+            "scscf-restore" | "scscf_restore" => Some(NodeFunctionality::SCscfRestore),
+            "ecscf" | "e-cscf" => Some(NodeFunctionality::Ecscf),
+            "atcf" => Some(NodeFunctionality::Atcf),
+            "mmtel" => Some(NodeFunctionality::Mmtel),
+            "tpf" => Some(NodeFunctionality::Tpf),
+            "atgw" => Some(NodeFunctionality::Atgw),
+            _ => None,
+        }
     }
 }
 
@@ -178,9 +219,11 @@ impl ServiceUnit {
 
 // ── IMS charging information ────────────────────────────────────────────
 
-/// IMS-specific charging data carried in Service-Information → IMS-Information.
-///
-/// Per TS 32.299 §7.2.71, this is the primary charging context for IMS sessions.
+/// IMS-specific charging data carried in Service-Information → IMS-Information
+/// per TS 32.299 §7.2.71.  Used by both Ro (online) and Rf (offline)
+/// charging — every field is optional to support partial population by
+/// proxy/B2BUA hooks where some context (e.g. called party for REGISTER)
+/// is not applicable.
 #[derive(Debug, Clone, Default)]
 pub struct ImsChargingData {
     pub calling_party: Option<String>,
@@ -191,6 +234,25 @@ pub struct ImsChargingData {
     pub node_functionality: Option<NodeFunctionality>,
     pub ims_charging_identifier: Option<String>,
     pub cause_code: Option<i32>,
+
+    /// SIP Call-ID — emitted as `User-Session-Id` (TS 32.299 §7.2.193).
+    pub user_session_id: Option<String>,
+    /// Time the trigger SIP request was received (`SIP-Request-Timestamp`,
+    /// TS 32.299 §7.2.183).
+    pub request_timestamp: Option<std::time::SystemTime>,
+    /// Time the corresponding SIP response was received
+    /// (`SIP-Response-Timestamp`, TS 32.299 §7.2.183).
+    pub response_timestamp: Option<std::time::SystemTime>,
+    /// Originating IOI (TS 32.299 §7.2.71, RFC 7315 §5.6).
+    pub originating_ioi: Option<String>,
+    /// Terminating IOI (TS 32.299 §7.2.71, RFC 7315 §5.6).
+    pub terminating_ioi: Option<String>,
+    /// Application Server URI (TS 32.299 §7.2.6) — populated for AS or
+    /// when an S-CSCF dispatched the request to an AS via iFC.
+    pub application_server: Option<String>,
+    /// IMS Visited Network Identifier (TS 32.299 §7.2.74) — populated
+    /// from inbound `P-Visited-Network-ID` for roaming users.
+    pub visited_network_id: Option<String>,
 }
 
 impl ImsChargingData {
@@ -224,6 +286,12 @@ impl ImsChargingData {
                 func.as_u32(),
             ));
         }
+        if let Some(ref session_id) = self.user_session_id {
+            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(
+                avp::USER_SESSION_ID,
+                session_id,
+            ));
+        }
         if let Some(ref caller) = self.calling_party {
             ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(
                 avp::CALLING_PARTY_ADDRESS,
@@ -236,10 +304,55 @@ impl ImsChargingData {
                 callee,
             ));
         }
+
+        // Time-Stamps grouped AVP (TS 32.299 §7.2.183)
+        if self.request_timestamp.is_some() || self.response_timestamp.is_some() {
+            let mut ts_children = Vec::new();
+            if let Some(t) = self.request_timestamp {
+                ts_children.extend_from_slice(&encode_avp_time_3gpp(avp::SIP_REQUEST_TIMESTAMP, t));
+            }
+            if let Some(t) = self.response_timestamp {
+                ts_children.extend_from_slice(&encode_avp_time_3gpp(
+                    avp::SIP_RESPONSE_TIMESTAMP,
+                    t,
+                ));
+            }
+            ims_inner
+                .extend_from_slice(&encode_avp_grouped_3gpp(avp::TIME_STAMPS, &ts_children));
+        }
+
+        // Application-Server (TS 32.299 §7.2.6)
+        if let Some(ref server) = self.application_server {
+            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(avp::APPLICATION_SERVER, server));
+        }
+
+        // Inter-Operator-Identifier grouped AVP (TS 32.299 §7.2.71)
+        if self.originating_ioi.is_some() || self.terminating_ioi.is_some() {
+            let mut ioi_children = Vec::new();
+            if let Some(ref orig) = self.originating_ioi {
+                ioi_children
+                    .extend_from_slice(&encode_avp_utf8_3gpp(avp::ORIGINATING_IOI, orig));
+            }
+            if let Some(ref term) = self.terminating_ioi {
+                ioi_children
+                    .extend_from_slice(&encode_avp_utf8_3gpp(avp::TERMINATING_IOI, term));
+            }
+            ims_inner.extend_from_slice(&encode_avp_grouped_3gpp(
+                avp::INTER_OPERATOR_IDENTIFIER,
+                &ioi_children,
+            ));
+        }
+
         if let Some(ref icid) = self.ims_charging_identifier {
             ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(
                 avp::IMS_CHARGING_IDENTIFIER,
                 icid,
+            ));
+        }
+        if let Some(ref vnid) = self.visited_network_id {
+            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(
+                avp::IMS_VISITED_NETWORK_IDENTIFIER,
+                vnid,
             ));
         }
         if let Some(cause) = self.cause_code {
@@ -509,7 +622,19 @@ mod tests {
         assert_eq!(NodeRole::OriginatingRole.as_u32(), 0);
         assert_eq!(NodeRole::TerminatingRole.as_u32(), 1);
         assert_eq!(NodeRole::ProxyRole.as_u32(), 2);
-        assert_eq!(NodeRole::BcfRole.as_u32(), 3);
+        assert_eq!(NodeRole::B2buaRole.as_u32(), 3);
+    }
+
+    #[test]
+    fn node_role_from_str() {
+        assert_eq!(NodeRole::from_str_ci("originating"), Some(NodeRole::OriginatingRole));
+        assert_eq!(NodeRole::from_str_ci("ORIG"), Some(NodeRole::OriginatingRole));
+        assert_eq!(NodeRole::from_str_ci("terminating"), Some(NodeRole::TerminatingRole));
+        assert_eq!(NodeRole::from_str_ci("term"), Some(NodeRole::TerminatingRole));
+        assert_eq!(NodeRole::from_str_ci("proxy"), Some(NodeRole::ProxyRole));
+        assert_eq!(NodeRole::from_str_ci("b2bua"), Some(NodeRole::B2buaRole));
+        assert_eq!(NodeRole::from_str_ci("b2b-ua"), Some(NodeRole::B2buaRole));
+        assert_eq!(NodeRole::from_str_ci("unknown"), None);
     }
 
     #[test]
@@ -522,8 +647,23 @@ mod tests {
         assert_eq!(NodeFunctionality::Bgcf.as_u32(), 5);
         assert_eq!(NodeFunctionality::ApplicationServer.as_u32(), 6);
         assert_eq!(NodeFunctionality::Ibcf.as_u32(), 7);
+        assert_eq!(NodeFunctionality::SCscfRestore.as_u32(), 8);
         assert_eq!(NodeFunctionality::Ecscf.as_u32(), 9);
         assert_eq!(NodeFunctionality::Atcf.as_u32(), 10);
+        assert_eq!(NodeFunctionality::Mmtel.as_u32(), 11);
+        assert_eq!(NodeFunctionality::Tpf.as_u32(), 12);
+        assert_eq!(NodeFunctionality::Atgw.as_u32(), 13);
+    }
+
+    #[test]
+    fn node_functionality_from_str() {
+        assert_eq!(NodeFunctionality::from_str_ci("scscf"), Some(NodeFunctionality::SCscf));
+        assert_eq!(NodeFunctionality::from_str_ci("S-CSCF"), Some(NodeFunctionality::SCscf));
+        assert_eq!(NodeFunctionality::from_str_ci("pcscf"), Some(NodeFunctionality::PCscf));
+        assert_eq!(NodeFunctionality::from_str_ci("as"), Some(NodeFunctionality::ApplicationServer));
+        assert_eq!(NodeFunctionality::from_str_ci("application-server"), Some(NodeFunctionality::ApplicationServer));
+        assert_eq!(NodeFunctionality::from_str_ci("mmtel"), Some(NodeFunctionality::Mmtel));
+        assert_eq!(NodeFunctionality::from_str_ci("bogus"), None);
     }
 
     // ── Subscriber identity encoding ────────────────────────────────────
@@ -599,11 +739,10 @@ mod tests {
             calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
             called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
             sip_method: Some("INVITE".into()),
-            event: None,
             role_of_node: Some(NodeRole::OriginatingRole),
             node_functionality: Some(NodeFunctionality::SCscf),
             ims_charging_identifier: Some("icid-001011234567890-1709734800".into()),
-            cause_code: None,
+            ..Default::default()
         };
         let encoded = data.encode_service_information();
         let code = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
@@ -618,11 +757,11 @@ mod tests {
             calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
             called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
             sip_method: Some("BYE".into()),
-            event: None,
             role_of_node: Some(NodeRole::OriginatingRole),
             node_functionality: Some(NodeFunctionality::SCscf),
             ims_charging_identifier: Some("icid-bye-test".into()),
             cause_code: Some(0), // Normal call clearing
+            ..Default::default()
         };
         let encoded = data.encode_service_information();
         assert!(!encoded.is_empty());
@@ -631,14 +770,10 @@ mod tests {
     #[test]
     fn ims_charging_with_event_type() {
         let data = ImsChargingData {
-            calling_party: None,
-            called_party: None,
-            sip_method: None,
             event: Some("reg".into()),
             role_of_node: Some(NodeRole::OriginatingRole),
             node_functionality: Some(NodeFunctionality::PCscf),
-            ims_charging_identifier: None,
-            cause_code: None,
+            ..Default::default()
         };
         let encoded = data.encode_service_information();
         assert!(!encoded.is_empty());
@@ -650,6 +785,138 @@ mod tests {
         let encoded = data.encode_service_information();
         // Even with no fields, the nested grouped structure is present
         assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn ims_charging_with_user_session_id() {
+        let data = ImsChargingData {
+            user_session_id: Some("call-id-1234@example.com".into()),
+            node_functionality: Some(NodeFunctionality::SCscf),
+            role_of_node: Some(NodeRole::OriginatingRole),
+            ..Default::default()
+        };
+        let encoded = data.encode_service_information();
+        let wire = build_acr_like_wire_for_test(&data);
+        let decoded = decode_diameter(&wire).unwrap();
+        let svc = decoded.avps.get("Service-Information").unwrap();
+        let ims = svc.get("IMS-Information").unwrap();
+        assert_eq!(
+            ims.get("User-Session-Id").and_then(|v| v.as_str()),
+            Some("call-id-1234@example.com")
+        );
+    }
+
+    #[test]
+    fn ims_charging_with_time_stamps() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let request_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let response_time = UNIX_EPOCH + Duration::from_secs(1_700_000_002);
+        let data = ImsChargingData {
+            sip_method: Some("INVITE".into()),
+            request_timestamp: Some(request_time),
+            response_timestamp: Some(response_time),
+            ..Default::default()
+        };
+        let wire = build_acr_like_wire_for_test(&data);
+        let decoded = decode_diameter(&wire).unwrap();
+        let ts = decoded
+            .avps
+            .get("Service-Information")
+            .and_then(|s| s.get("IMS-Information"))
+            .and_then(|i| i.get("Time-Stamps"))
+            .expect("Time-Stamps grouped AVP missing");
+        assert_eq!(
+            ts.get("SIP-Request-Timestamp").and_then(|v| v.as_u64()),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            ts.get("SIP-Response-Timestamp").and_then(|v| v.as_u64()),
+            Some(1_700_000_002)
+        );
+    }
+
+    #[test]
+    fn ims_charging_with_inter_operator_identifier() {
+        let data = ImsChargingData {
+            originating_ioi: Some("home1.net".into()),
+            terminating_ioi: Some("home2.net".into()),
+            ..Default::default()
+        };
+        let wire = build_acr_like_wire_for_test(&data);
+        let decoded = decode_diameter(&wire).unwrap();
+        let ioi = decoded
+            .avps
+            .get("Service-Information")
+            .and_then(|s| s.get("IMS-Information"))
+            .and_then(|i| i.get("Inter-Operator-Identifier"))
+            .expect("Inter-Operator-Identifier grouped AVP missing");
+        assert_eq!(
+            ioi.get("Originating-IOI").and_then(|v| v.as_str()),
+            Some("home1.net")
+        );
+        assert_eq!(
+            ioi.get("Terminating-IOI").and_then(|v| v.as_str()),
+            Some("home2.net")
+        );
+    }
+
+    #[test]
+    fn ims_charging_with_application_server() {
+        let data = ImsChargingData {
+            application_server: Some("sip:mmtel.ims.example.com".into()),
+            node_functionality: Some(NodeFunctionality::ApplicationServer),
+            ..Default::default()
+        };
+        let wire = build_acr_like_wire_for_test(&data);
+        let decoded = decode_diameter(&wire).unwrap();
+        let ims = decoded
+            .avps
+            .get("Service-Information")
+            .and_then(|s| s.get("IMS-Information"))
+            .unwrap();
+        assert_eq!(
+            ims.get("Application-Server").and_then(|v| v.as_str()),
+            Some("sip:mmtel.ims.example.com")
+        );
+    }
+
+    #[test]
+    fn ims_charging_with_visited_network_id() {
+        let data = ImsChargingData {
+            visited_network_id: Some("visited.example.com".into()),
+            ..Default::default()
+        };
+        let wire = build_acr_like_wire_for_test(&data);
+        let decoded = decode_diameter(&wire).unwrap();
+        let ims = decoded
+            .avps
+            .get("Service-Information")
+            .and_then(|s| s.get("IMS-Information"))
+            .unwrap();
+        assert_eq!(
+            ims.get("IMS-Visited-Network-Identifier").and_then(|v| v.as_str()),
+            Some("visited.example.com")
+        );
+    }
+
+    /// Helper: wrap an `ImsChargingData` Service-Information block in a
+    /// minimal Diameter message so the standard decoder can be used to
+    /// inspect grouped AVP children.
+    fn build_acr_like_wire_for_test(data: &ImsChargingData) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "test;sess"));
+        payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "scscf.example.com"));
+        payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
+        payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, "example.com"));
+        payload.extend_from_slice(&data.encode_service_information());
+        encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1,
+            2,
+            &payload,
+        )
     }
 
     // ── CCA parsing ─────────────────────────────────────────────────────

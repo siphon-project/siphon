@@ -5,6 +5,7 @@ pub mod refer;
 pub mod route;
 pub mod session_timer;
 pub mod rseq;
+pub mod charging;
 
 use indexmap::IndexMap;
 use std::sync::Arc;

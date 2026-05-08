@@ -2226,6 +2226,11 @@ class MockDiameter:
         self._default_server_name: Optional[str] = None
         self._default_rx_result_code: int = 2001
         self._default_sh_result_code: int = 2001
+        # Rf (CTF → CDF) — TS 32.299 offline charging
+        self._default_rf_result_code: int = 2001
+        self._default_rf_interim_interval: Optional[int] = None
+        self._rf_session_counter: int = 0
+        self._rf_acrs: list[dict] = []  # captured ACRs for assertions
 
     def is_connected(self, peer_name: str) -> bool:
         """Check if a Diameter peer is connected.
@@ -2469,6 +2474,220 @@ class MockDiameter:
             "result_code": result_code,
             "session_id": session_id,
         }
+
+    # -- Rf: CDF integration (offline charging — TS 32.299) --
+
+    def rf_acr_start(
+        self,
+        *,
+        calling_party: Optional[str] = None,
+        called_party: Optional[str] = None,
+        sip_method: Optional[str] = None,
+        role_of_node: Optional[str] = None,
+        node_functionality: Optional[str] = None,
+        ims_charging_identifier: Optional[str] = None,
+        user_session_id: Optional[str] = None,
+        originating_ioi: Optional[str] = None,
+        terminating_ioi: Optional[str] = None,
+        application_server: Optional[str] = None,
+        visited_network_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        cause_code: Optional[int] = None,
+        service_context_id: Optional[str] = None,
+        peer: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Send Rf ACR-START to the CDF (TS 32.299 §6.2.2)."""
+        return self._record_acr(
+            "START",
+            session_id=None,
+            record_number=0,
+            termination_cause=None,
+            calling_party=calling_party,
+            called_party=called_party,
+            sip_method=sip_method,
+            role_of_node=role_of_node,
+            node_functionality=node_functionality,
+            ims_charging_identifier=ims_charging_identifier,
+            user_session_id=user_session_id,
+            originating_ioi=originating_ioi,
+            terminating_ioi=terminating_ioi,
+            application_server=application_server,
+            visited_network_id=visited_network_id,
+            user_name=user_name,
+            cause_code=cause_code,
+            service_context_id=service_context_id,
+            peer=peer,
+        )
+
+    def rf_acr_interim(
+        self,
+        session_id: str,
+        record_number: int,
+        *,
+        calling_party: Optional[str] = None,
+        called_party: Optional[str] = None,
+        sip_method: Optional[str] = None,
+        role_of_node: Optional[str] = None,
+        node_functionality: Optional[str] = None,
+        ims_charging_identifier: Optional[str] = None,
+        user_session_id: Optional[str] = None,
+        originating_ioi: Optional[str] = None,
+        terminating_ioi: Optional[str] = None,
+        application_server: Optional[str] = None,
+        visited_network_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        cause_code: Optional[int] = None,
+        service_context_id: Optional[str] = None,
+        peer: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Send Rf ACR-INTERIM (mid-session accounting update)."""
+        return self._record_acr(
+            "INTERIM",
+            session_id=session_id,
+            record_number=record_number,
+            termination_cause=None,
+            calling_party=calling_party,
+            called_party=called_party,
+            sip_method=sip_method,
+            role_of_node=role_of_node,
+            node_functionality=node_functionality,
+            ims_charging_identifier=ims_charging_identifier,
+            user_session_id=user_session_id,
+            originating_ioi=originating_ioi,
+            terminating_ioi=terminating_ioi,
+            application_server=application_server,
+            visited_network_id=visited_network_id,
+            user_name=user_name,
+            cause_code=cause_code,
+            service_context_id=service_context_id,
+            peer=peer,
+        )
+
+    def rf_acr_stop(
+        self,
+        session_id: str,
+        record_number: int,
+        *,
+        termination_cause: int = 1,
+        calling_party: Optional[str] = None,
+        called_party: Optional[str] = None,
+        sip_method: Optional[str] = None,
+        role_of_node: Optional[str] = None,
+        node_functionality: Optional[str] = None,
+        ims_charging_identifier: Optional[str] = None,
+        user_session_id: Optional[str] = None,
+        originating_ioi: Optional[str] = None,
+        terminating_ioi: Optional[str] = None,
+        application_server: Optional[str] = None,
+        visited_network_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        cause_code: Optional[int] = None,
+        service_context_id: Optional[str] = None,
+        peer: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Send Rf ACR-STOP. ``termination_cause`` per RFC 6733 §8.15
+        (1=LOGOUT, 4=ADMINISTRATIVE, 5=LINK_BROKEN, 8=SESSION_TIMEOUT)."""
+        return self._record_acr(
+            "STOP",
+            session_id=session_id,
+            record_number=record_number,
+            termination_cause=termination_cause,
+            calling_party=calling_party,
+            called_party=called_party,
+            sip_method=sip_method,
+            role_of_node=role_of_node,
+            node_functionality=node_functionality,
+            ims_charging_identifier=ims_charging_identifier,
+            user_session_id=user_session_id,
+            originating_ioi=originating_ioi,
+            terminating_ioi=terminating_ioi,
+            application_server=application_server,
+            visited_network_id=visited_network_id,
+            user_name=user_name,
+            cause_code=cause_code,
+            service_context_id=service_context_id,
+            peer=peer,
+        )
+
+    def rf_acr_event(
+        self,
+        *,
+        calling_party: Optional[str] = None,
+        called_party: Optional[str] = None,
+        sip_method: Optional[str] = None,
+        role_of_node: Optional[str] = None,
+        node_functionality: Optional[str] = None,
+        ims_charging_identifier: Optional[str] = None,
+        user_session_id: Optional[str] = None,
+        originating_ioi: Optional[str] = None,
+        terminating_ioi: Optional[str] = None,
+        application_server: Optional[str] = None,
+        visited_network_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        cause_code: Optional[int] = None,
+        service_context_id: Optional[str] = None,
+        peer: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Send Rf ACR-EVENT (one-shot accounting — REGISTER/MESSAGE)."""
+        return self._record_acr(
+            "EVENT",
+            session_id=None,
+            record_number=0,
+            termination_cause=None,
+            calling_party=calling_party,
+            called_party=called_party,
+            sip_method=sip_method,
+            role_of_node=role_of_node,
+            node_functionality=node_functionality,
+            ims_charging_identifier=ims_charging_identifier,
+            user_session_id=user_session_id,
+            originating_ioi=originating_ioi,
+            terminating_ioi=terminating_ioi,
+            application_server=application_server,
+            visited_network_id=visited_network_id,
+            user_name=user_name,
+            cause_code=cause_code,
+            service_context_id=service_context_id,
+            peer=peer,
+        )
+
+    def _record_acr(self, record_type: str, **kwargs) -> Optional[dict]:
+        """Capture an ACR for assertions and synthesize an ACA dict."""
+        if record_type in ("START", "EVENT"):
+            self._rf_session_counter += 1
+            session_id = f"mock-cdf;rf;sess;{self._rf_session_counter}"
+        else:
+            session_id = kwargs.get("session_id") or "mock-cdf;rf;sess;1"
+        captured = {"record_type": record_type, "session_id": session_id, **kwargs}
+        self._rf_acrs.append(captured)
+        return {
+            "result_code": self._default_rf_result_code,
+            "session_id": session_id,
+            "record_number": kwargs.get("record_number") or 0,
+            "interim_interval": self._default_rf_interim_interval,
+        }
+
+    # Rf test helpers
+
+    def set_rf_result_code(self, code: int) -> None:
+        """Override the Result-Code returned by every Rf ACA (default 2001)."""
+        self._default_rf_result_code = code
+
+    def set_rf_interim_interval(self, interval_secs: Optional[int]) -> None:
+        """Configure the ``Acct-Interim-Interval`` returned in ACA-START."""
+        self._default_rf_interim_interval = interval_secs
+
+    def captured_acrs(self) -> list[dict]:
+        """Return all ACRs the script has emitted via ``rf_acr_*``.
+
+        Returns a fresh copy on each call.  Useful for asserting on
+        accounting flows in tests.
+        """
+        return [dict(entry) for entry in self._rf_acrs]
+
+    def clear_captured_acrs(self) -> None:
+        """Reset the captured-ACR list between tests."""
+        self._rf_acrs.clear()
 
     @staticmethod
     def on_rtr(fn: Any) -> Any:
@@ -2724,6 +2943,10 @@ class MockDiameter:
         self._default_server_name = None
         self._default_rx_result_code = 2001
         self._default_sh_result_code = 2001
+        self._default_rf_result_code = 2001
+        self._default_rf_interim_interval = None
+        self._rf_session_counter = 0
+        self._rf_acrs.clear()
 
 
 # ---------------------------------------------------------------------------

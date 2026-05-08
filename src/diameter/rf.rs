@@ -11,6 +11,7 @@
 //! with 3GPP IMS-specific AVPs in the Service-Information grouped AVP.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tracing::info;
 
@@ -18,6 +19,42 @@ use crate::diameter::codec::*;
 use crate::diameter::dictionary::{self, avp};
 use crate::diameter::peer::DiameterPeer;
 use crate::diameter::ro::ImsChargingData;
+
+// ── Service-Context-Id (TS 32.260 §5.0) ────────────────────────────────
+
+/// Default `Service-Context-Id` for IMS offline charging per TS 32.260
+/// (release-agnostic).  Identifies the service category being charged.
+pub const SERVICE_CONTEXT_ID_IMS: &str = "32260@3gpp.org";
+
+// ── Termination-Cause (RFC 6733 §8.15) ─────────────────────────────────
+
+/// `Termination-Cause` AVP enumerated values per RFC 6733 §8.15.
+/// Required in ACR-STOP records.
+pub mod termination_cause {
+    pub const DIAMETER_LOGOUT: u32 = 1;
+    pub const DIAMETER_SERVICE_NOT_PROVIDED: u32 = 2;
+    pub const DIAMETER_BAD_ANSWER: u32 = 3;
+    pub const DIAMETER_ADMINISTRATIVE: u32 = 4;
+    pub const DIAMETER_LINK_BROKEN: u32 = 5;
+    pub const DIAMETER_AUTH_EXPIRED: u32 = 6;
+    pub const DIAMETER_USER_MOVED: u32 = 7;
+    pub const DIAMETER_SESSION_TIMEOUT: u32 = 8;
+}
+
+/// Map a SIP final response code to a Cause-Code value suitable for the
+/// IMS-Information `Cause-Code` AVP per TS 32.299 §5.2.5.  Successful
+/// terminations (2xx) map to 0; failures pass through their negative SIP
+/// code (e.g. 486 Busy → -486), matching the convention used by every
+/// open-source IMS charging client.  Returns `None` for codes outside the
+/// 100–699 range.
+pub fn sip_status_to_cause_code(status: u16) -> Option<i32> {
+    match status {
+        100..=199 => None,
+        200..=299 => Some(0),
+        300..=699 => Some(-(status as i32)),
+        _ => None,
+    }
+}
 
 // ── Accounting-Record-Type (RFC 6733 §9.8.1) ───────────────────────────
 
@@ -55,6 +92,10 @@ pub struct AccountingAnswer {
     pub record_type: Option<u32>,
     pub record_number: Option<u32>,
     pub session_id: Option<String>,
+    /// `Acct-Interim-Interval` (RFC 6733 §8.19) returned by the CDF in
+    /// ACA-START.  When present, the CTF must use this value for
+    /// subsequent ACR-INTERIM cadence in preference to its local default.
+    pub interim_interval: Option<u32>,
 }
 
 impl AccountingAnswer {
@@ -81,17 +122,117 @@ fn parse_aca(avps: &serde_json::Value) -> AccountingAnswer {
             .get("Session-Id")
             .and_then(|v| v.as_str())
             .map(String::from),
+        interim_interval: avps
+            .get("Acct-Interim-Interval")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
     }
 }
 
 // ── ACR parameters ──────────────────────────────────────────────────────
 
-/// Full set of parameters for an Accounting-Request.
+/// Full set of parameters for an Accounting-Request per TS 32.299 §6.2.2.
 pub struct AccountingParams<'a> {
     pub record_type: AccountingRecordType,
     pub record_number: u32,
     pub session_id: Option<&'a str>,
     pub ims_data: Option<&'a ImsChargingData>,
+
+    /// `Event-Timestamp` AVP (RFC 6733 §8.21).  Defaults to the wall-clock
+    /// time of `send_acr` when `None`.
+    pub event_timestamp: Option<SystemTime>,
+    /// `Service-Context-Id` AVP (TS 32.299 §7.2.91).  Defaults to
+    /// [`SERVICE_CONTEXT_ID_IMS`] when `None`.
+    pub service_context_id: Option<&'a str>,
+    /// `User-Name` AVP (RFC 6733 §8.14) — typically a SIP URI / IMPU
+    /// identifying the served subscriber.
+    pub user_name: Option<&'a str>,
+    /// `Termination-Cause` AVP (RFC 6733 §8.15).  Mandatory in ACR-STOP;
+    /// must be `None` for START/INTERIM/EVENT.
+    pub termination_cause: Option<u32>,
+}
+
+impl<'a> AccountingParams<'a> {
+    /// Construct a parameter set with sensible defaults.  Only
+    /// `record_type` is required; everything else is optional.
+    pub fn new(record_type: AccountingRecordType) -> Self {
+        Self {
+            record_type,
+            record_number: 0,
+            session_id: None,
+            ims_data: None,
+            event_timestamp: None,
+            service_context_id: None,
+            user_name: None,
+            termination_cause: None,
+        }
+    }
+}
+
+// ── ACR encoder ─────────────────────────────────────────────────────────
+
+/// Encode the AVP payload of an Accounting-Request per TS 32.299 §6.2.2.
+///
+/// Pure function — testable without a live peer.
+pub fn encode_acr_payload(
+    origin_host: &str,
+    origin_realm: &str,
+    destination_realm: &str,
+    destination_host: Option<&str>,
+    session_id: &str,
+    params: &AccountingParams<'_>,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(512);
+    payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
+    payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, origin_host));
+    payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, origin_realm));
+    payload.extend_from_slice(&encode_avp_utf8(
+        avp::DESTINATION_REALM,
+        destination_realm,
+    ));
+    if let Some(host) = destination_host {
+        payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, host));
+    }
+
+    // Acct-Application-Id = 3 (Rf uses base accounting, not Vendor-Specific-Application-Id).
+    payload.extend_from_slice(&encode_avp_u32(avp::ACCT_APPLICATION_ID, dictionary::RF_APP_ID));
+
+    // Service-Context-Id (TS 32.299 §7.2.91) — mandatory for IMS Rf.
+    let service_context = params.service_context_id.unwrap_or(SERVICE_CONTEXT_ID_IMS);
+    payload.extend_from_slice(&encode_avp_utf8(avp::SERVICE_CONTEXT_ID, service_context));
+
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::ACCOUNTING_RECORD_TYPE,
+        params.record_type.as_u32(),
+    ));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::ACCOUNTING_RECORD_NUMBER,
+        params.record_number,
+    ));
+
+    // User-Name (RFC 6733 §8.14) — IMS uses this to carry the served
+    // subscriber's SIP URI / IMPU.
+    if let Some(name) = params.user_name {
+        payload.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, name));
+    }
+
+    // Event-Timestamp (RFC 6733 §8.21) — required for START/STOP/INTERIM
+    // per TS 32.299 §6.2.2.
+    let event_ts = params.event_timestamp.unwrap_or_else(SystemTime::now);
+    payload.extend_from_slice(&encode_avp_time(avp::EVENT_TIMESTAMP, event_ts));
+
+    // Termination-Cause (RFC 6733 §8.15) — mandatory in ACR-STOP per
+    // TS 32.299 §6.2.2.
+    if let Some(cause) = params.termination_cause {
+        payload.extend_from_slice(&encode_avp_u32(avp::TERMINATION_CAUSE, cause));
+    }
+
+    // Service-Information → IMS-Information (shared with Ro)
+    if let Some(ims) = params.ims_data {
+        payload.extend_from_slice(&ims.encode_service_information());
+    }
+
+    payload
 }
 
 // ── ACR sender ──────────────────────────────────────────────────────────
@@ -119,31 +260,14 @@ pub async fn send_acr(
         }
     };
 
-    let mut payload = Vec::with_capacity(512);
-    payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
-    payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
-    payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-    payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, &config.destination_realm));
-    if let Some(ref host) = config.destination_host {
-        payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, host));
-    }
-
-    // Acct-Application-Id = 3 (Rf uses base accounting, not Vendor-Specific-Application-Id)
-    payload.extend_from_slice(&encode_avp_u32(avp::ACCT_APPLICATION_ID, dictionary::RF_APP_ID));
-
-    payload.extend_from_slice(&encode_avp_u32(
-        avp::ACCOUNTING_RECORD_TYPE,
-        params.record_type.as_u32(),
-    ));
-    payload.extend_from_slice(&encode_avp_u32(
-        avp::ACCOUNTING_RECORD_NUMBER,
-        params.record_number,
-    ));
-
-    // Service-Information → IMS-Information (shared with Ro)
-    if let Some(ims) = params.ims_data {
-        payload.extend_from_slice(&ims.encode_service_information());
-    }
+    let payload = encode_acr_payload(
+        &config.origin_host,
+        &config.origin_realm,
+        &config.destination_realm,
+        config.destination_host.as_deref(),
+        session_id,
+        params,
+    );
 
     let wire = encode_diameter_message(
         FLAG_REQUEST | FLAG_PROXIABLE,
@@ -165,76 +289,70 @@ pub async fn send_acr(
     Ok(parse_aca(&answer.avps))
 }
 
-/// Send ACR-START (begin accounting session).
+/// Send ACR-START (begin accounting session).  Record-Number is fixed at 0
+/// per RFC 6733 §9.8.3.
 pub async fn send_acr_start(
     peer: &Arc<DiameterPeer>,
+    user_name: Option<&str>,
     ims_data: Option<&ImsChargingData>,
 ) -> Result<AccountingAnswer, String> {
-    send_acr(
-        peer,
-        &AccountingParams {
-            record_type: AccountingRecordType::StartRecord,
-            record_number: 0,
-            session_id: None,
-            ims_data,
-        },
-    )
-    .await
+    let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
+    params.user_name = user_name;
+    params.ims_data = ims_data;
+    send_acr(peer, &params).await
 }
 
-/// Send ACR-INTERIM (mid-session accounting update).
+/// Send ACR-INTERIM (mid-session accounting update).  `record_number` must
+/// be a strictly increasing non-zero integer for the same Session-Id per
+/// RFC 6733 §9.8.3.
 pub async fn send_acr_interim(
     peer: &Arc<DiameterPeer>,
     session_id: &str,
     record_number: u32,
+    user_name: Option<&str>,
     ims_data: Option<&ImsChargingData>,
 ) -> Result<AccountingAnswer, String> {
-    send_acr(
-        peer,
-        &AccountingParams {
-            record_type: AccountingRecordType::InterimRecord,
-            record_number,
-            session_id: Some(session_id),
-            ims_data,
-        },
-    )
-    .await
+    let mut params = AccountingParams::new(AccountingRecordType::InterimRecord);
+    params.record_number = record_number;
+    params.session_id = Some(session_id);
+    params.user_name = user_name;
+    params.ims_data = ims_data;
+    send_acr(peer, &params).await
 }
 
-/// Send ACR-STOP (end accounting session).
+/// Send ACR-STOP (end accounting session).  `termination_cause` should
+/// match the actual termination reason per RFC 6733 §8.15
+/// ([`termination_cause::DIAMETER_LOGOUT`] for normal BYE,
+/// [`termination_cause::DIAMETER_SESSION_TIMEOUT`] for session-timer
+/// expiry, etc.).
 pub async fn send_acr_stop(
     peer: &Arc<DiameterPeer>,
     session_id: &str,
     record_number: u32,
+    termination_cause: u32,
+    user_name: Option<&str>,
     ims_data: Option<&ImsChargingData>,
 ) -> Result<AccountingAnswer, String> {
-    send_acr(
-        peer,
-        &AccountingParams {
-            record_type: AccountingRecordType::StopRecord,
-            record_number,
-            session_id: Some(session_id),
-            ims_data,
-        },
-    )
-    .await
+    let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
+    params.record_number = record_number;
+    params.session_id = Some(session_id);
+    params.user_name = user_name;
+    params.ims_data = ims_data;
+    params.termination_cause = Some(termination_cause);
+    send_acr(peer, &params).await
 }
 
 /// Send ACR-EVENT (one-shot accounting, e.g., SIP MESSAGE or REGISTER).
+/// Record-Number is fixed at 0 per RFC 6733 §9.8.3.
 pub async fn send_acr_event(
     peer: &Arc<DiameterPeer>,
+    user_name: Option<&str>,
     ims_data: Option<&ImsChargingData>,
 ) -> Result<AccountingAnswer, String> {
-    send_acr(
-        peer,
-        &AccountingParams {
-            record_type: AccountingRecordType::EventRecord,
-            record_number: 0,
-            session_id: None,
-            ims_data,
-        },
-    )
-    .await
+    let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
+    params.user_name = user_name;
+    params.ims_data = ims_data;
+    send_acr(peer, &params).await
 }
 
 #[cfg(test)]
@@ -371,11 +489,11 @@ mod tests {
             calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
             called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
             sip_method: Some("INVITE".into()),
-            event: None,
             role_of_node: Some(NodeRole::OriginatingRole),
             node_functionality: Some(NodeFunctionality::SCscf),
             ims_charging_identifier: Some("icid-rf-test-001".into()),
             cause_code: Some(0),
+            ..Default::default()
         };
         let encoded = data.encode_service_information();
         assert!(!encoded.is_empty());
@@ -390,13 +508,10 @@ mod tests {
     fn ims_data_register_event_pcscf() {
         let data = ImsChargingData {
             calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
-            called_party: None,
             sip_method: Some("REGISTER".into()),
-            event: None,
             role_of_node: Some(NodeRole::OriginatingRole),
             node_functionality: Some(NodeFunctionality::PCscf),
-            ims_charging_identifier: None,
-            cause_code: None,
+            ..Default::default()
         };
         let encoded = data.encode_service_information();
         assert!(!encoded.is_empty());
@@ -643,5 +758,260 @@ mod tests {
     #[test]
     fn rf_diameter_success_code() {
         assert_eq!(dictionary::DIAMETER_SUCCESS, 2001);
+    }
+
+    // ── Event-Timestamp / Service-Context-Id / User-Name (TS 32.299 §6.2.2) ─
+
+    #[test]
+    fn acr_encodes_event_timestamp() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let event_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
+        params.event_timestamp = Some(event_time);
+
+        let payload = encode_acr_payload(
+            "scscf.ims.example.com",
+            "example.com",
+            "example.com",
+            None,
+            "sess;1",
+            &params,
+        );
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1, 2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert_eq!(
+            decoded.avps.get("Event-Timestamp").and_then(|v| v.as_u64()),
+            Some(1_700_000_000)
+        );
+    }
+
+    #[test]
+    fn acr_encodes_service_context_id_default_ims() {
+        let params = AccountingParams::new(AccountingRecordType::StartRecord);
+        let payload = encode_acr_payload(
+            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+        );
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1, 2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert_eq!(
+            decoded.avps.get("Service-Context-Id").and_then(|v| v.as_str()),
+            Some("32260@3gpp.org")
+        );
+    }
+
+    #[test]
+    fn acr_encodes_service_context_id_override() {
+        let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
+        params.service_context_id = Some("32274@3gpp.org"); // MMTel SC
+        let payload = encode_acr_payload(
+            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+        );
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1, 2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert_eq!(
+            decoded.avps.get("Service-Context-Id").and_then(|v| v.as_str()),
+            Some("32274@3gpp.org")
+        );
+    }
+
+    #[test]
+    fn acr_encodes_user_name_when_set() {
+        let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
+        params.user_name = Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org");
+        let payload = encode_acr_payload(
+            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+        );
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1, 2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert_eq!(
+            decoded.avps.get("User-Name").and_then(|v| v.as_str()),
+            Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org")
+        );
+    }
+
+    #[test]
+    fn acr_omits_user_name_when_none() {
+        let params = AccountingParams::new(AccountingRecordType::StartRecord);
+        let payload = encode_acr_payload(
+            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+        );
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1, 2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(decoded.avps.get("User-Name").is_none());
+    }
+
+    // ── Termination-Cause (RFC 6733 §8.15, mandatory in ACR-STOP) ────────
+
+    #[test]
+    fn acr_stop_encodes_termination_cause_logout() {
+        let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
+        params.session_id = Some("sess;1");
+        params.record_number = 1;
+        params.termination_cause = Some(termination_cause::DIAMETER_LOGOUT);
+        let payload = encode_acr_payload(
+            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+        );
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1, 2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert_eq!(
+            decoded.avps.get("Termination-Cause").and_then(|v| v.as_u64()),
+            Some(1) // DIAMETER_LOGOUT
+        );
+    }
+
+    #[test]
+    fn acr_stop_encodes_termination_cause_session_timeout() {
+        let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
+        params.session_id = Some("sess;1");
+        params.record_number = 5;
+        params.termination_cause = Some(termination_cause::DIAMETER_SESSION_TIMEOUT);
+        let payload = encode_acr_payload(
+            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+        );
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1, 2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert_eq!(
+            decoded.avps.get("Termination-Cause").and_then(|v| v.as_u64()),
+            Some(8) // DIAMETER_SESSION_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn acr_start_omits_termination_cause() {
+        let params = AccountingParams::new(AccountingRecordType::StartRecord);
+        let payload = encode_acr_payload(
+            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+        );
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1, 2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(
+            decoded.avps.get("Termination-Cause").is_none(),
+            "Termination-Cause must NOT be present in ACR-START per TS 32.299 §6.2.2"
+        );
+    }
+
+    #[test]
+    fn termination_cause_constants_match_rfc6733() {
+        // RFC 6733 §8.15 Termination-Cause enumerated values
+        assert_eq!(termination_cause::DIAMETER_LOGOUT, 1);
+        assert_eq!(termination_cause::DIAMETER_SERVICE_NOT_PROVIDED, 2);
+        assert_eq!(termination_cause::DIAMETER_BAD_ANSWER, 3);
+        assert_eq!(termination_cause::DIAMETER_ADMINISTRATIVE, 4);
+        assert_eq!(termination_cause::DIAMETER_LINK_BROKEN, 5);
+        assert_eq!(termination_cause::DIAMETER_AUTH_EXPIRED, 6);
+        assert_eq!(termination_cause::DIAMETER_USER_MOVED, 7);
+        assert_eq!(termination_cause::DIAMETER_SESSION_TIMEOUT, 8);
+    }
+
+    // ── Acct-Interim-Interval round-trip (RFC 6733 §8.19) ────────────────
+
+    #[test]
+    fn aca_with_interim_interval_returned_by_cdf() {
+        let json = serde_json::json!({
+            "Result-Code": 2001,
+            "Accounting-Record-Type": 2,
+            "Accounting-Record-Number": 0,
+            "Acct-Interim-Interval": 600,
+        });
+        let answer = parse_aca(&json);
+        assert!(answer.is_success());
+        assert_eq!(answer.interim_interval, Some(600));
+    }
+
+    #[test]
+    fn aca_without_interim_interval_is_none() {
+        let json = serde_json::json!({
+            "Result-Code": 2001,
+            "Accounting-Record-Type": 2,
+        });
+        let answer = parse_aca(&json);
+        assert!(answer.interim_interval.is_none());
+    }
+
+    // ── SIP → Diameter Cause-Code mapping (TS 32.299 §5.2.5) ─────────────
+
+    #[test]
+    fn sip_status_to_cause_code_2xx_is_zero() {
+        assert_eq!(sip_status_to_cause_code(200), Some(0));
+        assert_eq!(sip_status_to_cause_code(202), Some(0));
+    }
+
+    #[test]
+    fn sip_status_to_cause_code_4xx_is_negative() {
+        assert_eq!(sip_status_to_cause_code(486), Some(-486));
+        assert_eq!(sip_status_to_cause_code(404), Some(-404));
+    }
+
+    #[test]
+    fn sip_status_to_cause_code_5xx_6xx_is_negative() {
+        assert_eq!(sip_status_to_cause_code(503), Some(-503));
+        assert_eq!(sip_status_to_cause_code(603), Some(-603));
+    }
+
+    #[test]
+    fn sip_status_to_cause_code_provisional_is_none() {
+        assert_eq!(sip_status_to_cause_code(180), None);
+        assert_eq!(sip_status_to_cause_code(100), None);
+    }
+
+    #[test]
+    fn sip_status_to_cause_code_out_of_range_is_none() {
+        assert_eq!(sip_status_to_cause_code(99), None);
+        assert_eq!(sip_status_to_cause_code(700), None);
+    }
+
+    // ── Service-Context-Id constant (TS 32.260 §5.0) ──────────────────────
+
+    #[test]
+    fn service_context_id_ims_constant() {
+        assert_eq!(SERVICE_CONTEXT_ID_IMS, "32260@3gpp.org");
     }
 }

@@ -366,6 +366,9 @@ impl SiphonServer {
             });
         }
 
+        // --- Rf offline charging service (TS 32.299) ---
+        let rf_charger = init_rf_charging(&config, diameter_manager.as_ref());
+
         // --- Initialize metrics ---
         if let Err(error) = crate::metrics::init() {
             error!("Failed to initialize metrics: {error}");
@@ -1239,6 +1242,16 @@ impl SiphonServer {
         let registrar_event_rx = crate::script::api::registrar_arc()
             .map(|r| r.subscribe_events());
 
+        // --- Rf ACR-EVENT auto-emit on registration changes ---
+        if let (Some(rf_service), Some(registrar)) = (
+            rf_charger.as_ref(),
+            crate::script::api::registrar_arc(),
+        ) {
+            if rf_service.auto_emit_register() {
+                spawn_rf_register_emitter(Arc::clone(rf_service), registrar.subscribe_events());
+            }
+        }
+
         // --- Start dispatcher ---
         let drain = Arc::new(dispatcher::DrainState::new());
         let dispatcher_handle = tokio::spawn(dispatcher::run(
@@ -1713,6 +1726,85 @@ fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::DiameterManager
     });
 
     Some(manager)
+}
+
+/// Background task that consumes the registrar's broadcast channel and
+/// emits an Rf ACR-EVENT for every registration state change.  Each
+/// event is a one-shot accounting record — no session state is held.
+///
+/// `cause_code` per RFC 3326 / TS 32.299 §5.2.5:
+/// - `Registered` / `Refreshed` → 0 (success)
+/// - `Deregistered` → -200 (clean unbind, mapped from successful 200 OK)
+/// - `Expired` → -487 (Request Terminated semantically — the binding
+///   was torn down because no refresh arrived)
+fn spawn_rf_register_emitter(
+    service: Arc<crate::diameter::rf_service::RfChargingService>,
+    mut events: tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>,
+) {
+    use crate::diameter::ro::{ImsChargingData, NodeRole};
+    use crate::registrar::RegistrationEvent;
+
+    tokio::spawn(async move {
+        info!("rf: registrar ACR-EVENT emitter started");
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "rf: registrar event emitter lagged");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            let (aor, cause_code) = match &event {
+                RegistrationEvent::Registered { aor }
+                | RegistrationEvent::Refreshed { aor } => (aor.clone(), 0i32),
+                RegistrationEvent::Deregistered { aor } => (aor.clone(), -200),
+                RegistrationEvent::Expired { aor } => (aor.clone(), -487),
+            };
+            let mut ims_data = ImsChargingData::default();
+            ims_data.calling_party = Some(aor.clone());
+            ims_data.sip_method = Some("REGISTER".to_string());
+            ims_data.role_of_node = Some(NodeRole::OriginatingRole);
+            ims_data.node_functionality = service.node_functionality();
+            ims_data.cause_code = Some(cause_code);
+            let _ = service.acr_event(ims_data, Some(aor)).await;
+        }
+        info!("rf: registrar ACR-EVENT emitter stopped");
+    });
+}
+
+/// Build the Rf offline-charging service from the `rf:` config block.
+///
+/// Returns `None` (charging fully disabled) when:
+/// - the `rf:` section is missing,
+/// - `rf.enabled = false`, or
+/// - no Diameter manager is available (no `diameter:` peers configured).
+fn init_rf_charging(
+    config: &Config,
+    diameter_manager: Option<&Arc<crate::diameter::DiameterManager>>,
+) -> Option<Arc<crate::diameter::rf_service::RfChargingService>> {
+    let rf_config = config.rf.as_ref()?;
+    if !rf_config.enabled {
+        return None;
+    }
+    let manager = match diameter_manager {
+        Some(m) => Arc::clone(m),
+        None => {
+            warn!("rf.enabled = true but no diameter: peers configured — disabling Rf");
+            return None;
+        }
+    };
+    let service = crate::diameter::rf_service::RfChargingService::new(manager, rf_config.clone());
+    info!(
+        node_functionality = %rf_config.node_functionality,
+        service_context_id = %rf_config.service_context_id,
+        auto_emit_proxy = rf_config.auto_emit_proxy,
+        auto_emit_b2bua = rf_config.auto_emit_b2bua,
+        auto_emit_register = rf_config.auto_emit_register,
+        interim_secs = rf_config.interim_interval_secs,
+        "Rf offline charging enabled"
+    );
+    Some(service)
 }
 
 fn init_registrant(

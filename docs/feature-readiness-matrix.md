@@ -256,7 +256,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Diameter Cx (HSS auth) | **Production** | `auth.backend: diameter_cx` | MAR/SAA, SAR/SAA, UAR/UAA, LIR/LIA |
 | Diameter Sh (HSS user data) | **Production** | `diameter` | `sh_udr` for repository data, `@on_pnr` for profile pushes |
 | Diameter Ro (online charging) | Implemented | `diameter` | CCR/CCA |
-| Diameter Rf (offline charging) | Implemented | `diameter` | ACR/ACA |
+| Diameter Rf (offline charging) | Implemented | `diameter`, `rf:` | ACR/ACA wired through `diameter.rf_acr_start/interim/stop/event` (TS 32.299 §6.2.2) — kwargs-style Python API, mandatory AVPs (`Service-Context-Id`, `Event-Timestamp`, `User-Name`, `Termination-Cause`, `Acct-Interim-Interval`), full IMS-Information sub-AVPs (`User-Session-Id`, `Time-Stamps`, `Inter-Operator-Identifier`, `Application-Server`, `IMS-Visited-Network-Identifier`), TS 32.260 IMS Service-Context-Id default. `rf:` config block + `RfChargingService` runtime emits ACR-EVENT automatically on registrar state change. CDR auto-stamps `rf_session_id` / `rf_result_code` from auto-emitted records. B2BUA + proxy ACR-START/INTERIM/STOP auto-emit on call lifecycle is the next layer on the same infrastructure. |
 | Diameter Rx (policy/QoS) | **Production** | `diameter` | AAR/AAA, STR/STA, `@on_rar` + `@on_asr` |
 | Diameter S6c (SMS-over-Diameter, SMSC↔HSS) | Implemented | `diameter` | `s6c_srr` to discover served-node, `s6c_rsr` for delivery status, `@on_alr` for HSS reachability alerts (TS 29.336) |
 | Diameter SGd (SMS-over-NAS, SMSC↔MME) | Implemented | `diameter` | `sgd_tfr` to deliver SMS-DELIVER TPDU to UE, `@on_ofr` for incoming MO-SMS (TS 29.338) |

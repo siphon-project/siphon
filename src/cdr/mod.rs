@@ -80,6 +80,16 @@ pub struct Cdr {
     pub disconnect_initiator: Option<String>,
     /// SIP Reason header value (if present on BYE).
     pub sip_reason: Option<String>,
+    /// Rf accounting Session-Id (TS 32.299) returned by the CDF — set by
+    /// the auto-emit path on ACR-START so the CDR can be cross-referenced
+    /// with the Diameter accounting record on the billing system.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rf_session_id: Option<String>,
+    /// Result-Code (RFC 6733 §7.1) of the final ACR-STOP exchange — also
+    /// set by the auto-emit path so CDR consumers can detect rejected /
+    /// dropped accounting without correlating against a separate stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rf_result_code: Option<u32>,
     /// Extra custom fields from Python scripts.
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, String>,
@@ -118,6 +128,8 @@ impl Cdr {
             auth_user: None,
             disconnect_initiator: None,
             sip_reason: None,
+            rf_session_id: None,
+            rf_result_code: None,
             extra: std::collections::HashMap::new(),
             answer_instant: None,
         }
@@ -172,6 +184,18 @@ impl Cdr {
     /// Add a custom extra field.
     pub fn with_extra(mut self, key: String, value: String) -> Self {
         self.extra.insert(key, value);
+        self
+    }
+
+    /// Stamp the Rf accounting Session-Id (returned by the CDF).
+    pub fn with_rf_session_id(mut self, session_id: String) -> Self {
+        self.rf_session_id = Some(session_id);
+        self
+    }
+
+    /// Stamp the Rf accounting Result-Code (from the final ACA).
+    pub fn with_rf_result_code(mut self, code: u32) -> Self {
+        self.rf_result_code = Some(code);
         self
     }
 }

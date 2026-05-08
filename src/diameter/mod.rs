@@ -15,6 +15,7 @@ pub mod cx;
 pub mod dictionary;
 pub mod peer;
 pub mod rf;
+pub mod rf_service;
 pub mod ro;
 pub mod rx;
 pub mod s6c;

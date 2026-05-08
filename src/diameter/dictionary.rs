@@ -64,6 +64,7 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 44,  vendor_id: 0, name: "Acct-Session-Id",              data_type: AvpType::OctetString },
     AvpDef { code: 50,  vendor_id: 0, name: "Acct-Multi-Session-Id",        data_type: AvpType::UTF8String },
     AvpDef { code: 55,  vendor_id: 0, name: "Event-Timestamp",              data_type: AvpType::Time },
+    AvpDef { code: 85,  vendor_id: 0, name: "Acct-Interim-Interval",        data_type: AvpType::Unsigned32 },
     AvpDef { code: 97,  vendor_id: 0, name: "Framed-IPv6-Prefix",           data_type: AvpType::OctetString },
     AvpDef { code: 257, vendor_id: 0, name: "Host-IP-Address",              data_type: AvpType::Address },
     AvpDef { code: 258, vendor_id: 0, name: "Auth-Application-Id",          data_type: AvpType::Unsigned32 },
@@ -103,6 +104,7 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 431, vendor_id: 0, name: "Final-Unit-Indication",        data_type: AvpType::Grouped },
     AvpDef { code: 432, vendor_id: 0, name: "Final-Unit-Action",            data_type: AvpType::Enumerated },
     AvpDef { code: 437, vendor_id: 0, name: "Requested-Service-Unit",       data_type: AvpType::Grouped },
+    AvpDef { code: 439, vendor_id: 0, name: "Service-Identifier",           data_type: AvpType::Unsigned32 },
     AvpDef { code: 443, vendor_id: 0, name: "Subscription-Id",              data_type: AvpType::Grouped },
     AvpDef { code: 444, vendor_id: 0, name: "Subscription-Id-Data",         data_type: AvpType::UTF8String },
     AvpDef { code: 446, vendor_id: 0, name: "Used-Service-Unit",            data_type: AvpType::Grouped },
@@ -115,7 +117,7 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 457, vendor_id: 0, name: "CC-Input-Octets",              data_type: AvpType::Unsigned64 },
     AvpDef { code: 458, vendor_id: 0, name: "CC-Output-Octets",             data_type: AvpType::Unsigned64 },
     AvpDef { code: 459, vendor_id: 0, name: "CC-Service-Specific-Units",    data_type: AvpType::Unsigned64 },
-    AvpDef { code: 461, vendor_id: 0, name: "Service-Identifier",           data_type: AvpType::Unsigned32 },
+    AvpDef { code: 461, vendor_id: 0, name: "Service-Context-Id",           data_type: AvpType::UTF8String },
     AvpDef { code: 480, vendor_id: 0, name: "Accounting-Record-Type",       data_type: AvpType::Enumerated },
     AvpDef { code: 485, vendor_id: 0, name: "Accounting-Record-Number",     data_type: AvpType::Unsigned32 },
 
@@ -195,11 +197,13 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 824,  vendor_id: TGPP, name: "SIP-Method",                         data_type: AvpType::UTF8String },
     AvpDef { code: 825,  vendor_id: TGPP, name: "Event",                              data_type: AvpType::UTF8String },
     AvpDef { code: 829,  vendor_id: TGPP, name: "Role-of-Node",                       data_type: AvpType::Enumerated },
+    AvpDef { code: 830,  vendor_id: TGPP, name: "User-Session-Id",                    data_type: AvpType::UTF8String },
     AvpDef { code: 831,  vendor_id: TGPP, name: "Calling-Party-Address",              data_type: AvpType::UTF8String },
     AvpDef { code: 832,  vendor_id: TGPP, name: "Called-Party-Address",               data_type: AvpType::UTF8String },
     AvpDef { code: 833,  vendor_id: TGPP, name: "Time-Stamps",                        data_type: AvpType::Grouped },
     AvpDef { code: 834,  vendor_id: TGPP, name: "SIP-Request-Timestamp",              data_type: AvpType::Time },
     AvpDef { code: 835,  vendor_id: TGPP, name: "SIP-Response-Timestamp",             data_type: AvpType::Time },
+    AvpDef { code: 836,  vendor_id: TGPP, name: "Application-Server",                 data_type: AvpType::UTF8String },
     AvpDef { code: 838,  vendor_id: TGPP, name: "Inter-Operator-Identifier",          data_type: AvpType::Grouped },
     AvpDef { code: 839,  vendor_id: TGPP, name: "Originating-IOI",                    data_type: AvpType::UTF8String },
     AvpDef { code: 840,  vendor_id: TGPP, name: "Terminating-IOI",                    data_type: AvpType::UTF8String },
@@ -253,6 +257,8 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 1645, vendor_id: TGPP, name: "MME-Number-for-MT-SMS",              data_type: AvpType::OctetString },
     // Gy (TS 32.299)
     AvpDef { code: 2006, vendor_id: TGPP, name: "Multiple-Services-Credit-Control",   data_type: AvpType::Grouped },
+    // Charging — Visited Network Identifier (TS 32.299 §7.2.74)
+    AvpDef { code: 2713, vendor_id: TGPP, name: "IMS-Visited-Network-Identifier",     data_type: AvpType::UTF8String },
     // S6c (TS 29.336) and SGd (TS 29.338) — SMS over Diameter
     AvpDef { code: 3300, vendor_id: TGPP, name: "SC-Address",                         data_type: AvpType::OctetString },
     AvpDef { code: 3301, vendor_id: TGPP, name: "SM-RP-UI",                           data_type: AvpType::OctetString },
@@ -556,9 +562,14 @@ pub mod avp {
     pub const ROUTE_RECORD: u32 = 282;
     pub const DESTINATION_REALM: u32 = 283;
     pub const DESTINATION_HOST: u32 = 293;
+    pub const TERMINATION_CAUSE: u32 = 295;
     pub const ORIGIN_REALM: u32 = 296;
     pub const EXPERIMENTAL_RESULT: u32 = 297;
     pub const EXPERIMENTAL_RESULT_CODE: u32 = 298;
+
+    // RFC 6733 §8.21 Event-Timestamp / §8.19 Acct-Interim-Interval
+    pub const EVENT_TIMESTAMP: u32 = 55;
+    pub const ACCT_INTERIM_INTERVAL: u32 = 85;
 
     // Base RADIUS/Diameter
     pub const FRAMED_IP_ADDRESS: u32 = 8;
@@ -584,7 +595,10 @@ pub mod avp {
     pub const CC_TOTAL_OCTETS: u32 = 456;
     pub const CC_INPUT_OCTETS: u32 = 457;
     pub const CC_OUTPUT_OCTETS: u32 = 458;
-    pub const SERVICE_IDENTIFIER: u32 = 461;
+    // RFC 4006 §8.28 Service-Identifier (439) — was incorrectly assigned 461 before;
+    // 461 is Service-Context-Id (RFC 4006 §8.42).
+    pub const SERVICE_IDENTIFIER: u32 = 439;
+    pub const SERVICE_CONTEXT_ID: u32 = 461;
     pub const USED_SERVICE_UNIT: u32 = 446;
     pub const VALIDITY_TIME: u32 = 448;
 
@@ -672,11 +686,13 @@ pub mod avp {
     pub const SIP_METHOD_CHARGING: u32 = 824;
     pub const EVENT: u32 = 825;
     pub const ROLE_OF_NODE: u32 = 829;
+    pub const USER_SESSION_ID: u32 = 830;
     pub const CALLING_PARTY_ADDRESS: u32 = 831;
     pub const CALLED_PARTY_ADDRESS: u32 = 832;
     pub const TIME_STAMPS: u32 = 833;
     pub const SIP_REQUEST_TIMESTAMP: u32 = 834;
     pub const SIP_RESPONSE_TIMESTAMP: u32 = 835;
+    pub const APPLICATION_SERVER: u32 = 836;
     pub const INTER_OPERATOR_IDENTIFIER: u32 = 838;
     pub const ORIGINATING_IOI: u32 = 839;
     pub const TERMINATING_IOI: u32 = 840;
@@ -686,6 +702,7 @@ pub mod avp {
     pub const NODE_FUNCTIONALITY: u32 = 862;
     pub const SERVICE_INFORMATION: u32 = 873;
     pub const IMS_INFORMATION: u32 = 876;
+    pub const IMS_VISITED_NETWORK_IDENTIFIER: u32 = 2713;
 
     // 3GPP Gy (TS 32.299)
     pub const MULTIPLE_SERVICES_CREDIT_CONTROL: u32 = 2006;

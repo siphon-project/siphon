@@ -45,8 +45,12 @@ use crate::diameter::codec::{
 };
 use crate::diameter::cx::{octet_string_as_utf8, required_str};
 use crate::diameter::dictionary::{self, avp, AvpDef, AvpType};
+use crate::diameter::rf::{
+    self, AccountingAnswer, AccountingParams, AccountingRecordType,
+};
+use crate::diameter::ro::{ImsChargingData, NodeFunctionality, NodeRole};
 use crate::diameter::rx::extract_result_code;
-use crate::diameter::DiameterManager;
+use crate::diameter::{DiameterClient, DiameterManager};
 
 /// Extract Sh Data-Reference(s) from a Python object that may be ``int`` or ``list[int]``.
 fn extract_references(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
@@ -66,6 +70,97 @@ impl PyDiameter {
     pub fn new(manager: Arc<DiameterManager>) -> Self {
         Self { manager }
     }
+
+    /// Pick a Diameter peer for an Rf ACR.
+    ///
+    /// Resolution order matches the existing Cx/Sh/Rx pattern but allows
+    /// callers to override:
+    ///
+    /// 1. Explicit `peer` argument from Python (e.g. ``peer="cdf1"``).
+    /// 2. Otherwise the first registered client (`any_client`) — operators
+    ///    typically connect a single CDF, and routing tables aren't yet
+    ///    consulted by other applications either.
+    pub(crate) fn pick_rf_peer(&self, peer: Option<&str>) -> Option<Arc<DiameterClient>> {
+        if let Some(name) = peer {
+            return self.manager.client(name);
+        }
+        self.manager.any_client()
+    }
+}
+
+/// Build an `ImsChargingData` from the kwargs accepted by every `rf_acr_*`
+/// binding.  Returns a `PyValueError` on unrecognized role / functionality
+/// strings so script errors fail loudly rather than silently dropping the
+/// AVP.
+#[allow(clippy::too_many_arguments)]
+fn build_ims_data(
+    calling_party: Option<&str>,
+    called_party: Option<&str>,
+    sip_method: Option<&str>,
+    role_of_node: Option<&str>,
+    node_functionality: Option<&str>,
+    ims_charging_identifier: Option<&str>,
+    user_session_id: Option<&str>,
+    originating_ioi: Option<&str>,
+    terminating_ioi: Option<&str>,
+    application_server: Option<&str>,
+    visited_network_id: Option<&str>,
+    cause_code: Option<i32>,
+) -> PyResult<ImsChargingData> {
+    let role = match role_of_node {
+        Some(value) => Some(NodeRole::from_str_ci(value).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown role_of_node {value:?}; expected one of \
+                 'originating'/'terminating'/'proxy'/'b2bua'"
+            ))
+        })?),
+        None => None,
+    };
+    let func = match node_functionality {
+        Some(value) => Some(NodeFunctionality::from_str_ci(value).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown node_functionality {value:?}; expected one of \
+                 'scscf'/'pcscf'/'icscf'/'mrfc'/'mgcf'/'bgcf'/'as'/'ibcf'/\
+                 'ecscf'/'atcf'/'mmtel'/'tpf'/'atgw'"
+            ))
+        })?),
+        None => None,
+    };
+    Ok(ImsChargingData {
+        calling_party: calling_party.map(str::to_owned),
+        called_party: called_party.map(str::to_owned),
+        sip_method: sip_method.map(str::to_owned),
+        event: None,
+        role_of_node: role,
+        node_functionality: func,
+        ims_charging_identifier: ims_charging_identifier.map(str::to_owned),
+        cause_code,
+        user_session_id: user_session_id.map(str::to_owned),
+        request_timestamp: None,
+        response_timestamp: None,
+        originating_ioi: originating_ioi.map(str::to_owned),
+        terminating_ioi: terminating_ioi.map(str::to_owned),
+        application_server: application_server.map(str::to_owned),
+        visited_network_id: visited_network_id.map(str::to_owned),
+    })
+}
+
+/// Convert an `AccountingAnswer` to the dict shape every `rf_acr_*` binding
+/// returns to Python.
+fn accounting_answer_to_dict<'py>(
+    python: Python<'py>,
+    answer: AccountingAnswer,
+    fallback_session_id: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(python);
+    dict.set_item("result_code", answer.result_code)?;
+    let session_id = answer
+        .session_id
+        .or_else(|| fallback_session_id.map(str::to_owned));
+    dict.set_item("session_id", session_id)?;
+    dict.set_item("record_number", answer.record_number)?;
+    dict.set_item("interim_interval", answer.interim_interval)?;
+    Ok(dict)
 }
 
 #[pymethods]
@@ -1161,6 +1256,307 @@ impl PyDiameter {
             },
         )?;
         Ok(closure.into_any())
+    }
+
+    // ── Rf ACR/ACA — IMS offline charging (TS 32.299) ────────────────────
+
+    /// Send an Rf ACR-START to the CDF.
+    ///
+    /// Begins an offline-charging accounting session.  Returns a dict with
+    /// ``result_code`` (int, 2001 on success), ``session_id`` (str — use
+    /// for subsequent ``rf_acr_interim`` / ``rf_acr_stop``),
+    /// ``record_number`` (int — always 0 for START per RFC 6733 §9.8.3),
+    /// and ``interim_interval`` (int or None — when set by the CDF in
+    /// ACA-START, the CTF MUST honor this cadence per RFC 6733 §8.19).
+    ///
+    /// ``role_of_node`` accepts ``"originating"``, ``"terminating"``,
+    /// ``"proxy"``, ``"b2bua"`` (TS 32.299 §7.2.149).
+    ///
+    /// ``node_functionality`` accepts ``"scscf"``, ``"pcscf"``, ``"icscf"``,
+    /// ``"mrfc"``, ``"mgcf"``, ``"bgcf"``, ``"as"``, ``"ibcf"``, ``"ecscf"``,
+    /// ``"atcf"``, ``"mmtel"``, ``"tpf"``, ``"atgw"`` (TS 32.299 §7.2.111).
+    #[pyo3(signature = (
+        *,
+        calling_party=None, called_party=None, sip_method=None,
+        role_of_node=None, node_functionality=None,
+        ims_charging_identifier=None, user_session_id=None,
+        originating_ioi=None, terminating_ioi=None,
+        application_server=None, visited_network_id=None,
+        user_name=None, cause_code=None,
+        service_context_id=None, peer=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn rf_acr_start<'py>(
+        &self,
+        python: Python<'py>,
+        calling_party: Option<&str>,
+        called_party: Option<&str>,
+        sip_method: Option<&str>,
+        role_of_node: Option<&str>,
+        node_functionality: Option<&str>,
+        ims_charging_identifier: Option<&str>,
+        user_session_id: Option<&str>,
+        originating_ioi: Option<&str>,
+        terminating_ioi: Option<&str>,
+        application_server: Option<&str>,
+        visited_network_id: Option<&str>,
+        user_name: Option<&str>,
+        cause_code: Option<i32>,
+        service_context_id: Option<&str>,
+        peer: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.pick_rf_peer(peer) {
+            Some(client) => client,
+            None => {
+                warn!("rf_acr_start: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+        let ims_data = build_ims_data(
+            calling_party, called_party, sip_method,
+            role_of_node, node_functionality, ims_charging_identifier,
+            user_session_id, originating_ioi, terminating_ioi,
+            application_server, visited_network_id, cause_code,
+        )?;
+
+        let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
+        params.user_name = user_name;
+        params.ims_data = Some(&ims_data);
+        params.service_context_id = service_context_id;
+
+        let peer_handle = client.peer().clone();
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(rf::send_acr(&peer_handle, &params))
+        });
+        match answer {
+            Ok(answer) => Ok(Some(accounting_answer_to_dict(python, answer, None)?)),
+            Err(error) => {
+                warn!(error = %error, "rf_acr_start failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send an Rf ACR-INTERIM to the CDF.
+    ///
+    /// `record_number` MUST be a strictly increasing non-zero integer
+    /// scoped to the same `session_id` per RFC 6733 §9.8.3.
+    #[pyo3(signature = (
+        session_id, record_number,
+        *,
+        calling_party=None, called_party=None, sip_method=None,
+        role_of_node=None, node_functionality=None,
+        ims_charging_identifier=None, user_session_id=None,
+        originating_ioi=None, terminating_ioi=None,
+        application_server=None, visited_network_id=None,
+        user_name=None, cause_code=None,
+        service_context_id=None, peer=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn rf_acr_interim<'py>(
+        &self,
+        python: Python<'py>,
+        session_id: &str,
+        record_number: u32,
+        calling_party: Option<&str>,
+        called_party: Option<&str>,
+        sip_method: Option<&str>,
+        role_of_node: Option<&str>,
+        node_functionality: Option<&str>,
+        ims_charging_identifier: Option<&str>,
+        user_session_id: Option<&str>,
+        originating_ioi: Option<&str>,
+        terminating_ioi: Option<&str>,
+        application_server: Option<&str>,
+        visited_network_id: Option<&str>,
+        user_name: Option<&str>,
+        cause_code: Option<i32>,
+        service_context_id: Option<&str>,
+        peer: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.pick_rf_peer(peer) {
+            Some(client) => client,
+            None => {
+                warn!("rf_acr_interim: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+        let ims_data = build_ims_data(
+            calling_party, called_party, sip_method,
+            role_of_node, node_functionality, ims_charging_identifier,
+            user_session_id, originating_ioi, terminating_ioi,
+            application_server, visited_network_id, cause_code,
+        )?;
+
+        let mut params = AccountingParams::new(AccountingRecordType::InterimRecord);
+        params.record_number = record_number;
+        params.session_id = Some(session_id);
+        params.user_name = user_name;
+        params.ims_data = Some(&ims_data);
+        params.service_context_id = service_context_id;
+
+        let peer_handle = client.peer().clone();
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(rf::send_acr(&peer_handle, &params))
+        });
+        match answer {
+            Ok(answer) => Ok(Some(accounting_answer_to_dict(
+                python,
+                answer,
+                Some(session_id),
+            )?)),
+            Err(error) => {
+                warn!(error = %error, "rf_acr_interim failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send an Rf ACR-STOP to the CDF.
+    ///
+    /// `termination_cause` should match the actual termination reason
+    /// per RFC 6733 §8.15.  Defaults to 1 (DIAMETER_LOGOUT) for normal
+    /// session teardown.  Use 8 (DIAMETER_SESSION_TIMEOUT) for
+    /// session-timer expiry, 4 (DIAMETER_ADMINISTRATIVE) for forced
+    /// teardown.
+    #[pyo3(signature = (
+        session_id, record_number,
+        *,
+        termination_cause=1,
+        calling_party=None, called_party=None, sip_method=None,
+        role_of_node=None, node_functionality=None,
+        ims_charging_identifier=None, user_session_id=None,
+        originating_ioi=None, terminating_ioi=None,
+        application_server=None, visited_network_id=None,
+        user_name=None, cause_code=None,
+        service_context_id=None, peer=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn rf_acr_stop<'py>(
+        &self,
+        python: Python<'py>,
+        session_id: &str,
+        record_number: u32,
+        termination_cause: u32,
+        calling_party: Option<&str>,
+        called_party: Option<&str>,
+        sip_method: Option<&str>,
+        role_of_node: Option<&str>,
+        node_functionality: Option<&str>,
+        ims_charging_identifier: Option<&str>,
+        user_session_id: Option<&str>,
+        originating_ioi: Option<&str>,
+        terminating_ioi: Option<&str>,
+        application_server: Option<&str>,
+        visited_network_id: Option<&str>,
+        user_name: Option<&str>,
+        cause_code: Option<i32>,
+        service_context_id: Option<&str>,
+        peer: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.pick_rf_peer(peer) {
+            Some(client) => client,
+            None => {
+                warn!("rf_acr_stop: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+        let ims_data = build_ims_data(
+            calling_party, called_party, sip_method,
+            role_of_node, node_functionality, ims_charging_identifier,
+            user_session_id, originating_ioi, terminating_ioi,
+            application_server, visited_network_id, cause_code,
+        )?;
+
+        let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
+        params.record_number = record_number;
+        params.session_id = Some(session_id);
+        params.user_name = user_name;
+        params.ims_data = Some(&ims_data);
+        params.service_context_id = service_context_id;
+        params.termination_cause = Some(termination_cause);
+
+        let peer_handle = client.peer().clone();
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(rf::send_acr(&peer_handle, &params))
+        });
+        match answer {
+            Ok(answer) => Ok(Some(accounting_answer_to_dict(
+                python,
+                answer,
+                Some(session_id),
+            )?)),
+            Err(error) => {
+                warn!(error = %error, "rf_acr_stop failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send an Rf ACR-EVENT to the CDF.
+    ///
+    /// Used for one-shot accounting (REGISTER, MESSAGE, SUBSCRIBE, …).
+    /// Record-Number is fixed at 0 per RFC 6733 §9.8.3.
+    #[pyo3(signature = (
+        *,
+        calling_party=None, called_party=None, sip_method=None,
+        role_of_node=None, node_functionality=None,
+        ims_charging_identifier=None, user_session_id=None,
+        originating_ioi=None, terminating_ioi=None,
+        application_server=None, visited_network_id=None,
+        user_name=None, cause_code=None,
+        service_context_id=None, peer=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn rf_acr_event<'py>(
+        &self,
+        python: Python<'py>,
+        calling_party: Option<&str>,
+        called_party: Option<&str>,
+        sip_method: Option<&str>,
+        role_of_node: Option<&str>,
+        node_functionality: Option<&str>,
+        ims_charging_identifier: Option<&str>,
+        user_session_id: Option<&str>,
+        originating_ioi: Option<&str>,
+        terminating_ioi: Option<&str>,
+        application_server: Option<&str>,
+        visited_network_id: Option<&str>,
+        user_name: Option<&str>,
+        cause_code: Option<i32>,
+        service_context_id: Option<&str>,
+        peer: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.pick_rf_peer(peer) {
+            Some(client) => client,
+            None => {
+                warn!("rf_acr_event: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+        let ims_data = build_ims_data(
+            calling_party, called_party, sip_method,
+            role_of_node, node_functionality, ims_charging_identifier,
+            user_session_id, originating_ioi, terminating_ioi,
+            application_server, visited_network_id, cause_code,
+        )?;
+
+        let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
+        params.user_name = user_name;
+        params.ims_data = Some(&ims_data);
+        params.service_context_id = service_context_id;
+
+        let peer_handle = client.peer().clone();
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(rf::send_acr(&peer_handle, &params))
+        });
+        match answer {
+            Ok(answer) => Ok(Some(accounting_answer_to_dict(python, answer, None)?)),
+            Err(error) => {
+                warn!(error = %error, "rf_acr_event failed");
+                Ok(None)
+            }
+        }
     }
 }
 

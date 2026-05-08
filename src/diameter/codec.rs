@@ -344,6 +344,38 @@ pub fn encode_avp_i32_3gpp(code: u32, value: i32) -> Vec<u8> {
     encode_avp_vendor(code, AVP_FLAG_MANDATORY, dictionary::VENDOR_3GPP, &value.to_be_bytes())
 }
 
+/// Offset between the NTP epoch (1900-01-01 00:00:00 UTC) and the Unix
+/// epoch (1970-01-01 00:00:00 UTC) in seconds — exactly 70 years.
+pub const NTP_UNIX_EPOCH_OFFSET: u64 = 2_208_988_800;
+
+/// Convert a `SystemTime` to a Diameter Time AVP value (RFC 6733 §4.3.1):
+/// 32-bit unsigned NTP-style seconds since 1900-01-01 UTC.  Returns 0 for
+/// pre-1970 timestamps.
+pub fn system_time_to_diameter_time(time: std::time::SystemTime) -> u32 {
+    let unix_secs = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (unix_secs.wrapping_add(NTP_UNIX_EPOCH_OFFSET) & 0xFFFF_FFFF) as u32
+}
+
+/// Encode a Time AVP (no vendor).
+pub fn encode_avp_time(code: u32, time: std::time::SystemTime) -> Vec<u8> {
+    let secs = system_time_to_diameter_time(time);
+    encode_avp(code, AVP_FLAG_MANDATORY, &secs.to_be_bytes())
+}
+
+/// Encode a Time AVP with 3GPP vendor.
+pub fn encode_avp_time_3gpp(code: u32, time: std::time::SystemTime) -> Vec<u8> {
+    let secs = system_time_to_diameter_time(time);
+    encode_avp_vendor(
+        code,
+        AVP_FLAG_MANDATORY,
+        dictionary::VENDOR_3GPP,
+        &secs.to_be_bytes(),
+    )
+}
+
 /// Encode an Address AVP (IPv4).
 pub fn encode_avp_address_ipv4(code: u32, ip: std::net::Ipv4Addr) -> Vec<u8> {
     let mut data = Vec::with_capacity(6);
