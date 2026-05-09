@@ -3219,6 +3219,8 @@ fn handle_response(
                 source_addr,
                 transport,
                 inbound.remote_addr,
+                inbound_local_addr,
+                connection_id,
             );
             if !should_forward {
                 state.session_store.remove_client_key(client_key);
@@ -3244,16 +3246,28 @@ fn handle_response(
                             return (None, true);
                         }
                     };
-                    let py_req = match Py::new(python, PyRequest::new(
-                        Arc::clone(&req_arc),
-                        transport.to_string(),
-                        source_addr.ip().to_string(),
-                        source_addr.port(),
-                    )) {
-                        Ok(obj) => obj,
-                        Err(error) => {
-                            error!("failed to create PyRequest for relay callback: {error}");
-                            return (None, true);
+                    let py_req = {
+                        let mut req = PyRequest::new(
+                            Arc::clone(&req_arc),
+                            transport.to_string(),
+                            source_addr.ip().to_string(),
+                            source_addr.port(),
+                        );
+                        // Replay the inbound flow capture so
+                        // registrar.save(flow_token=…) /
+                        // request.relay(flow=…) called from the
+                        // on_reply / on_failure callback see the
+                        // same listener context as the on_request
+                        // handler did (P-CSCF Path-token MT routing
+                        // — see CLAUDE.md / TS 24.229 §5.2.7.2).
+                        req.set_local_port(inbound_local_addr.port());
+                        req.set_inbound_flow(inbound_local_addr, connection_id.0);
+                        match Py::new(python, req) {
+                            Ok(obj) => obj,
+                            Err(error) => {
+                                error!("failed to create PyRequest for relay callback: {error}");
+                                return (None, true);
+                            }
                         }
                     };
 
@@ -3363,12 +3377,18 @@ fn handle_response(
                             let response_arc = Arc::new(std::sync::Mutex::new(best_response));
                             let reply = PyReply::new(Arc::clone(&response_arc));
                             let request_arc = Arc::new(std::sync::Mutex::new(original_request));
-                            let py_request = PyRequest::new(
+                            let mut py_request = PyRequest::new(
                                 request_arc,
                                 transport.to_string(),
                                 source_addr.ip().to_string(),
                                 source_addr.port(),
                             );
+                            // Replay the inbound flow capture so the
+                            // failure handler can do Path-token MT
+                            // routing (`registrar.lookup_by_token` +
+                            // `request.relay(flow=…)`) on retry.
+                            py_request.set_local_port(inbound_local_addr.port());
+                            py_request.set_inbound_flow(inbound_local_addr, connection_id.0);
 
                             let forwarded = Python::attach(|python| {
                                 let py_reply = match Py::new(python, reply) {
@@ -3524,6 +3544,7 @@ fn handle_response(
 ///
 /// `response_source` is the observed source address of the entity that sent
 /// this response (for `reply.fix_nated_contact()`).
+#[allow(clippy::too_many_arguments)]
 fn run_reply_handlers(
     message: SipMessage,
     status_code: u16,
@@ -3533,6 +3554,8 @@ fn run_reply_handlers(
     source_addr: SocketAddr,
     transport: crate::transport::Transport,
     response_source: SocketAddr,
+    inbound_local_addr: SocketAddr,
+    inbound_connection_id: ConnectionId,
 ) -> (SipMessage, bool) {
     // Automatic NAT Contact fixup on responses (nat.fix_contact: true).
     // Rewrites the Contact URI host:port with the observed source address
@@ -3560,12 +3583,21 @@ fn run_reply_handlers(
 
     // Build a PyRequest from the original request so scripts get (request, reply)
     let request_arc = Arc::new(std::sync::Mutex::new(original_request));
-    let py_request_obj = PyRequest::new(
+    let mut py_request_obj = PyRequest::new(
         request_arc,
         transport.to_string(),
         source_addr.ip().to_string(),
         source_addr.port(),
     );
+    // Replay the inbound flow capture so `@proxy.on_reply` handlers
+    // that call `registrar.save(flow_token=…)` /
+    // `registrar.save_proxy(flow_token=…)` see the same listener
+    // context as the on_request handler did.  Without this,
+    // PyContact.flow comes back None on a later
+    // `registrar.lookup_by_token` (P-CSCF Path-token MT routing —
+    // RFC 3327 §5 / TS 24.229 §5.2.7.2).
+    py_request_obj.set_local_port(inbound_local_addr.port());
+    py_request_obj.set_inbound_flow(inbound_local_addr, inbound_connection_id.0);
 
     let forwarded = Python::attach(|python| {
         let py_reply = match Py::new(python, reply) {
