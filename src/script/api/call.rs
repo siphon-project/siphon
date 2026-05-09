@@ -428,6 +428,52 @@ impl PyCall {
         Ok(())
     }
 
+    /// Stash a charging-param the dispatcher's Rf B2BUA auto-emit hook
+    /// will read when building the IMS-Information block for this call.
+    ///
+    /// Mirrors `request.set_charging_param` for B2BUA scripts that
+    /// receive a `Call` object instead of a `Request`.  Recognised
+    /// names map to TS 32.299 IMS-Information AVPs:
+    ///
+    /// - `"outgoing-trunk-group-id"` — `Outgoing-Trunk-Group-Id` (BGCF/MGCF)
+    /// - `"incoming-trunk-group-id"` — `Incoming-Trunk-Group-Id`
+    /// - `"application-server"`     — `Application-Server` inside `Application-Server-Information`
+    /// - `"application-provided-called-party-address"`
+    ///
+    /// Typical BGCF (B2BUA) use:
+    ///
+    /// ```python,ignore
+    /// @b2bua.on_invite
+    /// async def on_invite(call):
+    ///     gw = gateway.select("connect")
+    ///     call.set_charging_param("outgoing-trunk-group-id", gw.attrs["group"])
+    ///     call.dial(gw.uri)
+    /// ```
+    ///
+    /// Keyed by the A-leg's `<Call-ID>\0<From-tag>` — the same dialog
+    /// key `spawn_rf_b2bua_start` reads when the call answers.
+    fn set_charging_param(&self, name: &str, value: &str) -> PyResult<()> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        let call_id = message.headers.call_id().cloned();
+        let from_tag = message
+            .headers
+            .from()
+            .and_then(|v| crate::sip::headers::nameaddr::NameAddr::parse(v).ok())
+            .and_then(|na| na.tag);
+        drop(message);
+        if let (Some(call_id), Some(from_tag)) = (call_id, from_tag) {
+            let dialog_key = format!("{}\0{}", call_id, from_tag);
+            crate::diameter::rf_service::set_rf_charging_param(
+                &dialog_key,
+                name.to_string(),
+                value.to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Remove a header.
     fn remove_header(&self, name: &str) -> PyResult<()> {
         let mut message = self.message.lock().map_err(|error| {

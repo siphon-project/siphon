@@ -154,3 +154,34 @@ class TestRequestChargingParams:
         request = self._make_request()
         request.set_charging_param("future-extension", "value")
         assert ("future-extension", "value") in request.charging_params
+
+
+class TestCallChargingParams:
+    """Test ``call.set_charging_param`` — the BGCF/MMTel-AS B2BUA
+    handoff that mirrors :class:`Request.set_charging_param`."""
+
+    def _make_call(self):
+        from siphon_sdk.call import Call
+        return Call(
+            call_id="call-uuid-1",
+            from_uri="sip:alice@example.com",
+            to_uri="sip:bob@example.com",
+            ruri="sip:bob@example.com",
+            source_ip="127.0.0.1",
+        )
+
+    def test_set_charging_param_captures_tuple(self):
+        call = self._make_call()
+        call.set_charging_param("outgoing-trunk-group-id", "carrier-A")
+        assert call.charging_params == [("outgoing-trunk-group-id", "carrier-A")]
+
+    def test_b2bua_bgcf_pattern(self):
+        # Mirror the documented BGCF B2BUA flow: select a gateway,
+        # stamp the trunk group, then dial.
+        call = self._make_call()
+        call.set_charging_param("outgoing-trunk-group-id", "carrier-A")
+        call.set_charging_param("application-server", "sip:mmtel.example.com")
+        assert call.charging_params == [
+            ("outgoing-trunk-group-id", "carrier-A"),
+            ("application-server", "sip:mmtel.example.com"),
+        ]

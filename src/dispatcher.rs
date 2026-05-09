@@ -4915,26 +4915,13 @@ fn spawn_rf_proxy_start_if_invite(
     };
     let icid = rf_extract_icid(original_request);
 
-    // Idempotency: if any storage key for the originating role is
-    // already filed, skip — iFC re-dispatch under the same ICID, or
-    // forked branches racing to insert.
-    let orig_primary_key = match icid.as_deref() {
-        Some(icid) => rf_icid_key(icid, RfRole::Originating),
-        None => build_rf_dialog_key(&call_id, &from_tag, RfRole::Originating),
-    };
-    if state.rf_sessions.contains_key(&orig_primary_key) {
-        debug!(
-            primary_key = %orig_primary_key,
-            "rf: proxy ACR-START skipped — record already tracked"
-        );
-        return;
-    }
-    debug!(
-        primary_key = %orig_primary_key,
-        icid = icid.as_deref().unwrap_or("(none)"),
-        "rf: proxy ACR-START spawning"
-    );
-
+    // Build the IMS data first so we can key the dedupe by the
+    // *actual* role (orig vs term) the request resolves to.  Hard-
+    // coding `:orig` here used to silently drop the MT leg of an
+    // intra-NF call (same ICID, different roles), because both legs
+    // hit the same `:orig` key and the second arrival saw the first
+    // already filed — even though the second was a TERMINATING
+    // record on a distinct From-URI.
     let local_predicate = rf_local_uri_predicate(&state.local_domains);
     let mut ims_data = crate::diameter::rf_service::ims_data_from_request(
         original_request,
@@ -4951,18 +4938,52 @@ fn spawn_rf_proxy_start_if_invite(
     );
     crate::diameter::rf_service::apply_charging_params(&mut ims_data, drained_params);
 
-    // Intra-S-CSCF detection: is the called party also locally served?
-    let term_user_name = ims_data
-        .called_party
-        .as_deref()
-        .filter(|uri| local_predicate(uri))
-        .filter(|_| {
-            charger.node_functionality()
-                == Some(crate::diameter::ro::NodeFunctionality::SCscf)
-        })
-        .map(str::to_owned);
+    // Resolve the RfRole from the request's role_of_node — defaults
+    // to ORIGINATING when ims_data_from_request couldn't detect.
+    let primary_role = match ims_data.role_of_node {
+        Some(crate::diameter::ro::NodeRole::TerminatingRole) => RfRole::Terminating,
+        _ => RfRole::Originating,
+    };
+    let primary_key = match icid.as_deref() {
+        Some(icid) => rf_icid_key(icid, primary_role),
+        None => build_rf_dialog_key(&call_id, &from_tag, primary_role),
+    };
+    if state.rf_sessions.contains_key(&primary_key) {
+        debug!(
+            primary_key = %primary_key,
+            "rf: proxy ACR-START skipped — record already tracked"
+        );
+        return;
+    }
+    debug!(
+        primary_key = %primary_key,
+        role = primary_role.as_suffix(),
+        icid = icid.as_deref().unwrap_or("(none)"),
+        "rf: proxy ACR-START spawning"
+    );
 
-    let orig_user_name = ims_data.calling_party.clone();
+    // Intra-S-CSCF dual-ACR detection (TS 32.260 §5.1): when this
+    // INVITE is itself the originating leg AND the called party is
+    // *also* locally served by an S-CSCF, emit a parallel
+    // terminating record.  Skipped when the primary role is already
+    // TERMINATING (the MT-only leg of an intra-NF call) — that path
+    // emits a single record under `:term` and the matching ORIG
+    // record arrives separately on the MO leg.
+    let term_user_name = if primary_role == RfRole::Originating {
+        ims_data
+            .called_party
+            .as_deref()
+            .filter(|uri| local_predicate(uri))
+            .filter(|_| {
+                charger.node_functionality()
+                    == Some(crate::diameter::ro::NodeFunctionality::SCscf)
+            })
+            .map(str::to_owned)
+    } else {
+        None
+    };
+
+    let primary_user_name = ims_data.calling_party.clone();
     let rf_sessions = Arc::clone(&state.rf_sessions);
 
     if let Some(term_user) = term_user_name {
@@ -4975,46 +4996,69 @@ fn spawn_rf_proxy_start_if_invite(
             &from_tag,
             RfRole::Terminating,
         );
-        let mut ims_term = ims_data.clone();
-        ims_term.role_of_node = Some(crate::diameter::ro::NodeRole::TerminatingRole);
-        let charger_term = Arc::clone(&charger);
-        let rf_sessions_term = Arc::clone(&rf_sessions);
-        let term_user_for_record = term_user.clone();
-        tokio::spawn(async move {
-            let session = match charger_term
-                .acr_start(ims_term.clone(), Some(term_user_for_record.clone()))
-                .await
-            {
-                Some(s) => s,
-                None => return,
-            };
-            let entry = Arc::new(ProxyRfState {
-                session,
-                ims_data: ims_term,
-                user_name: Some(term_user_for_record),
-                storage_keys: term_keys.clone(),
-            });
-            for key in term_keys {
-                rf_sessions_term.insert(key, Arc::clone(&entry));
+        // TERM-side dedupe: an iFC re-dispatch could land on the
+        // same dialog with a different role mapping.  Cheap probe of
+        // the first storage key (ICID-keyed when present, else
+        // dialog fallback) catches the duplicate before we spawn.
+        if let Some(first_term_key) = term_keys.first() {
+            if state.rf_sessions.contains_key(first_term_key) {
+                debug!(
+                    term_key = %first_term_key,
+                    "rf: dual-ACR TERM skipped — record already tracked"
+                );
+                // Fall through to spawn the ORIG record.
+                let _ = term_user;
+            } else {
+                let mut ims_term = ims_data.clone();
+                ims_term.role_of_node = Some(crate::diameter::ro::NodeRole::TerminatingRole);
+                let charger_term = Arc::clone(&charger);
+                let rf_sessions_term = Arc::clone(&rf_sessions);
+                let term_user_for_record = term_user.clone();
+                let term_keys_for_spawn = term_keys.clone();
+                tokio::spawn(async move {
+                    let session = match charger_term
+                        .acr_start(ims_term.clone(), Some(term_user_for_record.clone()))
+                        .await
+                    {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    let entry = Arc::new(ProxyRfState {
+                        session,
+                        ims_data: ims_term,
+                        user_name: Some(term_user_for_record),
+                        storage_keys: term_keys_for_spawn.clone(),
+                    });
+                    for key in term_keys_for_spawn {
+                        rf_sessions_term.insert(key, Arc::clone(&entry));
+                    }
+                });
             }
-        });
+        }
     }
 
-    // Originating record (always emitted; dual-ACR mode emits it
-    // alongside the terminating record above).
-    let orig_keys = rf_session_storage_keys(
+    // Primary record — emitted under the role this request resolved
+    // to (orig for MO legs / S-CSCF dual-ACR primary; term for the
+    // standalone MT leg of an intra-NF call where the same NF sees
+    // both legs separately).
+    let primary_keys = rf_session_storage_keys(
         icid.as_deref(),
         &call_id,
         &from_tag,
-        RfRole::Originating,
+        primary_role,
     );
-    let mut ims_orig = ims_data;
-    if ims_orig.role_of_node.is_none() {
-        ims_orig.role_of_node = Some(crate::diameter::ro::NodeRole::OriginatingRole);
+    let mut ims_primary = ims_data;
+    // ims_data_from_request always sets a role, but defend against
+    // future refactors that might leave it None.
+    if ims_primary.role_of_node.is_none() {
+        ims_primary.role_of_node = Some(match primary_role {
+            RfRole::Originating => crate::diameter::ro::NodeRole::OriginatingRole,
+            RfRole::Terminating => crate::diameter::ro::NodeRole::TerminatingRole,
+        });
     }
     tokio::spawn(async move {
         let session = match charger
-            .acr_start(ims_orig.clone(), orig_user_name.clone())
+            .acr_start(ims_primary.clone(), primary_user_name.clone())
             .await
         {
             Some(s) => s,
@@ -5022,11 +5066,11 @@ fn spawn_rf_proxy_start_if_invite(
         };
         let entry = Arc::new(ProxyRfState {
             session,
-            ims_data: ims_orig,
-            user_name: orig_user_name,
-            storage_keys: orig_keys.clone(),
+            ims_data: ims_primary,
+            user_name: primary_user_name,
+            storage_keys: primary_keys.clone(),
         });
-        for key in orig_keys {
+        for key in primary_keys {
             rf_sessions.insert(key, Arc::clone(&entry));
         }
     });

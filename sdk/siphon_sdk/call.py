@@ -59,6 +59,10 @@ class Call:
         self._call_id = call_id or self._id
         self._headers: dict[str, str] = dict(headers) if headers else {}
         self._actions: list[Action] = []
+        # Charging params stashed by ``set_charging_param`` for the Rf
+        # B2BUA auto-emit path.  Tests can assert on them via the
+        # ``charging_params`` property.
+        self._charging_params: list[tuple[str, str]] = []
         self._media = MediaHandle()
         self._refer_to = refer_to
         self._refer_replaces = refer_replaces
@@ -439,6 +443,33 @@ class Call:
     def set_header(self, name: str, value: str) -> None:
         """Set (replace) a header value."""
         self._headers[name] = value
+
+    def set_charging_param(self, name: str, value: str) -> None:
+        """Stash a charging-param for the Rf B2BUA auto-emit hook.
+
+        Mirrors :py:meth:`siphon_sdk.request.Request.set_charging_param`
+        for B2BUA scripts that get a ``Call`` object.  Recognised names
+        map to TS 32.299 IMS-Information AVPs; unknown names are still
+        captured so future siphon versions can recognise more without
+        breaking deployed scripts.
+
+        Example (BGCF as B2BUA)::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                gw = gateway.select("connect")
+                call.set_charging_param(
+                    "outgoing-trunk-group-id", gw.attrs["group"],
+                )
+                call.dial(gw.uri)
+        """
+        self._charging_params.append((name, value))
+
+    @property
+    def charging_params(self) -> list[tuple[str, str]]:
+        """List of `(name, value)` tuples stashed via
+        :meth:`set_charging_param`.  Test helper."""
+        return list(self._charging_params)
 
     def remove_header(self, name: str) -> None:
         """Remove a header entirely."""

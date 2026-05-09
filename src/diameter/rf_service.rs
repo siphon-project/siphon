@@ -785,6 +785,26 @@ mod tests {
     }
 
     #[test]
+    fn storage_keys_role_keys_disjoint_for_same_icid() {
+        // Regression: when one NF (e.g. P-CSCF) sees both legs of an
+        // intra-network call, the MO leg lands as ORIGINATING and the
+        // MT leg as TERMINATING — same ICID, different roles.  The
+        // generated key sets must NOT overlap, otherwise the second
+        // arrival's dedupe gate hits the first record and the second
+        // ACR-START is silently dropped.
+        let orig =
+            rf_session_storage_keys(Some("icid-X"), "call-mo", "tag-A", RfRole::Originating);
+        let term =
+            rf_session_storage_keys(Some("icid-X"), "call-mt", "tag-B", RfRole::Terminating);
+        for orig_key in &orig {
+            assert!(
+                !term.contains(orig_key),
+                "orig key {orig_key:?} collides with term key set {term:?}"
+            );
+        }
+    }
+
+    #[test]
     fn lookup_candidates_full_set() {
         let keys = rf_lookup_candidates(
             Some("icid-X"),
