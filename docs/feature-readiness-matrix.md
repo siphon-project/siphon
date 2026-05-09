@@ -60,6 +60,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Registration state change hooks | **Production** | `@registrar.on_change` | Callbacks on insert/delete/expire |
 | Outbound registration (registrant) | **Production** | `registrant:` | UAC REGISTER to upstream trunks |
 | Proxy-side binding cache | Implemented | `registrar.save_proxy(request, reply)` | P-CSCF caches what S-CSCF granted; reads Expires from reply (not request), bypasses local `max_expires` cap, +32 s Timer F grace, no auto-200 OK (proxy relays upstream's response) |
+| Path-token MT routing (RFC 3327 / TS 24.229 §5.2.7.2) | Implemented | `request.add_pcscf_path(token)`, `registrar.save(flow_token=)`/`save_proxy(flow_token=)`, `registrar.lookup_by_token(token)`, `request.relay(flow=binding.flow)`, `ipsec.path_host` | P-CSCF mints opaque token, embeds in Path userpart; binding stores token + captured inbound flow (source addr, listener local addr, accepted-connection id); MT routing bypasses DNS resolution and egresses from the same listener that received the REGISTER. UDP flow survives restart; TCP/TLS/WS/WSS bound to accepting instance lifetime. Via on flow-relay derives from `flow.local_addr` so IPSec port pairs are preserved (TS 33.203 §7.4). |
 
 ## Authentication
 

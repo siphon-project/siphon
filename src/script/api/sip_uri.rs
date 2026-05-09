@@ -92,6 +92,20 @@ impl PySipUri {
         }
     }
 
+    /// URI parameters as a dict.  Flag parameters (no `=value`, e.g.
+    /// `;lr` or `;ob`) appear with an empty-string value.  Useful for
+    /// reading parameters off a Path/Route URI the script consumed —
+    /// e.g. checking `;ob` on an RFC 5626 outbound flow token, or
+    /// extracting custom params from a P-CSCF Path entry.
+    #[getter]
+    fn params(&self) -> std::collections::BTreeMap<String, String> {
+        self.inner
+            .params
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone().unwrap_or_default()))
+            .collect()
+    }
+
     fn __str__(&self) -> String {
         self.inner.to_string()
     }

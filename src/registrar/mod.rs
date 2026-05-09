@@ -669,7 +669,15 @@ impl Registrar {
     pub fn remove_all(&self, aor: &str) {
         let primary = self.resolve_alias(aor);
         let aor = primary.as_str();
-        let had_bindings = self.bindings.remove(aor).is_some();
+        // Capture flow tokens before dropping the AoR so the reverse index
+        // doesn't strand entries pointing at gone bindings.
+        let removed = self.bindings.remove(aor);
+        let had_bindings = removed.is_some();
+        if let Some((_, contacts)) = removed {
+            for token in contacts.into_iter().filter_map(|c| c.flow_token) {
+                self.tokens.remove(&token);
+            }
+        }
         if let Some(writer) = self.backend_writer.get() {
             writer.remove(aor);
         }
@@ -690,7 +698,11 @@ impl Registrar {
     pub fn clear_bindings(&self, aor: &str) {
         let primary = self.resolve_alias(aor);
         let aor = primary.as_str();
-        self.bindings.remove(aor);
+        if let Some((_, contacts)) = self.bindings.remove(aor) {
+            for token in contacts.into_iter().filter_map(|c| c.flow_token) {
+                self.tokens.remove(&token);
+            }
+        }
         if let Some(writer) = self.backend_writer.get() {
             writer.remove(aor);
         }
@@ -705,6 +717,11 @@ impl Registrar {
     pub fn evict_connection_oriented(&self) -> usize {
         let mut evicted = 0usize;
         let aors: Vec<String> = self.bindings.iter().map(|e| e.key().clone()).collect();
+        // Tokens harvested from evicted contacts; pruned from the reverse
+        // index after the per-AoR loop so we don't hold the bindings entry
+        // guard across the tokens DashMap write (different shards, but
+        // explicit ordering keeps reasoning easy).
+        let mut tokens_to_remove: Vec<String> = Vec::new();
 
         for aor in aors {
             let before;
@@ -714,10 +731,16 @@ impl Registrar {
                 before = entry.value().len();
                 entry.value_mut().retain(|c| {
                     let transport = c.uri.get_param("transport").unwrap_or("");
-                    !matches!(
+                    let evict = matches!(
                         transport.to_ascii_lowercase().as_str(),
                         "tcp" | "tls" | "ws" | "wss"
-                    )
+                    );
+                    if evict {
+                        if let Some(token) = &c.flow_token {
+                            tokens_to_remove.push(token.clone());
+                        }
+                    }
+                    !evict
                 });
                 after = entry.value().len();
             } else {
@@ -754,6 +777,10 @@ impl Registrar {
                 }
                 self.emit_event(RegistrationEvent::Deregistered { aor });
             }
+        }
+
+        for token in &tokens_to_remove {
+            self.tokens.remove(token);
         }
 
         evicted
@@ -828,14 +855,27 @@ impl Registrar {
     pub fn remove_contact(&self, aor: &str, contact_uri: &str) {
         let primary = self.resolve_alias(aor);
         let aor = primary.as_str();
+        let mut tokens_to_remove: Vec<String> = Vec::new();
         if let Some(mut entry) = self.bindings.get_mut(aor) {
             let before = entry.value().len();
-            entry.value_mut().retain(|c| c.uri.to_string() != contact_uri);
+            entry.value_mut().retain(|c| {
+                if c.uri.to_string() == contact_uri {
+                    if let Some(token) = &c.flow_token {
+                        tokens_to_remove.push(token.clone());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
             let removed = entry.value().len() < before;
             let aor_empty = entry.value().is_empty();
             if aor_empty {
                 drop(entry);
                 self.bindings.remove(aor);
+            }
+            for token in &tokens_to_remove {
+                self.tokens.remove(token);
             }
             if removed {
                 if aor_empty {
@@ -918,6 +958,55 @@ impl Registrar {
         let hash = hasher.finish();
 
         Some(format!("sip:tgruu.{hash:016x}@{domain};gr"))
+    }
+
+    /// Resolve an opaque proxy-side token to its (AoR, Contact) binding.
+    ///
+    /// Used by P-CSCF MT routing (RFC 3327 §5 / TS 24.229 §5.2.7.2): the
+    /// proxy advertises a Path URI whose userpart contains the token; on
+    /// the MT request, `request.consumed_route_user` exposes that token
+    /// and this method locates the binding so the script can call
+    /// `request.relay(flow=binding.flow)`.
+    ///
+    /// Returns `None` when:
+    /// - The token is unknown (never set, or already evicted).
+    /// - The token resolves to an AoR with no contacts carrying it
+    ///   (race with deregister; the index entry is pruned on the next
+    ///   maintenance pass).
+    /// - The matching contact has expired (lazy expiry).
+    pub fn lookup_by_token(&self, token: &str) -> Option<(Aor, Contact)> {
+        let aor = self.tokens.get(token).map(|entry| entry.value().clone())?;
+        let entry = self.bindings.get(&aor)?;
+        for contact in entry.value().iter() {
+            if contact.is_expired() {
+                continue;
+            }
+            if contact.flow_token.as_deref() == Some(token) {
+                return Some((aor.clone(), contact.clone()));
+            }
+        }
+        None
+    }
+
+    /// Rebuild the `tokens` reverse index from scratch by scanning every
+    /// non-expired contact in `bindings`.  Called by `restore_from_backend`
+    /// after loading from a persistent backend, and after
+    /// `evict_connection_oriented` discards stream-transport bindings whose
+    /// connections did not survive restart.  Idempotent and O(N) over total
+    /// contacts; runs once at startup.
+    pub fn rebuild_token_index(&self) {
+        self.tokens.clear();
+        for entry in self.bindings.iter() {
+            let aor = entry.key();
+            for contact in entry.value().iter() {
+                if contact.is_expired() {
+                    continue;
+                }
+                if let Some(token) = &contact.flow_token {
+                    self.tokens.insert(token.clone(), aor.clone());
+                }
+            }
+        }
     }
 
     /// Look up contacts by `+sip.instance` for an AoR (GRUU resolution).
@@ -1028,6 +1117,9 @@ impl Registrar {
             pending: true,
             instance_id,
             instance_epoch,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
         };
 
         let mut entry = self.bindings.entry(aor.to_string()).or_default();
@@ -1073,12 +1165,25 @@ impl Registrar {
     /// Run a garbage-collection pass: remove expired contacts from all AoRs.
     pub fn expire_stale(&self) {
         let mut empty_aors = Vec::new();
+        let mut tokens_to_remove: Vec<String> = Vec::new();
         for mut entry in self.bindings.iter_mut() {
             let before = entry.value().len();
-            entry.value_mut().retain(|c| !c.is_expired());
+            entry.value_mut().retain(|c| {
+                if c.is_expired() {
+                    if let Some(token) = &c.flow_token {
+                        tokens_to_remove.push(token.clone());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
             if entry.value().is_empty() && before > 0 {
                 empty_aors.push(entry.key().clone());
             }
+        }
+        for token in &tokens_to_remove {
+            self.tokens.remove(token);
         }
         if !empty_aors.is_empty() {
             if let Some(metrics) = crate::metrics::try_metrics() {
@@ -1344,6 +1449,9 @@ mod tests {
             pending: false,
             instance_id: Some("siphon-7".to_string()),
             instance_epoch: Some("boot-2".to_string()),
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
         };
         assert!(
             !registrar.is_local_contact(&foreign),
@@ -1385,6 +1493,9 @@ mod tests {
             pending: false,
             instance_id: None,
             instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
         };
         // Just registered — remaining should be very close to 3600
         assert!(contact.remaining_seconds() >= 3599);
@@ -1411,6 +1522,9 @@ mod tests {
                 pending: false,
                 instance_id: None,
                 instance_epoch: None,
+                flow_token: None,
+                inbound_local_addr: None,
+                inbound_connection_id: None,
             };
             registrar.bindings.entry("sip:alice@example.com".to_string()).or_default().push(contact);
         }
@@ -1436,6 +1550,7 @@ mod tests {
                 3600, 1.0, "c1".into(), 1,
                 None, None, None, None,
                 path.clone(),
+                FlowCapture::default(),
             )
             .unwrap();
 
@@ -1455,6 +1570,7 @@ mod tests {
                 3600, 1.0, "c1".into(), 1,
                 None, None, None, None,
                 vec!["<sip:old-pcscf.example.com;lr>".to_string()],
+                FlowCapture::default(),
             )
             .unwrap();
 
@@ -1466,6 +1582,7 @@ mod tests {
                 3600, 1.0, "c2".into(), 2,
                 None, None, None, None,
                 vec!["<sip:new-pcscf.example.com;lr>".to_string()],
+                FlowCapture::default(),
             )
             .unwrap();
 
@@ -2011,5 +2128,408 @@ mod tests {
         // Old alias dropped, new one in place.
         assert!(!registrar.aliases.contains_key("sip:tel:+15550000"));
         assert!(registrar.aliases.contains_key("sip:tel:+15551111"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Path-token MT routing (RFC 3327 §5 / TS 24.229 §5.2.7.2)
+    // -----------------------------------------------------------------------
+
+    fn flow_capture(token: &str, local_port: u16, remote_port: u16) -> FlowCapture {
+        FlowCapture {
+            flow_token: Some(token.to_string()),
+            inbound_local_addr: Some(format!("127.0.0.1:{local_port}").parse().unwrap()),
+            inbound_connection_id: Some(0xfeed_face_dead_beef ^ remote_port as u64),
+        }
+    }
+
+    #[test]
+    fn save_with_flow_token_indexes_for_lookup() {
+        let registrar = Registrar::default();
+        registrar
+            .save_full(
+                "sip:alice@ims.example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                Some("10.0.0.1:5066".parse().unwrap()), Some("udp".into()),
+                None, None, vec![],
+                flow_capture("token-abc", 5066, 5066),
+            )
+            .unwrap();
+
+        let resolved = registrar.lookup_by_token("token-abc").expect("token resolves");
+        assert_eq!(resolved.0, "sip:alice@ims.example.com");
+        assert_eq!(resolved.1.flow_token.as_deref(), Some("token-abc"));
+        assert_eq!(resolved.1.inbound_local_addr.unwrap().port(), 5066);
+    }
+
+    #[test]
+    fn lookup_by_token_returns_none_for_unknown_token() {
+        let registrar = Registrar::default();
+        assert!(registrar.lookup_by_token("never-saved").is_none());
+    }
+
+    #[test]
+    fn re_register_with_new_token_retires_old_index_entry() {
+        // Same +sip.instance, fresh token: the new entry must resolve
+        // and the old one must not — the swap happens inside the
+        // bindings entry guard so there is no stale window.
+        let registrar = Registrar::default();
+        let instance = "<urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6>".to_string();
+        registrar
+            .save_full(
+                "sip:alice@ims.example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                None, Some("udp".into()),
+                Some(instance.clone()), None, vec![],
+                flow_capture("token-old", 5066, 5066),
+            )
+            .unwrap();
+        registrar
+            .save_full(
+                "sip:alice@ims.example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c2".into(), 2,
+                None, Some("udp".into()),
+                Some(instance), None, vec![],
+                flow_capture("token-new", 5066, 5066),
+            )
+            .unwrap();
+
+        assert!(
+            registrar.lookup_by_token("token-old").is_none(),
+            "old token must be retired by the same-instance refresh"
+        );
+        assert!(
+            registrar.lookup_by_token("token-new").is_some(),
+            "new token must resolve to the refreshed binding"
+        );
+    }
+
+    #[test]
+    fn refresh_with_same_token_keeps_index_entry() {
+        // A pure refresh (same token) must NOT race-clear its own
+        // entry: the harvester removes the old token first, the new
+        // insertion would be skipped if we naively deleted-then-inserted
+        // when they're equal.  Test the invariant.
+        let registrar = Registrar::default();
+        let instance = "<urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6>".to_string();
+        for cseq in 1..=3 {
+            registrar
+                .save_full(
+                    "sip:alice@ims.example.com",
+                    contact_uri("alice", "10.0.0.1"),
+                    3600, 1.0, format!("c{cseq}"), cseq,
+                    None, Some("udp".into()),
+                    Some(instance.clone()), None, vec![],
+                    flow_capture("token-stable", 5066, 5066),
+                )
+                .unwrap();
+            assert!(
+                registrar.lookup_by_token("token-stable").is_some(),
+                "refresh #{cseq} must keep token-stable resolvable"
+            );
+        }
+    }
+
+    #[test]
+    fn expires_zero_deregister_prunes_token() {
+        let registrar = Registrar::default();
+        registrar
+            .save_full(
+                "sip:alice@ims.example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                None, Some("udp".into()),
+                None, None, vec![],
+                flow_capture("token-x", 5066, 5066),
+            )
+            .unwrap();
+        assert!(registrar.lookup_by_token("token-x").is_some());
+
+        registrar
+            .save_full(
+                "sip:alice@ims.example.com",
+                contact_uri("alice", "10.0.0.1"),
+                0, 1.0, "c2".into(), 2,                 // Expires: 0
+                None, Some("udp".into()),
+                None, None, vec![],
+                FlowCapture::default(),                  // de-REGISTER carries no token
+            )
+            .unwrap();
+        assert!(
+            registrar.lookup_by_token("token-x").is_none(),
+            "Expires=0 deregister must prune the token from the reverse index"
+        );
+    }
+
+    #[test]
+    fn wildcard_remove_all_prunes_tokens() {
+        let registrar = Registrar::default();
+        registrar
+            .save_full(
+                "sip:alice@ims.example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                None, Some("udp".into()),
+                None, None, vec![],
+                flow_capture("tok-1", 5066, 5066),
+            )
+            .unwrap();
+        registrar.remove_all("sip:alice@ims.example.com");
+        assert!(registrar.lookup_by_token("tok-1").is_none());
+        assert!(registrar.tokens.is_empty());
+    }
+
+    #[test]
+    fn expire_stale_prunes_tokens() {
+        let registrar = Registrar::default();
+        // Insert an already-expired contact directly into bindings (the
+        // public save_full enforces min_expires); also wire its token
+        // into the reverse index manually so we can verify the GC pass
+        // unwires it.
+        let aor = "sip:alice@ims.example.com".to_string();
+        let stale = Contact {
+            uri: contact_uri("alice", "10.0.0.1"),
+            q: 1.0,
+            registered_at: Instant::now() - Duration::from_secs(7200),
+            expires: Duration::from_secs(3600),
+            call_id: "stale".into(),
+            cseq: 1,
+            source_addr: None,
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: Some("tok-gc".into()),
+            inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
+            inbound_connection_id: Some(42),
+        };
+        registrar.bindings.entry(aor.clone()).or_default().push(stale);
+        registrar.tokens.insert("tok-gc".into(), aor);
+
+        registrar.expire_stale();
+        assert!(registrar.lookup_by_token("tok-gc").is_none());
+        assert!(registrar.tokens.is_empty());
+    }
+
+    #[test]
+    fn rebuild_token_index_recovers_after_load() {
+        // Simulate the post-restore state: bindings carry flow_tokens
+        // but the in-memory index is empty (as if just deserialized).
+        let registrar = Registrar::default();
+        let aor = "sip:alice@ims.example.com".to_string();
+        let live = Contact {
+            uri: contact_uri("alice", "10.0.0.1"),
+            q: 1.0,
+            registered_at: Instant::now(),
+            expires: Duration::from_secs(3600),
+            call_id: "c1".into(),
+            cseq: 1,
+            source_addr: None,
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: Some("tok-restored".into()),
+            inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
+            inbound_connection_id: Some(7),
+        };
+        registrar.bindings.entry(aor.clone()).or_default().push(live);
+
+        // Index empty before rebuild — lookup misses.
+        assert!(registrar.lookup_by_token("tok-restored").is_none());
+
+        registrar.rebuild_token_index();
+        let resolved = registrar.lookup_by_token("tok-restored").expect("token now resolves");
+        assert_eq!(resolved.0, aor);
+    }
+
+    #[test]
+    fn rebuild_token_index_skips_expired_contacts() {
+        let registrar = Registrar::default();
+        let aor = "sip:alice@ims.example.com".to_string();
+        let stale = Contact {
+            uri: contact_uri("alice", "10.0.0.1"),
+            q: 1.0,
+            registered_at: Instant::now() - Duration::from_secs(7200),
+            expires: Duration::from_secs(3600),
+            call_id: "stale".into(),
+            cseq: 1,
+            source_addr: None,
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: Some("tok-expired".into()),
+            inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
+            inbound_connection_id: Some(7),
+        };
+        registrar.bindings.entry(aor).or_default().push(stale);
+
+        registrar.rebuild_token_index();
+        assert!(registrar.lookup_by_token("tok-expired").is_none());
+    }
+
+    #[test]
+    fn evict_connection_oriented_unwires_stream_tokens() {
+        // Two bindings, one UDP (survives) and one TCP (evicted).  The
+        // TCP token's index entry must be pruned; the UDP one stays.
+        let registrar = Registrar::default();
+        registrar
+            .save_full(
+                "sip:alice@ims.example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                None, Some("udp".into()),
+                None, None, vec![],
+                flow_capture("tok-udp", 5066, 5066),
+            )
+            .unwrap();
+        // Manually inject a TCP-tagged contact (transport=tcp on the URI)
+        // — the public save funnel doesn't carry the URI param, so we
+        // mutate the binding in place to model the real-world case where
+        // a UE registered over TCP and the URI carries `;transport=tcp`.
+        let tcp_contact = {
+            let entry = registrar.bindings.get("sip:alice@ims.example.com").unwrap();
+            let template = entry.value()[0].clone();
+            drop(entry);
+            let mut tcp = template.clone();
+            tcp.uri.params.push(("transport".into(), Some("tcp".into())));
+            tcp.flow_token = Some("tok-tcp".into());
+            tcp.inbound_connection_id = Some(99);
+            tcp
+        };
+        registrar
+            .bindings
+            .entry("sip:alice@ims.example.com".to_string())
+            .or_default()
+            .push(tcp_contact);
+        registrar.tokens.insert("tok-tcp".into(), "sip:alice@ims.example.com".into());
+
+        let evicted = registrar.evict_connection_oriented();
+        assert_eq!(evicted, 1, "exactly one TCP binding must be evicted");
+
+        assert!(
+            registrar.lookup_by_token("tok-udp").is_some(),
+            "UDP binding's token survives eviction"
+        );
+        assert!(
+            registrar.lookup_by_token("tok-tcp").is_none(),
+            "TCP binding's token is unwired by eviction"
+        );
+    }
+
+    #[test]
+    fn token_lookup_filters_expired_contact() {
+        // Contact carrying a token expires lazily — lookup_by_token must
+        // not return a `(aor, contact)` whose underlying contact is past
+        // its TTL even before the GC pass runs.
+        let registrar = Registrar::default();
+        let aor = "sip:alice@ims.example.com".to_string();
+        let stale = Contact {
+            uri: contact_uri("alice", "10.0.0.1"),
+            q: 1.0,
+            registered_at: Instant::now() - Duration::from_secs(7200),
+            expires: Duration::from_secs(3600),
+            call_id: "c1".into(),
+            cseq: 1,
+            source_addr: None,
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: Some("tok".into()),
+            inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
+            inbound_connection_id: Some(1),
+        };
+        registrar.bindings.entry(aor.clone()).or_default().push(stale);
+        registrar.tokens.insert("tok".into(), aor);
+
+        assert!(
+            registrar.lookup_by_token("tok").is_none(),
+            "expired contact must be filtered by lookup_by_token"
+        );
+    }
+
+    #[test]
+    fn token_index_concurrent_inserts_thread_safe() {
+        // Hammer save_full from multiple threads with distinct tokens.
+        // Every token written must be resolvable at the end — verifies
+        // DashMap-backed token index is genuinely concurrent-safe.
+        use std::sync::Arc;
+        use std::thread;
+
+        let registrar = Arc::new(Registrar::default());
+        let mut handles = Vec::new();
+        for thread_id in 0..8 {
+            let r = Arc::clone(&registrar);
+            handles.push(thread::spawn(move || {
+                for i in 0..50 {
+                    let token = format!("tok-{thread_id}-{i}");
+                    let aor = format!("sip:user{thread_id}_{i}@ims.example.com");
+                    r.save_full(
+                        &aor,
+                        SipUri::new("10.0.0.1".to_string()).with_user(format!("u{thread_id}_{i}")),
+                        3600, 1.0, format!("c{thread_id}-{i}"), 1,
+                        None, Some("udp".into()),
+                        None, None, vec![],
+                        FlowCapture {
+                            flow_token: Some(token),
+                            inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
+                            inbound_connection_id: Some(thread_id * 1000 + i),
+                        },
+                    ).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for thread_id in 0..8 {
+            for i in 0..50 {
+                let token = format!("tok-{thread_id}-{i}");
+                assert!(
+                    registrar.lookup_by_token(&token).is_some(),
+                    "concurrent insert lost token: {token}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flow_capture_default_leaves_contact_unflagged() {
+        // A bare save (no flow_token) must produce a Contact with all
+        // three flow fields = None — preserves the pre-feature semantics
+        // for non-P-CSCF deployments.
+        let registrar = Registrar::default();
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                None, None, None, None, vec![],
+                FlowCapture::default(),
+            )
+            .unwrap();
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts.len(), 1);
+        assert!(contacts[0].flow_token.is_none());
+        assert!(contacts[0].inbound_local_addr.is_none());
+        assert!(contacts[0].inbound_connection_id.is_none());
+        assert!(registrar.tokens.is_empty());
     }
 }

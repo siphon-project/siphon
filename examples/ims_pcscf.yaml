@@ -71,6 +71,13 @@ ipsec:
   backend: netlink           # "netlink" (default, fastest) or "ip" (shell-out fallback)
   # spi_range_start: 10000   # set per-instance for multi-process P-CSCFs
   # spi_range_count: 8192
+  # Path-token MT routing (RFC 3327 §5 / TS 24.229 §5.2.7.2): the
+  # host part siphon writes into the Path URI from
+  # ``request.add_pcscf_path(token)``.  Must resolve back to *this*
+  # P-CSCF instance — typically the pod FQDN or a per-replica DNS name
+  # in a StatefulSet deployment so MT requests from the S-CSCF route to
+  # the instance that owns the inbound flow.
+  path_host: "pcscf-0.ims.example.com:5060"
 
 # ---------------------------------------------------------------------------
 # NAT traversal

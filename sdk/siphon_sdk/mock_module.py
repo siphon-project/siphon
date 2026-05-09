@@ -619,6 +619,10 @@ class MockRegistrar:
         # Alias AoR → primary AoR.  Derived index over ``_associated_uris``,
         # mirrors the Rust ``Registrar::aliases`` map.
         self._aliases: dict[str, str] = {}
+        # Opaque flow-token → AoR.  Mirrors the Rust ``Registrar::tokens``
+        # reverse index used for Path-token MT routing
+        # (RFC 3327 §5 / TS 24.229 §5.2.7.2).
+        self._tokens: dict[str, str] = {}
         self._on_change_callbacks: list[Callable] = []
 
     @staticmethod
@@ -646,6 +650,7 @@ class MockRegistrar:
         request: Any,
         force: bool = False,
         aliases: Optional[list[str]] = None,
+        flow_token: Optional[str] = None,
     ) -> bool:
         """Save contact bindings from a REGISTER request and send the 200 OK reply.
 
@@ -665,6 +670,12 @@ class MockRegistrar:
                 the same contacts.  Empty / ``None`` is a no-op; clear
                 an existing set with
                 ``registrar.set_associated_uris(aor, [])``.
+            flow_token: Opaque proxy-side token to attach to every
+                contact saved by this call.  Captures the inbound flow
+                so subsequent ``registrar.lookup_by_token(flow_token)``
+                resolves back to this binding and the script can
+                ``request.relay(flow=binding.flow)`` for P-CSCF MT
+                routing (RFC 3327 §5 / TS 24.229 §5.2.7.2).
 
         Returns:
             ``True`` on success.
@@ -674,7 +685,11 @@ class MockRegistrar:
             if request.method == "REGISTER":
                 if not auth.require_digest(request, realm=DOMAIN):
                     return
-                registrar.save(request, aliases=["tel:+15551234"])
+                # Generate an opaque token, write it into Path so MT
+                # requests come back with it on the topmost Route.
+                token = secrets.token_urlsafe(16)
+                request.add_pcscf_path(token)
+                registrar.save(request, flow_token=token)
                 return
         """
         raw_aor = str(request.to_uri) if request.to_uri else str(request.ruri)
@@ -686,7 +701,20 @@ class MockRegistrar:
         default_uri = f"sip:{request.ruri.user or 'user'}@{request.source_ip}:5060"
         already_exists = any(c.uri == default_uri for c in contacts)
         if not already_exists:
-            contacts.append(Contact(uri=default_uri))
+            contact = Contact(uri=default_uri)
+            if flow_token is not None:
+                contact.flow_token = flow_token
+                # Reconstitute the Flow view from request context.
+                from siphon_sdk.types import Flow as _Flow
+                contact.flow = _Flow(
+                    transport=request.transport,
+                    remote_addr=f"{request.source_ip}:{request.source_port}",
+                    local_addr=getattr(request, "_local_addr", "0.0.0.0:0"),
+                )
+            contacts.append(contact)
+            # Index for lookup_by_token.
+            if flow_token is not None:
+                self._tokens[flow_token] = aor
         # Fire on_change callbacks
         event_type = "refreshed" if already_exists else "registered"
         self._fire_on_change(aor, event_type)
@@ -705,6 +733,7 @@ class MockRegistrar:
         request: Any,
         reply: Any,
         aliases: Optional[list[str]] = None,
+        flow_token: Optional[str] = None,
     ) -> bool:
         """Cache a binding on a proxy after the upstream registrar accepted it.
 
@@ -805,6 +834,37 @@ class MockRegistrar:
         key = self._resolve_alias(self._normalize_aor(str(uri)))
         contacts = self._store.get(key, [])
         return sorted(contacts, key=lambda c: c.q, reverse=True)
+
+    def lookup_by_token(self, token: str) -> Optional[Contact]:
+        """Resolve an opaque flow-token previously attached via
+        ``registrar.save(flow_token=...)`` to its bound contact.
+
+        Returns ``None`` when the token is unknown, the binding has
+        expired, or no contact in the resolved AoR carries this token.
+
+        Used by P-CSCF MT routing (RFC 3327 §5 / TS 24.229 §5.2.7.2):
+        the proxy advertised a Path URI of the form
+        ``<sip:TOKEN@pcscf;lr>``; on the MT request, after
+        ``loose_route()`` consumed that Route,
+        ``request.consumed_route_user`` exposes the token and this
+        method resolves it back to the binding so the script can call
+        ``request.relay(flow=binding.flow)``.
+
+        Args:
+            token: Opaque token previously passed to
+                ``registrar.save(flow_token=...)``.
+
+        Returns:
+            The matching :class:`Contact` (with ``.flow`` populated)
+            or ``None``.
+        """
+        aor = self._tokens.get(token)
+        if aor is None:
+            return None
+        for contact in self._store.get(aor, []):
+            if contact.flow_token == token:
+                return contact
+        return None
 
     def is_registered(self, uri: Union[str, SipUri]) -> bool:
         """Check if a URI has any registered contacts.
@@ -4516,6 +4576,9 @@ def install() -> ModuleType:
     mod.PendingSA = MockPendingSA  # type: ignore[attr-defined]
     mod.SecurityServerParams = MockSecurityServerParams  # type: ignore[attr-defined]
     mod.SAHandle = MockSAHandle  # type: ignore[attr-defined]
+    # Path-token MT routing (RFC 3327 §5 / TS 24.229 §5.2.7.2).
+    from siphon_sdk.types import Flow as _Flow
+    mod.Flow = _Flow  # type: ignore[attr-defined]
 
     # Also install the _siphon_registry mock
     registry_mod = ModuleType("_siphon_registry")

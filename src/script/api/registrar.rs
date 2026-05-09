@@ -22,6 +22,84 @@ use super::request::PyRequest;
 const PROXY_BINDING_GRACE_SECS: u32 = 32;
 
 /// Python-visible contact object returned from `registrar.lookup()`.
+/// Opaque view of an inbound flow captured at REGISTER time.  Carries the
+/// transport, the UE's source address, the listener local address, and the
+/// accepted-connection id — enough for `request.relay(flow=...)` to bypass
+/// DNS resolution and write directly to the listener that received the
+/// REGISTER.  Treat as opaque from Python: scripts pass it back to
+/// `request.relay(flow=)` and read `is_alive` to defend against dead
+/// stream connections.
+#[pyclass(name = "Flow")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PyFlow {
+    /// Lowercase transport name ("udp", "tcp", "tls", "ws", "wss").
+    pub transport: String,
+    /// UE's source address (where the REGISTER came from).
+    pub source_addr: std::net::SocketAddr,
+    /// Listener local address the REGISTER landed on.  Used by the
+    /// outbound router (`OutboundRouter::send`) to egress from the same
+    /// socket — load-bearing for IPSec where `pcscf_port_s` is non-default.
+    pub local_addr: std::net::SocketAddr,
+    /// `ConnectionId.0` of the accepted inbound connection.  For UDP this
+    /// is the deterministic `(local_addr, remote_addr)` hash; for stream
+    /// transports it identifies the live write half in `connection_map`.
+    pub connection_id: u64,
+}
+
+#[pymethods]
+impl PyFlow {
+    /// Lowercase transport name ("udp", "tcp", "tls", "ws", "wss").
+    #[getter]
+    fn transport(&self) -> &str {
+        &self.transport
+    }
+
+    /// String form of the captured remote (UE) address.
+    #[getter]
+    fn remote_addr(&self) -> String {
+        self.source_addr.to_string()
+    }
+
+    /// String form of the captured listener local address.
+    #[getter]
+    fn local_addr(&self) -> String {
+        self.local_addr.to_string()
+    }
+
+    /// Whether the flow is still usable.
+    ///
+    /// For UDP this is always ``True``: the listener socket survives
+    /// any individual exchange, and a stale `(local, remote)` tuple
+    /// just means the next datagram will land on a UE that may or
+    /// may not still be listening.
+    ///
+    /// For stream transports (TCP/TLS/WS/WSS) the flow is alive only
+    /// while the accepted connection that delivered the REGISTER is
+    /// still open on this process.  An accurate cross-transport check
+    /// requires wiring the per-listener `connection_map`s into a
+    /// shared registry; until that lands, this returns ``True`` for
+    /// stream transports too — scripts should defend against the
+    /// silent-drop case via :attr:`Contact.is_local` before calling
+    /// ``request.relay(flow=...)``.
+    #[getter]
+    fn is_alive(&self) -> bool {
+        // Conservative: treat all flows as live.  When the dispatcher
+        // can't find the connection at send time, the message is
+        // silently dropped (logged) — same failure mode as a closed
+        // socket on any other path.  When the cross-transport
+        // connection registry lands, this becomes a real DashMap
+        // lookup against the right per-transport map.
+        true
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Flow(transport={}, remote={}, local={})",
+            self.transport, self.source_addr, self.local_addr
+        )
+    }
+}
+
 #[pyclass(name = "Contact", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyContact {
@@ -47,6 +125,17 @@ pub struct PyContact {
     /// True when the binding's `(instance_id, instance_epoch)` matches the
     /// running siphon process — i.e. this process accepted the REGISTER.
     is_local_value: bool,
+    /// Opaque proxy-side token attached at REGISTER time via
+    /// `registrar.save(flow_token=...)`.  `None` when the script didn't
+    /// request a token (or the binding pre-dates flow-token support).
+    flow_token_value: Option<String>,
+    /// Captured inbound flow as a `Flow` view, when `flow_token_value`
+    /// is set.  `None` when this binding was loaded from a backend
+    /// without a complete flow capture (e.g. an older entry without
+    /// `inbound_local_addr`).  Pass to `request.relay(flow=...)` to
+    /// send a request back over the same listener that received the
+    /// REGISTER (RFC 3327 §5 / TS 24.229 §5.2.7.2 MT routing).
+    flow_value: Option<PyFlow>,
 }
 
 #[pymethods]
@@ -123,6 +212,26 @@ impl PyContact {
         self.is_local_value
     }
 
+    /// Opaque proxy-side token attached at REGISTER time via
+    /// `registrar.save(flow_token=...)`.  Returns `None` when the binding
+    /// wasn't tagged with a token (or was loaded from a backend without
+    /// the field).
+    #[getter]
+    fn flow_token(&self) -> Option<&str> {
+        self.flow_token_value.as_deref()
+    }
+
+    /// Captured inbound flow (`Flow` view) — pass to
+    /// `request.relay(flow=...)` to send a request back over the same
+    /// listener that received the REGISTER.  Returns `None` when this
+    /// binding lacks a captured flow (no `flow_token=` on save, or the
+    /// `inbound_local_addr`/`inbound_connection_id` fields were absent
+    /// in the persisted record).
+    #[getter]
+    fn flow(&self) -> Option<PyFlow> {
+        self.flow_value.clone()
+    }
+
     fn __str__(&self) -> &str {
         &self.uri_string
     }
@@ -155,6 +264,53 @@ impl PyContact {
         let is_local_value = registrar
             .map(|registrar| registrar.is_local_contact(contact))
             .unwrap_or(false);
+        // Reconstitute the `Flow` view from the stored tuple.  Requires
+        // both source_addr (the UE) and inbound_local_addr (our listener)
+        // to be present — otherwise the flow is incomplete and we can't
+        // honor `relay(flow=...)`, so expose `None`.
+        let flow_value = match (contact.source_addr, contact.inbound_local_addr) {
+            (Some(source_addr), Some(local_addr)) => {
+                let transport = contact
+                    .source_transport
+                    .as_deref()
+                    .unwrap_or("udp")
+                    .to_ascii_lowercase();
+                let connection_id = match contact.inbound_connection_id {
+                    Some(id) => id,
+                    // For UDP, the connection_id is a deterministic hash of
+                    // `(local_addr, remote_addr)` — recompute on demand if
+                    // the stored binding lacks it (older record).  For
+                    // stream transports, no captured id means no flow.
+                    None if transport == "udp" => {
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = DefaultHasher::new();
+                        local_addr.hash(&mut hasher);
+                        source_addr.hash(&mut hasher);
+                        hasher.finish()
+                    }
+                    None => return Self {
+                        uri_string: contact.uri.to_string(),
+                        q_value: contact.q,
+                        expires_remaining: contact.remaining_seconds(),
+                        received_string,
+                        path_headers: contact.path.clone(),
+                        instance_id_value: contact.instance_id.clone(),
+                        instance_epoch_value: contact.instance_epoch.clone(),
+                        is_local_value,
+                        flow_token_value: contact.flow_token.clone(),
+                        flow_value: None,
+                    },
+                };
+                Some(PyFlow {
+                    transport,
+                    source_addr,
+                    local_addr,
+                    connection_id,
+                })
+            }
+            _ => None,
+        };
         Self {
             uri_string: contact.uri.to_string(),
             q_value: contact.q,
@@ -164,6 +320,8 @@ impl PyContact {
             instance_id_value: contact.instance_id.clone(),
             instance_epoch_value: contact.instance_epoch.clone(),
             is_local_value,
+            flow_token_value: contact.flow_token.clone(),
+            flow_value,
         }
     }
 }
@@ -592,6 +750,25 @@ impl PyRegistrar {
             .collect())
     }
 
+    /// Look up a binding by the opaque token previously attached via
+    /// `registrar.save(flow_token=...)`.
+    ///
+    /// Returns the matching `Contact` (with `.flow` reconstituted from the
+    /// stored capture) or `None` when the token is unknown, the binding
+    /// has expired, or the underlying contact was removed.
+    ///
+    /// Used by P-CSCF MT routing (RFC 3327 §5 / TS 24.229 §5.2.7.2): the
+    /// proxy advertised a Path URI of the form `<sip:TOKEN@pcscf;lr>`;
+    /// on the MT request, after `loose_route()` has consumed that Route,
+    /// `request.consumed_route_user` exposes the token and this method
+    /// resolves it back to the binding so the script can call
+    /// `request.relay(flow=binding.flow)`.
+    fn lookup_by_token(&self, token: &str) -> Option<PyContact> {
+        let inner = &self.inner;
+        let (_aor, contact) = inner.lookup_by_token(token)?;
+        Some(PyContact::from_rust_contact_with_registrar(&contact, Some(inner)))
+    }
+
     /// Force-expire (remove) all contacts for a URI.
     ///
     /// Used for explicit de-REGISTER handling (Expires: 0).
@@ -899,7 +1076,7 @@ mod tests {
         let (mut request, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1:5060>", &registrar);
 
-        py_reg.save(&mut request, false, vec![]).unwrap();
+        py_reg.save(&mut request, false, vec![], None).unwrap();
 
         let contacts = py_reg.lookup_str("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
@@ -916,7 +1093,7 @@ mod tests {
             make_register_request("<sip:bob@example.com>", "<sip:bob@10.0.0.2>", &registrar);
 
         assert!(!py_reg.is_registered_str("sip:bob@example.com"));
-        py_reg.save(&mut request, false, vec![]).unwrap();
+        py_reg.save(&mut request, false, vec![], None).unwrap();
         assert!(py_reg.is_registered_str("sip:bob@example.com"));
     }
 
@@ -926,7 +1103,7 @@ mod tests {
         let (mut request, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
 
-        py_reg.save(&mut request, false, vec![]).unwrap();
+        py_reg.save(&mut request, false, vec![], None).unwrap();
         assert!(py_reg.is_registered_str("sip:alice@example.com"));
 
         // Wildcard Contact: *
@@ -950,7 +1127,7 @@ mod tests {
             "10.0.0.1".to_string(),
             5060,
         );
-        py_reg.save(&mut dereg_request, false, vec![]).unwrap();
+        py_reg.save(&mut dereg_request, false, vec![], None).unwrap();
         assert!(!py_reg.is_registered_str("sip:alice@example.com"));
     }
 
@@ -959,11 +1136,11 @@ mod tests {
         let registrar = make_registrar();
         let (mut request1, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
-        py_reg.save(&mut request1, false, vec![]).unwrap();
+        py_reg.save(&mut request1, false, vec![], None).unwrap();
 
         let (mut request2, _) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.2>", &registrar);
-        py_reg.save(&mut request2, true, vec![]).unwrap();
+        py_reg.save(&mut request2, true, vec![], None).unwrap();
 
         let contacts = py_reg.lookup_str("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
@@ -990,14 +1167,14 @@ mod tests {
             "<sip:alice@10.0.0.1>",
             &registrar,
         );
-        py_reg.save(&mut alice, false, vec![]).unwrap();
+        py_reg.save(&mut alice, false, vec![], None).unwrap();
 
         let (mut bob, _) = make_register_request(
             "<sip:bob@example.com>",
             "<sip:bob@10.0.0.2>",
             &registrar,
         );
-        py_reg.save(&mut bob, false, vec![]).unwrap();
+        py_reg.save(&mut bob, false, vec![], None).unwrap();
         assert_eq!(registrar.aor_count_distributed().await.unwrap(), 2);
 
         // Refreshing alice does not change the AoR count.
@@ -1006,7 +1183,7 @@ mod tests {
             "<sip:alice@10.0.0.1>",
             &registrar,
         );
-        py_reg.save(&mut alice_refresh, false, vec![]).unwrap();
+        py_reg.save(&mut alice_refresh, false, vec![], None).unwrap();
         assert_eq!(registrar.aor_count_distributed().await.unwrap(), 2);
 
         registrar.remove_all("sip:alice@example.com");
@@ -1057,7 +1234,7 @@ mod tests {
             "<sip:alice@10.0.0.1:5060>",
             &registrar,
         );
-        py_reg.save(&mut request, false, vec![]).unwrap();
+        py_reg.save(&mut request, false, vec![], None).unwrap();
 
         // Lookup with transport param should still find the contact
         let contacts = py_reg.lookup_str("sip:alice@example.com;transport=tcp");
@@ -1076,6 +1253,8 @@ mod tests {
             instance_id_value: None,
             instance_epoch_value: None,
             is_local_value: false,
+            flow_token_value: None,
+            flow_value: None,
         };
         assert_eq!(contact.__str__(), "sip:alice@10.0.0.1");
         assert!(contact.__repr__().contains("q=1"));
@@ -1090,7 +1269,7 @@ mod tests {
             &registrar,
         );
 
-        py_reg.save(&mut request, false, vec![]).unwrap();
+        py_reg.save(&mut request, false, vec![], None).unwrap();
         let contacts = py_reg.lookup_str("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
         assert!((contacts[0].q() - 0.7).abs() < 0.01);
@@ -1105,7 +1284,7 @@ mod tests {
         let (mut request, py_reg) =
             make_register_request("<sip:carol@example.com>", "<sip:carol@10.0.0.3>", &registrar);
 
-        py_reg.save(&mut request, false, vec![]).unwrap();
+        py_reg.save(&mut request, false, vec![], None).unwrap();
         assert!(py_reg.is_registered_str("sip:carol@example.com"));
 
         // expire() should remove all contacts
@@ -1147,7 +1326,7 @@ mod tests {
         let py_reg = PyRegistrar::new(Arc::clone(&registrar));
 
         // save() should return true and set the reply action
-        let result = py_reg.save(&mut request, false, vec![]).unwrap();
+        let result = py_reg.save(&mut request, false, vec![], None).unwrap();
         assert!(result);
 
         // The reply action should be 200 OK
@@ -1186,7 +1365,7 @@ mod tests {
         let (mut request, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
 
-        py_reg.save(&mut request, false, vec![]).unwrap();
+        py_reg.save(&mut request, false, vec![], None).unwrap();
         assert!(py_reg.is_registered_str("sip:alice@example.com"));
 
         let uri = SipUri::new("example.com".to_string());
@@ -1210,7 +1389,7 @@ mod tests {
             5060,
         );
 
-        let result = py_reg.save(&mut dereg_request, false, vec![]).unwrap();
+        let result = py_reg.save(&mut dereg_request, false, vec![], None).unwrap();
         assert!(result);
 
         // save() should have sent 200 OK for wildcard deregister
@@ -1245,6 +1424,7 @@ mod tests {
                 &mut request,
                 false,
                 vec!["tel:+15551234".to_string(), "sip:wildcard@ims.example.com".to_string()],
+                None,
             )
             .unwrap();
 
@@ -1319,7 +1499,7 @@ mod tests {
         // Upstream registrar capped to 3600.
         let reply = make_reply_with_expires("3600");
 
-        py_reg.save_proxy(&request, &reply, vec![]).unwrap();
+        py_reg.save_proxy(&request, &reply, vec![], None).unwrap();
 
         let contacts = py_reg.lookup_str("sip:alice@ims.example.com");
         assert_eq!(contacts.len(), 1);
@@ -1345,7 +1525,7 @@ mod tests {
             "<sip:alice@10.0.0.1:5060>",
             &registrar,
         );
-        py_reg.save(&mut req1, false, vec![]).unwrap();
+        py_reg.save(&mut req1, false, vec![], None).unwrap();
         assert!(py_reg.is_registered_str("sip:alice@ims.example.com"));
 
         // De-REGISTER via proxy save.
@@ -1370,7 +1550,7 @@ mod tests {
         );
         let reply = make_reply_with_expires("0");
 
-        py_reg.save_proxy(&dereg_req, &reply, vec![]).unwrap();
+        py_reg.save_proxy(&dereg_req, &reply, vec![], None).unwrap();
         assert!(!py_reg.is_registered_str("sip:alice@ims.example.com"));
     }
 
@@ -1408,7 +1588,7 @@ mod tests {
         );
         let reply = make_reply_with_expires("3600");
 
-        py_reg.save_proxy(&request, &reply, vec![]).unwrap();
+        py_reg.save_proxy(&request, &reply, vec![], None).unwrap();
 
         let contacts = py_reg.lookup_str("sip:bob@ims.example.com");
         let exp = contacts[0].expires();
@@ -1419,5 +1599,141 @@ mod tests {
             "expires {exp} should be ~3632, local max_expires cap of 600 \
              must not apply on save_proxy"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 — Path-token MT routing: Python surface
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pycontact_reconstitutes_flow_for_udp() {
+        let contact = Contact {
+            uri: SipUri::new("10.0.0.1".to_string()).with_user("alice".into()),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires: std::time::Duration::from_secs(3600),
+            call_id: "c1".into(),
+            cseq: 1,
+            source_addr: Some("10.0.0.1:50000".parse().unwrap()),
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: Some("tok".into()),
+            inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
+            inbound_connection_id: Some(0xc0ffee),
+        };
+        let py = PyContact::from_rust_contact(&contact);
+        let flow = py.flow().expect("flow should be present");
+        assert_eq!(flow.transport, "udp");
+        assert_eq!(flow.source_addr.to_string(), "10.0.0.1:50000");
+        assert_eq!(flow.local_addr.to_string(), "127.0.0.1:5066");
+        assert_eq!(flow.connection_id, 0xc0ffee);
+        assert_eq!(py.flow_token(), Some("tok"));
+    }
+
+    #[test]
+    fn pycontact_recomputes_udp_connection_id_when_missing() {
+        // Stored binding may pre-date the inbound_connection_id field
+        // (None) — for UDP, the connection_id is a deterministic hash
+        // of (local, remote) so we can recover it on demand.
+        let contact = Contact {
+            uri: SipUri::new("10.0.0.1".to_string()).with_user("alice".into()),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires: std::time::Duration::from_secs(3600),
+            call_id: "c1".into(),
+            cseq: 1,
+            source_addr: Some("10.0.0.1:50000".parse().unwrap()),
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: Some("tok".into()),
+            inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
+            inbound_connection_id: None,
+        };
+        let py = PyContact::from_rust_contact(&contact);
+        let flow = py.flow().expect("UDP flow should reconstitute");
+        // Recomputed from (local, remote) — must be non-zero and stable.
+        assert_ne!(flow.connection_id, 0);
+        let py2 = PyContact::from_rust_contact(&contact);
+        assert_eq!(flow.connection_id, py2.flow().unwrap().connection_id);
+    }
+
+    #[test]
+    fn pycontact_omits_flow_for_stream_without_connection_id() {
+        // For TCP/TLS/WS/WSS, no captured connection_id means we
+        // can't reach the UE — surface flow=None so the script can
+        // fall back instead of relay()ing into a void.
+        let contact = Contact {
+            uri: SipUri::new("10.0.0.1".to_string()).with_user("alice".into()),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires: std::time::Duration::from_secs(3600),
+            call_id: "c1".into(),
+            cseq: 1,
+            source_addr: Some("10.0.0.1:50000".parse().unwrap()),
+            source_transport: Some("tcp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: Some("tok".into()),
+            inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
+            inbound_connection_id: None,
+        };
+        let py = PyContact::from_rust_contact(&contact);
+        assert!(py.flow().is_none());
+        // flow_token still surfaces — the binding *exists*, the
+        // script just can't relay over the dead stream.
+        assert_eq!(py.flow_token(), Some("tok"));
+    }
+
+    #[test]
+    fn pycontact_omits_flow_when_no_local_addr() {
+        let contact = Contact {
+            uri: SipUri::new("10.0.0.1".to_string()).with_user("alice".into()),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires: std::time::Duration::from_secs(3600),
+            call_id: "c1".into(),
+            cseq: 1,
+            source_addr: Some("10.0.0.1:50000".parse().unwrap()),
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: Some("tok".into()),
+            inbound_local_addr: None,
+            inbound_connection_id: Some(42),
+        };
+        let py = PyContact::from_rust_contact(&contact);
+        assert!(py.flow().is_none());
+    }
+
+    #[test]
+    fn pyflow_is_alive_returns_true() {
+        // Conservative stub until cross-transport connection registry
+        // lands.  Tests the contract — if this assertion changes,
+        // the docstring on PyFlow.is_alive must change too.
+        let flow = PyFlow {
+            transport: "udp".into(),
+            source_addr: "10.0.0.1:50000".parse().unwrap(),
+            local_addr: "127.0.0.1:5066".parse().unwrap(),
+            connection_id: 1,
+        };
+        assert!(flow.is_alive());
     }
 }

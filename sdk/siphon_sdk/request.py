@@ -259,6 +259,38 @@ class Request:
         """
         return list(self._consumed_routes)
 
+    @property
+    def consumed_route(self) -> Optional[SipUri]:
+        """First Route entry consumed by ``loose_route()``, parsed as a
+        :class:`SipUri` so the script can read ``user`` / ``host`` / ``port``
+        directly without string-munging.
+
+        Returns ``None`` when no Route was consumed yet.  Convenience over
+        :attr:`consumed_route_user` for P-CSCF Path-token MT routing where
+        the script needs both the userpart (the opaque token to look up)
+        and the host (to verify it points at this proxy).
+        """
+        for raw in self._consumed_routes:
+            uri = _parse_uri(raw)
+            if uri:
+                return uri
+        return None
+
+    @property
+    def flow(self):
+        """View of the inbound flow this request arrived on, or ``None``
+        for synthetic requests without listener context.
+
+        Pass to :meth:`relay` (``flow=`` kwarg) for Path-token MT routing
+        — sends the request back over the same listener that received the
+        REGISTER without DNS-resolving the URI (RFC 3327 §5 /
+        TS 24.229 §5.2.7.2).
+
+        In the mock, returns the test-fixture flow if one was attached
+        via the test harness; otherwise ``None``.
+        """
+        return getattr(self, "_flow", None)
+
     # -- Response & forwarding -------------------------------------------------
 
     def reply(self, code: int, reason: str, reliable: bool = False) -> None:
@@ -294,6 +326,7 @@ class Request:
         next_hop: Optional[str] = None,
         on_reply: Optional[Callable] = None,
         on_failure: Optional[Callable] = None,
+        flow=None,
     ) -> None:
         """Forward the request to its destination.
 
@@ -304,18 +337,32 @@ class Request:
                       response arrives for this relay.
             on_failure: Optional callback ``(request, code, reason)`` invoked
                         when an error response (4xx+) arrives.
+            flow: Optional :class:`Flow` (typically ``binding.flow`` from
+                  ``registrar.lookup_by_token(...)``).  When supplied,
+                  bypasses DNS resolution of the Request-URI and sends the
+                  request directly to the captured inbound flow's listener
+                  — load-bearing for P-CSCF MT routing where the UE's
+                  Contact URI is unreachable (NAT, IPSec).
+                  Ignores ``next_hop`` when set.
 
         Example::
 
             request.relay()                           # default routing
             request.relay("sip:proxy@10.0.0.2:5060")  # explicit next-hop
             request.relay(on_reply=my_reply_handler)   # per-relay callback
+            # Path-token MT routing:
+            binding = registrar.lookup_by_token(token)
+            request.relay(flow=binding.flow)
         """
+        extras: Optional[dict] = None
+        if flow is not None:
+            extras = {"flow": flow}
         self._actions.append(Action(
             kind="relay",
             next_hop=next_hop,
             headers_set=dict(self._pending_headers()),
             headers_removed=list(self._pending_removed()),
+            extras=extras,
         ))
         self._on_reply_callback = on_reply
         self._on_failure_callback = on_failure
@@ -839,6 +886,27 @@ class Request:
             self.set_header("Path", f"<{uri};lr>, {existing}")
         else:
             self.set_header("Path", f"<{uri};lr>")
+
+    def add_pcscf_path(self, token: str) -> None:
+        """Insert a Path header (RFC 3327) of the form
+        ``<sip:TOKEN@${path_host};lr>`` where ``path_host`` comes from
+        the configured ``ipsec.path_host``.
+
+        On the matching mobile-terminating request, the topmost Route
+        will be this same URI; ``loose_route()`` consumes it,
+        :attr:`consumed_route_user` exposes the token, and
+        ``registrar.lookup_by_token(token)`` resolves back to the
+        stored binding (TS 24.229 §5.2.7.2).
+
+        The mock implementation uses a fixed test path host
+        ``"pcscf.test"`` so unit tests can exercise the Path / Route
+        / lookup loop without needing the full siphon config.
+        """
+        if not token or any(c in token for c in (" ", "\t", "\n", "@", "<", ">")):
+            raise ValueError(
+                "add_pcscf_path: token must be non-empty and contain no whitespace / '@' / '<' / '>'",
+            )
+        self.add_path(f"sip:{token}@pcscf.test")
 
     def prepend_route(self, uri: str) -> None:
         """Prepend a ``Route`` header.

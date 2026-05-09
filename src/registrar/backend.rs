@@ -51,6 +51,22 @@ pub struct StoredContact {
     /// `None` for legacy entries.
     #[serde(default)]
     pub instance_epoch: Option<String>,
+    /// Opaque proxy-side token referencing this binding (RFC 3327 §5 /
+    /// TS 24.229 §5.2.7.2 Path-token MT routing).  `None` for non-P-CSCF
+    /// bindings and for legacy entries written before this field existed.
+    #[serde(default)]
+    pub flow_token: Option<String>,
+    /// Listener local SocketAddr the inbound REGISTER landed on,
+    /// serialized as a string.  Survives restart for UDP (the listener
+    /// is recreated at the same address).  `None` for legacy entries.
+    #[serde(default)]
+    pub inbound_local_addr: Option<String>,
+    /// `ConnectionId.0` of the accepted inbound connection.  Meaningful
+    /// only on the accepting instance and only for the lifetime of the
+    /// connection (TCP/TLS/WS/WSS); for UDP it is the deterministic
+    /// `(local, remote)` hash that survives restart.
+    #[serde(default)]
+    pub inbound_connection_id: Option<u64>,
 }
 
 impl StoredContact {
@@ -76,6 +92,9 @@ impl StoredContact {
             path: contact.path.clone(),
             instance_id: contact.instance_id.clone(),
             instance_epoch: contact.instance_epoch.clone(),
+            flow_token: contact.flow_token.clone(),
+            inbound_local_addr: contact.inbound_local_addr.map(|a| a.to_string()),
+            inbound_connection_id: contact.inbound_connection_id,
         }
     }
 
@@ -115,6 +134,11 @@ impl StoredContact {
             .as_ref()
             .and_then(|s| s.parse::<SocketAddr>().ok());
 
+        let inbound_local_addr = self
+            .inbound_local_addr
+            .as_ref()
+            .and_then(|s| s.parse::<SocketAddr>().ok());
+
         Some(super::Contact {
             uri,
             q: self.q,
@@ -130,6 +154,9 @@ impl StoredContact {
             pending: false,
             instance_id: self.instance_id.clone(),
             instance_epoch: self.instance_epoch.clone(),
+            flow_token: self.flow_token.clone(),
+            inbound_local_addr,
+            inbound_connection_id: self.inbound_connection_id,
         })
     }
 }
@@ -1343,6 +1370,12 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
         }
     }
 
+    // Rebuild the flow-token reverse index from the restored bindings so
+    // `lookup_by_token` works immediately after restart.  Wholesale rebuild
+    // is the cleanest invariant: never carry the index across the boundary
+    // between "what the backend says" and "what's in memory now".
+    registrar.rebuild_token_index();
+
     Ok((aor_count, contact_count))
 }
 
@@ -1374,6 +1407,9 @@ mod tests {
             path: vec![],
             instance_id: None,
             instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
         }
     }
 
@@ -1409,6 +1445,92 @@ mod tests {
         let deserialized: StoredContact = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.uri, stored.uri);
         assert_eq!(deserialized.q, stored.q);
+    }
+
+    #[test]
+    fn flow_token_fields_roundtrip() {
+        // RFC 3327 Path-token MT routing: flow_token, inbound_local_addr,
+        // and inbound_connection_id must survive the StoredContact ↔
+        // Contact conversion so a binding written to Redis/Postgres can
+        // be looked up by token after restart.
+        let mut stored = sample_stored_contact();
+        stored.flow_token = Some("token-xyz".into());
+        stored.inbound_local_addr = Some("127.0.0.1:5066".into());
+        stored.inbound_connection_id = Some(0xdeadbeef);
+        stored.source_addr = Some("10.0.0.1:50000".into());
+        stored.source_transport = Some("udp".into());
+        let stored = stored;
+
+        let contact = stored.to_contact().expect("non-expired contact");
+        assert_eq!(contact.flow_token.as_deref(), Some("token-xyz"));
+        assert_eq!(
+            contact.inbound_local_addr.unwrap().to_string(),
+            "127.0.0.1:5066"
+        );
+        assert_eq!(contact.inbound_connection_id, Some(0xdeadbeef));
+
+        let back = StoredContact::from_contact(&contact);
+        assert_eq!(back.flow_token, stored.flow_token);
+        assert_eq!(back.inbound_local_addr, stored.inbound_local_addr);
+        assert_eq!(back.inbound_connection_id, stored.inbound_connection_id);
+    }
+
+    #[test]
+    fn legacy_contact_without_flow_fields_deserializes() {
+        // A JSON blob persisted before the flow_token feature must still
+        // round-trip cleanly with all three new fields = None.
+        let json = r#"{"uri":"sip:alice@10.0.0.1","q":1.0,"expires_secs":3600,
+            "expires_at":null,"call_id":"c1","cseq":1,"source_addr":null,
+            "sip_instance":null,"reg_id":null,"path":[],"instance_id":null,
+            "instance_epoch":null}"#;
+        let contact: StoredContact = serde_json::from_str(json).unwrap();
+        assert!(contact.flow_token.is_none());
+        assert!(contact.inbound_local_addr.is_none());
+        assert!(contact.inbound_connection_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_from_backend_rebuilds_token_index() {
+        // End-to-end: persist a binding with a flow_token, restore into
+        // a fresh registrar, lookup_by_token must work without any
+        // explicit rebuild_token_index call (restore wires it for us).
+        let backend = MemoryBackend::new();
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let stored = StoredContact {
+            uri: "sip:alice@10.0.0.1".to_string(),
+            q: 1.0,
+            expires_secs: 3600,
+            expires_at: Some(now_epoch + 3600),
+            call_id: "c1".to_string(),
+            cseq: 1,
+            source_addr: Some("10.0.0.1:50000".into()),
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: Some("restored-token".into()),
+            inbound_local_addr: Some("127.0.0.1:5066".into()),
+            inbound_connection_id: Some(7777),
+        };
+        backend
+            .save("sip:alice@example.com", &[stored])
+            .await
+            .unwrap();
+
+        let registrar = Registrar::default();
+        restore_from_backend(&backend, &registrar).await.unwrap();
+
+        let resolved = registrar
+            .lookup_by_token("restored-token")
+            .expect("restored token must resolve after restart");
+        assert_eq!(resolved.0, "sip:alice@example.com");
+        assert_eq!(resolved.1.flow_token.as_deref(), Some("restored-token"));
     }
 
     #[tokio::test]
@@ -1588,6 +1710,9 @@ mod tests {
                 path: vec![],
                 instance_id: None,
                 instance_epoch: None,
+                flow_token: None,
+                inbound_local_addr: None,
+                inbound_connection_id: None,
             }])
             .await
             .unwrap();
@@ -1607,6 +1732,9 @@ mod tests {
                     path: vec![],
                     instance_id: None,
                     instance_epoch: None,
+                    flow_token: None,
+                    inbound_local_addr: None,
+                    inbound_connection_id: None,
                 },
                 StoredContact {
                     uri: "sip:bob@10.0.0.3".to_string(),
@@ -1622,6 +1750,9 @@ mod tests {
                     path: vec![],
                     instance_id: None,
                     instance_epoch: None,
+                    flow_token: None,
+                    inbound_local_addr: None,
+                    inbound_connection_id: None,
                 },
             ])
             .await
@@ -1657,6 +1788,9 @@ mod tests {
                 path: vec![],
                 instance_id: None,
                 instance_epoch: None,
+                flow_token: None,
+                inbound_local_addr: None,
+                inbound_connection_id: None,
             }])
             .await
             .unwrap();
@@ -1693,6 +1827,9 @@ mod tests {
                 path: vec![],
                 instance_id: None,
                 instance_epoch: None,
+                flow_token: None,
+                inbound_local_addr: None,
+                inbound_connection_id: None,
             }])
             .await
             .unwrap();

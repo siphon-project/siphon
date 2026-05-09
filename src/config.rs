@@ -2001,6 +2001,16 @@ pub struct IpsecConfig {
     /// concurrent registration count.
     #[serde(default = "default_spi_range_count")]
     pub spi_range_count: u32,
+    /// Host part siphon writes into the Path URI advertised by
+    /// `request.add_pcscf_path(token)` (RFC 3327 §5 / TS 24.229
+    /// §5.2.7.2 Path-token MT routing).  Must resolve back to *this*
+    /// P-CSCF instance — typically the pod FQDN in a
+    /// StatefulSet deployment so MT requests from the S-CSCF route to
+    /// the instance that owns the inbound flow.  Optional; when unset,
+    /// `add_pcscf_path()` errors at script time so the misconfiguration
+    /// is caught loudly rather than producing unroutable Path URIs.
+    #[serde(default)]
+    pub path_host: Option<String>,
 }
 
 /// XFRM backend selection.  Defaults to `Netlink` on Linux (the only

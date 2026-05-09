@@ -499,6 +499,14 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
     module
         .add_class::<ipsec::PySAHandle>()
         .map_err(|error| SiphonError::Script(format!("add_class SAHandle: {error}")))?;
+    // Path-token MT routing (RFC 3327 §5 / TS 24.229 §5.2.7.2):
+    // `Flow` is the opaque view returned by `request.flow` and
+    // `Contact.flow`.  Scripts pass it to `request.relay(flow=...)` to
+    // reach the UE on the captured inbound flow without DNS-resolving
+    // the Contact URI.
+    module
+        .add_class::<registrar::PyFlow>()
+        .map_err(|error| SiphonError::Script(format!("add_class Flow: {error}")))?;
 
     // If Rust singletons are available, inject them now — before any user
     // script does `from siphon import auth`.

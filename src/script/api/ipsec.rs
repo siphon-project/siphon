@@ -84,6 +84,15 @@ pub fn is_protected_local_port(local_port: u16) -> bool {
     }
 }
 
+/// Configured `ipsec.path_host` — the host part siphon writes into the
+/// Path URI advertised by `request.add_pcscf_path(token)` (RFC 3327 §5
+/// / TS 24.229 §5.2.7.2).  Returns `None` when not configured (siphon
+/// not running as P-CSCF, or the deployment hasn't set the per-replica
+/// path host); callers should error rather than guess.
+pub fn pcscf_path_host() -> Option<String> {
+    IPSEC_CONFIG_REF.get().and_then(|config| config.path_host.clone())
+}
+
 /// Find the active SA pair (if any) matching the given UE address and
 /// source port.  The UE may be sending from either its client port
 /// (`ue_port_c`) or its server port (`ue_port_s`); we try both keys

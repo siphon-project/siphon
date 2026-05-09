@@ -585,6 +585,9 @@ mod tests {
             pending: false,
             instance_id: None,
             instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
         }
     }
 

@@ -2071,6 +2071,9 @@ fn handle_request(
     // Tag the request with its arrival local port so `is_ipsec_protected`
     // / `matched_sa` can resolve when running as P-CSCF (3GPP TS 33.203).
     request.set_local_port(inbound.local_addr.port());
+    // Capture the full inbound flow for token-keyed MT routing
+    // (`registrar.save(flow_token=...)` and `request.relay(flow=...)`).
+    request.set_inbound_flow(inbound.local_addr, inbound.connection_id.0);
 
     // Call Python handlers
     let (action, record_routed, on_reply_cb, on_failure_cb, send_via_transport, send_via_target, reply_headers, reply_body) = Python::attach(|python| {
@@ -2277,7 +2280,7 @@ fn handle_request(
             }
 
         }
-        RequestAction::Relay { next_hop } => {
+        RequestAction::Relay { next_hop, flow } => {
             // RFC 3261 §16.2: a stateful proxy SHOULD send 100 Trying
             // immediately upon receiving an INVITE to stop UAC retransmissions.
             if method == "INVITE" {
@@ -2295,6 +2298,7 @@ fn handle_request(
                 on_failure_cb,
                 send_via_transport.as_deref(),
                 send_via_target.as_deref(),
+                flow.as_ref(),
             );
         }
         RequestAction::Fork { targets, strategy } => {
@@ -2335,6 +2339,15 @@ fn handle_request(
 /// 2. Clone the message, add Via, decrement Max-Forwards
 /// 3. Store branch in pending map for response routing
 /// 4. Send to target
+///
+/// When `flow` is `Some`, target resolution is bypassed entirely:
+/// the destination, transport, and outbound listener are taken from
+/// the captured inbound flow.  Used for P-CSCF Path-token MT routing
+/// (TS 24.229 §5.2.7.2) where the Contact URI is unreachable and
+/// the only path back to the UE is the listener that received the
+/// REGISTER.  Via host/port are derived from `flow.local_addr` so
+/// the UE's response routes back to the right port (load-bearing for
+/// IPSec sec-agree port pairs — 3GPP TS 33.203 §7.4).
 #[allow(clippy::too_many_arguments)]
 fn relay_request(
     message: &SipMessage,
@@ -2347,51 +2360,80 @@ fn relay_request(
     on_failure_callback: Option<Py<PyAny>>,
     send_via_transport: Option<&str>,
     send_via_target: Option<&str>,
+    flow: Option<&crate::script::api::registrar::PyFlow>,
 ) {
-    // Determine target URI string (RFC 3261 §16.6 step 6):
-    // 1. Explicit next-hop from script
-    // 2. Top Route header URI (loose-routing — remaining after loose_route() popped ours)
-    // 3. Request-URI (no Route headers)
-    let target_uri_string = match next_hop {
-        Some(hop) => hop.to_string(),
-        None => {
-            if let Some(route_uri) = core::next_hop_from_route(&message.headers) {
-                route_uri
-            } else {
-                match &message.start_line {
-                    StartLine::Request(request_line) => request_line.request_uri.to_string(),
-                    _ => {
-                        error!("relay called on non-request");
-                        return;
+    // Two ways to know where this request is going:
+    //   a) flow=Some — use the captured inbound flow directly,
+    //      bypassing DNS resolution of any URI.
+    //   b) flow=None — resolve the next_hop / top Route / R-URI as usual.
+    let (target_uri_string, destination, mut outbound_transport, flow_local_addr) =
+        if let Some(flow) = flow {
+            let transport = match flow.transport.as_str() {
+                "udp" => Transport::Udp,
+                "tcp" => Transport::Tcp,
+                "tls" => Transport::Tls,
+                "ws" => Transport::WebSocket,
+                "wss" => Transport::WebSocketSecure,
+                other => {
+                    warn!(transport = %other, "flow-relay: unknown transport, falling back to inbound");
+                    inbound.transport
+                }
+            };
+            // For diagnostics only — the URI isn't used to pick the destination.
+            let uri_string = match &message.start_line {
+                StartLine::Request(request_line) => request_line.request_uri.to_string(),
+                _ => {
+                    error!("flow-relay called on non-request");
+                    return;
+                }
+            };
+            (uri_string, flow.source_addr, transport, Some(flow.local_addr))
+        } else {
+            // Determine target URI string (RFC 3261 §16.6 step 6):
+            // 1. Explicit next-hop from script
+            // 2. Top Route header URI (loose-routing — remaining after loose_route() popped ours)
+            // 3. Request-URI (no Route headers)
+            let target_uri_string = match next_hop {
+                Some(hop) => hop.to_string(),
+                None => {
+                    if let Some(route_uri) = core::next_hop_from_route(&message.headers) {
+                        route_uri
+                    } else {
+                        match &message.start_line {
+                            StartLine::Request(request_line) => request_line.request_uri.to_string(),
+                            _ => {
+                                error!("relay called on non-request");
+                                return;
+                            }
+                        }
                     }
                 }
-            }
-        }
-    };
-
-    // Resolve to SocketAddr + transport
-    let target = match resolve_target(&target_uri_string, &state.dns_resolver) {
-        Some(t) => t,
-        None => {
-            warn!(target = %target_uri_string, "cannot resolve relay target");
-            let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref(), &[]);
-            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
-            return;
-        }
-    };
-    let destination = target.address;
-    let mut outbound_transport = target.transport.unwrap_or(inbound.transport);
-
-    // Apply force_send_via transport override from script
-    if let Some(via_transport) = send_via_transport {
-        outbound_transport = match via_transport.to_lowercase().as_str() {
-            "udp" => Transport::Udp,
-            "tcp" => Transport::Tcp,
-            "tls" => Transport::Tls,
-            "ws" => Transport::WebSocket,
-            "wss" => Transport::WebSocketSecure,
-            _ => outbound_transport,
+            };
+            let target = match resolve_target(&target_uri_string, &state.dns_resolver) {
+                Some(t) => t,
+                None => {
+                    warn!(target = %target_uri_string, "cannot resolve relay target");
+                    let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref(), &[]);
+                    send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                    return;
+                }
+            };
+            (target_uri_string, target.address, target.transport.unwrap_or(inbound.transport), None)
         };
+
+    // Apply force_send_via transport override from script (non-flow path only;
+    // the flow already pins the transport).
+    if flow.is_none() {
+        if let Some(via_transport) = send_via_transport {
+            outbound_transport = match via_transport.to_lowercase().as_str() {
+                "udp" => Transport::Udp,
+                "tcp" => Transport::Tcp,
+                "tls" => Transport::Tls,
+                "ws" => Transport::WebSocket,
+                "wss" => Transport::WebSocketSecure,
+                _ => outbound_transport,
+            };
+        }
     }
 
     // Prevent routing loops — don't relay to ourselves
@@ -2431,7 +2473,15 @@ fn relay_request(
     // Add our Via — use the outbound transport for the Via header.
     // If force_send_via set a target, use it as the Via sent-by address.
     let transport_str = format!("{}", outbound_transport);
-    let (via_host, via_port) = if let Some(target_str) = send_via_target {
+    let (via_host, via_port) = if let Some(local) = flow_local_addr {
+        // Flow-relay: pin Via to the listener that received the
+        // REGISTER.  Critical for IPSec sec-agree where the protected
+        // server port (e.g. 5066) is non-default — using the per-
+        // transport via_host would emit a Via with the wrong port and
+        // the UE's response would land on the wrong listener
+        // (3GPP TS 33.203 §7.4).
+        (local.ip().to_string(), Some(local.port()))
+    } else if let Some(target_str) = send_via_target {
         // Parse "host:port" or just "host"
         if let Some((host, port_str)) = target_str.rsplit_once(':') {
             (host.to_string(), port_str.parse::<u16>().ok())
@@ -2539,10 +2589,45 @@ fn relay_request(
         }
     };
 
-    // Now actually send. For TCP/TLS the returned connection_id may differ from
-    // the placeholder; update the session's ClientBranch so retransmits and BYE
-    // routing use the correct connection.
-    let connection_id = send_to_target(data, &target, inbound.transport, inbound.connection_id, state);
+    // Now actually send.  Two paths:
+    //   - Flow-relay: build the OutboundMessage directly with the captured
+    //     `(connection_id, transport, destination, source_local_addr)` so
+    //     UDP egresses from the right listener and stream transports route
+    //     to the live accepted-connection write half registered in
+    //     `connection_map`.  No DNS, no pool lookup.
+    //   - URI-relay: the legacy path through `send_to_target`.
+    let connection_id = if let Some(local) = flow_local_addr {
+        let outbound_message = OutboundMessage {
+            connection_id: ConnectionId(flow.map(|f| f.connection_id).unwrap_or(0)),
+            transport: outbound_transport,
+            destination,
+            data,
+            source_local_addr: Some(local),
+        };
+        let cid = outbound_message.connection_id;
+        if let Err(error) = state.outbound.send(outbound_message) {
+            error!(
+                destination = %destination,
+                transport = %outbound_transport,
+                "flow-relay outbound send failed: {error}"
+            );
+        } else {
+            debug!(
+                destination = %destination,
+                transport = %outbound_transport,
+                connection_id = ?cid,
+                "relayed via captured flow"
+            );
+        }
+        cid
+    } else {
+        // Build the legacy RelayTarget for the URI path.
+        let target = RelayTarget {
+            address: destination,
+            transport: Some(outbound_transport),
+        };
+        send_to_target(data, &target, inbound.transport, inbound.connection_id, state)
+    };
     if connection_id != placeholder_connection_id {
         if let (Some(srv_key), Some(client_key)) = (server_key, client_key_opt.as_ref()) {
             if let Some(session_arc) = state.session_store.get_by_server_key(srv_key) {
@@ -2595,7 +2680,7 @@ fn relay_fork_request(
         Some(key) => key.clone(),
         None => {
             // Fall back to single-target relay if no server transaction
-            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None, None, None);
+            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None, None, None, None);
             return;
         }
     };

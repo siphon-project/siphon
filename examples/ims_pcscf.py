@@ -13,10 +13,27 @@ Flow (3GPP TS 33.203 / TS 24.229):
   5. P-CSCF activates the SAs on the 200 OK from S-CSCF
   6. Subsequent requests flow over IPsec-protected ports
 
+  + Path-token MT routing (RFC 3327 §5 / TS 24.229 §5.2.7.2):
+      a. On REGISTER, P-CSCF mints an opaque token and inserts a Path
+         entry of the form ``<sip:TOKEN@${ipsec.path_host};lr>``.
+      b. After upstream 200 OK, the binding is cached locally with the
+         token via ``registrar.save_proxy(request, reply, flow_token=)``,
+         capturing the inbound flow (source_addr, listener local_addr,
+         accepted-connection id).
+      c. On a mobile-terminating request from the S-CSCF, the topmost
+         Route is the Path URI we advertised; ``loose_route()`` consumes
+         it, ``request.consumed_route_user`` exposes the token,
+         ``registrar.lookup_by_token(token)`` resolves to the binding,
+         and ``request.relay(flow=binding.flow)`` sends the request back
+         over the captured flow without DNS-resolving the Contact URI
+         (which is unreachable for IMS-AKA UEs behind NAT/IPSec).
+
 Equivalent to: opensips_ims_pcscf/opensips.cfg from docker_open5gs
 
 Config: examples/ims_pcscf.yaml
 """
+import secrets
+
 from siphon import proxy, registrar, ipsec, diameter, log, Transform
 
 REALM = "ims.example.com"
@@ -25,6 +42,12 @@ PCSCF_URI = f"sip:{REALM};lr"
 # Track Rx sessions per dialog (call_id -> rx_session_id).
 # Used to release QoS resources on BYE.
 rx_sessions = {}
+
+# Pending Path-tokens by Call-ID — minted on the initial REGISTER and
+# attached to the binding when the upstream 200 OK arrives.  Cleared on
+# 200 (consumed) or on REGISTER failure (timeout/4xx — we don't want to
+# leak the slot indefinitely; in production wire a TTL).
+pending_path_tokens: dict[str, str] = {}
 
 # Operator transform policy — first one acceptable to the UE wins.
 PREFERRED_TRANSFORMS = [
@@ -84,7 +107,13 @@ def handle_register(request):
         return
 
     # Add Path so subsequent requests route through us (RFC 3327).
-    request.add_path(PCSCF_URI)
+    # Mint an opaque token and use the framework helper that builds
+    # ``<sip:TOKEN@${ipsec.path_host};lr>`` — siphon owns the host part
+    # so MT requests reach *this* P-CSCF instance in a multi-replica
+    # deployment.
+    token = secrets.token_urlsafe(16)
+    pending_path_tokens[request.call_id] = token
+    request.add_pcscf_path(token)
     request.set_header("P-Visited-Network-ID", REALM)
 
     # Relay to S-CSCF.  The 401 flow-back is handled by handle_register_reply.
@@ -177,7 +206,7 @@ async def _handle_401_register(request, reply):
 
 
 def _handle_200_register(request, reply):
-    """Activate stashed SAs and cache P-Associated-URI."""
+    """Activate stashed SAs, cache binding with Path-token, store P-AU."""
     pending = ipsec.unstash(request.call_id)
     if pending is not None:
         try:
@@ -185,6 +214,17 @@ def _handle_200_register(request, reply):
             log.info(f"200 REGISTER for {request.call_id}: SAs activated")
         except ValueError as exc:
             log.warn(f"PendingSA.activate failed: {exc}")
+
+    # Cache the binding locally with the Path-token so MT requests
+    # carrying the token in the topmost Route can relay back over the
+    # captured inbound flow without consulting the Contact URI.
+    token = pending_path_tokens.pop(request.call_id, None)
+    if token is not None:
+        try:
+            registrar.save_proxy(request, reply, flow_token=token)
+            log.info(f"200 REGISTER for {request.call_id}: binding cached with flow_token")
+        except ValueError as exc:
+            log.warn(f"save_proxy failed for {request.call_id}: {exc}")
 
     pau = reply.get_header("P-Associated-URI")
     if pau:
@@ -246,6 +286,20 @@ def handle_request(request):
     # Initial INVITE — add P-Visited-Network-ID and route.
     if request.method == "INVITE":
         request.ensure_header("P-Visited-Network-ID", REALM)
+
+    # Path-token MT routing (TS 24.229 §5.2.7.2): if the topmost Route
+    # we just consumed in loose_route() carries one of our flow tokens,
+    # send the request back over the captured inbound flow.  This
+    # bypasses DNS resolution of the Contact URI — required for IMS-AKA
+    # UEs whose Contact URI carries the private NATed address.
+    consumed_token = request.consumed_route_user
+    if consumed_token:
+        binding = registrar.lookup_by_token(consumed_token)
+        if binding and binding.flow:
+            request.record_route()
+            on_reply = on_invite_reply if request.method == "INVITE" else None
+            request.relay(flow=binding.flow, on_reply=on_reply)
+            return
 
     # Look up registered contacts for terminating calls.
     contacts = registrar.lookup(str(request.ruri))

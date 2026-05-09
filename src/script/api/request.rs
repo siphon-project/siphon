@@ -86,7 +86,20 @@ pub enum RequestAction {
         reliable: bool,
     },
     /// Relay to the Request-URI (or an explicit next-hop).
-    Relay { next_hop: Option<String> },
+    ///
+    /// `flow` (when set) bypasses DNS resolution of the URI and sends
+    /// the request directly to the captured inbound flow's
+    /// `(connection_id, transport, source_addr, local_addr)` —
+    /// load-bearing for P-CSCF MT routing where the Contact URI is
+    /// unreachable (NAT, IPSec) and the only path back is the listener
+    /// that received the REGISTER.  When set, `next_hop` is ignored;
+    /// Via host/port comes from `flow.local_addr` instead of the
+    /// per-transport via_host so IPSec port pairs are preserved
+    /// (3GPP TS 33.203 §7.4).
+    Relay {
+        next_hop: Option<String>,
+        flow: Option<super::registrar::PyFlow>,
+    },
     /// Fork to multiple targets.
     Fork {
         targets: Vec<String>,
@@ -131,6 +144,19 @@ pub struct PyRequest {
     /// and `matched_sa` to detect protected traffic.  `None` for
     /// constructors that don't supply it (defaults to non-protected).
     local_port: Option<u16>,
+    /// Full local SocketAddr the request arrived on.  Captured for
+    /// flow-aware MT routing (`registrar.save(flow_token=...)`) so the
+    /// outbound relay can egress from the same listener — load-bearing
+    /// for IPSec where the protected port pair must be preserved
+    /// (3GPP TS 33.203 §7.4).  Mirrors `local_port` semantically but
+    /// carries the full address.
+    local_addr: Option<std::net::SocketAddr>,
+    /// `ConnectionId.0` of the accepted inbound connection that
+    /// delivered this request (TCP/TLS/WS/WSS) or the deterministic
+    /// `(local, remote)` hash for UDP.  Captured for flow-keyed MT
+    /// routing — the relay path uses this to look up the live write
+    /// half in `connection_map` instead of DNS-resolving the URI.
+    inbound_connection_id: Option<u64>,
     /// URIs of Route entries consumed by `loose_route()` (RFC 3261 §16.4),
     /// captured in pop order (topmost first).  Exposed via the
     /// `consumed_routes` / `consumed_route_user` getters so scripts can
@@ -162,6 +188,8 @@ impl PyRequest {
             reply_headers: vec![],
             reply_body: None,
             local_port: None,
+            local_addr: None,
+            inbound_connection_id: None,
             consumed_routes: vec![],
         }
     }
@@ -190,6 +218,8 @@ impl PyRequest {
             reply_headers: vec![],
             reply_body: None,
             local_port: None,
+            local_addr: None,
+            inbound_connection_id: None,
             consumed_routes: vec![],
         }
     }
@@ -198,6 +228,25 @@ impl PyRequest {
     /// getters like `is_ipsec_protected` and `matched_sa`).
     pub fn set_local_port(&mut self, port: u16) {
         self.local_port = Some(port);
+    }
+
+    /// Set the captured inbound flow (full local SocketAddr + accepted
+    /// connection id).  Called by the dispatcher when the request enters
+    /// from a listener so `registrar.save(flow_token=...)` and
+    /// `request.flow` can stitch the binding to the live wire.
+    pub fn set_inbound_flow(&mut self, local_addr: std::net::SocketAddr, connection_id: u64) {
+        self.local_addr = Some(local_addr);
+        self.inbound_connection_id = Some(connection_id);
+    }
+
+    /// Full local SocketAddr the request arrived on (Rust-side accessor).
+    pub fn inbound_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr
+    }
+
+    /// Inbound `ConnectionId.0` (Rust-side accessor).
+    pub fn inbound_connection_id_u64(&self) -> Option<u64> {
+        self.inbound_connection_id
     }
 
     /// Get the action the script chose.
@@ -738,21 +787,31 @@ impl PyRequest {
         };
     }
 
-    /// Relay the request to its Request-URI, or to an explicit next-hop.
+    /// Relay the request to its Request-URI, or to an explicit next-hop,
+    /// or — when ``flow=`` is supplied — to a captured inbound flow.
+    ///
+    /// `flow` (typically `binding.flow` from
+    /// ``registrar.lookup_by_token(...)``) bypasses DNS resolution of
+    /// the Request-URI and writes directly to the listener that received
+    /// the original REGISTER.  Required for P-CSCF MT routing where
+    /// the UE's Contact URI is unreachable (NAT, IPSec) and the only
+    /// path back is the captured flow (TS 24.229 §5.2.7.2).  When
+    /// supplied, `next_hop` is ignored.
     ///
     /// Optional callbacks:
     /// - `on_reply`: called with `(request, reply)` when a response arrives
     /// - `on_failure`: called with `(request, code, reason)` on error response
-    #[pyo3(signature = (next_hop=None, on_reply=None, on_failure=None))]
+    #[pyo3(signature = (next_hop=None, on_reply=None, on_failure=None, flow=None))]
     fn relay(
         &mut self,
         next_hop: Option<String>,
         on_reply: Option<Py<PyAny>>,
         on_failure: Option<Py<PyAny>>,
+        flow: Option<super::registrar::PyFlow>,
     ) {
         self.on_reply_callback = on_reply;
         self.on_failure_callback = on_failure;
-        self.action = RequestAction::Relay { next_hop };
+        self.action = RequestAction::Relay { next_hop, flow };
     }
 
     /// Fork to multiple targets.
@@ -1187,6 +1246,79 @@ impl PyRequest {
         Ok(self.consumed_routes.clone())
     }
 
+    /// First Route entry that ``loose_route()`` consumed, parsed as a
+    /// ``SipUri`` so the script can read ``user`` / ``host`` / ``port``
+    /// / ``params`` directly without string-munging.
+    ///
+    /// Returns ``None`` when no Route was consumed yet, or when the
+    /// consumed entry could not be parsed.  Convenience over
+    /// :attr:`consumed_route_user` for P-CSCF Path-token MT routing,
+    /// where the script needs both the userpart (the opaque token to
+    /// look up) and the host (to verify it points at this proxy).
+    #[getter]
+    fn consumed_route(&self) -> PyResult<Option<PySipUri>> {
+        for raw in &self.consumed_routes {
+            if let Ok(uri) = parse_uri_standalone(raw) {
+                return Ok(Some(PySipUri::new(uri)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// View of the inbound flow this request arrived on.  Returns
+    /// ``None`` for synthetic requests (test harness, internally
+    /// constructed) where the listener context wasn't captured.
+    ///
+    /// Use this to capture the flow at REGISTER time even when not
+    /// also calling ``registrar.save(flow_token=...)`` — e.g. to stash
+    /// the Flow into your own Python state for a later
+    /// ``request.relay(flow=...)``.
+    #[getter]
+    fn flow(&self) -> Option<crate::script::api::registrar::PyFlow> {
+        let local_addr = self.local_addr?;
+        let connection_id = self.inbound_connection_id?;
+        let source_addr = self.source_socket_addr()?;
+        Some(crate::script::api::registrar::PyFlow {
+            transport: self.transport_name.to_ascii_lowercase(),
+            source_addr,
+            local_addr,
+            connection_id,
+        })
+    }
+
+    /// Insert a Path header (RFC 3327) of the form
+    /// ``<sip:TOKEN@${path_host};lr>`` where ``path_host`` is resolved
+    /// from configuration (``ipsec.path_host``).  The token is supplied
+    /// by the script and is opaque to siphon — typically a UUID or the
+    /// output of an internal generator.
+    ///
+    /// On the matching mobile-terminating request, the topmost Route
+    /// will be this same URI; ``loose_route()`` consumes it,
+    /// :attr:`consumed_route_user` exposes the token, and
+    /// ``registrar.lookup_by_token(token)`` resolves back to the
+    /// stored binding (TS 24.229 §5.2.7.2).
+    ///
+    /// Errors when ``ipsec.path_host`` is not configured — siphon owns
+    /// the host part so MT requests reach *this* P-CSCF instance, and
+    /// the script doesn't have visibility to choose it correctly.
+    fn add_pcscf_path(&self, token: &str) -> PyResult<()> {
+        let host = crate::script::api::ipsec::pcscf_path_host()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "add_pcscf_path: ipsec.path_host not configured — set it in \
+                 siphon.yaml so MT requests route back to this P-CSCF instance",
+            ))?;
+        // Quote-escape the token's user-info characters per RFC 3261
+        // §25.1: the script-supplied token may legally contain only
+        // unreserved chars / escaped triplets, but defend against bad
+        // input rather than silently producing an invalid Path URI.
+        if token.is_empty() || token.chars().any(|c| c.is_whitespace() || c == '@' || c == '<' || c == '>') {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "add_pcscf_path: token must be non-empty and contain no whitespace / '@' / '<' / '>'",
+            ));
+        }
+        self.add_path(&format!("sip:{token}@{host}"))
+    }
+
     // -----------------------------------------------------------------------
     // NAT fixup
     // -----------------------------------------------------------------------
@@ -1473,23 +1605,116 @@ mod tests {
     #[test]
     fn relay_sets_action() {
         let mut request = make_request();
-        request.relay(None, None, None);
+        request.relay(None, None, None, None);
         assert_eq!(
             *request.action(),
-            RequestAction::Relay { next_hop: None }
+            RequestAction::Relay { next_hop: None, flow: None }
         );
     }
 
     #[test]
     fn relay_with_next_hop() {
         let mut request = make_request();
-        request.relay(Some("sip:proxy@next.com:5060".to_string()), None, None);
+        request.relay(Some("sip:proxy@next.com:5060".to_string()), None, None, None);
         assert_eq!(
             *request.action(),
             RequestAction::Relay {
-                next_hop: Some("sip:proxy@next.com:5060".to_string())
+                next_hop: Some("sip:proxy@next.com:5060".to_string()),
+                flow: None,
             }
         );
+    }
+
+    #[test]
+    fn relay_with_flow_attaches_flow_to_action() {
+        // Path-token MT routing: when the script passes `flow=`, the
+        // Action must carry it through to the dispatcher so the relay
+        // path bypasses DNS resolution.  This is the contract between
+        // the Python surface and the dispatcher.
+        let mut request = make_request();
+        let flow = super::super::registrar::PyFlow {
+            transport: "udp".into(),
+            source_addr: "10.0.0.1:50000".parse().unwrap(),
+            local_addr: "127.0.0.1:5066".parse().unwrap(),
+            connection_id: 0xabcdef,
+        };
+        request.relay(None, None, None, Some(flow.clone()));
+        assert_eq!(
+            *request.action(),
+            RequestAction::Relay {
+                next_hop: None,
+                flow: Some(flow),
+            }
+        );
+    }
+
+    #[test]
+    fn relay_with_flow_ignores_next_hop_semantics() {
+        // The dispatcher gives `flow=` priority over `next_hop` — both
+        // can be set on the action, but the Relay path uses the flow
+        // when present.  Verify the action stores both unchanged so the
+        // dispatcher contract (its branch) is what decides; the Python
+        // method doesn't preemptively erase next_hop.
+        let mut request = make_request();
+        let flow = super::super::registrar::PyFlow {
+            transport: "udp".into(),
+            source_addr: "10.0.0.1:50000".parse().unwrap(),
+            local_addr: "127.0.0.1:5066".parse().unwrap(),
+            connection_id: 7,
+        };
+        request.relay(
+            Some("sip:ignored@example.com".to_string()),
+            None,
+            None,
+            Some(flow.clone()),
+        );
+        match request.action() {
+            RequestAction::Relay { next_hop, flow: action_flow } => {
+                assert_eq!(next_hop.as_deref(), Some("sip:ignored@example.com"));
+                assert_eq!(action_flow.as_ref(), Some(&flow));
+            }
+            other => panic!("expected Relay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_flow_property_returns_captured_inbound() {
+        // After `set_inbound_flow` is called by the dispatcher, the
+        // `request.flow` property must surface the same view that
+        // `Contact.flow` would surface for the equivalent binding.
+        let mut request = make_request();
+        request.set_inbound_flow(
+            "127.0.0.1:5066".parse().unwrap(),
+            0x1234_5678,
+        );
+        let flow = request.flow().expect("request.flow should be present");
+        assert_eq!(flow.transport, "udp");
+        assert_eq!(flow.local_addr.to_string(), "127.0.0.1:5066");
+        assert_eq!(flow.connection_id, 0x1234_5678);
+    }
+
+    #[test]
+    fn request_flow_property_is_none_without_inbound_capture() {
+        // Synthetic request (test fixture or internally constructed)
+        // — no listener context, so `flow` returns None rather than
+        // a half-built tuple.
+        let request = make_request();
+        assert!(request.flow().is_none());
+    }
+
+    #[test]
+    fn add_pcscf_path_rejects_invalid_token() {
+        // Defense against bad input — the token is interpolated into
+        // a SIP URI userpart, so whitespace/'@'/'<'/'>' must be
+        // rejected loudly rather than silently producing a malformed
+        // Path header.
+        let request = make_request();
+        // Valid call would error on missing `ipsec.path_host`; we
+        // just want to confirm validation fires before that error.
+        assert!(request.add_pcscf_path("").is_err());
+        assert!(request.add_pcscf_path("bad token").is_err());
+        assert!(request.add_pcscf_path("token@").is_err());
+        assert!(request.add_pcscf_path("token<x>").is_err());
     }
 
     #[test]

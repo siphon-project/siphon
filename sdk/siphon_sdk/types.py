@@ -71,6 +71,48 @@ class SipUri:
 
 
 @dataclass
+class Flow:
+    """Opaque view of an inbound flow captured at REGISTER time.
+
+    Returned by :attr:`Contact.flow` and :attr:`Request.flow`.  Pass back
+    to :meth:`Request.relay` (``flow=`` kwarg) to send a request over the
+    same listener that received the REGISTER — bypassing DNS resolution
+    of the Request-URI.  Used by P-CSCF MT routing (RFC 3327 §5 /
+    TS 24.229 §5.2.7.2) where the UE's Contact URI is unreachable
+    (NAT, IPSec) and the only path back is the captured flow.
+
+    Treat as opaque: scripts read :attr:`is_alive` for defensive checks
+    but should not depend on the internal field shapes.
+    """
+
+    transport: str = "udp"
+    """Lowercase transport name: ``"udp"``, ``"tcp"``, ``"tls"``, ``"ws"``,
+    or ``"wss"``."""
+
+    remote_addr: str = "0.0.0.0:0"
+    """String form of the captured UE source address (``"ip:port"``)."""
+
+    local_addr: str = "0.0.0.0:0"
+    """String form of the captured listener local address — load-bearing
+    for IPSec sec-agree where the protected port pair must be preserved
+    (3GPP TS 33.203 §7.4)."""
+
+    @property
+    def is_alive(self) -> bool:
+        """Whether the flow is still usable.
+
+        For UDP, always ``True``: the listener socket survives any
+        individual exchange.  For stream transports, ``True`` only while
+        the accepted connection is still open on this process.
+
+        The mock implementation always returns ``True``; the real one
+        will gate on the per-listener connection registry once that's
+        wired (see PyFlow.is_alive in src/script/api/registrar.rs).
+        """
+        return True
+
+
+@dataclass
 class Contact:
     """A registered contact binding returned by ``registrar.lookup()``.
 
@@ -108,6 +150,18 @@ class Contact:
     """``True`` when the binding's ``(instance_id, instance_epoch)`` matches
     the *current* siphon process — i.e. this process accepted the REGISTER.
     Useful for graceful-shutdown deregister and NAT keepalive ownership."""
+
+    flow_token: Optional[str] = None
+    """Opaque proxy-side token attached at REGISTER time via
+    ``registrar.save(flow_token=...)``.  ``None`` for non-P-CSCF
+    bindings."""
+
+    flow: Optional[Flow] = None
+    """Captured inbound flow (``Flow`` view).  Pass to
+    ``request.relay(flow=...)`` for Path-token MT routing.  ``None``
+    when the binding lacks a complete flow capture (no ``flow_token=``
+    on save, or a stream-transport binding whose connection_id isn't
+    available)."""
 
 
 @dataclass
