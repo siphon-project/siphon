@@ -526,6 +526,79 @@ pub fn install_rf_lookup(lookup: RfLookup) {
     let _ = RF_LOOKUP.set(lookup);
 }
 
+// ── Script → auto-emit charging-param channel ────────────────────────
+//
+// Scripts that drive auto-emit (BGCF stamping outgoing-trunk-group-id
+// after gateway.select, MMTel-AS stamping application-server, …) call
+// `request.set_charging_param(name, value)` from within a SIP-handler
+// callback.  The dispatcher's auto-emit hook reads these values back
+// out via [`read_rf_charging_params`] when assembling the IMS-Information
+// block, so the resulting ACR carries the AVP with no extra script
+// plumbing required.
+//
+// Storage is a side-map keyed by SIP dialog key
+// (`<Call-ID>\0<From-tag>`) installed by the dispatcher at startup.
+// Cleanup happens implicitly: the auto-emit hook drains the entry
+// after reading it, so the map only ever holds in-flight parameters
+// for INVITEs that haven't yet hit ACR-START.
+
+type RfParamWriter = Arc<dyn Fn(&str, String, String) + Send + Sync + 'static>;
+type RfParamReader = Arc<dyn Fn(&str) -> Vec<(String, String)> + Send + Sync + 'static>;
+
+static RF_PARAM_WRITER: OnceLock<RfParamWriter> = OnceLock::new();
+static RF_PARAM_READER: OnceLock<RfParamReader> = OnceLock::new();
+
+/// Install the dispatcher's charging-param writer + reader.  Called
+/// once at startup; subsequent calls are no-ops.
+pub fn install_rf_param_channel(writer: RfParamWriter, reader: RfParamReader) {
+    let _ = RF_PARAM_WRITER.set(writer);
+    let _ = RF_PARAM_READER.set(reader);
+}
+
+/// Stash a script-supplied charging-param value (e.g.
+/// `("outgoing-trunk-group-id", "carrier-A")`) for the given SIP
+/// dialog.  Read back by the dispatcher's auto-emit hook when it
+/// builds the ACR for this dialog.  No-op when the dispatcher hasn't
+/// installed a writer (unit-test contexts).
+pub fn set_rf_charging_param(dialog_key: &str, name: String, value: String) {
+    if let Some(writer) = RF_PARAM_WRITER.get() {
+        writer(dialog_key, name, value);
+    }
+}
+
+/// Drain every script-supplied charging-param tuple for the given
+/// dialog.  Returns an empty vector when the dispatcher hasn't
+/// installed a reader, or when no params were stashed for this
+/// dialog.  Drain semantics ensure each param is consumed once per
+/// auto-emit pass.
+pub fn read_rf_charging_params(dialog_key: &str) -> Vec<(String, String)> {
+    RF_PARAM_READER
+        .get()
+        .map(|r| r(dialog_key))
+        .unwrap_or_default()
+}
+
+/// Apply a name/value list of script-supplied charging params on top
+/// of an `ImsChargingData` built from request headers.  Recognised
+/// keys cover the IMS-Information AVPs scripts most commonly need
+/// to override: trunk-group identifiers (BGCF/MGCF settlement) and
+/// `application-server` (MMTel-AS).  Unknown keys are silently
+/// ignored — operators can add custom keys later without breaking
+/// the auto-emit path.
+pub fn apply_charging_params(ims: &mut ImsChargingData, params: Vec<(String, String)>) {
+    for (name, value) in params {
+        match name.as_str() {
+            "incoming-trunk-group-id" => ims.incoming_trunk_group_id = Some(value),
+            "outgoing-trunk-group-id" => ims.outgoing_trunk_group_id = Some(value),
+            "application-server" => ims.application_server = Some(value),
+            "application-provided-called-party-address" => {
+                ims.application_provided_called_party_address = Some(value)
+            }
+            _ => {} // Unknown key — preserved for future extensions.
+        }
+    }
+}
+
 /// Look up a tracked Rf session by SIP dialog key.  Returns
 /// `(session_id, last_result_code)` when a session is present,
 /// otherwise `None`.  Used by the CDR Python API to auto-stamp
@@ -636,6 +709,9 @@ where
         user_session_id,
         request_timestamp: Some(SystemTime::now()),
         response_timestamp: None,
+        application_provided_called_party_address: None,
+        incoming_trunk_group_id: None,
+        outgoing_trunk_group_id: None,
         originating_ioi: charging_vector.orig_ioi,
         terminating_ioi: charging_vector.term_ioi,
         application_server: None,

@@ -845,6 +845,46 @@ impl PyRequest {
         Ok(())
     }
 
+    /// Stash a charging-param the dispatcher's Rf auto-emit hook will
+    /// read when building the IMS-Information block for this dialog.
+    ///
+    /// Recognised names map to TS 32.299 IMS-Information AVPs:
+    ///
+    /// - `"outgoing-trunk-group-id"`              — `Outgoing-Trunk-Group-Id` (BGCF/MGCF settlement)
+    /// - `"incoming-trunk-group-id"`              — `Incoming-Trunk-Group-Id`
+    /// - `"application-server"`                   — `Application-Server` inside `Application-Server-Information`
+    /// - `"application-provided-called-party-address"` — same grouped AVP
+    ///
+    /// Unknown names are silently ignored so future extensions don't
+    /// break existing scripts.  Typical BGCF use:
+    ///
+    /// ```python,ignore
+    /// @proxy.on_request("INVITE")
+    /// def route_breakout(request):
+    ///     gw = gateway.select("trunks")
+    ///     request.set_charging_param("outgoing-trunk-group-id", gw.attrs["group"])
+    ///     request.relay(gw.uri)
+    /// ```
+    fn set_charging_param(&self, name: &str, value: &str) -> PyResult<()> {
+        let message = self.lock_mut()?;
+        let call_id = message.headers.call_id().cloned();
+        let from_tag = message
+            .headers
+            .from()
+            .and_then(|v| NameAddr::parse(v).ok())
+            .and_then(|na| na.tag);
+        drop(message);
+        if let (Some(call_id), Some(from_tag)) = (call_id, from_tag) {
+            let dialog_key = format!("{}\0{}", call_id, from_tag);
+            crate::diameter::rf_service::set_rf_charging_param(
+                &dialog_key,
+                name.to_string(),
+                value.to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Set (replace) a header on the response built by ``request.reply()``
     /// or ``registrar.save()``.
     ///

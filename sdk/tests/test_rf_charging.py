@@ -92,3 +92,65 @@ class TestRfMock:
         first = diameter.rf_acr_start(sip_method="INVITE")
         second = diameter.rf_acr_start(sip_method="INVITE")
         assert first["session_id"] != second["session_id"]
+
+    def test_acr_start_carries_trunk_group_kwargs(self):
+        # BGCF emit shape — Outgoing-Trunk-Group-Id (TS 32.299 §7.2.71)
+        # plus Application-Server (MMTel forward).
+        from siphon import diameter
+        diameter.rf_acr_start(
+            sip_method="INVITE",
+            node_functionality="bgcf",
+            outgoing_trunk_group_id="carrier-A",
+            incoming_trunk_group_id="trunk-in-001",
+            application_server="sip:mmtel.ims.example.com",
+            application_provided_called_party_address="sip:bob@example.com",
+        )
+        captured = self.diameter.captured_acrs()
+        assert len(captured) == 1
+        entry = captured[0]
+        assert entry["outgoing_trunk_group_id"] == "carrier-A"
+        assert entry["incoming_trunk_group_id"] == "trunk-in-001"
+        assert entry["application_server"] == "sip:mmtel.ims.example.com"
+        assert (
+            entry["application_provided_called_party_address"]
+            == "sip:bob@example.com"
+        )
+
+
+class TestRequestChargingParams:
+    """Test ``request.set_charging_param`` — the BGCF auto-emit
+    handoff."""
+
+    def _make_request(self):
+        from siphon_sdk.request import Request
+        return Request(
+            method="INVITE",
+            ruri="sip:bob@example.com",
+            from_uri="sip:alice@example.com",
+            to_uri="sip:bob@example.com",
+            from_tag="a-tag",
+            call_id="call-1",
+            cseq=(1, "INVITE"),
+        )
+
+    def test_set_charging_param_captures_tuple(self):
+        request = self._make_request()
+        request.set_charging_param("outgoing-trunk-group-id", "carrier-A")
+        assert request.charging_params == [("outgoing-trunk-group-id", "carrier-A")]
+
+    def test_multiple_params_preserve_order(self):
+        request = self._make_request()
+        request.set_charging_param("outgoing-trunk-group-id", "carrier-A")
+        request.set_charging_param("application-server", "sip:as.example.com")
+        assert request.charging_params == [
+            ("outgoing-trunk-group-id", "carrier-A"),
+            ("application-server", "sip:as.example.com"),
+        ]
+
+    def test_unknown_param_name_still_captured(self):
+        # SDK mock keeps everything; production siphon ignores unknown
+        # names but doesn't error.  Tests rely on the SDK shape so they
+        # can assert what the script *intended* to stamp.
+        request = self._make_request()
+        request.set_charging_param("future-extension", "value")
+        assert ("future-extension", "value") in request.charging_params

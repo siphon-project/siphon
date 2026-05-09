@@ -469,6 +469,34 @@ pub async fn run(
         }));
     }
 
+    // Install the script → auto-emit charging-param channel so
+    // `request.set_charging_param("outgoing-trunk-group-id", ...)` from
+    // a Python handler bridges to the proxy/B2BUA ACR-START builders
+    // without needing to thread state through every API surface.
+    {
+        let params_store: Arc<DashMap<String, Vec<(String, String)>>> =
+            Arc::new(DashMap::new());
+        let writer_store = Arc::clone(&params_store);
+        let reader_store = Arc::clone(&params_store);
+        crate::diameter::rf_service::install_rf_param_channel(
+            Arc::new(move |dialog_key: &str, name: String, value: String| {
+                writer_store
+                    .entry(dialog_key.to_string())
+                    .or_default()
+                    .push((name, value));
+            }),
+            Arc::new(move |dialog_key: &str| {
+                // Drain semantics: removing on read keeps the map
+                // bounded even when an INVITE never reaches the
+                // auto-emit path (rejected, dropped, etc.).
+                reader_store
+                    .remove(dialog_key)
+                    .map(|(_, v)| v)
+                    .unwrap_or_default()
+            }),
+        );
+    }
+
     // Spawn background task: fire transaction timers + sweep stale entries
     {
         let state = Arc::clone(&state);
@@ -4823,11 +4851,20 @@ fn spawn_rf_proxy_start_if_invite(
     );
 
     let local_predicate = rf_local_uri_predicate(&state.local_domains);
-    let ims_data = crate::diameter::rf_service::ims_data_from_request(
+    let mut ims_data = crate::diameter::rf_service::ims_data_from_request(
         original_request,
         charger.node_functionality(),
         &local_predicate,
     );
+    // Apply any script-supplied charging params (set via
+    // `request.set_charging_param("outgoing-trunk-group-id", "...")`).
+    // Drained from the side-map keyed by the inbound dialog key so a
+    // BGCF script that picked a gateway via gateway.select(...) can
+    // stamp the trunk-group-id without writing the whole ACR by hand.
+    let drained_params = crate::diameter::rf_service::read_rf_charging_params(
+        &format!("{}\0{}", call_id, from_tag),
+    );
+    crate::diameter::rf_service::apply_charging_params(&mut ims_data, drained_params);
 
     // Intra-S-CSCF detection: is the called party also locally served?
     let term_user_name = ims_data
@@ -5086,6 +5123,14 @@ fn spawn_rf_b2bua_start(
         charger.node_functionality(),
         local_predicate,
     );
+    // Drain any script-supplied charging params keyed by the A-leg
+    // dialog (BGCF / MGCF auto-emit stamping trunk-group-id, etc.).
+    if let Some((call_id, from_tag)) = rf_extract_dialog_parts(&invite_clone) {
+        let drained = crate::diameter::rf_service::read_rf_charging_params(
+            &format!("{}\0{}", call_id, from_tag),
+        );
+        crate::diameter::rf_service::apply_charging_params(&mut ims_data, drained);
+    }
     // B2BUA mode → Role-of-Node = B2BUA_ROLE per TS 32.299 §7.2.149,
     // overriding the orig/term derived from local-domain matching.
     // Operators that need orig/term semantics (AS-as-B2BUA) can set

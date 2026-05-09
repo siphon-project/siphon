@@ -700,6 +700,94 @@ class MockRegistrar:
             request.reply(200, "OK")
         return True
 
+    def save_proxy(
+        self,
+        request: Any,
+        reply: Any,
+        aliases: Optional[list[str]] = None,
+    ) -> bool:
+        """Cache a binding on a proxy after the upstream registrar accepted it.
+
+        Use on a proxy (e.g. P-CSCF in IMS) that wants a local copy of a
+        UE's binding for routing terminating requests, where the actual
+        REGISTER was forwarded to a registrar of record (e.g. S-CSCF)
+        and a 200 OK has just come back.
+
+        Differs from :meth:`save` in three ways:
+
+        1. The contact lifetime is read from the **reply's** ``Expires``
+           header (the registrar's grant per RFC 3261 §10.3 step 8), not
+           the request's (the UE's ask).  UEs commonly ask for
+           ``600000`` s; the registrar caps to a sensible value, and
+           mirroring that cap locally is incorrect — the proxy must
+           trust the upstream's decision.
+        2. The local ``max_expires`` cap is **not** applied.  The
+           registrar of record has already capped, and a tighter local
+           cap would expire the proxy cache before the upstream binding,
+           opening a window where MT requests would 404 against an entry
+           the registrar still considers live.
+        3. No 200 OK is generated — the proxy will relay the upstream's
+           response itself.
+
+        A grace of ~32 s (RFC 3261 Timer F = 64·T1) is added on top so
+        a ``NOTIFY[reg-event;state=terminated]`` from the registrar at
+        expiry has a transaction-timer window to land before the proxy
+        forgets.
+
+        ``Expires: 0`` on the reply clears the binding (de-REGISTER
+        path).
+
+        Args:
+            request: The original REGISTER (read for AoR + Contact list).
+            reply: The upstream 200 OK (read for granted ``Expires``).
+            aliases: IMS implicit registration set, same shape as
+                :meth:`save` ``aliases=`` — see that method's docs.
+
+        Raises:
+            ValueError: when the reply has no parseable ``Expires``
+                header (the registrar of record must include the
+                granted ``Expires`` per RFC 3261 §10.3 step 8).
+
+        Example::
+
+            @proxy.on_reply
+            def on_reply(request, reply):
+                if request.method == "REGISTER" and reply.status_code == 200:
+                    registrar.save_proxy(request, reply,
+                                         aliases=raw_uris or [])
+                reply.relay()
+        """
+        # Pull the granted Expires from the reply.  Mirror the Rust-side
+        # validation so scripts fail identically in unit tests.
+        granted_raw = None
+        if hasattr(reply, "get_header"):
+            granted_raw = reply.get_header("Expires")
+        if granted_raw is None:
+            raise ValueError(
+                "save_proxy: reply has no parseable Expires header — "
+                "the registrar of record must include the granted "
+                "Expires per RFC 3261 §10.3 step 8"
+            )
+        granted = int(granted_raw)
+
+        raw_aor = str(request.to_uri) if request.to_uri else str(request.ruri)
+        aor = self._resolve_alias(self._normalize_aor(raw_aor))
+
+        if granted == 0:
+            self._store.pop(aor, None)
+            return True
+
+        contacts = self._store.setdefault(aor, [])
+        default_uri = f"sip:{request.ruri.user or 'user'}@{request.source_ip}:5060"
+        already_exists = any(c.uri == default_uri for c in contacts)
+        if not already_exists:
+            contacts.append(Contact(uri=default_uri))
+        event_type = "refreshed" if already_exists else "registered"
+        self._fire_on_change(aor, event_type)
+        if aliases:
+            self.set_associated_uris(aor, list(aliases))
+        return True
+
     def lookup(self, uri: Union[str, SipUri]) -> list[Contact]:
         """Look up contacts for an address-of-record.
 
@@ -2550,6 +2638,9 @@ class MockDiameter:
         originating_ioi: Optional[str] = None,
         terminating_ioi: Optional[str] = None,
         application_server: Optional[str] = None,
+        application_provided_called_party_address: Optional[str] = None,
+        incoming_trunk_group_id: Optional[str] = None,
+        outgoing_trunk_group_id: Optional[str] = None,
         visited_network_id: Optional[str] = None,
         user_name: Optional[str] = None,
         cause_code: Optional[int] = None,
@@ -2572,6 +2663,9 @@ class MockDiameter:
             originating_ioi=originating_ioi,
             terminating_ioi=terminating_ioi,
             application_server=application_server,
+            application_provided_called_party_address=application_provided_called_party_address,
+            incoming_trunk_group_id=incoming_trunk_group_id,
+            outgoing_trunk_group_id=outgoing_trunk_group_id,
             visited_network_id=visited_network_id,
             user_name=user_name,
             cause_code=cause_code,
@@ -2594,6 +2688,9 @@ class MockDiameter:
         originating_ioi: Optional[str] = None,
         terminating_ioi: Optional[str] = None,
         application_server: Optional[str] = None,
+        application_provided_called_party_address: Optional[str] = None,
+        incoming_trunk_group_id: Optional[str] = None,
+        outgoing_trunk_group_id: Optional[str] = None,
         visited_network_id: Optional[str] = None,
         user_name: Optional[str] = None,
         cause_code: Optional[int] = None,
@@ -2616,6 +2713,9 @@ class MockDiameter:
             originating_ioi=originating_ioi,
             terminating_ioi=terminating_ioi,
             application_server=application_server,
+            application_provided_called_party_address=application_provided_called_party_address,
+            incoming_trunk_group_id=incoming_trunk_group_id,
+            outgoing_trunk_group_id=outgoing_trunk_group_id,
             visited_network_id=visited_network_id,
             user_name=user_name,
             cause_code=cause_code,
@@ -2639,6 +2739,9 @@ class MockDiameter:
         originating_ioi: Optional[str] = None,
         terminating_ioi: Optional[str] = None,
         application_server: Optional[str] = None,
+        application_provided_called_party_address: Optional[str] = None,
+        incoming_trunk_group_id: Optional[str] = None,
+        outgoing_trunk_group_id: Optional[str] = None,
         visited_network_id: Optional[str] = None,
         user_name: Optional[str] = None,
         cause_code: Optional[int] = None,
@@ -2662,6 +2765,9 @@ class MockDiameter:
             originating_ioi=originating_ioi,
             terminating_ioi=terminating_ioi,
             application_server=application_server,
+            application_provided_called_party_address=application_provided_called_party_address,
+            incoming_trunk_group_id=incoming_trunk_group_id,
+            outgoing_trunk_group_id=outgoing_trunk_group_id,
             visited_network_id=visited_network_id,
             user_name=user_name,
             cause_code=cause_code,
@@ -2682,6 +2788,9 @@ class MockDiameter:
         originating_ioi: Optional[str] = None,
         terminating_ioi: Optional[str] = None,
         application_server: Optional[str] = None,
+        application_provided_called_party_address: Optional[str] = None,
+        incoming_trunk_group_id: Optional[str] = None,
+        outgoing_trunk_group_id: Optional[str] = None,
         visited_network_id: Optional[str] = None,
         user_name: Optional[str] = None,
         cause_code: Optional[int] = None,
@@ -2704,6 +2813,9 @@ class MockDiameter:
             originating_ioi=originating_ioi,
             terminating_ioi=terminating_ioi,
             application_server=application_server,
+            application_provided_called_party_address=application_provided_called_party_address,
+            incoming_trunk_group_id=incoming_trunk_group_id,
+            outgoing_trunk_group_id=outgoing_trunk_group_id,
             visited_network_id=visited_network_id,
             user_name=user_name,
             cause_code=cause_code,
@@ -4240,10 +4352,29 @@ class MockPendingSA:
     def security_server_params(self) -> MockSecurityServerParams:
         return self._params
 
-    def activate(self) -> None:
+    def activate(self, *, hard_lifetime_secs: Optional[int] = None) -> None:
+        """Mark the SA pair active.
+
+        ``hard_lifetime_secs`` (optional) re-pins the kernel
+        hard-lifetime on all four SAs of the pair via ``XFRM_MSG_UPDSA``,
+        without rekeying or disturbing selectors / SPIs.  Use on the
+        path that processes the 200 OK to the auth REGISTER to tighten
+        the SA expiry from the placeholder value installed at
+        allocation time (typically the UE's ``Expires:`` ask) to the
+        actual grant from the registrar of record (3GPP TS 33.203 §7.4
+        — IPsec SA lifetime tracks SIP registration lifetime).
+
+        ``None`` (default) preserves the original metadata-only
+        transition.
+
+        In the mock, this only updates ``self.expires_secs`` so tests
+        can assert the script wired the grant through correctly.
+        """
         if self.is_cleaned:
             raise ValueError("PendingSA already cleaned up")
         self.is_active = True
+        if hard_lifetime_secs is not None:
+            self.expires_secs = hard_lifetime_secs
 
     async def cleanup(self) -> None:
         self.is_cleaned = True

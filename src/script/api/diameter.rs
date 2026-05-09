@@ -104,6 +104,9 @@ fn build_ims_data(
     originating_ioi: Option<&str>,
     terminating_ioi: Option<&str>,
     application_server: Option<&str>,
+    application_provided_called_party_address: Option<&str>,
+    incoming_trunk_group_id: Option<&str>,
+    outgoing_trunk_group_id: Option<&str>,
     visited_network_id: Option<&str>,
     cause_code: Option<i32>,
 ) -> PyResult<ImsChargingData> {
@@ -141,6 +144,10 @@ fn build_ims_data(
         originating_ioi: originating_ioi.map(str::to_owned),
         terminating_ioi: terminating_ioi.map(str::to_owned),
         application_server: application_server.map(str::to_owned),
+        application_provided_called_party_address: application_provided_called_party_address
+            .map(str::to_owned),
+        incoming_trunk_group_id: incoming_trunk_group_id.map(str::to_owned),
+        outgoing_trunk_group_id: outgoing_trunk_group_id.map(str::to_owned),
         visited_network_id: visited_network_id.map(str::to_owned),
     })
 }
@@ -1281,7 +1288,9 @@ impl PyDiameter {
         role_of_node=None, node_functionality=None,
         ims_charging_identifier=None, user_session_id=None,
         originating_ioi=None, terminating_ioi=None,
-        application_server=None, visited_network_id=None,
+        application_server=None, application_provided_called_party_address=None,
+        incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
+        visited_network_id=None,
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
@@ -1299,6 +1308,9 @@ impl PyDiameter {
         originating_ioi: Option<&str>,
         terminating_ioi: Option<&str>,
         application_server: Option<&str>,
+        application_provided_called_party_address: Option<&str>,
+        incoming_trunk_group_id: Option<&str>,
+        outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
         user_name: Option<&str>,
         cause_code: Option<i32>,
@@ -1316,7 +1328,9 @@ impl PyDiameter {
             calling_party, called_party, sip_method,
             role_of_node, node_functionality, ims_charging_identifier,
             user_session_id, originating_ioi, terminating_ioi,
-            application_server, visited_network_id, cause_code,
+            application_server, application_provided_called_party_address,
+            incoming_trunk_group_id, outgoing_trunk_group_id,
+            visited_network_id, cause_code,
         )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
@@ -1348,7 +1362,9 @@ impl PyDiameter {
         role_of_node=None, node_functionality=None,
         ims_charging_identifier=None, user_session_id=None,
         originating_ioi=None, terminating_ioi=None,
-        application_server=None, visited_network_id=None,
+        application_server=None, application_provided_called_party_address=None,
+        incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
+        visited_network_id=None,
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
@@ -1368,6 +1384,9 @@ impl PyDiameter {
         originating_ioi: Option<&str>,
         terminating_ioi: Option<&str>,
         application_server: Option<&str>,
+        application_provided_called_party_address: Option<&str>,
+        incoming_trunk_group_id: Option<&str>,
+        outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
         user_name: Option<&str>,
         cause_code: Option<i32>,
@@ -1385,7 +1404,9 @@ impl PyDiameter {
             calling_party, called_party, sip_method,
             role_of_node, node_functionality, ims_charging_identifier,
             user_session_id, originating_ioi, terminating_ioi,
-            application_server, visited_network_id, cause_code,
+            application_server, application_provided_called_party_address,
+            incoming_trunk_group_id, outgoing_trunk_group_id,
+            visited_network_id, cause_code,
         )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::InterimRecord);
@@ -1427,7 +1448,9 @@ impl PyDiameter {
         role_of_node=None, node_functionality=None,
         ims_charging_identifier=None, user_session_id=None,
         originating_ioi=None, terminating_ioi=None,
-        application_server=None, visited_network_id=None,
+        application_server=None, application_provided_called_party_address=None,
+        incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
+        visited_network_id=None,
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
@@ -1448,6 +1471,9 @@ impl PyDiameter {
         originating_ioi: Option<&str>,
         terminating_ioi: Option<&str>,
         application_server: Option<&str>,
+        application_provided_called_party_address: Option<&str>,
+        incoming_trunk_group_id: Option<&str>,
+        outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
         user_name: Option<&str>,
         cause_code: Option<i32>,
@@ -1465,7 +1491,9 @@ impl PyDiameter {
             calling_party, called_party, sip_method,
             role_of_node, node_functionality, ims_charging_identifier,
             user_session_id, originating_ioi, terminating_ioi,
-            application_server, visited_network_id, cause_code,
+            application_server, application_provided_called_party_address,
+            incoming_trunk_group_id, outgoing_trunk_group_id,
+            visited_network_id, cause_code,
         )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
@@ -1503,7 +1531,9 @@ impl PyDiameter {
         role_of_node=None, node_functionality=None,
         ims_charging_identifier=None, user_session_id=None,
         originating_ioi=None, terminating_ioi=None,
-        application_server=None, visited_network_id=None,
+        application_server=None, application_provided_called_party_address=None,
+        incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
+        visited_network_id=None,
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
@@ -1521,6 +1551,9 @@ impl PyDiameter {
         originating_ioi: Option<&str>,
         terminating_ioi: Option<&str>,
         application_server: Option<&str>,
+        application_provided_called_party_address: Option<&str>,
+        incoming_trunk_group_id: Option<&str>,
+        outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
         user_name: Option<&str>,
         cause_code: Option<i32>,
@@ -1538,7 +1571,9 @@ impl PyDiameter {
             calling_party, called_party, sip_method,
             role_of_node, node_functionality, ims_charging_identifier,
             user_session_id, originating_ioi, terminating_ioi,
-            application_server, visited_network_id, cause_code,
+            application_server, application_provided_called_party_address,
+            incoming_trunk_group_id, outgoing_trunk_group_id,
+            visited_network_id, cause_code,
         )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::EventRecord);

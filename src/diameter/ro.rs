@@ -247,12 +247,25 @@ pub struct ImsChargingData {
     pub originating_ioi: Option<String>,
     /// Terminating IOI (TS 32.299 §7.2.71, RFC 7315 §5.6).
     pub terminating_ioi: Option<String>,
-    /// Application Server URI (TS 32.299 §7.2.6) — populated for AS or
-    /// when an S-CSCF dispatched the request to an AS via iFC.
+    /// `Application-Server` URI (TS 32.299 §7.2.6).  When present it
+    /// is emitted as the mandatory child of the grouped
+    /// `Application-Server-Information` AVP (TS 32.299 §7.2.5).
     pub application_server: Option<String>,
+    /// `Application-Provided-Called-Party-Address` (TS 32.299 §7.2.7)
+    /// — set by an AS that rewrote the called party.  Co-emitted
+    /// inside `Application-Server-Information` when `application_server`
+    /// is also set.
+    pub application_provided_called_party_address: Option<String>,
     /// IMS Visited Network Identifier (TS 32.299 §7.2.74) — populated
     /// from inbound `P-Visited-Network-ID` for roaming users.
     pub visited_network_id: Option<String>,
+    /// `Incoming-Trunk-Group-Id` AVP (TS 32.299 §7.2.71) — set by
+    /// BGCF/MGCF to identify the trunk group on the originating side
+    /// for inter-operator settlement.
+    pub incoming_trunk_group_id: Option<String>,
+    /// `Outgoing-Trunk-Group-Id` AVP — same on the terminating side
+    /// (typically the chosen `gateway.select(...)` group).
+    pub outgoing_trunk_group_id: Option<String>,
 }
 
 impl ImsChargingData {
@@ -321,9 +334,51 @@ impl ImsChargingData {
                 .extend_from_slice(&encode_avp_grouped_3gpp(avp::TIME_STAMPS, &ts_children));
         }
 
-        // Application-Server (TS 32.299 §7.2.6)
-        if let Some(ref server) = self.application_server {
-            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(avp::APPLICATION_SERVER, server));
+        // Application-Server-Information grouped AVP (TS 32.299 §7.2.5)
+        // wraps Application-Server (mandatory when present) and any
+        // Application-Provided-Called-Party-Address children.
+        if self.application_server.is_some()
+            || self.application_provided_called_party_address.is_some()
+        {
+            let mut info = Vec::new();
+            if let Some(ref server) = self.application_server {
+                info.extend_from_slice(&encode_avp_utf8_3gpp(
+                    avp::APPLICATION_SERVER,
+                    server,
+                ));
+            }
+            if let Some(ref addr) = self.application_provided_called_party_address {
+                info.extend_from_slice(&encode_avp_utf8_3gpp(
+                    avp::APPLICATION_PROVIDED_CALLED_PARTY_ADDRESS,
+                    addr,
+                ));
+            }
+            ims_inner.extend_from_slice(&encode_avp_grouped_3gpp(
+                avp::APPLICATION_SERVER_INFORMATION,
+                &info,
+            ));
+        }
+
+        // Trunk-Group-Id grouped AVP (TS 32.299 §7.2.71) — used by
+        // BGCF/MGCF for inter-operator settlement.
+        if self.incoming_trunk_group_id.is_some() || self.outgoing_trunk_group_id.is_some() {
+            let mut tg = Vec::new();
+            if let Some(ref id) = self.incoming_trunk_group_id {
+                tg.extend_from_slice(&encode_avp_utf8_3gpp(
+                    avp::INCOMING_TRUNK_GROUP_ID,
+                    id,
+                ));
+            }
+            if let Some(ref id) = self.outgoing_trunk_group_id {
+                tg.extend_from_slice(&encode_avp_utf8_3gpp(
+                    avp::OUTGOING_TRUNK_GROUP_ID,
+                    id,
+                ));
+            }
+            ims_inner.extend_from_slice(&encode_avp_grouped_3gpp(
+                avp::TRUNK_GROUP_ID,
+                &tg,
+            ));
         }
 
         // Inter-Operator-Identifier grouped AVP (TS 32.299 §7.2.71)
@@ -861,23 +916,83 @@ mod tests {
     }
 
     #[test]
-    fn ims_charging_with_application_server() {
+    fn ims_charging_with_application_server_information_grouped() {
+        // TS 32.299 §7.2.5: Application-Server is wrapped in the
+        // Application-Server-Information grouped AVP, not emitted bare
+        // inside IMS-Information.
         let data = ImsChargingData {
             application_server: Some("sip:mmtel.ims.example.com".into()),
+            application_provided_called_party_address: Some("sip:bob@example.com".into()),
             node_functionality: Some(NodeFunctionality::ApplicationServer),
             ..Default::default()
         };
         let wire = build_acr_like_wire_for_test(&data);
         let decoded = decode_diameter(&wire).unwrap();
-        let ims = decoded
+        let asi = decoded
             .avps
             .get("Service-Information")
             .and_then(|s| s.get("IMS-Information"))
-            .unwrap();
+            .and_then(|i| i.get("Application-Server-Information"))
+            .expect("Application-Server-Information grouped AVP missing");
         assert_eq!(
-            ims.get("Application-Server").and_then(|v| v.as_str()),
+            asi.get("Application-Server").and_then(|v| v.as_str()),
             Some("sip:mmtel.ims.example.com")
         );
+        assert_eq!(
+            asi.get("Application-Provided-Called-Party-Address")
+                .and_then(|v| v.as_str()),
+            Some("sip:bob@example.com")
+        );
+    }
+
+    #[test]
+    fn ims_charging_with_trunk_group_id_grouped() {
+        // TS 32.299 §7.2.71: Trunk-Group-Id is grouped, carrying
+        // optional Incoming- and Outgoing-Trunk-Group-Id children.
+        // Required for BGCF/MGCF settlement charging.
+        let data = ImsChargingData {
+            incoming_trunk_group_id: Some("trunk-in-001".into()),
+            outgoing_trunk_group_id: Some("carrier-A".into()),
+            node_functionality: Some(NodeFunctionality::Bgcf),
+            ..Default::default()
+        };
+        let wire = build_acr_like_wire_for_test(&data);
+        let decoded = decode_diameter(&wire).unwrap();
+        let trunk = decoded
+            .avps
+            .get("Service-Information")
+            .and_then(|s| s.get("IMS-Information"))
+            .and_then(|i| i.get("Trunk-Group-Id"))
+            .expect("Trunk-Group-Id grouped AVP missing");
+        assert_eq!(
+            trunk.get("Incoming-Trunk-Group-Id").and_then(|v| v.as_str()),
+            Some("trunk-in-001")
+        );
+        assert_eq!(
+            trunk.get("Outgoing-Trunk-Group-Id").and_then(|v| v.as_str()),
+            Some("carrier-A")
+        );
+    }
+
+    #[test]
+    fn ims_charging_outgoing_trunk_group_id_only() {
+        let data = ImsChargingData {
+            outgoing_trunk_group_id: Some("carrier-A".into()),
+            ..Default::default()
+        };
+        let wire = build_acr_like_wire_for_test(&data);
+        let decoded = decode_diameter(&wire).unwrap();
+        let trunk = decoded
+            .avps
+            .get("Service-Information")
+            .and_then(|s| s.get("IMS-Information"))
+            .and_then(|i| i.get("Trunk-Group-Id"))
+            .expect("Trunk-Group-Id grouped AVP missing");
+        assert_eq!(
+            trunk.get("Outgoing-Trunk-Group-Id").and_then(|v| v.as_str()),
+            Some("carrier-A")
+        );
+        assert!(trunk.get("Incoming-Trunk-Group-Id").is_none());
     }
 
     #[test]

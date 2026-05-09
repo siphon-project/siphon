@@ -113,6 +113,9 @@ class Request:
         # ``consumed_route_user`` (e.g. for IMS orig/term sescase) can be
         # exercised in tests.
         self._consumed_routes: list[str] = []
+        # Charging params stashed by ``set_charging_param`` for the Rf
+        # auto-emit path.  Tests can assert on them directly.
+        self._charging_params: list[tuple[str, str]] = []
 
     # -- Read-only properties --------------------------------------------------
 
@@ -434,6 +437,37 @@ class Request:
             request.set_header("X-Custom", "my-value")
         """
         self._headers[name] = value
+
+    def set_charging_param(self, name: str, value: str) -> None:
+        """Stash a charging-param for the Rf auto-emit hook.
+
+        Recognised names (TS 32.299 IMS-Information AVPs):
+
+        - ``"outgoing-trunk-group-id"`` — BGCF/MGCF settlement
+        - ``"incoming-trunk-group-id"``
+        - ``"application-server"`` — MMTel-AS
+        - ``"application-provided-called-party-address"``
+
+        Unknown names are silently kept on the request so future
+        siphon versions can recognise them without breaking scripts.
+        Tests can assert on the captured values via the
+        ``charging_params`` property.
+
+        Example::
+
+            gw = gateway.select("trunks")
+            request.set_charging_param(
+                "outgoing-trunk-group-id", gw.attrs["group"],
+            )
+            request.relay(gw.uri)
+        """
+        self._charging_params.append((name, value))
+
+    @property
+    def charging_params(self) -> list[tuple[str, str]]:
+        """List of `(name, value)` tuples stashed via
+        :meth:`set_charging_param`.  Test helper."""
+        return list(self._charging_params)
 
     def set_reply_header(self, name: str, value: str) -> None:
         """Set (replace) a single-value header on the response built by

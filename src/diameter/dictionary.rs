@@ -204,11 +204,16 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 834,  vendor_id: TGPP, name: "SIP-Request-Timestamp",              data_type: AvpType::Time },
     AvpDef { code: 835,  vendor_id: TGPP, name: "SIP-Response-Timestamp",             data_type: AvpType::Time },
     AvpDef { code: 836,  vendor_id: TGPP, name: "Application-Server",                 data_type: AvpType::UTF8String },
+    AvpDef { code: 837,  vendor_id: TGPP, name: "Application-Provided-Called-Party-Address", data_type: AvpType::UTF8String },
     AvpDef { code: 838,  vendor_id: TGPP, name: "Inter-Operator-Identifier",          data_type: AvpType::Grouped },
     AvpDef { code: 839,  vendor_id: TGPP, name: "Originating-IOI",                    data_type: AvpType::UTF8String },
     AvpDef { code: 840,  vendor_id: TGPP, name: "Terminating-IOI",                    data_type: AvpType::UTF8String },
     AvpDef { code: 841,  vendor_id: TGPP, name: "IMS-Charging-Identifier",            data_type: AvpType::UTF8String },
     AvpDef { code: 848,  vendor_id: TGPP, name: "Served-Party-IP-Address",            data_type: AvpType::Address },
+    AvpDef { code: 850,  vendor_id: TGPP, name: "Application-Server-Information",     data_type: AvpType::Grouped },
+    AvpDef { code: 851,  vendor_id: TGPP, name: "Trunk-Group-Id",                     data_type: AvpType::Grouped },
+    AvpDef { code: 852,  vendor_id: TGPP, name: "Incoming-Trunk-Group-Id",            data_type: AvpType::UTF8String },
+    AvpDef { code: 853,  vendor_id: TGPP, name: "Outgoing-Trunk-Group-Id",            data_type: AvpType::UTF8String },
     AvpDef { code: 861,  vendor_id: TGPP, name: "Cause-Code",                         data_type: AvpType::Integer32 },
     AvpDef { code: 862,  vendor_id: TGPP, name: "Node-Functionality",                 data_type: AvpType::Enumerated },
     AvpDef { code: 873,  vendor_id: TGPP, name: "Service-Information",                data_type: AvpType::Grouped },
@@ -693,11 +698,16 @@ pub mod avp {
     pub const SIP_REQUEST_TIMESTAMP: u32 = 834;
     pub const SIP_RESPONSE_TIMESTAMP: u32 = 835;
     pub const APPLICATION_SERVER: u32 = 836;
+    pub const APPLICATION_PROVIDED_CALLED_PARTY_ADDRESS: u32 = 837;
     pub const INTER_OPERATOR_IDENTIFIER: u32 = 838;
     pub const ORIGINATING_IOI: u32 = 839;
     pub const TERMINATING_IOI: u32 = 840;
     pub const IMS_CHARGING_IDENTIFIER: u32 = 841;
     pub const SERVED_PARTY_IP_ADDRESS: u32 = 848;
+    pub const APPLICATION_SERVER_INFORMATION: u32 = 850;
+    pub const TRUNK_GROUP_ID: u32 = 851;
+    pub const INCOMING_TRUNK_GROUP_ID: u32 = 852;
+    pub const OUTGOING_TRUNK_GROUP_ID: u32 = 853;
     pub const CAUSE_CODE: u32 = 861;
     pub const NODE_FUNCTIONALITY: u32 = 862;
     pub const SERVICE_INFORMATION: u32 = 873;
