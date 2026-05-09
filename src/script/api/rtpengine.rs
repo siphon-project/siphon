@@ -108,6 +108,42 @@ fn resolve_play_media_source(
 /// Default profile name when none is specified.
 const DEFAULT_PROFILE: &str = "rtp_passthrough";
 
+/// Resolve which RTP profile to use on the answer side.
+///
+/// Precedence:
+///   1. Explicit `profile` argument from the script (override).
+///   2. Profile recorded by the matching `offer` (looked up by Call-ID).
+///   3. [`DEFAULT_PROFILE`].
+///
+/// Step 2 is what makes B2BUA `on_answer` / `on_early_media` "just work" without
+/// every script having to re-pass `profile=` — once `rtpengine.offer(call,
+/// profile=…)` runs, the answer side mirrors the offer profile automatically,
+/// so directional flags (e.g. `direction: ["trunk", "ims"]`) don't get
+/// silently dropped on the 200 OK / early-media 18x.
+fn resolve_answer_profile(
+    profile: Option<&str>,
+    sessions: &MediaSessionStore,
+    call_id: &str,
+) -> String {
+    if let Some(name) = profile {
+        return name.to_string();
+    }
+    if let Some(session) = sessions.get(call_id) {
+        debug!(
+            call_id = %call_id,
+            profile = %session.profile,
+            "rtpengine.answer: using profile recorded at offer"
+        );
+        return session.profile;
+    }
+    debug!(
+        call_id = %call_id,
+        default = %DEFAULT_PROFILE,
+        "rtpengine.answer: no offer-side profile found, falling back to default"
+    );
+    DEFAULT_PROFILE.to_string()
+}
+
 /// Extract `Arc<Mutex<SipMessage>>` from a Python object that is either
 /// a `Request`, `Reply`, or `Call`.
 pub(super) fn extract_message(object: &Bound<'_, PyAny>) -> PyResult<Arc<Mutex<SipMessage>>> {
@@ -201,9 +237,20 @@ impl PyRtpEngine {
     /// automatically when the reply carries an A-leg reference (set by the
     /// dispatcher), or via an explicit `call` parameter.
     ///
+    /// Profile precedence:
+    ///   1. Explicit ``profile=`` argument (script override).
+    ///   2. Profile recorded by the matching ``offer`` (looked up by A-leg
+    ///      Call-ID).  This is what most B2BUA scripts want — call
+    ///      ``rtpengine.offer(call, profile="…")`` once and the answer side
+    ///      mirrors it automatically, including for early-media 18x.
+    ///   3. ``DEFAULT_PROFILE`` (``rtp_passthrough``) when no offer was ever
+    ///      recorded for this Call-ID.
+    ///
     /// Args:
     ///     reply: A Reply or Call object containing the 200 OK with SDP.
-    ///     profile: RTP profile name (default: "rtp_passthrough").
+    ///     profile: RTP profile name. When omitted, the profile recorded by
+    ///              the matching offer is used; falls back to
+    ///              ``"rtp_passthrough"`` only if no prior offer exists.
     ///     call: Optional Call object — when provided, Call-ID and From-tag are
     ///           taken from this object (matching the earlier `offer`), while
     ///           To-tag and SDP body still come from `reply`.
@@ -215,15 +262,6 @@ impl PyRtpEngine {
         profile: Option<&str>,
         call: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
-        let entry = self.registry.get(profile_name).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown RTP profile '{profile_name}'; valid profiles: {}",
-                self.registry.profile_names().join(", ")
-            ))
-        })?;
-        let flags = entry.answer.clone();
-
         let message = extract_message(reply)?;
 
         // Resolve A-leg identifiers for RTPEngine correlation:
@@ -245,6 +283,15 @@ impl PyRtpEngine {
         } else {
             extract_answer_params(&message)?
         };
+
+        let profile_name = resolve_answer_profile(profile, &self.sessions, &call_id);
+        let entry = self.registry.get(&profile_name).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown RTP profile '{profile_name}'; valid profiles: {}",
+                self.registry.profile_names().join(", ")
+            ))
+        })?;
+        let flags = entry.answer.clone();
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
@@ -1114,5 +1161,45 @@ mod tests {
             Some(&new_body.len().to_string())
         );
         assert_eq!(guard.body, new_body);
+    }
+
+    fn make_session(call_id: &str, profile: &str) -> MediaSession {
+        MediaSession {
+            call_id: call_id.to_string(),
+            from_tag: "tag-a".to_string(),
+            to_tag: None,
+            profile: profile.to_string(),
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn resolve_answer_profile_explicit_arg_wins() {
+        let store = MediaSessionStore::new();
+        store.insert(make_session("call-1", "srtp_to_rtp"));
+        let chosen = resolve_answer_profile(Some("ws_to_rtp"), &store, "call-1");
+        assert_eq!(chosen, "ws_to_rtp");
+    }
+
+    #[test]
+    fn resolve_answer_profile_recovers_from_offer() {
+        let store = MediaSessionStore::new();
+        store.insert(make_session("call-1", "srtp_to_rtp"));
+        let chosen = resolve_answer_profile(None, &store, "call-1");
+        assert_eq!(chosen, "srtp_to_rtp");
+    }
+
+    #[test]
+    fn resolve_answer_profile_falls_back_when_no_offer() {
+        let store = MediaSessionStore::new();
+        let chosen = resolve_answer_profile(None, &store, "no-such-call");
+        assert_eq!(chosen, DEFAULT_PROFILE);
+    }
+
+    #[test]
+    fn resolve_answer_profile_explicit_arg_wins_when_no_offer() {
+        let store = MediaSessionStore::new();
+        let chosen = resolve_answer_profile(Some("rtp_passthrough"), &store, "no-such-call");
+        assert_eq!(chosen, "rtp_passthrough");
     }
 }

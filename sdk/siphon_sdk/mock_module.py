@@ -1468,7 +1468,7 @@ class MockRtpEngine:
         return 1
 
     async def offer(self, request: Any,
-                    profile: str = "srtp_to_rtp") -> bool:
+                    profile: Optional[str] = None) -> bool:
         """Send ``offer`` command to RTPEngine.
 
         Extracts SDP from message body, sends to engine, replaces body
@@ -1476,25 +1476,48 @@ class MockRtpEngine:
 
         Args:
             request: Request or Call object with SDP body.
-            profile: RTP profile name.
+            profile: RTP profile name. Defaults to ``"rtp_passthrough"``.
 
         Returns:
             ``True`` on success.
         """
-        self.operations.append(("offer", profile))
+        self.operations.append(("offer", profile or "rtp_passthrough"))
         return True
 
     async def answer(self, reply: Any,
-                     profile: str = "srtp_to_rtp") -> bool:
+                     profile: Optional[str] = None,
+                     call: Any = None) -> bool:
         """Send ``answer`` command to RTPEngine.
+
+        Profile precedence (matches the real implementation):
+
+        1. Explicit ``profile=`` argument (script override).
+        2. Profile recorded by the matching ``offer`` (looked up by A-leg
+           Call-ID). Lets ``@b2bua.on_answer`` / ``@b2bua.on_early_media``
+           call ``rtpengine.answer(reply)`` with no ``profile=`` and still
+           get the directional flags from the offer-side profile.
+        3. ``"rtp_passthrough"`` when no offer was ever recorded.
 
         Args:
             reply: Reply or Call object with SDP body.
-            profile: RTP profile name.
+            profile: Optional explicit RTP profile name. When omitted, the
+                     profile recorded by the matching offer is used.
+            call: Optional Call object — when provided, Call-ID and
+                  From-tag are taken from this object (matching the earlier
+                  ``offer``), while To-tag and SDP body still come from
+                  ``reply``.
 
         Returns:
             ``True`` on success.
         """
+        if profile is None:
+            # Mirror real behavior: recover from last recorded offer.
+            for op, recorded in reversed(self.operations):
+                if op == "offer":
+                    profile = recorded
+                    break
+            else:
+                profile = "rtp_passthrough"
         self.operations.append(("answer", profile))
         return True
 
