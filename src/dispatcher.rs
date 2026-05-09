@@ -153,26 +153,41 @@ struct DispatcherState {
     /// Rf offline-charging service (3GPP TS 32.299) — `None` when
     /// `rf:` is unset/disabled or no Diameter peers are configured.
     rf_charger: Option<Arc<crate::diameter::rf_service::RfChargingService>>,
-    /// Per-dialog Rf state for proxy auto-emit, keyed by
-    /// `<Call-ID>\0<From-tag>` (matching `ProxySessionStore::dialog_key`).
-    /// Inserted when ACR-START succeeds for a 2xx INVITE; removed when
-    /// ACR-STOP fires for the matching BYE.  Empty when `rf_charger` is
-    /// `None` so the auto-emit hot path branches out cheaply.
-    rf_sessions: Arc<DashMap<String, ProxyRfState>>,
+    /// Per-record Rf state for proxy + B2BUA auto-emit.
+    ///
+    /// Keys (TS 32.260 §5.5 ICID + role suffix, with SIP-dialog
+    /// fallback — see `crate::diameter::rf_service`):
+    /// - `icid:<ICID>:orig` / `icid:<ICID>:term` — primary, deduplicates
+    ///   iFC re-dispatch hits that share the same ICID.
+    /// - `dialog:<Call-ID>\0<tag>:orig` / `dialog:<...>:term` — fallback
+    ///   when ICID is absent, plus a co-stored alias of the ICID record
+    ///   so STOP / CDR lookups still resolve when the in-dialog request
+    ///   arrives without an ICID.
+    /// - `b2bua:<internal-call-id>` — B2BUA path (no role suffix; no
+    ///   dual-ACR support there yet).
+    ///
+    /// Values are wrapped in `Arc` so co-storing under multiple keys
+    /// (ICID alias + dialog fallback) is just a refcount bump.  Empty
+    /// when `rf_charger` is `None` so the auto-emit hot path branches
+    /// out cheaply.
+    rf_sessions: Arc<DashMap<String, Arc<ProxyRfState>>>,
 }
 
 /// Bundle held in `DispatcherState::rf_sessions` so ACR-STOP can reuse
 /// the IMS data captured at ACR-START (calling/called party, ICID, IOI,
 /// User-Session-Id, etc.) and just update the cause_code from the BYE.
 ///
-/// Used by both the proxy auto-emit path (keyed by the SIP dialog
-/// `<Call-ID>\0<From-tag>`) and the B2BUA path (keyed by
-/// `b2bua:<internal-call-id>`); the disjoint key prefix prevents
-/// collision between the two storage paths.
+/// Multiple map entries may point at the same `Arc<ProxyRfState>` —
+/// every record is co-stored under both the ICID-keyed primary and a
+/// SIP-dialog fallback so lookups via either path resolve identically.
 pub(crate) struct ProxyRfState {
     session: crate::diameter::rf_service::RfChargingSession,
     ims_data: crate::diameter::ro::ImsChargingData,
     user_name: Option<String>,
+    /// Every storage key under which this record is filed.  Used by
+    /// the STOP path so a single found-by-X lookup can clean up all
+    /// the aliases without scanning the map.
+    storage_keys: Vec<String>,
 }
 
 impl ProxyRfState {
@@ -4697,17 +4712,25 @@ pub fn inject_python_singletons(config: &Config) {
 // Rf offline-charging helpers (3GPP TS 32.299) — proxy auto-emit
 // ---------------------------------------------------------------------------
 
-/// Compute the dialog key used by `ProxySessionStore::by_dialog_key` —
-/// `<Call-ID>\0<From-tag>`.  Returns `None` when either header is
+/// Extract the IMS-Charging-Identifier from a SIP message's
+/// `P-Charging-Vector` header (RFC 7315 §5.6 / TS 32.260 §5.5).
+/// Returns `None` when the header is absent or carries no `icid-value`.
+fn rf_extract_icid(message: &SipMessage) -> Option<String> {
+    let header = message.headers.get("P-Charging-Vector")?;
+    crate::sip::headers::charging::ChargingVector::parse(header).icid
+}
+
+/// Extract `(Call-ID, From-tag)` from a SIP message — the inputs to
+/// the dialog-fallback storage key.  Returns `None` when either is
 /// missing (an in-dialog request without a From-tag would be malformed).
-fn rf_dialog_key(message: &SipMessage) -> Option<String> {
-    let call_id = message.headers.get("Call-ID")?;
+fn rf_extract_dialog_parts(message: &SipMessage) -> Option<(String, String)> {
+    let call_id = message.headers.get("Call-ID")?.to_string();
     let from_tag = message
         .typed_from()
         .ok()
         .flatten()
         .and_then(|na| na.tag)?;
-    Some(format!("{}\0{}", call_id, from_tag))
+    Some((call_id, from_tag))
 }
 
 /// Predicate factory: returns `true` when a SIP URI / name-addr value
@@ -4727,22 +4750,31 @@ fn rf_local_uri_predicate(local_domains: &Arc<Vec<String>>) -> impl Fn(&str) -> 
 
 /// Spawn ACR-START for the INVITE that just got a 2xx forwarded by the
 /// proxy.  No-op when `rf_charger` is unset, auto-emit is disabled, or
-/// the original method wasn't INVITE.  The handle returned by the CDF
-/// is stored in `state.rf_sessions` keyed by dialog key so the
-/// matching BYE can find and STOP it.
+/// the original method wasn't INVITE.
+///
+/// **Keying (TS 32.260 §5.5):** the resulting `RfChargingSession` is
+/// co-stored under both an ICID-keyed primary (when the inbound INVITE
+/// carries `P-Charging-Vector`) and a SIP-dialog fallback
+/// `<Call-ID>\0<From-tag>`.  iFC re-dispatch through MMTel-AS — which
+/// rewrites From-tag but preserves ICID — therefore deduplicates on
+/// the ICID key, no longer producing the orphan ACR-STARTs that
+/// plagued the From-tag-only keying scheme.
 ///
 /// **Intra-S-CSCF dual-ACR (TS 32.260 §5.1):** when both the calling
 /// and called parties are locally-served identities, the S-CSCF emits
-/// two independent ACR sequences — one with `ORIGINATING_ROLE` on
-/// behalf of the calling user, one with `TERMINATING_ROLE` on behalf
-/// of the called user.  Each sequence has its own Session-Id and
-/// Record-Number; they're stored under disjoint keys
-/// (`<dialog>` and `term:<dialog>`) so the BYE handler can stop both.
+/// two independent ACR sequences — one ORIGINATING, one TERMINATING.
+/// Each sequence has its own Session-Id and Record-Number, and is
+/// stored under its own `:orig` / `:term` keys so the BYE handler can
+/// stop both in parallel.
 fn spawn_rf_proxy_start_if_invite(
     state: &DispatcherState,
     server_key: &TransactionKey,
     original_request: &SipMessage,
 ) {
+    use crate::diameter::rf_service::{
+        rf_icid_key, rf_dialog_key as build_rf_dialog_key, rf_session_storage_keys, RfRole,
+    };
+
     let charger = match state.rf_charger.as_ref() {
         Some(c) if c.auto_emit_proxy() => Arc::clone(c),
         Some(_) => {
@@ -4761,28 +4793,35 @@ fn spawn_rf_proxy_start_if_invite(
         );
         return;
     }
-    let dialog_key = match rf_dialog_key(original_request) {
-        Some(k) => k,
+    let (call_id, from_tag) = match rf_extract_dialog_parts(original_request) {
+        Some(parts) => parts,
         None => {
-            debug!(
-                "rf: proxy ACR-START skipped — INVITE has no Call-ID + From-tag"
-            );
+            debug!("rf: proxy ACR-START skipped — INVITE has no Call-ID + From-tag");
             return;
         }
     };
-    if state.rf_sessions.contains_key(&dialog_key) {
-        // Already charging this dialog (e.g. forked branches that all
-        // went 2xx in quick succession before the first task inserted).
+    let icid = rf_extract_icid(original_request);
+
+    // Idempotency: if any storage key for the originating role is
+    // already filed, skip — iFC re-dispatch under the same ICID, or
+    // forked branches racing to insert.
+    let orig_primary_key = match icid.as_deref() {
+        Some(icid) => rf_icid_key(icid, RfRole::Originating),
+        None => build_rf_dialog_key(&call_id, &from_tag, RfRole::Originating),
+    };
+    if state.rf_sessions.contains_key(&orig_primary_key) {
         debug!(
-            dialog_key = %dialog_key,
-            "rf: proxy ACR-START skipped — dialog already tracked"
+            primary_key = %orig_primary_key,
+            "rf: proxy ACR-START skipped — record already tracked"
         );
         return;
     }
     debug!(
-        dialog_key = %dialog_key,
+        primary_key = %orig_primary_key,
+        icid = icid.as_deref().unwrap_or("(none)"),
         "rf: proxy ACR-START spawning"
     );
+
     let local_predicate = rf_local_uri_predicate(&state.local_domains);
     let ims_data = crate::diameter::rf_service::ims_data_from_request(
         original_request,
@@ -4791,11 +4830,6 @@ fn spawn_rf_proxy_start_if_invite(
     );
 
     // Intra-S-CSCF detection: is the called party also locally served?
-    // When yes (and node is configured as S-CSCF), TS 32.260 §5.1 says
-    // we must emit a second ACR with TERMINATING_ROLE on behalf of the
-    // called user.  For other node roles (P-CSCF / AS / BGCF / …) only
-    // the originating record is generated — those nodes don't take on
-    // dual-role even when both users happen to be in the same realm.
     let term_user_name = ims_data
         .called_party
         .as_deref()
@@ -4806,14 +4840,19 @@ fn spawn_rf_proxy_start_if_invite(
         })
         .map(str::to_owned);
 
-    let user_name = ims_data.calling_party.clone();
+    let orig_user_name = ims_data.calling_party.clone();
     let rf_sessions = Arc::clone(&state.rf_sessions);
 
     if let Some(term_user) = term_user_name {
-        // Dual-ACR: spawn the originating record with the existing
-        // ims_data (Role=ORIGINATING) AND a parallel terminating
-        // record with Role=TERMINATING and User-Name = called party.
-        let term_dialog_key = format!("term:{}", dialog_key);
+        // Dual-ACR (TS 32.260 §5.1): spawn the originating record
+        // AND a parallel terminating record.  Each gets its own set
+        // of storage keys (ICID + dialog fallback, both with `:term`).
+        let term_keys = rf_session_storage_keys(
+            icid.as_deref(),
+            &call_id,
+            &from_tag,
+            RfRole::Terminating,
+        );
         let mut ims_term = ims_data.clone();
         ims_term.role_of_node = Some(crate::diameter::ro::NodeRole::TerminatingRole);
         let charger_term = Arc::clone(&charger);
@@ -4827,48 +4866,59 @@ fn spawn_rf_proxy_start_if_invite(
                 Some(s) => s,
                 None => return,
             };
-            rf_sessions_term.insert(
-                term_dialog_key,
-                ProxyRfState {
-                    session,
-                    ims_data: ims_term,
-                    user_name: Some(term_user_for_record),
-                },
-            );
+            let entry = Arc::new(ProxyRfState {
+                session,
+                ims_data: ims_term,
+                user_name: Some(term_user_for_record),
+                storage_keys: term_keys.clone(),
+            });
+            for key in term_keys {
+                rf_sessions_term.insert(key, Arc::clone(&entry));
+            }
         });
     }
 
-    // Originating record (single-ACR mode emits this only; dual-ACR
-    // mode emits this in addition to the terminating record above).
+    // Originating record (always emitted; dual-ACR mode emits it
+    // alongside the terminating record above).
+    let orig_keys = rf_session_storage_keys(
+        icid.as_deref(),
+        &call_id,
+        &from_tag,
+        RfRole::Originating,
+    );
     let mut ims_orig = ims_data;
     if ims_orig.role_of_node.is_none() {
         ims_orig.role_of_node = Some(crate::diameter::ro::NodeRole::OriginatingRole);
     }
     tokio::spawn(async move {
         let session = match charger
-            .acr_start(ims_orig.clone(), user_name.clone())
+            .acr_start(ims_orig.clone(), orig_user_name.clone())
             .await
         {
             Some(s) => s,
             None => return,
         };
-        rf_sessions.insert(
-            dialog_key,
-            ProxyRfState {
-                session,
-                ims_data: ims_orig,
-                user_name,
-            },
-        );
+        let entry = Arc::new(ProxyRfState {
+            session,
+            ims_data: ims_orig,
+            user_name: orig_user_name,
+            storage_keys: orig_keys.clone(),
+        });
+        for key in orig_keys {
+            rf_sessions.insert(key, Arc::clone(&entry));
+        }
     });
 }
 
 /// Spawn ACR-STOP for the dialog this BYE belongs to.  No-op when no
 /// matching Rf session is tracked.
 ///
-/// Also handles intra-S-CSCF dual-ACR (TS 32.260 §5.1): when an
-/// ORIGINATING record is present, the matching TERMINATING record is
-/// stopped in parallel.
+/// **Lookup priority (TS 32.260 §5.5):** ICID key first (preserved
+/// across iFC chain when P-CSCF is spec-compliant), falling back to
+/// SIP-dialog key with both From-tag and To-tag candidates.
+///
+/// Also handles intra-S-CSCF dual-ACR (TS 32.260 §5.1): both the
+/// ORIGINATING and TERMINATING records are stopped in parallel.
 ///
 /// Entries are removed from `rf_sessions` **after** ACR-STOP completes
 /// rather than at BYE arrival.  This keeps the entry visible to
@@ -4879,40 +4929,57 @@ fn spawn_rf_proxy_start_if_invite(
 /// duplicate BYE retransmits short-circuit without re-emitting on the
 /// wire.
 fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
+    use crate::diameter::rf_service::{rf_lookup_candidates, RfRole};
+
     let charger = match state.rf_charger.as_ref() {
         Some(c) if c.auto_emit_proxy() => Arc::clone(c),
         _ => return,
     };
-    let direct_key = match rf_dialog_key(bye) {
-        Some(k) => k,
-        None => return,
-    };
-    // BYE may flow in either direction — try the dialog key as-is
-    // first (caller-initiated BYE matches our INVITE's From-tag) and
-    // fall back to swapping From/To tags (callee-initiated BYE).
-    // Use `get` instead of `remove` so the script's CDR write that
-    // follows can still see the rf_session for auto-stamping.
-    let (orig_key, found) = if state.rf_sessions.contains_key(&direct_key) {
-        (direct_key, true)
-    } else {
-        let swapped_key = bye
-            .typed_to()
-            .ok()
-            .flatten()
-            .and_then(|na| na.tag)
-            .and_then(|to_tag| {
-                let call_id = bye.headers.get("Call-ID")?;
-                Some(format!("{}\0{}", call_id, to_tag))
-            });
-        match swapped_key {
-            Some(k) => {
-                let exists = state.rf_sessions.contains_key(&k);
-                (k, exists)
+
+    let icid = rf_extract_icid(bye);
+    let call_id = bye.headers.get("Call-ID").cloned();
+    let from_tag = bye
+        .typed_from()
+        .ok()
+        .flatten()
+        .and_then(|na| na.tag);
+    let to_tag = bye
+        .typed_to()
+        .ok()
+        .flatten()
+        .and_then(|na| na.tag);
+
+    let candidates = rf_lookup_candidates(
+        icid.as_deref(),
+        call_id.as_deref(),
+        from_tag.as_deref(),
+        to_tag.as_deref(),
+    );
+
+    // Find the first storage entry the BYE resolves to, then collect
+    // every Rf record reachable from there (orig + term in dual-ACR).
+    // Using DashMap::get over the candidate list keeps the hot path
+    // bounded — at most 8 hashmap probes for a complete BYE.
+    let mut found_orig: Option<Arc<ProxyRfState>> = None;
+    let mut found_term: Option<Arc<ProxyRfState>> = None;
+    for key in &candidates {
+        if let Some(entry) = state.rf_sessions.get(key) {
+            let role_suffix = key.rsplit(':').next();
+            match role_suffix {
+                Some("orig") if found_orig.is_none() => {
+                    found_orig = Some(Arc::clone(entry.value()));
+                }
+                Some("term") if found_term.is_none() => {
+                    found_term = Some(Arc::clone(entry.value()));
+                }
+                _ => {}
             }
-            None => return,
+            if found_orig.is_some() && found_term.is_some() {
+                break;
+            }
         }
-    };
-    if !found {
+    }
+    if found_orig.is_none() && found_term.is_none() {
         return;
     }
 
@@ -4933,19 +5000,12 @@ fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
     let response_timestamp = std::time::SystemTime::now();
 
     let stop_one =
-        |key: String, charger: Arc<crate::diameter::rf_service::RfChargingService>| {
+        |entry: Arc<ProxyRfState>, charger: Arc<crate::diameter::rf_service::RfChargingService>| {
             let rf_sessions = Arc::clone(&state.rf_sessions);
             tokio::spawn(async move {
-                // Snapshot the entry without removing it so concurrent
-                // CDR-stamp lookups still resolve while we await the
-                // ACR-STOP round-trip.
-                let snapshot = rf_sessions.get(&key).map(|entry| {
-                    let v = entry.value();
-                    (v.session.clone(), v.ims_data.clone(), v.user_name.clone())
-                });
-                let Some((session, mut ims_data, user_name)) = snapshot else {
-                    return;
-                };
+                let session = entry.session.clone();
+                let mut ims_data = entry.ims_data.clone();
+                let user_name = entry.user_name.clone();
                 ims_data.sip_method = Some("BYE".to_string());
                 ims_data.cause_code = cause_code.or(Some(0));
                 ims_data.response_timestamp = Some(response_timestamp);
@@ -4958,17 +5018,20 @@ fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
                     )
                     .await;
                 // ACR-STOP is committed; the CDR-correlation window is
-                // now closed.  Drop the entry.
-                rf_sessions.remove(&key);
+                // now closed.  Drop every alias under which this
+                // record was filed.
+                for key in &entry.storage_keys {
+                    rf_sessions.remove(key);
+                }
             });
         };
 
-    stop_one(orig_key.clone(), Arc::clone(&charger));
-
-    // Intra-S-CSCF dual-ACR teardown.
-    let term_key = format!("term:{}", orig_key);
-    if state.rf_sessions.contains_key(&term_key) {
-        stop_one(term_key, charger);
+    let _ = RfRole::Originating; // enum import kept for symmetry with start side
+    if let Some(entry) = found_orig {
+        stop_one(entry, Arc::clone(&charger));
+    }
+    if let Some(entry) = found_term {
+        stop_one(entry, charger);
     }
 }
 
@@ -5038,12 +5101,13 @@ fn spawn_rf_b2bua_start(
             None => return,
         };
         rf_sessions.insert(
-            key,
-            ProxyRfState {
+            key.clone(),
+            Arc::new(ProxyRfState {
                 session,
                 ims_data,
                 user_name,
-            },
+                storage_keys: vec![key],
+            }),
         );
     });
 }

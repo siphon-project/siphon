@@ -391,6 +391,118 @@ impl RfChargingService {
     }
 }
 
+// ── Proxy rf_sessions keying (ICID + role, with dialog fallback) ─────
+//
+// The dispatcher's `rf_sessions` DashMap stores one entry per active
+// Rf accounting record.  Keys must satisfy three conflicting goals:
+//
+// 1. **Idempotency for iFC re-dispatch.**  TS 32.260 §5.5 mandates that
+//    the IMS-Charging-Identifier (ICID) is preserved across the entire
+//    SIP dialog — every iFC re-entry into the S-CSCF carries the same
+//    ICID even though MMTel-AS B2BUA may rewrite the From-tag.  Keying
+//    on ICID lets `spawn_rf_proxy_start_if_invite` dedupe re-dispatch
+//    hits cleanly.
+//
+// 2. **Resilience when ICID is absent or unstable.**  At the very edge
+//    of the IMS network (UE → P-CSCF, before P-CSCF stamps an ICID)
+//    inbound INVITEs have no `P-Charging-Vector` at all.  A buggy
+//    P-CSCF that mints a fresh ICID on the in-dialog BYE breaks STOP
+//    correlation by ICID alone.  Both cases need a SIP-dialog
+//    fallback (`<Call-ID>\0<From-tag>`).
+//
+// 3. **Dual-ACR (TS 32.260 §5.1).**  When the same S-CSCF serves both
+//    endpoints, we open two independent records on the same ICID with
+//    different roles.  Role must therefore be part of the key.
+//
+// Solution: every record is stored under BOTH the ICID-keyed primary
+// (when ICID exists) AND the dialog-keyed fallback, both with the
+// role suffix.  Lookups try ICID first, then dialog.  Idempotency
+// checks the ICID key when present, the dialog key otherwise.
+
+/// Role of an Rf accounting record.  Encoded as the trailing component
+/// of the storage key so ORIGINATING and TERMINATING records on the
+/// same dialog cannot collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RfRole {
+    Originating,
+    Terminating,
+}
+
+impl RfRole {
+    pub fn as_suffix(self) -> &'static str {
+        match self {
+            RfRole::Originating => "orig",
+            RfRole::Terminating => "term",
+        }
+    }
+}
+
+/// ICID-based storage key.  Use as the primary key when the inbound
+/// request carries a `P-Charging-Vector: icid-value=...`.
+pub fn rf_icid_key(icid: &str, role: RfRole) -> String {
+    format!("icid:{icid}:{}", role.as_suffix())
+}
+
+/// Dialog-based fallback storage key.  Use when ICID is absent or as
+/// a co-stored alias so STOP/CDR lookups still resolve when ICID has
+/// been corrupted across the dialog.
+pub fn rf_dialog_key(call_id: &str, tag: &str, role: RfRole) -> String {
+    format!("dialog:{call_id}\0{tag}:{}", role.as_suffix())
+}
+
+/// Storage keys that should be inserted at ACR-START time for a given
+/// (icid, call_id, from_tag, role) tuple.  Returns either one key
+/// (dialog fallback only when ICID absent) or two keys (ICID primary
+/// + dialog fallback, so STOP/CDR lookups resolve through either path).
+pub fn rf_session_storage_keys(
+    icid: Option<&str>,
+    call_id: &str,
+    from_tag: &str,
+    role: RfRole,
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(2);
+    if let Some(icid) = icid {
+        keys.push(rf_icid_key(icid, role));
+    }
+    keys.push(rf_dialog_key(call_id, from_tag, role));
+    keys
+}
+
+/// Candidate lookup keys for resolving an Rf session from a SIP
+/// request that may belong to either side of the dialog.  The lookup
+/// caller iterates these in order and stops at the first hit.
+///
+/// Returned keys span:
+/// - ICID-keyed (orig + term)            — when `P-Charging-Vector` is preserved per spec
+/// - Dialog-keyed via From-tag           — primary fallback
+/// - Dialog-keyed via To-tag             — callee-initiated BYE / lookup from the term side
+pub fn rf_lookup_candidates(
+    icid: Option<&str>,
+    call_id: Option<&str>,
+    from_tag: Option<&str>,
+    to_tag: Option<&str>,
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(8);
+    if let Some(icid) = icid {
+        keys.push(rf_icid_key(icid, RfRole::Originating));
+        keys.push(rf_icid_key(icid, RfRole::Terminating));
+    }
+    if let Some(call_id) = call_id {
+        if let Some(tag) = from_tag {
+            keys.push(rf_dialog_key(call_id, tag, RfRole::Originating));
+            keys.push(rf_dialog_key(call_id, tag, RfRole::Terminating));
+        }
+        if let Some(tag) = to_tag {
+            // Skip the duplicate when From-tag == To-tag.
+            if from_tag != Some(tag) {
+                keys.push(rf_dialog_key(call_id, tag, RfRole::Originating));
+                keys.push(rf_dialog_key(call_id, tag, RfRole::Terminating));
+            }
+        }
+    }
+    keys
+}
+
 // ── CDR auto-stamp registry ──────────────────────────────────────────
 //
 // The proxy/B2BUA auto-emit hooks live in src/dispatcher.rs and own
@@ -548,6 +660,107 @@ fn extract_uri(name_addr: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Storage-key helpers (ICID + dialog fallback, TS 32.260 §5.5) ─────
+
+    #[test]
+    fn rf_role_suffix_strings() {
+        assert_eq!(RfRole::Originating.as_suffix(), "orig");
+        assert_eq!(RfRole::Terminating.as_suffix(), "term");
+    }
+
+    #[test]
+    fn rf_icid_key_format() {
+        assert_eq!(
+            rf_icid_key("28afeda870bd", RfRole::Originating),
+            "icid:28afeda870bd:orig"
+        );
+        assert_eq!(
+            rf_icid_key("28afeda870bd", RfRole::Terminating),
+            "icid:28afeda870bd:term"
+        );
+    }
+
+    #[test]
+    fn rf_dialog_key_format() {
+        let key = rf_dialog_key("call-1", "tag-A", RfRole::Originating);
+        // Sentinel between Call-ID and tag is NUL to disambiguate
+        // Call-IDs that happen to contain `:`.
+        assert_eq!(key, "dialog:call-1\0tag-A:orig");
+    }
+
+    #[test]
+    fn storage_keys_with_icid_emit_both() {
+        let keys =
+            rf_session_storage_keys(Some("icid-X"), "call-1", "tag-A", RfRole::Originating);
+        assert_eq!(
+            keys,
+            vec![
+                "icid:icid-X:orig".to_string(),
+                "dialog:call-1\0tag-A:orig".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn storage_keys_without_icid_emit_dialog_only() {
+        let keys = rf_session_storage_keys(None, "call-1", "tag-A", RfRole::Terminating);
+        assert_eq!(keys, vec!["dialog:call-1\0tag-A:term".to_string()]);
+    }
+
+    #[test]
+    fn lookup_candidates_full_set() {
+        let keys = rf_lookup_candidates(
+            Some("icid-X"),
+            Some("call-1"),
+            Some("tag-A"),
+            Some("tag-B"),
+        );
+        // Order matters — ICID-based first, then dialog-by-from-tag, then dialog-by-to-tag.
+        assert_eq!(
+            keys,
+            vec![
+                "icid:icid-X:orig",
+                "icid:icid-X:term",
+                "dialog:call-1\0tag-A:orig",
+                "dialog:call-1\0tag-A:term",
+                "dialog:call-1\0tag-B:orig",
+                "dialog:call-1\0tag-B:term",
+            ]
+        );
+    }
+
+    #[test]
+    fn lookup_candidates_skips_duplicate_when_tags_match() {
+        let keys = rf_lookup_candidates(
+            None,
+            Some("call-1"),
+            Some("tag-A"),
+            Some("tag-A"),
+        );
+        assert_eq!(
+            keys,
+            vec![
+                "dialog:call-1\0tag-A:orig".to_string(),
+                "dialog:call-1\0tag-A:term".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn lookup_candidates_handles_missing_pieces() {
+        // No ICID and no Call-ID → empty
+        assert!(rf_lookup_candidates(None, None, None, None).is_empty());
+
+        // No tag → no dialog candidates
+        assert!(rf_lookup_candidates(None, Some("call-1"), None, None).is_empty());
+
+        // ICID alone is enough for the orig/term pair
+        assert_eq!(
+            rf_lookup_candidates(Some("icid-X"), None, None, None),
+            vec!["icid:icid-X:orig", "icid:icid-X:term"]
+        );
+    }
 
     #[test]
     fn termination_cause_for_reason_default() {

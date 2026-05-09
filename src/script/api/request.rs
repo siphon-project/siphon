@@ -362,13 +362,13 @@ impl PyRequest {
         self.transport_name.clone()
     }
 
-    /// Candidate dialog keys for the Rf CDR auto-stamp lookup.
+    /// Candidate Rf-session storage keys for the CDR auto-stamp lookup.
     ///
-    /// Returns up to two `<Call-ID>\0<tag>` strings — first the
-    /// caller's tag (matches the originating S-CSCF / proxy
-    /// ACR-START), then the callee's tag (matches the callee-initiated
-    /// BYE).  Empty when the message has no Call-ID.  The CDR API
-    /// stamps the first match.
+    /// Mirrors the keying scheme used by the dispatcher's auto-emit
+    /// hooks (TS 32.260 §5.5 ICID + role suffix, with SIP-dialog
+    /// fallback): up to eight candidates spanning ICID-keyed orig/term
+    /// records and dialog-keyed orig/term records via both From-tag
+    /// and To-tag.  The CDR API stamps the first match.
     pub fn cdr_rf_dialog_key_candidates(&self) -> Vec<String> {
         let message = match self.message.lock() {
             Ok(guard) => guard,
@@ -379,9 +379,11 @@ impl PyRequest {
                 poisoned.into_inner()
             }
         };
-        let Some(call_id) = message.headers.call_id() else {
-            return Vec::new();
-        };
+        let icid = message
+            .headers
+            .get("P-Charging-Vector")
+            .and_then(|v| crate::sip::headers::charging::ChargingVector::parse(v).icid);
+        let call_id = message.headers.call_id();
         let from_tag = message
             .headers
             .from()
@@ -393,18 +395,12 @@ impl PyRequest {
             .and_then(|v| NameAddr::parse(v).ok())
             .and_then(|na| na.tag);
 
-        let mut keys = Vec::with_capacity(2);
-        if let Some(tag) = from_tag.as_deref() {
-            keys.push(format!("{}\0{}", call_id, tag));
-        }
-        if let Some(tag) = to_tag.as_deref() {
-            // Skip the duplicate when From-tag == To-tag (rare but
-            // possible on early-dialog edge cases).
-            if from_tag.as_deref() != Some(tag) {
-                keys.push(format!("{}\0{}", call_id, tag));
-            }
-        }
-        keys
+        crate::diameter::rf_service::rf_lookup_candidates(
+            icid.as_deref(),
+            call_id.map(|s| s.as_str()),
+            from_tag.as_deref(),
+            to_tag.as_deref(),
+        )
     }
 
     // --- LI helper accessors (Rust-side, no PyResult) ---
