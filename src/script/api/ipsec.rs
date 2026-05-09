@@ -545,24 +545,86 @@ impl PyPendingSA {
     /// REGISTER (the SAs are already installed in the kernel — this is a
     /// metadata-only transition).  Idempotent on repeated calls; raises
     /// :class:`ValueError` if the PendingSA was already cleaned up.
-    fn activate(&self) -> PyResult<()> {
-        let mut guard = self.inner.lock().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "PendingSA lock poisoned: {error}"
-            ))
-        })?;
-        if guard.state == PendingState::Cleaned {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "PendingSA already cleaned up",
-            ));
+    ///
+    /// ``hard_lifetime_secs`` (optional) — when set, also re-pins the
+    /// kernel hard-lifetime on all four SAs of the pair via
+    /// ``XFRM_MSG_UPDSA``, without rekeying or disturbing selectors / SPIs.
+    /// Use this on the path that processes the 200 OK to the auth
+    /// REGISTER to tighten the SA expiry from the placeholder value
+    /// installed at allocation time (typically the UE's `Expires:` ask,
+    /// commonly 600000 s for VoLTE handsets) down to the actual grant
+    /// from the registrar of record (3GPP TS 33.203 §7.4 — IPsec SA
+    /// lifetime tracks SIP registration lifetime).  ``None`` (the
+    /// default) preserves the existing behaviour: state transition only,
+    /// no kernel touch.
+    ///
+    /// The kernel preserves ``xfrm_state.curlft.add_time`` across
+    /// ``UPDSA``, so the resulting deadline is
+    /// ``add_time + hard_lifetime_secs`` — i.e. the SAs expire
+    /// ``hard_lifetime_secs`` after their **original** install, not from
+    /// "now".  For a normal REGISTER → 401 → REGISTER → 200 OK round-trip
+    /// the install / repin gap is sub-second, so this is
+    /// indistinguishable from "expires after the granted Expires".
+    ///
+    /// The kernel re-pin is dispatched as a fire-and-forget tokio task,
+    /// matching the broader IPsec API shape (`ipsec.stash` auto-cleanup,
+    /// `PyPendingSA.cleanup` on stash TTL).  Failures are logged but
+    /// don't fail ``activate`` — the metadata transition has already
+    /// committed, and a missed repin only widens (never tightens) the
+    /// expiry window relative to the spec.
+    #[pyo3(signature = (*, hard_lifetime_secs=None))]
+    fn activate(&self, hard_lifetime_secs: Option<u64>) -> PyResult<()> {
+        let (manager, ue_addr, ue_port_c) = {
+            let mut guard = self.inner.lock().map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "PendingSA lock poisoned: {error}"
+                ))
+            })?;
+            if guard.state == PendingState::Cleaned {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "PendingSA already cleaned up",
+                ));
+            }
+            guard.state = PendingState::Active;
+            // Mirror into the cached SA so subsequent inspection sees the
+            // tightened limit even before the netlink call lands.
+            if hard_lifetime_secs.is_some() {
+                guard.sa.hard_lifetime_secs = hard_lifetime_secs;
+            }
+            info!(
+                spi_pc = guard.sa.spi_pc,
+                spi_ps = guard.sa.spi_ps,
+                ue = %guard.sa.ue_addr,
+                hard_lifetime_secs = ?hard_lifetime_secs,
+                "ipsec.PendingSA: activated"
+            );
+            (
+                Arc::clone(&guard.manager),
+                guard.sa.ue_addr,
+                guard.sa.ue_port_c,
+            )
+        };
+
+        if let Some(secs) = hard_lifetime_secs {
+            // Fire-and-forget the four UPDSA messages.  See doc-comment
+            // for why this is sound — a missed repin can only widen the
+            // expiry window, never tighten it past the registrar's grant.
+            tokio::spawn(async move {
+                if let Err(error) = manager
+                    .update_sa_pair_lifetime(&ue_addr, ue_port_c, Some(secs))
+                    .await
+                {
+                    warn!(
+                        %error,
+                        ue = %ue_addr,
+                        ue_port_c,
+                        hard_lifetime_secs = secs,
+                        "ipsec.PendingSA.activate: kernel hard-lifetime repin failed"
+                    );
+                }
+            });
         }
-        guard.state = PendingState::Active;
-        info!(
-            spi_pc = guard.sa.spi_pc,
-            spi_ps = guard.sa.spi_ps,
-            ue = %guard.sa.ue_addr,
-            "ipsec.PendingSA: activated"
-        );
+
         Ok(())
     }
 
@@ -1323,6 +1385,146 @@ mod tests {
         assert_eq!(params.protocol, "tcp");
         let rendered = params.__repr__();
         assert!(rendered.contains("protocol=\"tcp\""));
+    }
+
+    /// `activate(hard_lifetime_secs=…)` flips the metadata to Active and
+    /// writes the new lifetime into the cached SA in-line, before
+    /// dispatching the kernel UPDSA work.  Subsequent inspection sees
+    /// the tightened limit even if the netlink call hasn't landed yet.
+    #[tokio::test]
+    async fn activate_with_hard_lifetime_secs_updates_cached_sa() {
+        let manager = Arc::new(IpsecManager::new());
+        let sa = SecurityAssociationPair {
+            ue_addr: "10.0.0.1".parse().unwrap(),
+            pcscf_addr: "10.0.0.10".parse().unwrap(),
+            ue_port_c: 50000,
+            ue_port_s: 50001,
+            pcscf_port_c: 5064,
+            pcscf_port_s: 5066,
+            spi_uc: 1000,
+            spi_us: 1001,
+            spi_pc: 10000,
+            spi_ps: 10001,
+            ealg: EncryptionAlgorithm::Null,
+            aalg: IntegrityAlgorithm::HmacSha1,
+            encryption_key: String::new(),
+            integrity_key: "deadbeefdeadbeefdeadbeefdeadbeef".into(),
+            hard_lifetime_secs: Some(600_000),
+            protocol: SaProtocol::Udp,
+        };
+        let params = PySecurityServerParams {
+            mechanism: "ipsec-3gpp".into(),
+            alg: "hmac-sha-1-96".into(),
+            ealg: "null".into(),
+            spi_c: 10000,
+            spi_s: 10001,
+            port_c: 5064,
+            port_s: 5066,
+            protocol: "udp".into(),
+        };
+        let pending = PyPendingSA::new(manager, sa, params);
+
+        // No SA installed in the kernel — the spawned UPDSA work
+        // resolves to a no-op via `update_sa_pair_lifetime`'s unknown-UE
+        // branch, so the test is hermetic.
+        pending
+            .activate(Some(3632))
+            .expect("activate must accept hard_lifetime_secs kwarg");
+
+        let guard = pending.inner.lock().unwrap();
+        assert_eq!(guard.state, PendingState::Active);
+        assert_eq!(
+            guard.sa.hard_lifetime_secs,
+            Some(3632),
+            "cached SA should reflect the tightened hard-lifetime in-line"
+        );
+    }
+
+    /// `activate()` (no kwarg) keeps the original behaviour: pure
+    /// metadata transition, no kernel work, cached lifetime preserved.
+    #[tokio::test]
+    async fn activate_without_kwarg_preserves_cached_lifetime() {
+        let manager = Arc::new(IpsecManager::new());
+        let sa = SecurityAssociationPair {
+            ue_addr: "10.0.0.2".parse().unwrap(),
+            pcscf_addr: "10.0.0.10".parse().unwrap(),
+            ue_port_c: 50002,
+            ue_port_s: 50003,
+            pcscf_port_c: 5064,
+            pcscf_port_s: 5066,
+            spi_uc: 2000,
+            spi_us: 2001,
+            spi_pc: 20000,
+            spi_ps: 20001,
+            ealg: EncryptionAlgorithm::Null,
+            aalg: IntegrityAlgorithm::HmacSha1,
+            encryption_key: String::new(),
+            integrity_key: "cafebabecafebabecafebabecafebabe".into(),
+            hard_lifetime_secs: Some(600_000),
+            protocol: SaProtocol::Udp,
+        };
+        let params = PySecurityServerParams {
+            mechanism: "ipsec-3gpp".into(),
+            alg: "hmac-sha-1-96".into(),
+            ealg: "null".into(),
+            spi_c: 20000,
+            spi_s: 20001,
+            port_c: 5064,
+            port_s: 5066,
+            protocol: "udp".into(),
+        };
+        let pending = PyPendingSA::new(manager, sa, params);
+
+        pending.activate(None).unwrap();
+
+        let guard = pending.inner.lock().unwrap();
+        assert_eq!(guard.state, PendingState::Active);
+        assert_eq!(
+            guard.sa.hard_lifetime_secs,
+            Some(600_000),
+            "cached SA lifetime must be untouched when kwarg omitted"
+        );
+    }
+
+    /// `activate(hard_lifetime_secs=…)` on an already-cleaned PendingSA
+    /// raises before scheduling kernel work — the spec contract
+    /// (idempotence on cleanup) is preserved across the kwarg path.
+    #[tokio::test]
+    async fn activate_after_cleanup_rejects_lifetime_kwarg() {
+        let manager = Arc::new(IpsecManager::new());
+        let sa = SecurityAssociationPair {
+            ue_addr: "10.0.0.3".parse().unwrap(),
+            pcscf_addr: "10.0.0.10".parse().unwrap(),
+            ue_port_c: 50004,
+            ue_port_s: 50005,
+            pcscf_port_c: 5064,
+            pcscf_port_s: 5066,
+            spi_uc: 3000,
+            spi_us: 3001,
+            spi_pc: 30000,
+            spi_ps: 30001,
+            ealg: EncryptionAlgorithm::Null,
+            aalg: IntegrityAlgorithm::HmacSha1,
+            encryption_key: String::new(),
+            integrity_key: "11111111111111111111111111111111".into(),
+            hard_lifetime_secs: None,
+            protocol: SaProtocol::Udp,
+        };
+        let params = PySecurityServerParams {
+            mechanism: "ipsec-3gpp".into(),
+            alg: "hmac-sha-1-96".into(),
+            ealg: "null".into(),
+            spi_c: 30000,
+            spi_s: 30001,
+            port_c: 5064,
+            port_s: 5066,
+            protocol: "udp".into(),
+        };
+        let pending = PyPendingSA::new(manager, sa, params);
+        // Mark cleaned without going through the async cleanup path.
+        pending.inner.lock().unwrap().state = PendingState::Cleaned;
+
+        assert!(pending.activate(Some(3632)).is_err());
     }
 
     #[test]

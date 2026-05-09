@@ -42,6 +42,11 @@ const XFRM_MSG_NEWSA: u16 = 0x10;
 const XFRM_MSG_DELSA: u16 = 0x11;
 const XFRM_MSG_NEWPOLICY: u16 = 0x13;
 const XFRM_MSG_DELPOLICY: u16 = 0x14;
+/// Update an existing SA's mutable fields (notably `lft` lifetime config).
+/// Kernel maps to `xfrm_state_update()`, which preserves `add_time` so a
+/// tightened `hard_add_expires_seconds` produces deadline = original
+/// install time + new value (not "now + new value").
+const XFRM_MSG_UPDSA: u16 = 0x1a;
 
 const XFRMA_ALG_AUTH: u16 = 1;
 const XFRMA_ALG_CRYPT: u16 = 2;
@@ -461,6 +466,65 @@ pub async fn add_sa(
     }
 
     send_and_ack(XFRM_MSG_NEWSA, NLM_F_CREATE | NLM_F_EXCL, &payload).await
+}
+
+/// Update an existing IPsec SA via XFRM netlink (`XFRM_MSG_UPDSA`).
+///
+/// Re-installs the SA's mutable fields (lifetime, replay window) without
+/// disturbing keys, SPIs, selectors, or `add_time` — the kernel keys the
+/// existing state by `(daddr, spi, proto)` and merges the new
+/// `xfrm_lifetime_cfg` in.  Used by [`super::IpsecManager::update_sa_pair_lifetime`]
+/// to repin a previously-installed SA's hard expiry once the registrar
+/// of record has granted a real `Expires` value (3GPP TS 33.203 §7.4 —
+/// IPsec SA lifetime tracks SIP registration lifetime).
+///
+/// All payload-shape arguments mirror [`add_sa`] so the kernel sees the
+/// same selector/keys/SPIs and only updates the lifetime fields.  The
+/// caller is responsible for passing identical key material; if the
+/// `integrity_key` / `encryption_key` change between install and update,
+/// the kernel rekeys the SA mid-flight (correct behaviour, but rarely
+/// what scripts intend).
+#[allow(clippy::too_many_arguments)]
+pub async fn update_sa(
+    source: &IpAddr,
+    source_port: u16,
+    destination: &IpAddr,
+    destination_port: u16,
+    spi: u32,
+    ealg: EncryptionAlgorithm,
+    aalg: IntegrityAlgorithm,
+    encryption_key: &[u8],
+    integrity_key: &[u8],
+    selector_proto: u8,
+    hard_lifetime_secs: Option<u64>,
+) -> Result<(), IpsecError> {
+    let mut payload = Vec::with_capacity(256);
+    encode_xfrm_usersa_info(
+        source,
+        source_port,
+        destination,
+        destination_port,
+        spi,
+        selector_proto,
+        hard_lifetime_secs,
+        &mut payload,
+    );
+
+    let (auth_name, trunc_bits) = xfrm_auth_name_and_trunc(aalg);
+    let auth_attr = encode_xfrm_algo_auth_trunc(auth_name, integrity_key, trunc_bits);
+    push_nla(&mut payload, XFRMA_ALG_AUTH_TRUNC, &auth_attr);
+
+    if ealg != EncryptionAlgorithm::Null {
+        let enc_attr = encode_xfrm_algo(xfrm_enc_name(ealg), encryption_key);
+        push_nla(&mut payload, XFRMA_ALG_CRYPT, &enc_attr);
+    } else {
+        let enc_attr = encode_xfrm_algo(xfrm_enc_name(EncryptionAlgorithm::Null), &[]);
+        push_nla(&mut payload, XFRMA_ALG_CRYPT, &enc_attr);
+    }
+
+    // No NLM_F_CREATE / NLM_F_EXCL — UPDSA targets an existing SA;
+    // requesting create-exclusive against a known SPI yields EEXIST.
+    send_and_ack(XFRM_MSG_UPDSA, 0, &payload).await
 }
 
 /// Delete an IPsec SA via XFRM netlink.
@@ -967,6 +1031,18 @@ mod tests {
         assert_eq!(std::mem::size_of::<XfrmStats>(), 12);
         assert_eq!(std::mem::size_of::<XfrmUsersaInfo>(), 224);
         assert_eq!(std::mem::size_of::<XfrmUserpolicyInfo>(), 168);
+    }
+
+    /// XFRM_MSG_UPDSA is the kernel netlink type used by
+    /// `update_sa` — value taken verbatim from `linux/xfrm.h`
+    /// (`XFRM_MSG_BASE + 10`).  Wrong value here would silently
+    /// reroute the netlink message to a different kernel handler
+    /// (probably XFRM_MSG_GETPOLICY at 0x15), producing baffling EINVAL
+    /// failures at runtime — pin it down with a unit test.
+    #[test]
+    fn xfrm_msg_updsa_constant_matches_kernel_uapi() {
+        assert_eq!(XFRM_MSG_UPDSA, 0x1a);
+        assert_eq!(XFRM_MSG_UPDSA, XFRM_MSG_NEWSA + 10);
     }
 
     #[test]

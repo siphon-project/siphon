@@ -672,6 +672,90 @@ impl IpsecManager {
         Ok(())
     }
 
+    /// Re-pin the kernel hard-lifetime on all four SAs of an existing
+    /// pair, without rekeying or disturbing selectors / SPIs.
+    ///
+    /// Used by ``ipsec.PendingSA.activate(hard_lifetime_secs=…)`` to
+    /// tighten the SA expiry from whatever was installed at allocation
+    /// time (usually the UE's `Expires:` ask, commonly 600000 s for
+    /// VoLTE handsets) to the value the registrar of record actually
+    /// granted (3GPP TS 33.203 §7.4 ties IPsec SA lifetime to SIP
+    /// registration lifetime).
+    ///
+    /// The kernel keys `XFRM_MSG_UPDSA` by `(daddr, spi, proto=ESP)` and
+    /// preserves `xfrm_state.curlft.add_time`, so the resulting deadline
+    /// is `add_time + hard_lifetime_secs` — i.e. the SA expires
+    /// `hard_lifetime_secs` after its **original** install, not from
+    /// "now".  For a typical IMS REGISTER → 401 → REGISTER → 200 OK
+    /// round-trip the install / repin gap is sub-second, so this is
+    /// indistinguishable from "expires after the granted Expires".
+    ///
+    /// Returns `Ok(())` even when the UE has no active SA pair (no-op).
+    /// Errors from any of the four UPDSA messages are surfaced verbatim.
+    pub async fn update_sa_pair_lifetime(
+        &self,
+        ue_addr: &IpAddr,
+        ue_port_c: u16,
+        hard_lifetime_secs: Option<u64>,
+    ) -> Result<(), IpsecError> {
+        let key = Self::contact_key(ue_addr, ue_port_c);
+        let mut sa = match self.associations.get(&key) {
+            Some(entry) => entry.value().clone(),
+            None => {
+                debug!(ue = %ue_addr, ue_port_c, "IPsec: update_sa_pair_lifetime — no active SA, ignoring");
+                return Ok(());
+            }
+        };
+        let proto = sa.protocol;
+
+        // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps
+        self.update_sa_only(
+            &sa.ue_addr, sa.ue_port_c,
+            &sa.pcscf_addr, sa.pcscf_port_s,
+            sa.spi_ps,
+            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
+            proto, hard_lifetime_secs,
+        ).await?;
+        // SA2: PCSCF:port_ps → UE:port_uc, SPI=spi_uc
+        self.update_sa_only(
+            &sa.pcscf_addr, sa.pcscf_port_s,
+            &sa.ue_addr, sa.ue_port_c,
+            sa.spi_uc,
+            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
+            proto, hard_lifetime_secs,
+        ).await?;
+        // SA3: PCSCF:port_pc → UE:port_us, SPI=spi_us
+        self.update_sa_only(
+            &sa.pcscf_addr, sa.pcscf_port_c,
+            &sa.ue_addr, sa.ue_port_s,
+            sa.spi_us,
+            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
+            proto, hard_lifetime_secs,
+        ).await?;
+        // SA4: UE:port_us → PCSCF:port_pc, SPI=spi_pc
+        self.update_sa_only(
+            &sa.ue_addr, sa.ue_port_s,
+            &sa.pcscf_addr, sa.pcscf_port_c,
+            sa.spi_pc,
+            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
+            proto, hard_lifetime_secs,
+        ).await?;
+
+        info!(
+            ue = %sa.ue_addr,
+            ue_port_c = sa.ue_port_c,
+            hard_lifetime_secs = ?hard_lifetime_secs,
+            "IPsec: SA pair hard-lifetime re-pinned"
+        );
+
+        // Mirror the new value into the cached SecurityAssociationPair so
+        // any subsequent inspection (or downstream re-pin) sees the
+        // tightened limit.  Re-insert under the same key.
+        sa.hard_lifetime_secs = hard_lifetime_secs;
+        self.associations.insert(key, sa);
+        Ok(())
+    }
+
     /// Number of active SA pairs.
     pub fn active_count(&self) -> usize {
         self.associations.len()
@@ -763,6 +847,73 @@ impl IpsecManager {
             )),
             XfrmBackend::IpCommand => {
                 Self::xfrm_sa_add(
+                    source,
+                    source_port,
+                    destination,
+                    destination_port,
+                    spi,
+                    ealg,
+                    aalg,
+                    encryption_key,
+                    integrity_key,
+                    protocol,
+                    hard_lifetime_secs,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Update an existing SA's mutable fields (lifetime today; replay
+    /// window in the future).  Backend-routed sibling of [`add_sa`].
+    /// IPCommand backend reuses the `xfrm_sa_add` path with `update`
+    /// instead of `add` — iproute2 maps both to the same payload, only
+    /// the netlink message type differs.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_sa_only(
+        &self,
+        source: &IpAddr,
+        source_port: u16,
+        destination: &IpAddr,
+        destination_port: u16,
+        spi: u32,
+        ealg: &EncryptionAlgorithm,
+        aalg: &IntegrityAlgorithm,
+        encryption_key: &str,
+        integrity_key: &str,
+        protocol: SaProtocol,
+        hard_lifetime_secs: Option<u64>,
+    ) -> Result<(), IpsecError> {
+        match self.backend {
+            #[cfg(target_os = "linux")]
+            XfrmBackend::Netlink => {
+                let auth_key_bytes = decode_hex(integrity_key)?;
+                let enc_key_bytes = if *ealg == EncryptionAlgorithm::Null {
+                    Vec::new()
+                } else {
+                    decode_hex(encryption_key)?
+                };
+                netlink::update_sa(
+                    source,
+                    source_port,
+                    destination,
+                    destination_port,
+                    spi,
+                    *ealg,
+                    *aalg,
+                    &enc_key_bytes,
+                    &auth_key_bytes,
+                    protocol.as_u8(),
+                    hard_lifetime_secs,
+                )
+                .await
+            }
+            #[cfg(not(target_os = "linux"))]
+            XfrmBackend::Netlink => Err(IpsecError::Command(
+                "XFRM netlink backend is Linux-only".to_string(),
+            )),
+            XfrmBackend::IpCommand => {
+                Self::xfrm_sa_update(
                     source,
                     source_port,
                     destination,
@@ -964,6 +1115,74 @@ impl IpsecManager {
 
         // Optional hard lifetime — `limit time-hard <secs>` instructs the
         // kernel to expire the SA after this many wall-clock seconds.
+        if let Some(secs) = hard_lifetime_secs {
+            lifetime_secs_str = secs.to_string();
+            args.push("limit");
+            args.push("time-hard");
+            args.push(&lifetime_secs_str);
+        }
+
+        Self::run_ip_command(&args).await
+    }
+
+    /// `ip xfrm state update` — same payload shape as `add`, different
+    /// kernel verb.  iproute2 sends `XFRM_MSG_UPDSA` instead of NEWSA;
+    /// the kernel preserves `add_time`, so a tightened
+    /// `limit time-hard` produces deadline = original install + new
+    /// value, not now + new value.
+    #[allow(clippy::too_many_arguments)]
+    async fn xfrm_sa_update(
+        source: &IpAddr,
+        source_port: u16,
+        destination: &IpAddr,
+        destination_port: u16,
+        spi: u32,
+        ealg: &EncryptionAlgorithm,
+        aalg: &IntegrityAlgorithm,
+        encryption_key: &str,
+        integrity_key: &str,
+        protocol: SaProtocol,
+        hard_lifetime_secs: Option<u64>,
+    ) -> Result<(), IpsecError> {
+        let source_str = source.to_string();
+        let destination_str = destination.to_string();
+        let spi_str = format!("0x{:x}", spi);
+        let sel_src = format!("{}/{}", source, host_prefix(source));
+        let sel_dst = format!("{}/{}", destination, host_prefix(destination));
+        let sel_sport = source_port.to_string();
+        let sel_dport = destination_port.to_string();
+        let proto_str = protocol.as_str();
+        let lifetime_secs_str;
+
+        let mut args = vec![
+            "xfrm", "state", "update",
+            "src", &source_str,
+            "dst", &destination_str,
+            "proto", "esp",
+            "spi", &spi_str,
+            "mode", "transport",
+            "sel",
+            "src", &sel_src,
+            "dst", &sel_dst,
+            "proto", proto_str,
+            "sport", &sel_sport,
+            "dport", &sel_dport,
+        ];
+
+        let enc_key_hex = format!("0x{}", encryption_key);
+        let int_key_hex = format_integrity_key(aalg, integrity_key);
+
+        args.push("enc");
+        args.push(ealg.xfrm_name());
+        if *ealg != EncryptionAlgorithm::Null {
+            args.push(&enc_key_hex);
+        } else {
+            args.push("");
+        }
+        args.push("auth");
+        args.push(aalg.xfrm_name());
+        args.push(&int_key_hex);
+
         if let Some(secs) = hard_lifetime_secs {
             lifetime_secs_str = secs.to_string();
             args.push("limit");
@@ -1338,6 +1557,22 @@ mod tests {
         assert_eq!(SaProtocol::Udp.as_str(), "udp");
         assert_eq!(SaProtocol::Tcp.as_str(), "tcp");
         assert_eq!(format!("{}", SaProtocol::Tcp), "tcp");
+    }
+
+    /// `update_sa_pair_lifetime` is a no-op (returns Ok) when the UE
+    /// has no active SA pair — the script may activate after the SA was
+    /// already auto-cleaned (de-REGISTER race, stash TTL fire), and that
+    /// must not surface as an error.
+    #[tokio::test]
+    async fn update_sa_pair_lifetime_no_op_for_unknown_ue() {
+        let manager = IpsecManager::new();
+        let unknown_ue: IpAddr = "10.99.99.99".parse().unwrap();
+        // No SA installed → must not touch the kernel and must succeed.
+        manager
+            .update_sa_pair_lifetime(&unknown_ue, 50000, Some(3632))
+            .await
+            .expect("update_sa_pair_lifetime should be Ok for unknown UE");
+        assert_eq!(manager.active_count(), 0);
     }
 
     #[test]
