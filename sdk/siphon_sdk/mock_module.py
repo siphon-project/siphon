@@ -818,7 +818,13 @@ class MockRegistrar:
         return True
 
     def lookup(self, uri: Union[str, SipUri]) -> list[Contact]:
-        """Look up contacts for an address-of-record.
+        """Look up routable contacts for an address-of-record.
+
+        Returns only UE-side bindings (``kind == "ue"``).  AS-side
+        capability records — captured via :meth:`save_as_contact` —
+        are excluded so a misrouted MT INVITE never goes to an AS
+        (TS 24.229 §5.4.2.1.2).  See :func:`registrar.reginfo_xml` for
+        the merged view that surfaces AS feature tags.
 
         If the URI is an alias of an IMS implicit registration set,
         resolves to the primary's contacts (matching production
@@ -828,12 +834,131 @@ class MockRegistrar:
             uri: AoR as string or :class:`SipUri`.
 
         Returns:
-            List of :class:`Contact` objects sorted by q-value (descending).
-            Empty list if no contacts registered.
+            List of UE-side :class:`Contact` objects sorted by q-value
+            (descending).  Empty list if no UE contacts registered.
         """
         key = self._resolve_alias(self._normalize_aor(str(uri)))
-        contacts = self._store.get(key, [])
+        contacts = [
+            c for c in self._store.get(key, [])
+            if getattr(c, "kind", "ue") == "ue"
+        ]
         return sorted(contacts, key=lambda c: c.q, reverse=True)
+
+    def save_as_contact(
+        self,
+        aor: Union[str, SipUri],
+        reply: Any,
+        expires_secs: Optional[int] = None,
+    ) -> bool:
+        """Save AS-side capability contacts from a 3PR 200 OK
+        (3GPP TS 24.229 §5.4.2.1.2).
+
+        The S-CSCF runs iFC, fires a third-party REGISTER at each
+        matched AS, and receives a 200 OK whose ``Contact:`` header
+        carries the AS's URI plus RFC 3840 feature tags
+        (``+g.3gpp.smsip``, ``+g.3gpp.icsi-ref``, …).  Calling this from
+        ``@proxy.on_reply`` (or after a
+        ``proxy.send_request(..., wait_for_response=True)``) caches
+        every such Contact alongside the UE's own bindings so the next
+        reg-event NOTIFY surfaces them to watchers.
+
+        AS contacts are stored with ``kind="as"`` and **excluded** from
+        :meth:`lookup` — they only exist to be advertised in reg-event
+        NOTIFY bodies (no MT INVITE ever routes to them).
+
+        Args:
+            aor: IMPU the AS responded for.
+            reply: 200 OK from the AS.  Its ``Contact:`` headers are
+                walked; ``+sip.instance`` / ``reg-id`` are NOT broken
+                out (no GRUU semantic on the AS side).
+            expires_secs: lifetime for the cached AS contact.  When
+                ``None``, falls back to the reply's ``Expires`` header
+                (raises ``ValueError`` if absent).
+
+        Returns:
+            ``True`` if at least one Contact was stored; ``False`` if
+            the reply had no Contact headers, or the AoR has no UE-side
+            binding (the registrar refuses to store an AS capability
+            record against an unregistered user).
+
+        Example::
+
+            @proxy.on_reply
+            def on_reply(request, reply):
+                if request.method == "REGISTER" and reply.status_code == 200:
+                    registrar.save_as_contact(str(request.to_uri), reply)
+                reply.relay()
+        """
+        # Lifetime: explicit arg wins, else fall back to the reply's
+        # Expires header.
+        if expires_secs is None:
+            if hasattr(reply, "get_header"):
+                raw = reply.get_header("Expires")
+            else:
+                raw = None
+            if raw is None:
+                raise ValueError(
+                    "save_as_contact: pass expires_secs= explicitly or "
+                    "include an Expires header on the AS's 200 OK"
+                )
+            expires_secs = int(raw)
+
+        key = self._resolve_alias(self._normalize_aor(str(aor)))
+        contacts = self._store.get(key, [])
+        has_ue = any(
+            getattr(c, "kind", "ue") == "ue" for c in contacts
+        )
+        if not has_ue:
+            return False
+
+        # Walk every Contact header on the reply.  The mock keeps a
+        # very simple structure — single Contact value, no NameAddr
+        # parsing — so script tests should pass the AS URI directly via
+        # a Contact header on the synthesized reply.
+        if not hasattr(reply, "get_header"):
+            return False
+        contact_raw = reply.get_header("Contact")
+        if contact_raw is None:
+            return False
+
+        # Minimal Contact parser sufficient for the mock: strip angle
+        # brackets, split on ';' to collect params.
+        raw = contact_raw.strip()
+        if "<" in raw and ">" in raw:
+            uri_part = raw.split("<", 1)[1].split(">", 1)[0]
+            after = raw.split(">", 1)[1]
+        else:
+            head = raw.split(";", 1)
+            uri_part = head[0].strip()
+            after = ";" + head[1] if len(head) > 1 else ""
+        params: list = []
+        for chunk in after.split(";"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "=" in chunk:
+                name, value = chunk.split("=", 1)
+                name = name.strip().lower()
+                if name in ("tag", "q", "expires"):
+                    continue
+                params.append((name, value.strip()))
+            else:
+                name = chunk.lower()
+                if name in ("tag", "q", "expires"):
+                    continue
+                params.append((name, None))
+
+        # Replace any AS contact with the same URI; never collide with
+        # a UE contact even if URIs happen to match.
+        retained = [
+            c for c in contacts
+            if not (getattr(c, "kind", "ue") == "as" and c.uri == uri_part)
+        ]
+        retained.append(Contact(uri=uri_part, expires=int(expires_secs)))
+        retained[-1].kind = "as"
+        retained[-1].params = params
+        self._store[key] = retained
+        return True
 
     def lookup_by_token(self, token: str) -> Optional[Contact]:
         """Resolve an opaque flow-token previously attached via
@@ -867,7 +992,10 @@ class MockRegistrar:
         return None
 
     def is_registered(self, uri: Union[str, SipUri]) -> bool:
-        """Check if a URI has any registered contacts.
+        """Check if a URI has any registered UE-side contacts.
+
+        Mirrors the Rust-side semantic — AS capability records don't
+        register a user.
 
         Args:
             uri: AoR as string or :class:`SipUri`.
@@ -1046,8 +1174,14 @@ class MockRegistrar:
                     version: int = 0) -> str:
         """Generate RFC 3680 reginfo XML for an AoR.
 
-        Returns the XML document as a string. Used to build NOTIFY bodies
-        for reg event subscriptions.
+        Returns the XML document as a string.  Includes both UE-side
+        bindings and AS-side capability records (TS 24.229 §5.4.2.1.2)
+        — the latter surface their RFC 3840 feature tags as
+        ``<unknown-param>`` children (RFC 3680 §5.3.2).
+
+        Registration state is ``"active"`` when at least one UE-side
+        contact exists, otherwise ``"terminated"`` (AS-only AoRs don't
+        register a user).
 
         Args:
             aor: Address of Record (e.g. ``"sip:alice@example.com"``).
@@ -1058,14 +1192,41 @@ class MockRegistrar:
             XML string conforming to RFC 3680.
         """
         contacts = self._store.get(aor, [])
-        reg_state = "active" if contacts else "terminated"
+        has_ue = any(getattr(c, "kind", "ue") == "ue" for c in contacts)
+        reg_state = "active" if has_ue else "terminated"
+
+        def _xml_escape(value: str) -> str:
+            return (
+                value.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
+                .replace("'", "&apos;")
+            )
 
         contacts_xml = ""
-        for contact in contacts:
+        # UE-first then AS, each sorted by q descending.
+        ue = [c for c in contacts if getattr(c, "kind", "ue") == "ue"]
+        as_ = [c for c in contacts if getattr(c, "kind", "ue") == "as"]
+        ue.sort(key=lambda c: c.q, reverse=True)
+        as_.sort(key=lambda c: c.q, reverse=True)
+        for contact in (*ue, *as_):
+            params_xml = ""
+            for name, value in getattr(contact, "params", []) or []:
+                if value is None:
+                    params_xml += (
+                        f'        <unknown-param name="{_xml_escape(name)}"/>\n'
+                    )
+                else:
+                    params_xml += (
+                        f'        <unknown-param name="{_xml_escape(name)}">'
+                        f'{_xml_escape(value)}</unknown-param>\n'
+                    )
             contacts_xml += (
                 f'      <contact id="c-{hash(contact.uri) & 0xFFFF:04x}" '
                 f'state="active" event="registered">\n'
-                f'        <uri>{contact.uri}</uri>\n'
+                f'        <uri>{_xml_escape(contact.uri)}</uri>\n'
+                f'{params_xml}'
                 f'      </contact>\n'
             )
 

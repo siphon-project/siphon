@@ -163,6 +163,26 @@ class Contact:
     on save, or a stream-transport binding whose connection_id isn't
     available)."""
 
+    params: list = field(default_factory=list)
+    """Contact-header parameters preserved from the originating REGISTER
+    (or 3PR 200 OK), excluding ``tag``, ``q``, ``expires``,
+    ``+sip.instance``, and ``reg-id`` which are broken out into other
+    fields.  Each entry is a ``(name, value)`` tuple — ``value`` is
+    ``None`` for flag parameters (e.g. ``+g.3gpp.smsip``) and a string
+    for valued parameters (e.g. ``+g.3gpp.icsi-ref="urn:..."``).
+
+    Surfaced verbatim by :func:`registrar.reginfo_xml` as
+    ``<unknown-param>`` children per RFC 3680 §5.3.2 so watchers see the
+    same capability advertisement the registrar received."""
+
+    kind: str = "ue"
+    """``"ue"`` (UE-side binding from a REGISTER — the default and the
+    only contacts returned by :func:`registrar.lookup`) or ``"as"``
+    (application-server capability record captured from a 3PR 200 OK
+    via :func:`registrar.save_as_contact`).  AS contacts surface in
+    reg-event NOTIFY bodies (TS 24.229 §5.4.2.1.2) but are excluded
+    from routing lookups."""
+
 
 @dataclass
 class Action:

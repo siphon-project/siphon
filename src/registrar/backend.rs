@@ -67,6 +67,24 @@ pub struct StoredContact {
     /// `(local, remote)` hash that survives restart.
     #[serde(default)]
     pub inbound_connection_id: Option<u64>,
+    /// Additional Contact-header parameters carried through from the
+    /// originating REGISTER.  Holds RFC 3840 feature tags
+    /// (`+g.3gpp.smsip`, `+g.3gpp.icsi-ref`, …) and any other params
+    /// not broken out into typed fields.  `Vec::new()` for legacy
+    /// entries written before this field existed.
+    #[serde(default)]
+    pub params: Vec<(String, Option<String>)>,
+    /// `"ue"` (UE-side, default) or `"as"` (application-server contact
+    /// captured from a 3PR 200 OK).  AS contacts are excluded from
+    /// routing lookups but surface in reg-event NOTIFY bodies
+    /// (TS 24.229 §5.4.2.1.2).  Defaults to `"ue"` for legacy entries
+    /// written before this field existed.
+    #[serde(default = "default_contact_kind")]
+    pub kind: String,
+}
+
+fn default_contact_kind() -> String {
+    "ue".to_string()
 }
 
 impl StoredContact {
@@ -95,6 +113,8 @@ impl StoredContact {
             flow_token: contact.flow_token.clone(),
             inbound_local_addr: contact.inbound_local_addr.map(|a| a.to_string()),
             inbound_connection_id: contact.inbound_connection_id,
+            params: contact.params.clone(),
+            kind: contact.kind.as_str().to_string(),
         }
     }
 
@@ -157,6 +177,11 @@ impl StoredContact {
             flow_token: self.flow_token.clone(),
             inbound_local_addr,
             inbound_connection_id: self.inbound_connection_id,
+            params: self.params.clone(),
+            kind: match self.kind.as_str() {
+                "as" => super::ContactKind::As,
+                _ => super::ContactKind::Ue,
+            },
         })
     }
 }
@@ -1410,6 +1435,8 @@ mod tests {
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
+            params: vec![],
+            kind: "ue".to_string(),
         }
     }
 
@@ -1436,6 +1463,57 @@ mod tests {
         let contact = stored.to_contact().unwrap();
         assert_eq!(contact.sip_instance.as_deref(), Some("<urn:uuid:abc>"));
         assert_eq!(contact.reg_id, Some(1));
+    }
+
+    #[test]
+    fn stored_contact_roundtrips_params() {
+        // RFC 3840 feature tags carried on the originating REGISTER's
+        // Contact must survive serialization to a backend (Redis/Postgres)
+        // and reload after a registrar restart.  Otherwise the next
+        // reg-event NOTIFY emitted after restart would drop them and the
+        // watcher (UE / AS) would lose visibility of the capability set.
+        let mut stored = sample_stored_contact();
+        stored.params = vec![
+            ("+g.3gpp.smsip".to_string(), None),
+            (
+                "+g.3gpp.icsi-ref".to_string(),
+                Some("\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"".to_string()),
+            ),
+        ];
+        let json = serde_json::to_string(&stored).unwrap();
+        let reloaded: StoredContact = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded.params, stored.params);
+
+        // And the in-memory Contact reconstituted from the deserialized
+        // record must carry the same params.
+        let contact = reloaded.to_contact().expect("non-expired");
+        assert_eq!(contact.params, stored.params);
+    }
+
+    #[test]
+    fn stored_contact_params_default_empty_for_legacy_json() {
+        // A blob persisted before the params field was added must still
+        // deserialize cleanly with `params == []`.
+        let json = r#"{
+            "uri":"sip:alice@10.0.0.1","q":1.0,"expires_secs":3600,
+            "call_id":"c1","cseq":1,"source_addr":null,
+            "sip_instance":null,"reg_id":null
+        }"#;
+        let contact: StoredContact = serde_json::from_str(json).unwrap();
+        assert!(contact.params.is_empty());
+    }
+
+    #[test]
+    fn from_contact_carries_params_into_stored() {
+        // Mirror of stored_contact_roundtrips_params for the
+        // Contact → StoredContact direction: write-through to the
+        // backend must include params, not silently drop them.
+        let mut contact = sample_stored_contact().to_contact().expect("non-expired");
+        contact.params = vec![
+            ("+g.3gpp.iari-ref".to_string(), Some("\"x\"".to_string())),
+        ];
+        let stored = StoredContact::from_contact(&contact);
+        assert_eq!(stored.params, contact.params);
     }
 
     #[test]
@@ -1517,6 +1595,8 @@ mod tests {
             flow_token: Some("restored-token".into()),
             inbound_local_addr: Some("127.0.0.1:5066".into()),
             inbound_connection_id: Some(7777),
+            params: vec![],
+            kind: "ue".to_string(),
         };
         backend
             .save("sip:alice@example.com", &[stored])
@@ -1713,6 +1793,8 @@ mod tests {
                 flow_token: None,
                 inbound_local_addr: None,
                 inbound_connection_id: None,
+                params: vec![],
+                kind: "ue".to_string(),
             }])
             .await
             .unwrap();
@@ -1735,6 +1817,8 @@ mod tests {
                     flow_token: None,
                     inbound_local_addr: None,
                     inbound_connection_id: None,
+                    params: vec![],
+                    kind: "ue".to_string(),
                 },
                 StoredContact {
                     uri: "sip:bob@10.0.0.3".to_string(),
@@ -1753,6 +1837,8 @@ mod tests {
                     flow_token: None,
                     inbound_local_addr: None,
                     inbound_connection_id: None,
+                    params: vec![],
+                    kind: "ue".to_string(),
                 },
             ])
             .await
@@ -1791,6 +1877,8 @@ mod tests {
                 flow_token: None,
                 inbound_local_addr: None,
                 inbound_connection_id: None,
+                params: vec![],
+                kind: "ue".to_string(),
             }])
             .await
             .unwrap();
@@ -1830,6 +1918,8 @@ mod tests {
                 flow_token: None,
                 inbound_local_addr: None,
                 inbound_connection_id: None,
+                params: vec![],
+                kind: "ue".to_string(),
             }])
             .await
             .unwrap();

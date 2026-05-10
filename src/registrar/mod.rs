@@ -64,6 +64,38 @@ pub fn normalize_aor(uri: &str) -> Aor {
     }
 }
 
+/// What kind of registration the contact represents.
+///
+/// `Ue` is the default — a UE-side binding that came in on a REGISTER and
+/// participates in routing (`lookup()` returns these).
+///
+/// `As` is an application-server-side contact that the S-CSCF learned from
+/// a 3PR 200 OK to an iFC-matched AS (TS 24.229 §5.4.2.1.2). AS contacts
+/// carry the AS's `Contact:` URI and its RFC 3840 feature tags
+/// (`+g.3gpp.smsip`, `+g.3gpp.icsi-ref`, …) so they can be advertised back
+/// to watchers of the reg event package (RFC 3680).  They are **not**
+/// routing targets: `lookup()` filters them out, so a downstream INVITE
+/// for the AoR will never be sent to `sip:mmtel.…:8060` by mistake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContactKind {
+    /// UE-side binding from a REGISTER (default).
+    #[default]
+    Ue,
+    /// AS-side contact captured from a 3PR 200 OK; carries the AS's
+    /// capability advertisement but is not a routing target.
+    As,
+}
+
+impl ContactKind {
+    /// Stable string form for persistence (Redis / Postgres).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContactKind::Ue => "ue",
+            ContactKind::As => "as",
+        }
+    }
+}
+
 /// A single contact binding.
 #[derive(Debug, Clone)]
 pub struct Contact {
@@ -120,6 +152,24 @@ pub struct Contact {
     /// on demand for UDP since UDP `ConnectionId`s are deterministic
     /// hashes of `(local_addr, remote_addr)`.
     pub inbound_connection_id: Option<u64>,
+    /// Additional Contact-header parameters carried through from the
+    /// originating REGISTER (or 3PR 200 OK), excluding the ones we
+    /// already break out into typed fields (`tag`, `q`, `expires`,
+    /// `+sip.instance`, `reg-id`).  Holds RFC 3840 feature tags
+    /// (`+g.3gpp.smsip`, `+g.3gpp.icsi-ref`, `+g.3gpp.iari-ref`, …)
+    /// and any other vendor / future params, both flag form
+    /// (`Some(name), None`) and valued form (`Some(name), Some(value)`).
+    /// Surfaced verbatim in RFC 3680 reg-event NOTIFY bodies so
+    /// watchers (UE / AS) see the same capability advertisement that
+    /// the registrar received.
+    pub params: Vec<(String, Option<String>)>,
+    /// What kind of binding this is.  `Ue` (the default) participates
+    /// in routing via `lookup()`.  `As` is captured from a 3PR 200 OK
+    /// and exists only to surface the AS's capability advertisement in
+    /// reg-event NOTIFY bodies — it is **excluded** from routing
+    /// lookups so an MT INVITE never gets sent to the AS by mistake
+    /// (TS 24.229 §5.4.2.1.2).
+    pub kind: ContactKind,
 }
 
 impl Contact {
@@ -443,7 +493,7 @@ impl Registrar {
         source_addr: Option<SocketAddr>,
         source_transport: Option<String>,
     ) -> Result<(), RegistrarError> {
-        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, source_transport, None, None, vec![], FlowCapture::default())
+        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, source_transport, None, None, vec![], FlowCapture::default(), Vec::new())
     }
 
     /// Core save with all fields including +sip.instance and reg-id.
@@ -468,11 +518,12 @@ impl Registrar {
         reg_id: Option<u32>,
         path: Vec<String>,
         flow: FlowCapture,
+        params: Vec<(String, Option<String>)>,
     ) -> Result<(), RegistrarError> {
         let capped = std::cmp::min(expires_secs, self.config.max_expires);
         self.save_full_uncapped(
             aor, uri, capped, q, call_id, cseq, source_addr, source_transport,
-            sip_instance, reg_id, path, flow,
+            sip_instance, reg_id, path, flow, params,
         )
     }
 
@@ -501,6 +552,7 @@ impl Registrar {
         reg_id: Option<u32>,
         path: Vec<String>,
         flow: FlowCapture,
+        params: Vec<(String, Option<String>)>,
     ) -> Result<(), RegistrarError> {
         // Resolve alias → primary so a REGISTER arriving with a non-primary
         // IMPU still attaches contacts to the implicit set's primary AoR.
@@ -537,6 +589,8 @@ impl Registrar {
             flow_token: flow_token.clone(),
             inbound_local_addr,
             inbound_connection_id,
+            params,
+            kind: ContactKind::Ue,
         };
 
         let uri_string = uri.to_string();
@@ -563,9 +617,13 @@ impl Registrar {
         });
 
         if expires_secs == 0 {
-            // Expires=0 means deregister this specific contact.
+            // Expires=0 means deregister this specific UE contact.  Only
+            // touches UE-kind entries — an AS-side capability record
+            // happens to share the same URI string only by coincidence
+            // and survives until the cascade-clear below decides
+            // otherwise.
             contacts.retain(|c| {
-                if c.uri.to_string() == uri_string {
+                if c.kind == ContactKind::Ue && c.uri.to_string() == uri_string {
                     if let Some(token) = &c.flow_token {
                         tokens_to_remove.push(token.clone());
                     }
@@ -574,6 +632,17 @@ impl Registrar {
                     true
                 }
             });
+            // Cascade-clear: AS contacts only make sense while the user
+            // is registered (TS 24.229 §5.4.2.1.2).  If the dereg
+            // emptied the last UE binding, drop any remaining AS
+            // capability records so the next reg-event NOTIFY emits a
+            // clean terminated registration with no stale contacts.
+            let any_ue_left = contacts
+                .iter()
+                .any(|c| c.kind == ContactKind::Ue && !c.is_expired());
+            if !any_ue_left {
+                contacts.clear();
+            }
             let remaining: Vec<_> = contacts
                 .iter()
                 .map(backend::StoredContact::from_contact)
@@ -786,14 +855,39 @@ impl Registrar {
         evicted
     }
 
-    /// Look up contacts for an AoR. Returns non-expired contacts sorted by q descending.
+    /// Look up routable contacts for an AoR. Returns non-expired UE-side
+    /// contacts sorted by q descending.
     ///
     /// If `aor` is an alias of an IMS implicit registration set's primary,
     /// returns the primary's contacts (so terminating routing on a non-primary
     /// IMPU like `tel:+15551234` resolves transparently).
+    ///
+    /// AS-side contacts (captured from 3PR 200 OKs — TS 24.229 §5.4.2.1.2)
+    /// are **excluded** from this list.  They are capability advertisements,
+    /// not routing targets — see [`lookup_all`](Self::lookup_all) for the
+    /// merged view that reg-event NOTIFY emission uses.
     pub fn lookup(&self, aor: &str) -> Vec<Contact> {
         let primary = self.resolve_alias(aor);
         match self.bindings.get(primary.as_str()) {
+            Some(entry) => entry
+                .value()
+                .iter()
+                .filter(|c| !c.is_expired() && c.kind == ContactKind::Ue)
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Look up every non-expired contact for an AoR, including AS-side
+    /// capability records.  Sorted UE-first, then AS, each by q descending.
+    ///
+    /// Used by reg-event NOTIFY emission (RFC 3680 + TS 24.229 §5.4.2.1.2)
+    /// so a watcher (UE or AS) sees both the UE's routable bindings and
+    /// the iFC-matched AS's `+g.3gpp.*` feature tags.
+    pub fn lookup_all(&self, aor: &str) -> Vec<Contact> {
+        let primary = self.resolve_alias(aor);
+        let mut out: Vec<Contact> = match self.bindings.get(primary.as_str()) {
             Some(entry) => entry
                 .value()
                 .iter()
@@ -801,24 +895,52 @@ impl Registrar {
                 .cloned()
                 .collect(),
             None => Vec::new(),
-        }
+        };
+        out.sort_by(|a, b| {
+            // UE-first then AS, then q desc within each kind.
+            match (a.kind, b.kind) {
+                (ContactKind::Ue, ContactKind::As) => std::cmp::Ordering::Less,
+                (ContactKind::As, ContactKind::Ue) => std::cmp::Ordering::Greater,
+                _ => b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal),
+            }
+        });
+        out
     }
 
-    /// Check if an AoR has any non-expired contacts.
+    /// Check if an AoR has any non-expired UE-side contacts.
+    ///
+    /// AS-side contacts (which exist only as capability advertisements) do
+    /// not register a user — an AoR with only AS contacts is treated as
+    /// unregistered, matching the IMS lifecycle (no UE binding → AS
+    /// contacts should never have been written, or should be cleaned up).
     pub fn is_registered(&self, aor: &str) -> bool {
         let primary = self.resolve_alias(aor);
         match self.bindings.get(primary.as_str()) {
-            Some(entry) => entry.value().iter().any(|c| !c.is_expired()),
+            Some(entry) => entry
+                .value()
+                .iter()
+                .any(|c| !c.is_expired() && c.kind == ContactKind::Ue),
             None => false,
         }
     }
 
-    /// Number of registered AoRs (with at least one non-expired contact)
-    /// known to *this* instance's in-memory map.
+    /// Number of registered AoRs (with at least one non-expired UE-side
+    /// contact) known to *this* instance's in-memory map.
+    ///
+    /// AS-side contacts don't count — they're capability records, not
+    /// registrations.  An AoR populated only with AS contacts (which
+    /// shouldn't happen with the cascade-clear semantic in `save_full`,
+    /// but defends against externally manipulated state) is treated as
+    /// unregistered.
     pub fn aor_count(&self) -> usize {
         self.bindings
             .iter()
-            .filter(|entry| entry.value().iter().any(|c| !c.is_expired()))
+            .filter(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .any(|c| !c.is_expired() && c.kind == ContactKind::Ue)
+            })
             .count()
     }
 
@@ -888,6 +1010,130 @@ impl Registrar {
         }
     }
 
+    /// Save an application-server-side contact captured from a 3PR 200 OK
+    /// (3GPP TS 24.229 §5.4.2.1.2).
+    ///
+    /// AS contacts carry the AS's `Contact:` URI plus its RFC 3840 feature
+    /// tags (`+g.3gpp.smsip`, `+g.3gpp.icsi-ref`, …) so reg-event NOTIFY
+    /// emission can surface them to watchers.  They are **not** routing
+    /// targets — `Registrar::lookup` filters them out so a downstream
+    /// MT INVITE never gets sent to `sip:mmtel.…:8060` by mistake.
+    ///
+    /// Semantics differ from `save_full`:
+    ///
+    /// - No `+sip.instance` / `reg-id` matching — replacement is by URI
+    ///   only, which is the natural identity for an AS-side contact.
+    /// - No flow capture, source address, transport, or path — none of
+    ///   those exist on a reply-side Contact.
+    /// - `min_expires` / `max_expires` are not enforced — the AS chose
+    ///   its own lifetime and the S-CSCF mirrors it.
+    /// - `Expires: 0` removes any prior AS contact with the same URI.
+    /// - An AoR with no UE-side contacts at all rejects new AS contacts
+    ///   with `ContactKind` does not change registration state — keep the
+    ///   capability record only while the user is registered.  Returns
+    ///   `Ok(false)` in that case so callers can ignore silently.
+    pub fn save_as_contact(
+        &self,
+        aor: &str,
+        uri: SipUri,
+        expires_secs: u32,
+        q: f32,
+        params: Vec<(String, Option<String>)>,
+    ) -> Result<bool, RegistrarError> {
+        let primary = self.resolve_alias(aor);
+        let aor = primary.as_str();
+        let uri_string = uri.to_string();
+
+        let mut entry = self.bindings.entry(aor.to_string()).or_default();
+        let contacts = entry.value_mut();
+
+        // Drop expired entries first so we don't race against a UE
+        // binding that is technically gone.
+        contacts.retain(|c| !c.is_expired());
+
+        if expires_secs == 0 {
+            // Targeted AS-contact removal — same URI, AS-kind only.
+            let before = contacts.len();
+            contacts.retain(|c| {
+                !(c.kind == ContactKind::As && c.uri.to_string() == uri_string)
+            });
+            if contacts.len() == before {
+                drop(entry);
+                return Ok(false);
+            }
+            let stored: Vec<_> = contacts
+                .iter()
+                .map(backend::StoredContact::from_contact)
+                .collect();
+            let aor_owned = aor.to_string();
+            let aor_empty = contacts.is_empty();
+            if aor_empty {
+                drop(entry);
+                self.bindings.remove(aor);
+            } else {
+                drop(entry);
+            }
+            self.persist_aor(&aor_owned, stored);
+            return Ok(true);
+        }
+
+        // Guard: never write an AS contact under an AoR that has no
+        // UE-side binding.  This keeps reginfo emission honest — a
+        // <contact> element only surfaces while the user is actually
+        // registered.  Caller can check the return value if needed.
+        let has_ue_binding = contacts
+            .iter()
+            .any(|c| c.kind == ContactKind::Ue && !c.is_expired());
+        if !has_ue_binding {
+            drop(entry);
+            return Ok(false);
+        }
+
+        let contact = Contact {
+            uri,
+            q,
+            registered_at: Instant::now(),
+            expires: Duration::from_secs(expires_secs as u64),
+            call_id: String::new(),
+            cseq: 0,
+            source_addr: None,
+            source_transport: None,
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
+            params,
+            kind: ContactKind::As,
+        };
+
+        // Replace existing AS contact with the same URI; never collide
+        // with a UE contact even if URIs happen to match.
+        let replace_idx = contacts.iter().position(|c| {
+            c.kind == ContactKind::As && c.uri.to_string() == uri_string
+        });
+        if let Some(idx) = replace_idx {
+            contacts[idx] = contact;
+        } else {
+            // No max_contacts cap for AS records — iFC chains can ramp
+            // up legitimate AS counts.  Operator can enforce upstream.
+            contacts.push(contact);
+        }
+
+        let stored: Vec<_> = contacts
+            .iter()
+            .map(backend::StoredContact::from_contact)
+            .collect();
+        let aor_owned = aor.to_string();
+        drop(entry);
+        self.persist_aor(&aor_owned, stored);
+        Ok(true)
+    }
+
     /// Save a contact binding with GRUU parameters (RFC 5627 + RFC 5626).
     #[allow(clippy::too_many_arguments)]
     pub fn save_with_gruu(
@@ -902,7 +1148,7 @@ impl Registrar {
         sip_instance: Option<String>,
         reg_id: Option<u32>,
     ) -> Result<(), RegistrarError> {
-        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, None, sip_instance, reg_id, vec![], FlowCapture::default())
+        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, None, sip_instance, reg_id, vec![], FlowCapture::default(), Vec::new())
     }
 
     /// Generate a public GRUU for a contact with a `+sip.instance`.
@@ -978,7 +1224,7 @@ impl Registrar {
         let aor = self.tokens.get(token).map(|entry| entry.value().clone())?;
         let entry = self.bindings.get(&aor)?;
         for contact in entry.value().iter() {
-            if contact.is_expired() {
+            if contact.is_expired() || contact.kind != ContactKind::Ue {
                 continue;
             }
             if contact.flow_token.as_deref() == Some(token) {
@@ -1025,6 +1271,7 @@ impl Registrar {
                 .iter()
                 .filter(|c| {
                     !c.is_expired()
+                        && c.kind == ContactKind::Ue
                         && c.sip_instance.as_deref().map(|s| {
                             let s = s.strip_prefix('"').unwrap_or(s);
                             let s = s.strip_suffix('"').unwrap_or(s);
@@ -1120,6 +1367,8 @@ impl Registrar {
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
+            params: Vec::new(),
+            kind: ContactKind::Ue,
         };
 
         let mut entry = self.bindings.entry(aor.to_string()).or_default();
@@ -1178,6 +1427,16 @@ impl Registrar {
                     true
                 }
             });
+            // Cascade-clear AS contacts whose UE has expired out from
+            // under them.  Keeps reginfo NOTIFY honest after the GC
+            // pass.
+            let any_ue_left = entry
+                .value()
+                .iter()
+                .any(|c| c.kind == ContactKind::Ue);
+            if !any_ue_left {
+                entry.value_mut().clear();
+            }
             if entry.value().is_empty() && before > 0 {
                 empty_aors.push(entry.key().clone());
             }
@@ -1452,6 +1711,8 @@ mod tests {
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
+            params: Vec::new(),
+            kind: ContactKind::Ue,
         };
         assert!(
             !registrar.is_local_contact(&foreign),
@@ -1496,6 +1757,8 @@ mod tests {
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
+            params: Vec::new(),
+            kind: ContactKind::Ue,
         };
         // Just registered — remaining should be very close to 3600
         assert!(contact.remaining_seconds() >= 3599);
@@ -1525,6 +1788,8 @@ mod tests {
                 flow_token: None,
                 inbound_local_addr: None,
                 inbound_connection_id: None,
+                params: Vec::new(),
+                kind: ContactKind::Ue,
             };
             registrar.bindings.entry("sip:alice@example.com".to_string()).or_default().push(contact);
         }
@@ -1551,6 +1816,7 @@ mod tests {
                 None, None, None, None,
                 path.clone(),
                 FlowCapture::default(),
+                Vec::new(),
             )
             .unwrap();
 
@@ -1571,6 +1837,7 @@ mod tests {
                 None, None, None, None,
                 vec!["<sip:old-pcscf.example.com;lr>".to_string()],
                 FlowCapture::default(),
+                Vec::new(),
             )
             .unwrap();
 
@@ -1583,6 +1850,7 @@ mod tests {
                 None, None, None, None,
                 vec!["<sip:new-pcscf.example.com;lr>".to_string()],
                 FlowCapture::default(),
+                Vec::new(),
             )
             .unwrap();
 
@@ -2153,6 +2421,7 @@ mod tests {
                 Some("10.0.0.1:5066".parse().unwrap()), Some("udp".into()),
                 None, None, vec![],
                 flow_capture("token-abc", 5066, 5066),
+                Vec::new(),
             )
             .unwrap();
 
@@ -2183,6 +2452,7 @@ mod tests {
                 None, Some("udp".into()),
                 Some(instance.clone()), None, vec![],
                 flow_capture("token-old", 5066, 5066),
+                Vec::new(),
             )
             .unwrap();
         registrar
@@ -2193,6 +2463,7 @@ mod tests {
                 None, Some("udp".into()),
                 Some(instance), None, vec![],
                 flow_capture("token-new", 5066, 5066),
+                Vec::new(),
             )
             .unwrap();
 
@@ -2223,6 +2494,7 @@ mod tests {
                     None, Some("udp".into()),
                     Some(instance.clone()), None, vec![],
                     flow_capture("token-stable", 5066, 5066),
+                    Vec::new(),
                 )
                 .unwrap();
             assert!(
@@ -2243,6 +2515,7 @@ mod tests {
                 None, Some("udp".into()),
                 None, None, vec![],
                 flow_capture("token-x", 5066, 5066),
+                Vec::new(),
             )
             .unwrap();
         assert!(registrar.lookup_by_token("token-x").is_some());
@@ -2255,6 +2528,7 @@ mod tests {
                 None, Some("udp".into()),
                 None, None, vec![],
                 FlowCapture::default(),                  // de-REGISTER carries no token
+                Vec::new(),
             )
             .unwrap();
         assert!(
@@ -2274,6 +2548,7 @@ mod tests {
                 None, Some("udp".into()),
                 None, None, vec![],
                 flow_capture("tok-1", 5066, 5066),
+                Vec::new(),
             )
             .unwrap();
         registrar.remove_all("sip:alice@ims.example.com");
@@ -2307,6 +2582,8 @@ mod tests {
             flow_token: Some("tok-gc".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(42),
+            params: vec![],
+            kind: ContactKind::Ue,
         };
         registrar.bindings.entry(aor.clone()).or_default().push(stale);
         registrar.tokens.insert("tok-gc".into(), aor);
@@ -2340,6 +2617,8 @@ mod tests {
             flow_token: Some("tok-restored".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(7),
+            params: vec![],
+            kind: ContactKind::Ue,
         };
         registrar.bindings.entry(aor.clone()).or_default().push(live);
 
@@ -2373,6 +2652,8 @@ mod tests {
             flow_token: Some("tok-expired".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(7),
+            params: vec![],
+            kind: ContactKind::Ue,
         };
         registrar.bindings.entry(aor).or_default().push(stale);
 
@@ -2393,6 +2674,7 @@ mod tests {
                 None, Some("udp".into()),
                 None, None, vec![],
                 flow_capture("tok-udp", 5066, 5066),
+                Vec::new(),
             )
             .unwrap();
         // Manually inject a TCP-tagged contact (transport=tcp on the URI)
@@ -2454,6 +2736,8 @@ mod tests {
             flow_token: Some("tok".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(1),
+            params: vec![],
+            kind: ContactKind::Ue,
         };
         registrar.bindings.entry(aor.clone()).or_default().push(stale);
         registrar.tokens.insert("tok".into(), aor);
@@ -2491,6 +2775,7 @@ mod tests {
                             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
                             inbound_connection_id: Some(thread_id * 1000 + i),
                         },
+                        Vec::new(),
                     ).unwrap();
                 }
             }));
@@ -2523,6 +2808,7 @@ mod tests {
                 3600, 1.0, "c1".into(), 1,
                 None, None, None, None, vec![],
                 FlowCapture::default(),
+                Vec::new(),
             )
             .unwrap();
         let contacts = registrar.lookup("sip:alice@example.com");
@@ -2531,5 +2817,382 @@ mod tests {
         assert!(contacts[0].inbound_local_addr.is_none());
         assert!(contacts[0].inbound_connection_id.is_none());
         assert!(registrar.tokens.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC 3840 Contact-header parameters (feature tags etc.)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_full_preserves_contact_params_through_lookup() {
+        // Feature tags carried on the originating REGISTER's Contact must
+        // round-trip into the stored binding so reg-event NOTIFY bodies
+        // can surface them to watchers (RFC 3680 §5.3 + RFC 3840 §9).
+        let registrar = Registrar::default();
+        let params = vec![
+            ("+g.3gpp.smsip".to_string(), None),
+            (
+                "+g.3gpp.icsi-ref".to_string(),
+                Some("\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"".to_string()),
+            ),
+            ("+sip.rcs".to_string(), Some("\"true\"".to_string())),
+        ];
+        registrar
+            .save_full(
+                "sip:alice@ims.example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                None, None, None, None, vec![],
+                FlowCapture::default(),
+                params.clone(),
+            )
+            .unwrap();
+
+        let contacts = registrar.lookup("sip:alice@ims.example.com");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].params, params);
+    }
+
+    #[test]
+    fn save_full_with_empty_params_yields_empty_vec() {
+        // Pre-feature semantics: callers that don't care about params
+        // pass `Vec::new()` and the stored Contact's `params` is empty
+        // (not `None`, not a unit type — just an empty Vec).
+        let registrar = Registrar::default();
+        registrar
+            .save_full(
+                "sip:bob@ims.example.com",
+                contact_uri("bob", "10.0.0.2"),
+                3600, 1.0, "c1".into(), 1,
+                None, None, None, None, vec![],
+                FlowCapture::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        let contacts = registrar.lookup("sip:bob@ims.example.com");
+        assert_eq!(contacts.len(), 1);
+        assert!(contacts[0].params.is_empty());
+    }
+
+    #[test]
+    fn save_full_refresh_replaces_params() {
+        // Re-REGISTER with a different params set must replace, not
+        // accumulate — an AS that drops a feature on refresh must not
+        // see the old tag stick around (RFC 3261 §10.3 step 7: refresh
+        // == replace).
+        let registrar = Registrar::default();
+        let instance =
+            "<urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6>".to_string();
+        registrar
+            .save_full(
+                "sip:carol@ims.example.com",
+                contact_uri("carol", "10.0.0.3"),
+                3600, 1.0, "c1".into(), 1,
+                None, None,
+                Some(instance.clone()), None, vec![],
+                FlowCapture::default(),
+                vec![("+g.3gpp.smsip".to_string(), None)],
+            )
+            .unwrap();
+        registrar
+            .save_full(
+                "sip:carol@ims.example.com",
+                contact_uri("carol", "10.0.0.3"),
+                3600, 1.0, "c2".into(), 2,
+                None, None,
+                Some(instance), None, vec![],
+                FlowCapture::default(),
+                vec![("+g.3gpp.iari-ref".to_string(), Some("\"x\"".to_string()))],
+            )
+            .unwrap();
+        let contacts = registrar.lookup("sip:carol@ims.example.com");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].params.len(), 1);
+        assert_eq!(contacts[0].params[0].0, "+g.3gpp.iari-ref");
+    }
+
+    // -----------------------------------------------------------------------
+    // AS-side contacts (TS 24.229 §5.4.2.1.2): capture, lookup filtering,
+    // reginfo merge, cascade-clear.
+    // -----------------------------------------------------------------------
+
+    fn save_ue(registrar: &Registrar, aor: &str, user: &str, host: &str) {
+        registrar
+            .save_full(
+                aor,
+                contact_uri(user, host),
+                3600, 1.0, format!("c-{user}"), 1,
+                None, None, None, None, vec![],
+                FlowCapture::default(),
+                Vec::new(),
+            )
+            .expect("UE save should succeed");
+    }
+
+    #[test]
+    fn save_as_contact_requires_ue_binding() {
+        // TS 24.229 §5.4.2.1.2 ties the AS capability record's lifetime
+        // to the registration.  Without a UE binding, refusing to write
+        // the AS contact keeps reginfo emission honest.
+        let registrar = Registrar::default();
+        let as_uri = SipUri::new("ims.example.com".to_string())
+            .with_user("mmtel".into());
+        let saved = registrar
+            .save_as_contact(
+                "sip:alice@ims.example.com",
+                as_uri,
+                3600,
+                1.0,
+                vec![("+g.3gpp.smsip".to_string(), None)],
+            )
+            .unwrap();
+        assert!(!saved, "save must refuse when no UE binding exists");
+        assert!(registrar.lookup_all("sip:alice@ims.example.com").is_empty());
+    }
+
+    #[test]
+    fn save_as_contact_stored_with_kind_as() {
+        let registrar = Registrar::default();
+        save_ue(&registrar, "sip:alice@ims.example.com", "alice", "10.0.0.1");
+
+        let as_uri = SipUri::new("ims.example.com".to_string())
+            .with_user("mmtel".into());
+        let saved = registrar
+            .save_as_contact(
+                "sip:alice@ims.example.com",
+                as_uri,
+                3600,
+                1.0,
+                vec![
+                    (
+                        "+g.3gpp.icsi-ref".to_string(),
+                        Some(
+                            "\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""
+                                .to_string(),
+                        ),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert!(saved);
+
+        let merged = registrar.lookup_all("sip:alice@ims.example.com");
+        assert_eq!(merged.len(), 2);
+        // UE-first ordering — routing-priority view stays consistent.
+        assert_eq!(merged[0].kind, ContactKind::Ue);
+        assert_eq!(merged[1].kind, ContactKind::As);
+        assert_eq!(merged[1].params.len(), 1);
+        assert_eq!(merged[1].params[0].0, "+g.3gpp.icsi-ref");
+    }
+
+    #[test]
+    fn lookup_excludes_as_contacts() {
+        // A misrouted MT INVITE must never go to an AS — `lookup()` is
+        // the routing path and must return UE-only.
+        let registrar = Registrar::default();
+        save_ue(&registrar, "sip:alice@ims.example.com", "alice", "10.0.0.1");
+        registrar
+            .save_as_contact(
+                "sip:alice@ims.example.com",
+                SipUri::new("ims.example.com".to_string()).with_user("mmtel".into()),
+                3600, 1.0,
+                vec![("+g.3gpp.smsip".to_string(), None)],
+            )
+            .unwrap();
+
+        let routes = registrar.lookup("sip:alice@ims.example.com");
+        assert_eq!(routes.len(), 1, "AS contact must be hidden from routing");
+        assert_eq!(routes[0].kind, ContactKind::Ue);
+    }
+
+    #[test]
+    fn save_as_contact_refresh_replaces_same_uri() {
+        let registrar = Registrar::default();
+        save_ue(&registrar, "sip:alice@ims.example.com", "alice", "10.0.0.1");
+
+        let as_uri = SipUri::new("ims.example.com".to_string())
+            .with_user("mmtel".into());
+
+        registrar
+            .save_as_contact(
+                "sip:alice@ims.example.com",
+                as_uri.clone(),
+                3600, 1.0,
+                vec![("+g.3gpp.smsip".to_string(), None)],
+            )
+            .unwrap();
+        // Refresh with a different param set — must replace, not stack.
+        registrar
+            .save_as_contact(
+                "sip:alice@ims.example.com",
+                as_uri,
+                3600, 1.0,
+                vec![("+g.3gpp.iari-ref".to_string(), Some("\"x\"".to_string()))],
+            )
+            .unwrap();
+
+        let merged = registrar.lookup_all("sip:alice@ims.example.com");
+        let as_contacts: Vec<_> = merged
+            .iter()
+            .filter(|c| c.kind == ContactKind::As)
+            .collect();
+        assert_eq!(as_contacts.len(), 1, "same-URI AS save must replace");
+        assert_eq!(as_contacts[0].params[0].0, "+g.3gpp.iari-ref");
+    }
+
+    #[test]
+    fn save_as_contact_expires_zero_removes_only_named_as() {
+        let registrar = Registrar::default();
+        save_ue(&registrar, "sip:alice@ims.example.com", "alice", "10.0.0.1");
+
+        let mmtel = SipUri::new("ims.example.com".to_string()).with_user("mmtel".into());
+        let ipsmgw = SipUri::new("ims.example.com".to_string()).with_user("ipsmgw".into());
+
+        registrar
+            .save_as_contact("sip:alice@ims.example.com", mmtel.clone(), 3600, 1.0,
+                vec![("+g.3gpp.smsip".to_string(), None)])
+            .unwrap();
+        registrar
+            .save_as_contact("sip:alice@ims.example.com", ipsmgw, 3600, 1.0,
+                vec![("+g.3gpp.smsip".to_string(), None)])
+            .unwrap();
+
+        // Targeted removal of just the mmtel AS contact.
+        registrar
+            .save_as_contact("sip:alice@ims.example.com", mmtel, 0, 1.0, vec![])
+            .unwrap();
+
+        let as_contacts: Vec<_> = registrar
+            .lookup_all("sip:alice@ims.example.com")
+            .into_iter()
+            .filter(|c| c.kind == ContactKind::As)
+            .collect();
+        assert_eq!(as_contacts.len(), 1);
+        assert!(as_contacts[0].uri.user.as_deref() == Some("ipsmgw"));
+    }
+
+    #[test]
+    fn cascade_clear_when_last_ue_contact_deregs() {
+        // Dereg path: when the only UE contact's Expires:0 lands, AS
+        // capability records must vanish too — keeps reg-event NOTIFY
+        // emitting a clean terminated registration.
+        let registrar = Registrar::default();
+        save_ue(&registrar, "sip:alice@ims.example.com", "alice", "10.0.0.1");
+        registrar
+            .save_as_contact(
+                "sip:alice@ims.example.com",
+                SipUri::new("ims.example.com".to_string()).with_user("mmtel".into()),
+                3600, 1.0,
+                vec![("+g.3gpp.smsip".to_string(), None)],
+            )
+            .unwrap();
+
+        // UE de-REGISTER
+        registrar
+            .save_full(
+                "sip:alice@ims.example.com",
+                contact_uri("alice", "10.0.0.1"),
+                0, 1.0, "c-dereg".into(), 2,
+                None, None, None, None, vec![],
+                FlowCapture::default(),
+                Vec::new(),
+            )
+            .unwrap();
+
+        assert!(registrar.lookup_all("sip:alice@ims.example.com").is_empty());
+        assert!(!registrar.is_registered("sip:alice@ims.example.com"));
+    }
+
+    #[test]
+    fn cascade_clear_when_ue_contact_expires_via_gc() {
+        // expire_stale path: AS records must also drop when the UE
+        // binding hits its TTL.
+        let registrar = Registrar::default();
+        let aor = "sip:alice@ims.example.com".to_string();
+
+        // Inject an already-expired UE contact + a live AS record so
+        // we can verify the cascade.
+        let stale_ue = Contact {
+            uri: contact_uri("alice", "10.0.0.1"),
+            q: 1.0,
+            registered_at: Instant::now() - Duration::from_secs(7200),
+            expires: Duration::from_secs(3600),
+            call_id: "c1".into(),
+            cseq: 1,
+            source_addr: None,
+            source_transport: None,
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
+            params: vec![],
+            kind: ContactKind::Ue,
+        };
+        let live_as = Contact {
+            uri: SipUri::new("ims.example.com".to_string()).with_user("mmtel".into()),
+            q: 1.0,
+            registered_at: Instant::now(),
+            expires: Duration::from_secs(3600),
+            call_id: String::new(),
+            cseq: 0,
+            source_addr: None,
+            source_transport: None,
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
+            params: vec![("+g.3gpp.smsip".to_string(), None)],
+            kind: ContactKind::As,
+        };
+        registrar
+            .bindings
+            .entry(aor.clone())
+            .or_default()
+            .extend([stale_ue, live_as]);
+
+        registrar.expire_stale();
+        assert!(registrar.lookup_all(&aor).is_empty());
+    }
+
+    #[test]
+    fn aor_count_ignores_as_only_aors() {
+        // An AoR populated only with AS records doesn't count as a
+        // registered user.  Defends against externally manipulated
+        // state too.
+        let registrar = Registrar::default();
+        let aor = "sip:alice@ims.example.com".to_string();
+        let as_only = Contact {
+            uri: SipUri::new("ims.example.com".to_string()).with_user("mmtel".into()),
+            q: 1.0,
+            registered_at: Instant::now(),
+            expires: Duration::from_secs(3600),
+            call_id: String::new(),
+            cseq: 0,
+            source_addr: None,
+            source_transport: None,
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
+            params: vec![],
+            kind: ContactKind::As,
+        };
+        registrar.bindings.entry(aor).or_default().push(as_only);
+        assert_eq!(registrar.aor_count(), 0);
     }
 }

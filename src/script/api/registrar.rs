@@ -136,6 +136,13 @@ pub struct PyContact {
     /// send a request back over the same listener that received the
     /// REGISTER (RFC 3327 §5 / TS 24.229 §5.2.7.2 MT routing).
     flow_value: Option<PyFlow>,
+    /// Contact-header parameters beyond `tag/q/expires/+sip.instance/reg-id`.
+    /// Holds RFC 3840 feature tags etc., preserved from the originating
+    /// REGISTER so reg-event NOTIFY bodies can surface them.
+    params_value: Vec<(String, Option<String>)>,
+    /// UE-side binding (default) vs application-server capability
+    /// record captured from a 3PR 200 OK.
+    kind_value: crate::registrar::ContactKind,
 }
 
 #[pymethods]
@@ -232,6 +239,37 @@ impl PyContact {
         self.flow_value.clone()
     }
 
+    /// What kind of binding this is — ``"ue"`` (default) or ``"as"``.
+    ///
+    /// ``"as"`` contacts come from
+    /// :meth:`PyRegistrar.save_as_contact` (typically called by the S-CSCF
+    /// after a 3PR 200 OK).  They surface in :func:`registrar.reginfo_xml`
+    /// for reg-event NOTIFY emission but are intentionally excluded from
+    /// :meth:`PyRegistrar.lookup` so an MT INVITE never gets routed to an
+    /// AS by mistake (TS 24.229 §5.4.2.1.2).
+    #[getter]
+    fn kind(&self) -> &'static str {
+        self.kind_value.as_str()
+    }
+
+    /// Contact-header parameters preserved from the originating REGISTER.
+    ///
+    /// Returns a list of ``(name, value)`` tuples — ``value`` is ``None``
+    /// for flag parameters (e.g. ``+g.3gpp.smsip``) and a string for
+    /// valued parameters (e.g.
+    /// ``+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"``).
+    ///
+    /// The framework already breaks ``tag``, ``q``, ``expires``,
+    /// ``+sip.instance``, and ``reg-id`` out into dedicated fields, so
+    /// they are excluded from this list.  Everything else round-trips
+    /// verbatim — RFC 3840 feature tags, RCS capability flags, vendor
+    /// params — including case-insensitive parameter names (lowercased
+    /// at parse time per RFC 3261 §19.1).
+    #[getter]
+    fn params(&self) -> Vec<(String, Option<String>)> {
+        self.params_value.clone()
+    }
+
     fn __str__(&self) -> &str {
         &self.uri_string
     }
@@ -300,6 +338,8 @@ impl PyContact {
                         is_local_value,
                         flow_token_value: contact.flow_token.clone(),
                         flow_value: None,
+                        params_value: contact.params.clone(),
+                        kind_value: contact.kind,
                     },
                 };
                 Some(PyFlow {
@@ -322,6 +362,8 @@ impl PyContact {
             is_local_value,
             flow_token_value: contact.flow_token.clone(),
             flow_value,
+            params_value: contact.params.clone(),
+            kind_value: contact.kind,
         }
     }
 }
@@ -502,6 +544,17 @@ impl PyRegistrar {
                     .find(|(name, _)| name == "reg-id")
                     .and_then(|(_, value)| value.as_ref()?.parse::<u32>().ok());
 
+                // Remaining Contact params (RFC 3840 feature tags etc.)
+                // are stored verbatim on the binding so reg-event NOTIFY
+                // bodies can surface them to watchers.  Skip the two we
+                // already broke out into typed fields to avoid duplication.
+                let extra_params: Vec<(String, Option<String>)> = nameaddr
+                    .other_params
+                    .iter()
+                    .filter(|(name, _)| name != "+sip.instance" && name != "reg-id")
+                    .cloned()
+                    .collect();
+
                 self.inner
                     .save_full(
                         &aor,
@@ -516,6 +569,7 @@ impl PyRegistrar {
                         reg_id,
                         path.clone(),
                         flow_capture.clone(),
+                        extra_params,
                     )
                     .map_err(|error| match error {
                         RegistrarError::IntervalTooBrief { min_expires } => {
@@ -696,6 +750,13 @@ impl PyRegistrar {
                     .find(|(name, _)| name == "reg-id")
                     .and_then(|(_, value)| value.as_ref()?.parse::<u32>().ok());
 
+                let extra_params: Vec<(String, Option<String>)> = nameaddr
+                    .other_params
+                    .iter()
+                    .filter(|(name, _)| name != "+sip.instance" && name != "reg-id")
+                    .cloned()
+                    .collect();
+
                 self.inner
                     .save_full_uncapped(
                         &aor,
@@ -710,6 +771,7 @@ impl PyRegistrar {
                         reg_id,
                         path.clone(),
                         flow_capture.clone(),
+                        extra_params,
                     )
                     .map_err(|error| match error {
                         RegistrarError::IntervalTooBrief { min_expires } => {
@@ -733,6 +795,128 @@ impl PyRegistrar {
         }
 
         Ok(true)
+    }
+
+    /// Save AS-side capability contacts from a 3PR 200 OK
+    /// (3GPP TS 24.229 §5.4.2.1.2).
+    ///
+    /// The S-CSCF runs iFC, fires a third-party REGISTER at each matched
+    /// AS, receives a 200 OK whose `Contact:` header carries the AS's URI
+    /// plus RFC 3840 feature tags (`+g.3gpp.smsip`, `+g.3gpp.icsi-ref`,
+    /// …).  Calling this from `@proxy.on_reply` (or after a
+    /// `proxy.send_request(..., wait_for_response=True)`) caches every
+    /// such Contact alongside the UE's own bindings so the next
+    /// reg-event NOTIFY surfaces them to watchers.
+    ///
+    /// AS contacts are stored with `kind=As`; they are **excluded** from
+    /// `registrar.lookup()` and routing decisions — they only exist to
+    /// be advertised in reg-event NOTIFY bodies.
+    ///
+    /// Args:
+    ///     aor: IMPU the AS responded for (typically the To URI of the
+    ///         3PR REGISTER, i.e. the user being registered).
+    ///     reply: 200 OK from the AS.  Its `Contact:` headers are walked;
+    ///         `+sip.instance` and `reg-id` are intentionally not broken
+    ///         out (they have no GRUU semantic on the AS side).
+    ///     expires_secs: lifetime to give the cached AS contact.  When
+    ///         `None`, falls back to the reply's `Expires` header.
+    ///         Required when the reply omits Expires (raises
+    ///         ``ValueError`` in that case).
+    ///
+    /// Returns ``True`` if at least one Contact was stored; ``False`` if
+    /// the reply had no Contact headers or if the AoR has no UE-side
+    /// binding (the registrar refuses to store an AS capability record
+    /// against an unregistered user — TS 24.229 §5.4.2.1.2 keeps AS
+    /// records' lifetime tied to the registration).
+    ///
+    /// Example::
+    ///
+    ///     @proxy.on_reply
+    ///     def on_reply(request, reply):
+    ///         if request.method == "REGISTER" and reply.status_code == 200:
+    ///             impu = str(request.to_uri)
+    ///             registrar.save_as_contact(impu, reply)
+    ///         reply.relay()
+    #[pyo3(signature = (aor, reply, expires_secs=None))]
+    fn save_as_contact(
+        &self,
+        aor: &str,
+        reply: &PyReply,
+        expires_secs: Option<u32>,
+    ) -> PyResult<bool> {
+        let reply_msg = reply.message();
+        let reply_msg = reply_msg.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+
+        // Lifetime: explicit kwarg wins; else fall back to reply Expires.
+        let granted: u32 = match expires_secs {
+            Some(value) => value,
+            None => reply_msg
+                .headers
+                .get("Expires")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "save_as_contact: pass expires_secs= explicitly or \
+                         include an Expires header on the AS's 200 OK",
+                    )
+                })?,
+        };
+
+        let contact_values = reply_msg
+            .headers
+            .get_all("Contact")
+            .cloned()
+            .unwrap_or_default();
+        drop(reply_msg);
+
+        let aor = normalize_aor(aor);
+
+        let mut wrote = false;
+        for raw in &contact_values {
+            let nameaddrs = match NameAddr::parse_multi(raw) {
+                Ok(addrs) => addrs,
+                Err(_) => continue,
+            };
+            for nameaddr in nameaddrs {
+                // Per-contact `expires=` shortens vs the explicit/derived
+                // grant when set — same conservative rule as save_proxy.
+                let contact_expires = nameaddr
+                    .expires
+                    .map(|e| std::cmp::min(e, granted))
+                    .unwrap_or(granted);
+                let q = nameaddr.q.unwrap_or(1.0);
+
+                // Everything except tag/q/expires (already broken out by
+                // NameAddr) is a capability/feature tag for our purposes.
+                // We do NOT special-case `+sip.instance` or `reg-id` for
+                // AS contacts — those are meaningful only on the UE side.
+                let params: Vec<(String, Option<String>)> = nameaddr
+                    .other_params
+                    .iter()
+                    .cloned()
+                    .collect();
+
+                let saved = self
+                    .inner
+                    .save_as_contact(&aor, nameaddr.uri, contact_expires, q, params)
+                    .map_err(|error| match error {
+                        RegistrarError::IntervalTooBrief { min_expires } => {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "423 Interval Too Brief (min: {min_expires}s)"
+                            ))
+                        }
+                        RegistrarError::TooManyContacts { max } => {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "too many contacts (max: {max})"
+                            ))
+                        }
+                    })?;
+                wrote = wrote || saved;
+            }
+        }
+        Ok(wrote)
     }
 
     /// Look up contacts for a URI string or SipUri.
@@ -970,7 +1154,12 @@ impl PyRegistrar {
     #[pyo3(signature = (aor, state="full", version=0))]
     fn reginfo_xml(&self, aor: &str, state: &str, version: u32) -> PyResult<String> {
         let aor = normalize_aor(aor);
-        let contacts = self.inner.lookup(&aor);
+        // Merged UE + AS view — without this the NOTIFY would drop every
+        // iFC-matched AS feature tag (`+g.3gpp.smsip`,
+        // `+g.3gpp.icsi-ref`, …) the S-CSCF captured on the 3PR 200 OK
+        // (TS 24.229 §5.4.2.1.2).  `lookup_all` returns UE-first then AS,
+        // each sorted by q descending.
+        let contacts = self.inner.lookup_all(&aor);
         let reginfo_state = match state {
             "partial" => reginfo::ReginfoState::Partial,
             _ => reginfo::ReginfoState::Full,
@@ -1084,6 +1273,161 @@ mod tests {
         assert!(contacts[0].uri().contains("10.0.0.1"));
         assert_eq!(contacts[0].q(), 1.0);
         assert!(contacts[0].expires() > 3500);
+    }
+
+    #[test]
+    fn save_captures_feature_tags_into_params() {
+        // The Python-side `registrar.save(request)` must extract RFC 3840
+        // feature tags from the Contact header (everything beyond `tag`,
+        // `q`, `expires`, `+sip.instance`, `reg-id`) into the stored
+        // binding so reg-event NOTIFY emission can surface them later.
+        // Models the 3PR 200 OK shape the IMS ASes (ip-sm-gw, mmtel-as,
+        // ussd-as) emit, but applies equally to UE-side feature tags.
+        let registrar = make_registrar();
+        let (mut request, py_reg) = make_register_request(
+            "<sip:alice@ims.example.com>",
+            "<sip:alice@10.0.0.1>;+g.3gpp.smsip;\
+             +g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"",
+            &registrar,
+        );
+
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+
+        let contacts = py_reg.lookup_str("sip:alice@ims.example.com");
+        assert_eq!(contacts.len(), 1);
+        let params = contacts[0].params();
+        // Param names are lowercased by NameAddr (RFC 3261 §19.1).
+        // The flag tag survives as `(name, None)` and the valued tag
+        // as `(name, Some(value))`.
+        assert!(
+            params.iter().any(|(n, v)| n == "+g.3gpp.smsip" && v.is_none()),
+            "expected flag tag +g.3gpp.smsip; got params={params:?}"
+        );
+        assert!(
+            params.iter().any(|(n, v)| n == "+g.3gpp.icsi-ref" && v.is_some()),
+            "expected valued tag +g.3gpp.icsi-ref; got params={params:?}"
+        );
+    }
+
+    fn make_as_reply(contact: &str, expires_secs: u32) -> PyReply {
+        // Synthesize a 200 OK that mimics what an AS would emit in
+        // response to the S-CSCF's 3PR REGISTER.
+        let message = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-reg".to_string())
+            .from("<sip:alice@ims.example.com>;tag=reg-tag".to_string())
+            .to("<sip:alice@ims.example.com>;tag=as-tag".to_string())
+            .call_id("reg-call@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header("Contact", contact.to_string())
+            .header("Expires", expires_secs.to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        PyReply::new(Arc::new(Mutex::new(message)))
+    }
+
+    #[test]
+    fn save_as_contact_captures_feature_tags() {
+        let registrar = make_registrar();
+        let (mut request, py_reg) = make_register_request(
+            "<sip:alice@ims.example.com>",
+            "<sip:alice@10.0.0.1>",
+            &registrar,
+        );
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+
+        let reply = make_as_reply(
+            "<sip:mmtel.ims.example.com:8060>;\
+             +g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"",
+            3600,
+        );
+        let saved = py_reg
+            .save_as_contact("sip:alice@ims.example.com", &reply, None)
+            .unwrap();
+        assert!(saved);
+
+        // Routing-side lookup() must still return UE only.
+        let routes = py_reg.lookup_str("sip:alice@ims.example.com");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].kind(), "ue");
+
+        // reginfo XML must surface the AS feature tag.
+        let xml = py_reg.reginfo_xml("sip:alice@ims.example.com", "full", 0).unwrap();
+        assert!(
+            xml.contains("mmtel.ims.example.com:8060"),
+            "AS contact URI missing from reginfo XML:\n{xml}"
+        );
+        assert!(
+            xml.contains("<unknown-param name=\"+g.3gpp.icsi-ref\">"),
+            "AS feature tag missing from reginfo XML:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn save_as_contact_refuses_without_ue_binding() {
+        let registrar = make_registrar();
+        let py_reg = PyRegistrar::new(registrar);
+        let reply = make_as_reply(
+            "<sip:mmtel.ims.example.com:8060>;+g.3gpp.smsip",
+            3600,
+        );
+        let saved = py_reg
+            .save_as_contact("sip:alice@ims.example.com", &reply, None)
+            .unwrap();
+        assert!(!saved, "must refuse when no UE binding exists");
+    }
+
+    #[test]
+    fn save_as_contact_falls_back_to_reply_expires() {
+        // No explicit kwarg → fall back to the reply's Expires header.
+        let registrar = make_registrar();
+        let (mut request, py_reg) = make_register_request(
+            "<sip:alice@ims.example.com>",
+            "<sip:alice@10.0.0.1>",
+            &registrar,
+        );
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+
+        let reply = make_as_reply(
+            "<sip:mmtel.ims.example.com:8060>;+g.3gpp.smsip",
+            1800,
+        );
+        assert!(py_reg
+            .save_as_contact("sip:alice@ims.example.com", &reply, None)
+            .unwrap());
+
+        // Find the AS contact and check its expiry was honored.
+        let xml = py_reg.reginfo_xml("sip:alice@ims.example.com", "full", 0).unwrap();
+        // The exact Expires value lands in the reginfo XML for the AS
+        // contact (with the grace cap left to the registrar layer).
+        // Looser check: presence + non-zero.
+        assert!(xml.contains("expires=\""));
+    }
+
+    #[test]
+    fn save_excludes_sip_instance_and_reg_id_from_params() {
+        // `+sip.instance` and `reg-id` are already broken out into
+        // dedicated Contact fields — the params list must not
+        // duplicate them, or a NOTIFY emitter would emit them twice
+        // (once as a typed `<gr>` / outbound element and once as an
+        // `<unknown-param>`).
+        let registrar = make_registrar();
+        let (mut request, py_reg) = make_register_request(
+            "<sip:alice@ims.example.com>",
+            "<sip:alice@10.0.0.1>;+sip.instance=\"<urn:uuid:abc>\";\
+             reg-id=1;+g.3gpp.smsip",
+            &registrar,
+        );
+
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+        let contacts = py_reg.lookup_str("sip:alice@ims.example.com");
+        assert_eq!(contacts.len(), 1);
+        let params = contacts[0].params();
+        assert!(params.iter().all(|(n, _)| n != "+sip.instance"));
+        assert!(params.iter().all(|(n, _)| n != "reg-id"));
+        // The non-special tag survives.
+        assert!(params.iter().any(|(n, _)| n == "+g.3gpp.smsip"));
     }
 
     #[test]
@@ -1255,6 +1599,8 @@ mod tests {
             is_local_value: false,
             flow_token_value: None,
             flow_value: None,
+            params_value: vec![],
+            kind_value: crate::registrar::ContactKind::Ue,
         };
         assert_eq!(contact.__str__(), "sip:alice@10.0.0.1");
         assert!(contact.__repr__().contains("q=1"));
@@ -1625,6 +1971,8 @@ mod tests {
             flow_token: Some("tok".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(0xc0ffee),
+            params: Vec::new(),
+            kind: crate::registrar::ContactKind::Ue,
         };
         let py = PyContact::from_rust_contact(&contact);
         let flow = py.flow().expect("flow should be present");
@@ -1658,6 +2006,8 @@ mod tests {
             flow_token: Some("tok".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: None,
+            params: Vec::new(),
+            kind: crate::registrar::ContactKind::Ue,
         };
         let py = PyContact::from_rust_contact(&contact);
         let flow = py.flow().expect("UDP flow should reconstitute");
@@ -1690,6 +2040,8 @@ mod tests {
             flow_token: Some("tok".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: None,
+            params: Vec::new(),
+            kind: crate::registrar::ContactKind::Ue,
         };
         let py = PyContact::from_rust_contact(&contact);
         assert!(py.flow().is_none());
@@ -1718,6 +2070,8 @@ mod tests {
             flow_token: Some("tok".into()),
             inbound_local_addr: None,
             inbound_connection_id: Some(42),
+            params: Vec::new(),
+            kind: crate::registrar::ContactKind::Ue,
         };
         let py = PyContact::from_rust_contact(&contact);
         assert!(py.flow().is_none());

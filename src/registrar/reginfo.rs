@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use super::Contact;
+use super::{Contact, ContactKind};
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -116,6 +116,12 @@ pub struct ReginfoContact {
     pub expires: Option<u64>,
     /// Quality value (0.0–1.0).
     pub q: Option<f32>,
+    /// Additional Contact-header parameters (RFC 3840 feature tags etc.)
+    /// preserved from the originating REGISTER or 3PR 200 OK.  Emitted as
+    /// `<unknown-param name="…">value</unknown-param>` children per
+    /// RFC 3680 §5.3.2 so watchers see the same capability advertisement
+    /// the registrar received.  Empty `Vec` when there is nothing to emit.
+    pub params: Vec<(String, Option<String>)>,
 }
 
 /// A single AoR registration entry.
@@ -183,6 +189,24 @@ impl ReginfoBody {
                     "      <uri>{}</uri>\n",
                     xml_escape(&contact.uri),
                 ));
+                // RFC 3680 §5.3.2 — surface RFC 3840 feature tags and
+                // other Contact-header parameters as <unknown-param>
+                // children.  Flag params (`+g.3gpp.smsip`) become
+                // self-closing; valued params (`+g.3gpp.icsi-ref="urn:…"`)
+                // carry the value as text content with XML-escaping.
+                for (name, value) in &contact.params {
+                    match value {
+                        Some(v) => output.push_str(&format!(
+                            "      <unknown-param name=\"{}\">{}</unknown-param>\n",
+                            xml_escape(name),
+                            xml_escape(v),
+                        )),
+                        None => output.push_str(&format!(
+                            "      <unknown-param name=\"{}\"/>\n",
+                            xml_escape(name),
+                        )),
+                    }
+                }
                 output.push_str("    </contact>\n");
             }
 
@@ -200,12 +224,22 @@ impl ReginfoBody {
 
 /// Build a full-state reginfo document from current registrar contacts.
 ///
-/// If `contacts` is empty, the registration is marked as terminated.
+/// `contacts` should be the merged view (UE + AS) from `Registrar::lookup_all`
+/// so watchers see iFC-matched AS feature tags (`+g.3gpp.smsip`,
+/// `+g.3gpp.icsi-ref`, …) alongside the UE's own bindings per
+/// TS 24.229 §5.4.2.1.2.
+///
+/// Registration state is `Active` when there is at least one non-expired
+/// UE-side contact, otherwise `Terminated` — an AoR populated only by AS
+/// capability records is treated as terminated (the user is not registered).
 pub fn build_full_reginfo(aor: &str, contacts: &[Contact], version: u32) -> ReginfoBody {
-    let registration_state = if contacts.is_empty() {
-        RegistrationState::Terminated
-    } else {
+    let has_ue = contacts
+        .iter()
+        .any(|c| !c.is_expired() && c.kind == ContactKind::Ue);
+    let registration_state = if has_ue {
         RegistrationState::Active
+    } else {
+        RegistrationState::Terminated
     };
 
     let reginfo_contacts: Vec<ReginfoContact> = contacts
@@ -217,6 +251,7 @@ pub fn build_full_reginfo(aor: &str, contacts: &[Contact], version: u32) -> Regi
             event: ContactEvent::Registered,
             expires: Some(contact.remaining_seconds()),
             q: Some(contact.q),
+            params: contact.params.clone(),
         })
         .collect();
 
@@ -285,6 +320,11 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
     // declared URI matches the inner text rather than the contact id.
     let mut in_uri_text: bool = false;
     let mut uri_text_buffer = String::new();
+    // <unknown-param> elements may be empty (flag form) or carry a value
+    // as text content (RFC 3680 §5.3.2).  Track the param name on Start
+    // and accumulate text until End.
+    let mut pending_unknown_param_name: Option<String> = None;
+    let mut unknown_param_text_buffer = String::new();
 
     let mut buf = Vec::new();
     loop {
@@ -407,6 +447,7 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                             event: parsed_event,
                             expires,
                             q,
+                            params: Vec::new(),
                         });
                         if is_empty {
                             if let Some(contact) = current_contact.take() {
@@ -420,6 +461,23 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                         in_uri_text = true;
                         uri_text_buffer.clear();
                     }
+                    b"unknown-param" => {
+                        // RFC 3680 §5.3.2.  Flag form is self-closing
+                        // (`<unknown-param name="…"/>`); valued form
+                        // carries its value as inner text.  We stash the
+                        // name and accumulate text until End — empty
+                        // accumulator on End ⇒ flag param.
+                        let name = attr_required_str(&element, "name")?;
+                        unknown_param_text_buffer.clear();
+                        if is_empty {
+                            if let Some(contact) = current_contact.as_mut() {
+                                contact.params.push((name, None));
+                            }
+                            pending_unknown_param_name = None;
+                        } else {
+                            pending_unknown_param_name = Some(name);
+                        }
+                    }
                     _ => {
                         // Unknown element — ignored for forward compat.
                     }
@@ -431,6 +489,11 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                         .unescape()
                         .map_err(|error| ReginfoParseError::Xml(error.to_string()))?;
                     uri_text_buffer.push_str(s.as_ref());
+                } else if pending_unknown_param_name.is_some() {
+                    let s = text
+                        .unescape()
+                        .map_err(|error| ReginfoParseError::Xml(error.to_string()))?;
+                    unknown_param_text_buffer.push_str(s.as_ref());
                 }
             }
             Event::End(element) => {
@@ -446,6 +509,20 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                         }
                         in_uri_text = false;
                         uri_text_buffer.clear();
+                    }
+                    b"unknown-param" => {
+                        if let Some(name) = pending_unknown_param_name.take() {
+                            let trimmed = unknown_param_text_buffer.trim();
+                            let value = if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed.to_string())
+                            };
+                            if let Some(contact) = current_contact.as_mut() {
+                                contact.params.push((name, value));
+                            }
+                        }
+                        unknown_param_text_buffer.clear();
                     }
                     b"contact" => {
                         if let Some(contact) = current_contact.take() {
@@ -588,6 +665,8 @@ mod tests {
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
+            params: Vec::new(),
+            kind: ContactKind::Ue,
         }
     }
 
@@ -682,6 +761,7 @@ mod tests {
             event: ContactEvent::Refreshed,
             expires: Some(1800),
             q: Some(0.5),
+            params: Vec::new(),
         };
         let body = ReginfoBody {
             version: 2,
@@ -832,5 +912,155 @@ mod tests {
 </reginfo>"#;
         let body = parse_reginfo(xml).unwrap();
         assert_eq!(body.registrations[0].contacts[0].event, ContactEvent::Registered);
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 3680 §5.3.2 — <unknown-param> emission + parser tolerance
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn to_xml_emits_unknown_param_for_flag_and_valued() {
+        let body = ReginfoBody {
+            version: 0,
+            state: ReginfoState::Full,
+            registrations: vec![Registration {
+                aor: "sip:alice@ims.example.com".to_string(),
+                id: "reg-1".to_string(),
+                state: RegistrationState::Active,
+                contacts: vec![ReginfoContact {
+                    uri: "sip:alice@10.0.0.1".to_string(),
+                    state: ContactState::Active,
+                    event: ContactEvent::Registered,
+                    expires: Some(3600),
+                    q: Some(1.0),
+                    params: vec![
+                        ("+g.3gpp.smsip".to_string(), None),
+                        (
+                            "+g.3gpp.icsi-ref".to_string(),
+                            Some(
+                                "\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""
+                                    .to_string(),
+                            ),
+                        ),
+                    ],
+                }],
+            }],
+        };
+        let xml = body.to_xml();
+        // Flag form (self-closing).
+        assert!(
+            xml.contains("<unknown-param name=\"+g.3gpp.smsip\"/>"),
+            "flag tag should be self-closing; got\n{xml}"
+        );
+        // Valued form with XML-escaped value.  Quotes round-trip
+        // unchanged in value content because RFC 3680 §5.3.2 places the
+        // value in element text, not an attribute — but our writer still
+        // escapes them defensively (`&quot;`).
+        assert!(
+            xml.contains("<unknown-param name=\"+g.3gpp.icsi-ref\">"),
+            "valued tag should open <unknown-param name=…>; got\n{xml}"
+        );
+        assert!(
+            xml.contains("urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"),
+            "valued tag should carry the percent-encoded URN; got\n{xml}"
+        );
+        assert!(
+            xml.contains("</unknown-param>"),
+            "valued tag should have an end tag; got\n{xml}"
+        );
+    }
+
+    #[test]
+    fn build_full_reginfo_terminated_when_only_as_contacts() {
+        // An AoR populated with AS-only records (cascade-clear race)
+        // must still emit a terminated registration — the user is not
+        // registered, only the iFC chain knows about them.
+        let as_only = Contact {
+            uri: crate::sip::uri::SipUri::new("ims.example.com".to_string())
+                .with_user("mmtel".into()),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires: Duration::from_secs(3600),
+            call_id: String::new(),
+            cseq: 0,
+            source_addr: None,
+            source_transport: None,
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
+            params: vec![("+g.3gpp.smsip".to_string(), None)],
+            kind: ContactKind::As,
+        };
+        let body = build_full_reginfo("sip:alice@ims.example.com", &[as_only], 0);
+        assert_eq!(body.registrations[0].state, RegistrationState::Terminated);
+    }
+
+    #[test]
+    fn parse_reginfo_accepts_unknown_param_children() {
+        // Watcher-side: an inbound NOTIFY from another registrar
+        // implementation (or a future siphon) must be parseable even
+        // when it carries <unknown-param>.
+        let xml = r#"<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="0" state="full">
+  <registration aor="sip:alice@ims.example.com" id="r-1" state="active">
+    <contact id="c-1" state="active" event="registered">
+      <uri>sip:alice@10.0.0.1</uri>
+      <unknown-param name="+g.3gpp.smsip"/>
+      <unknown-param name="+g.3gpp.icsi-ref">urn:urn-7:3gpp-service.ims.icsi.mmtel</unknown-param>
+    </contact>
+  </registration>
+</reginfo>"#;
+        let body = parse_reginfo(xml).unwrap();
+        let params = &body.registrations[0].contacts[0].params;
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], ("+g.3gpp.smsip".to_string(), None));
+        assert_eq!(
+            params[1],
+            (
+                "+g.3gpp.icsi-ref".to_string(),
+                Some("urn:urn-7:3gpp-service.ims.icsi.mmtel".to_string()),
+            ),
+        );
+    }
+
+    #[test]
+    fn build_to_xml_parse_roundtrip_preserves_params() {
+        // End-to-end: write a body with params, serialize, reparse, and
+        // verify every (name, value) pair survives.
+        let contact = ReginfoContact {
+            uri: "sip:alice@10.0.0.1".to_string(),
+            state: ContactState::Active,
+            event: ContactEvent::Registered,
+            expires: Some(3600),
+            q: Some(1.0),
+            params: vec![
+                ("+g.3gpp.smsip".to_string(), None),
+                (
+                    "+g.3gpp.icsi-ref".to_string(),
+                    Some(
+                        "urn:urn-7:3gpp-service.ims.icsi.mmtel".to_string(),
+                    ),
+                ),
+                ("vendor.x".to_string(), Some("y".to_string())),
+            ],
+        };
+        let body = ReginfoBody {
+            version: 1,
+            state: ReginfoState::Full,
+            registrations: vec![Registration {
+                aor: "sip:alice@ims.example.com".to_string(),
+                id: "reg-1".to_string(),
+                state: RegistrationState::Active,
+                contacts: vec![contact.clone()],
+            }],
+        };
+        let xml = body.to_xml();
+        let reparsed = parse_reginfo(&xml).unwrap();
+        assert_eq!(reparsed.registrations[0].contacts[0].params, contact.params);
     }
 }
