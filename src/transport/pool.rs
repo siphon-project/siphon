@@ -152,6 +152,41 @@ impl ConnectionPool {
         destination: SocketAddr,
         data: Bytes,
     ) -> Result<ConnectionId, std::io::Error> {
+        // Default outbound: bind to the local IP (correct interface) but
+        // an ephemeral port — see send_tcp_inner for the rationale.
+        let bind_addr = SocketAddr::new(self.local_addr.ip(), 0);
+        self.send_tcp_inner(bind_addr, destination, data).await
+    }
+
+    /// Send data to a destination, binding the local socket to a
+    /// specific source address — used for ESP-over-TCP IPsec where
+    /// the kernel egress XFRM selector for SA #3 (TS 33.203 §6.3 /
+    /// §7.2) requires src=`pcscf_port_c`, dst=`ue_port_us`, and an
+    /// ephemerally-bound socket would never match.
+    ///
+    /// Same pooling semantics as `send_tcp` — but **destinations
+    /// reached this way must always use the same source**.  The pool
+    /// keys connections by destination only, so mixing source-bound
+    /// and ephemeral connections to the same destination would either
+    /// reuse the wrong one or hit `EADDRNOTAVAIL` on rebind.  In
+    /// practice IPsec destinations are exclusively source-bound and
+    /// non-IPsec destinations are exclusively ephemeral; no mixing
+    /// occurs at runtime.
+    pub async fn send_tcp_from(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        data: Bytes,
+    ) -> Result<ConnectionId, std::io::Error> {
+        self.send_tcp_inner(source, destination, data).await
+    }
+
+    async fn send_tcp_inner(
+        &self,
+        bind_addr: SocketAddr,
+        destination: SocketAddr,
+        data: Bytes,
+    ) -> Result<ConnectionId, std::io::Error> {
         let key = PoolKey {
             destination,
             transport: Transport::Tcp,
@@ -169,11 +204,14 @@ impl ConnectionPool {
             self.connections.remove(&key);
         }
 
-        // Create new connection, binding to the local IP (so outbound traffic
-        // uses the correct interface) but with port 0 (OS picks an ephemeral
-        // port).  Binding to the exact listen port (e.g. :5060) causes
-        // EADDRNOTAVAIL when a pooled connection to the same destination already
-        // exists in TIME_WAIT — the 4-tuple (local:5060 → remote:6060) collides.
+        // Create new connection.  Default bind (`port 0`) lets the OS
+        // pick an ephemeral port — required for non-IPsec destinations
+        // because binding to the exact listen port causes EADDRNOTAVAIL
+        // when a pooled connection in TIME_WAIT collides on the 4-tuple
+        // (local:5060 → remote:6060).  IPsec callers (`send_tcp_from`)
+        // bind to a specific `(pcscf_addr, pcscf_port_c)` because
+        // ESP-over-TCP SA selectors require it; SO_REUSEADDR (set
+        // below) lets us survive single-UE TIME_WAIT churn.
         let socket = if destination.is_ipv6() {
             tokio::net::TcpSocket::new_v6()?
         } else {
@@ -184,7 +222,6 @@ impl ConnectionPool {
             let sock_ref = socket2::SockRef::from(&socket);
             sock_ref.set_tos_v4(tos)?;
         }
-        let bind_addr = SocketAddr::new(self.local_addr.ip(), 0);
         socket.bind(bind_addr)?;
         let stream = socket.connect(destination).await?;
         configure_tcp_socket(&stream, self.tos);
@@ -618,5 +655,66 @@ mod tests {
 
         // Different connection (reconnected)
         assert_ne!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn send_tcp_from_binds_to_specified_source() {
+        // ESP-over-TCP IPsec (TS 33.203 §7.2): the outbound TCP
+        // socket for SA #3 must bind to (pcscf_addr, pcscf_port_c).
+        // Verify that send_tcp_from honours the requested source —
+        // an ephemerally-bound socket would have a random source
+        // port and the kernel selector for SA #3 would never match.
+        ensure_crypto_provider();
+
+        // Pick a free local port to use as the "source"; we'll
+        // assert the server sees this exact port on the inbound
+        // connection.
+        let bind_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        bind_socket.set_reuseaddr(true).unwrap();
+        bind_socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let source_addr = bind_socket.local_addr().unwrap();
+        drop(bind_socket); // release; SO_REUSEADDR lets us rebind
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (socket, peer_addr) = listener.accept().await.unwrap();
+            // Keep the socket alive so the pool's read task doesn't
+            // observe an EOF mid-test.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(socket);
+            peer_addr
+        });
+
+        let connection_map = Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let pool = ConnectionPool::new(
+            connection_map,
+            inbound_tx,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+        );
+
+        let connection_id = pool
+            .send_tcp_from(
+                source_addr,
+                server_addr,
+                Bytes::from_static(b"INVITE sip:bob@example.com SIP/2.0\r\n\r\n"),
+            )
+            .await
+            .expect("send_tcp_from must succeed");
+        assert_ne!(connection_id, ConnectionId::default());
+
+        // The server's view of the peer must match the source we
+        // asked for — exact-port match is the IPsec invariant.
+        let peer = server_task.await.unwrap();
+        assert_eq!(
+            peer.port(),
+            source_addr.port(),
+            "send_tcp_from must bind to the requested source port"
+        );
+        assert_eq!(peer.ip(), source_addr.ip());
     }
 }

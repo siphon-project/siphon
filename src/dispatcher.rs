@@ -2470,20 +2470,26 @@ fn relay_request(
         return;
     }
 
-    // For UDP destinations, ask the IPsec module whether this
-    // destination is on a registered SA pair — if so, the source
-    // (and therefore Via) must reflect the matching P-CSCF port
-    // (e.g. `pcscf_port_c` for an MT INVITE landing on the UE's
-    // `port_us`) rather than the default per-transport via_host /
-    // listener (3GPP TS 33.203 §6.3 / §7.4).  Returns `None` for
-    // non-IPsec deployments and ordinary destinations — zero impact
-    // on the hot path when no IpsecManager is wired.  Computed once
-    // here and reused for both Via construction and the OutboundMessage
-    // built below.
-    let ipsec_source = if outbound_transport == Transport::Udp {
-        crate::script::api::ipsec::outbound_local_addr_for(destination)
-    } else {
-        None
+    // Ask the IPsec module whether this destination is on a registered
+    // SA pair — if so, the source (and therefore Via) must reflect the
+    // matching P-CSCF port (e.g. `pcscf_port_c` for an MT INVITE landing
+    // on the UE's `port_us`) rather than the default per-transport
+    // via_host / listener (3GPP TS 33.203 §6.3 / §7.4).
+    //
+    // Applies to both UDP (ESP-over-UDP, the common case) and TCP
+    // (ESP-over-TCP, TS 33.203 §7.2 — used by some iOS clients).  For
+    // TCP this also drives `pool.send_tcp_from(source, ...)` so the
+    // outbound socket binds to the SA's source endpoint instead of
+    // ephemeral; an ephemerally-bound socket would never match the
+    // kernel selector for SA #3.  Returns `None` for non-IPsec
+    // deployments and ordinary destinations — zero impact on the hot
+    // path when no IpsecManager is wired.  Computed once here and
+    // reused for Via construction and the outbound send.
+    let ipsec_source = match outbound_transport {
+        Transport::Udp | Transport::Tcp => {
+            crate::script::api::ipsec::outbound_local_addr_for(destination)
+        }
+        _ => None,
     };
 
     // Add our Via — use the outbound transport for the Via header.
@@ -3793,13 +3799,24 @@ fn send_to_target(
 
     match transport {
         Transport::Tcp => {
-            // Use connection pool for outbound TCP
+            // Use connection pool for outbound TCP.  For ESP-over-TCP
+            // IPsec destinations (TS 33.203 §7.2 — iOS clients),
+            // bind the local socket to the SA-pair source endpoint
+            // (`pcscf_addr:pcscf_port_c`) so the kernel egress XFRM
+            // selector for SA #3 matches.  An ephemerally-bound socket
+            // never matches and the packet is silently dropped.
             let pool = Arc::clone(&state.connection_pool);
             let data_clone = data;
-            match tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(pool.send_tcp(destination, data_clone))
-            }) {
+            let ipsec_source = crate::script::api::ipsec::outbound_local_addr_for(destination);
+            let connect_result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    match ipsec_source {
+                        Some(source) => pool.send_tcp_from(source, destination, data_clone).await,
+                        None => pool.send_tcp(destination, data_clone).await,
+                    }
+                })
+            });
+            match connect_result {
                 Ok(connection_id) => {
                     debug!(
                         destination = %destination,
