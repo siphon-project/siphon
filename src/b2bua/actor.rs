@@ -158,19 +158,31 @@ impl Dialog {
         }
     }
 
-    /// Rewrite dialog headers (Call-ID + From/To tags) on a SIP message.
+    /// Rewrite dialog headers (Call-ID + From-tag, optionally To-tag) on a SIP message.
     ///
-    /// Replaces the Call-ID and swaps `old_tag` → `new_tag` in From and To.
+    /// - Replaces `Call-ID` with `new_call_id`.
+    /// - Swaps `old_from_tag` → `new_from_tag` in the From header (string match
+    ///   on `;tag=…`). Same swap is applied to the To header — load-bearing for
+    ///   the rare case where From-tag and To-tag happen to coincide, otherwise
+    ///   a no-op there.
+    /// - When `new_to_tag` is `Some(tag)` AND the inbound message already
+    ///   carries a To-tag, the To-tag is replaced with `tag` (RFC 3261
+    ///   §12.2.1.1 — across a B2BUA dialog boundary, the receiving UA matches
+    ///   on the dialog tags *we* assigned to its leg, not the far end's).
+    ///   `Some("")` clears the tag; `None` leaves the To header untouched
+    ///   (caller's responsibility for tagless messages — out-of-dialog
+    ///   requests, 100 Trying without an early dialog, …).
     pub fn rewrite_headers(
         message: &mut SipMessage,
         new_call_id: &str,
-        old_tag: &str,
-        new_tag: &str,
+        old_from_tag: &str,
+        new_from_tag: &str,
+        new_to_tag: Option<&str>,
     ) {
         message.headers.set("Call-ID", new_call_id.to_string());
 
-        let old_pattern = format!("tag={}", old_tag);
-        let new_pattern = format!("tag={}", new_tag);
+        let old_pattern = format!("tag={}", old_from_tag);
+        let new_pattern = format!("tag={}", new_from_tag);
 
         if let Some(from) = message.headers.get("From").or_else(|| message.headers.get("f")) {
             if from.contains(&old_pattern) {
@@ -182,6 +194,21 @@ impl Dialog {
             if to.contains(&old_pattern) {
                 let new_to = to.replace(&old_pattern, &new_pattern);
                 message.headers.set("To", new_to);
+            }
+        }
+
+        if let Some(new_tag) = new_to_tag {
+            if let Some(to) = message.headers.get("To").or_else(|| message.headers.get("t")) {
+                if let Ok(mut name_addr) = crate::sip::headers::nameaddr::NameAddr::parse(&to) {
+                    if name_addr.tag.is_some() {
+                        name_addr.tag = if new_tag.is_empty() {
+                            None
+                        } else {
+                            Some(new_tag.to_string())
+                        };
+                        message.headers.set("To", name_addr.to_string());
+                    }
+                }
             }
         }
     }
@@ -1400,12 +1427,98 @@ mod tests {
             .build()
             .unwrap();
 
-        Dialog::rewrite_headers(&mut msg, "new-call-id", "old-tag", "new-tag");
+        Dialog::rewrite_headers(&mut msg, "new-call-id", "old-tag", "new-tag", None);
 
         assert_eq!(msg.headers.get("Call-ID").unwrap(), "new-call-id");
         assert!(msg.headers.get("From").unwrap().contains("tag=new-tag"));
         assert!(!msg.headers.get("From").unwrap().contains("tag=old-tag"));
         assert!(msg.headers.get("To").unwrap().contains("tag=bob-tag"));
+    }
+
+    #[test]
+    fn dialog_rewrite_overwrites_to_tag_when_new_to_tag_given() {
+        // Reproduces the B2BUA 200 OK forwarding scenario:
+        //   B-leg 200 OK has From=siphon-b-tag and To=gateway-tag.
+        //   Forwarding to A-leg must rewrite both — From → A-leg's stored
+        //   remote tag, AND To → A-leg's local tag (the one the receiving UA
+        //   stores as its dialog's remote tag and matches in-dialog requests
+        //   against). Without the To rewrite, the BYE we later build with
+        //   a_leg.dialog.local_tag in From is rejected with 481.
+        let mut msg = crate::sip::builder::SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-test".to_string())
+            .from("<sip:alice@example.com>;tag=b-leg-from-tag".to_string())
+            .to("<sip:bob@example.com>;tag=gateway-far-end-tag".to_string())
+            .call_id("b-leg-call-id".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        Dialog::rewrite_headers(
+            &mut msg,
+            "a-leg-call-id",
+            "b-leg-from-tag",
+            "a-leg-remote-tag",
+            Some("a-leg-local-tag"),
+        );
+
+        assert_eq!(msg.headers.get("Call-ID").unwrap(), "a-leg-call-id");
+        let from = msg.headers.get("From").unwrap();
+        assert!(from.contains("tag=a-leg-remote-tag"), "From should have A-leg remote tag, got: {from}");
+        assert!(!from.contains("tag=b-leg-from-tag"));
+        let to = msg.headers.get("To").unwrap();
+        assert!(to.contains("tag=a-leg-local-tag"), "To should have A-leg local tag, got: {to}");
+        assert!(!to.contains("tag=gateway-far-end-tag"));
+    }
+
+    #[test]
+    fn dialog_rewrite_skips_to_when_no_existing_tag() {
+        // 100 Trying / out-of-dialog responses without an early dialog must
+        // not get a synthetic To-tag spliced in: passing Some(...) is a no-op
+        // when the inbound message has no To-tag.
+        let mut msg = crate::sip::builder::SipMessageBuilder::new()
+            .response(100, "Trying".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-test".to_string())
+            .from("<sip:alice@example.com>;tag=from-tag".to_string())
+            .to("<sip:bob@example.com>".to_string())
+            .call_id("call-id".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        Dialog::rewrite_headers(
+            &mut msg,
+            "call-id",
+            "from-tag",
+            "from-tag",
+            Some("would-be-synthetic-tag"),
+        );
+
+        let to = msg.headers.get("To").unwrap();
+        assert!(!to.contains(";tag="), "tagless To must remain tagless, got: {to}");
+    }
+
+    #[test]
+    fn dialog_rewrite_to_tag_none_leaves_to_alone() {
+        // Original out-of-dialog INVITE retry path: caller passes None,
+        // To header (whether tagged or not) is left untouched.
+        let mut msg = crate::sip::builder::SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-test".to_string())
+            .from("<sip:alice@example.com>;tag=from-tag".to_string())
+            .to("<sip:bob@example.com>;tag=to-tag-original".to_string())
+            .call_id("call-id".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        Dialog::rewrite_headers(&mut msg, "call-id", "from-tag", "from-tag-new", None);
+
+        let to = msg.headers.get("To").unwrap();
+        assert!(to.contains("tag=to-tag-original"), "To should be untouched, got: {to}");
     }
 
     // --- CallActor tests ---

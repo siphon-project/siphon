@@ -6885,7 +6885,11 @@ fn handle_b2bua_response(
             // A→B: response from B-leg → rewrite B-leg identifiers back to A-leg
             if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
                 crate::b2bua::actor::Dialog::rewrite_headers(
-                    message, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                    message,
+                    &a_leg.dialog.call_id,
+                    b_ftag,
+                    &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                    Some(&a_leg.dialog.local_tag),
                 );
             }
         } else {
@@ -6893,7 +6897,11 @@ fn handle_b2bua_response(
             if let Some(call) = state.call_actors.get_call(call_id) {
                 if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
                     crate::b2bua::actor::Dialog::rewrite_headers(
-                        message, &winner.dialog.call_id, a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &winner.dialog.local_tag,
+                        message,
+                        &winner.dialog.call_id,
+                        a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                        &winner.dialog.local_tag,
+                        winner.dialog.remote_tag.as_deref(),
                     );
                 }
             }
@@ -7107,14 +7115,22 @@ fn handle_b2bua_response(
         if is_a2b {
             if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
                 crate::b2bua::actor::Dialog::rewrite_headers(
-                    message, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                    message,
+                    &a_leg.dialog.call_id,
+                    b_ftag,
+                    &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                    Some(&a_leg.dialog.local_tag),
                 );
             }
         } else {
             if let Some(call) = state.call_actors.get_call(call_id) {
                 if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
                     crate::b2bua::actor::Dialog::rewrite_headers(
-                        message, &winner.dialog.call_id, a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &winner.dialog.local_tag,
+                        message,
+                        &winner.dialog.call_id,
+                        a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                        &winner.dialog.local_tag,
+                        winner.dialog.remote_tag.as_deref(),
                     );
                 }
             }
@@ -7494,10 +7510,21 @@ fn handle_b2bua_response(
             }
         }
 
-        // Rewrite B-leg dialog headers back to A-leg identifiers
+        // Rewrite B-leg dialog headers back to A-leg identifiers.
+        // The To-tag MUST be rewritten to A-leg's local_tag (RFC 3261 §12.2.1.1):
+        // B-leg 2xx carries the B-leg far end's tag in To, but the A-leg far
+        // end will store whatever it sees there as its dialog's remote-tag and
+        // match in-dialog requests against it. Without this rewrite, the BYE
+        // we later send toward A — built with a_leg.dialog.local_tag (the
+        // freshly generated sb-... tag) in its From — would mismatch the
+        // stored remote tag and get 481 Call/Transaction Does Not Exist.
         if let Some((ref b_cid, ref b_ftag)) = b_leg_dialog {
             crate::b2bua::actor::Dialog::rewrite_headers(
-                &mut response, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                &mut response,
+                &a_leg.dialog.call_id,
+                b_ftag,
+                &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                Some(&a_leg.dialog.local_tag),
             );
             let _ = (b_cid,); // Call-ID already set by rewrite_dialog_headers
         }
@@ -7848,10 +7875,17 @@ fn handle_b2bua_response(
             }
         }
 
-        // Rewrite B-leg dialog headers back to A-leg identifiers
+        // Rewrite B-leg dialog headers back to A-leg identifiers.
+        // For provisional responses that carry a To-tag (early dialogs —
+        // 180/183 with tag), the rewrite ensures A-leg's view of the early
+        // dialog matches its later view of the confirmed dialog (200 OK).
         if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
             crate::b2bua::actor::Dialog::rewrite_headers(
-                message, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                message,
+                &a_leg.dialog.call_id,
+                b_ftag,
+                &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                Some(&a_leg.dialog.local_tag),
             );
         }
         // Replace B-leg Via(s) and CSeq with A-leg originals from stored INVITE
@@ -7943,11 +7977,17 @@ fn handle_b2bua_response(
                                 );
                                 retry.headers.add("Min-SE", min_se.to_string());
 
-                                // Reuse B-leg dialog identifiers from the failed attempt
+                                // Reuse B-leg dialog identifiers from the failed attempt.
+                                // Retry source is the original A-leg INVITE — out-of-dialog,
+                                // To has no tag, so pass None for new_to_tag.
                                 let (retry_call_id, retry_from_tag) = b_leg_dialog.clone()
                                     .unwrap_or_else(|| (a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()));
                                 crate::b2bua::actor::Dialog::rewrite_headers(
-                                    &mut retry, &retry_call_id, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &retry_from_tag,
+                                    &mut retry,
+                                    &retry_call_id,
+                                    &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                                    &retry_from_tag,
+                                    None,
                                 );
 
                                 let b_leg = Leg::new_b_leg(
@@ -8186,7 +8226,11 @@ fn handle_b2bua_response(
         // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg
         if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
             crate::b2bua::actor::Dialog::rewrite_headers(
-                message, &a_leg.dialog.call_id, b_ftag, &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                message,
+                &a_leg.dialog.call_id,
+                b_ftag,
+                &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                Some(&a_leg.dialog.local_tag),
             );
         }
         // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
@@ -8545,9 +8589,16 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
         }
     }
 
-    // Rewrite A-leg dialog headers → B-leg dialog headers
+    // Rewrite A-leg dialog headers → B-leg dialog headers.
+    // Source is the original out-of-dialog A-leg INVITE (no To-tag), so
+    // pass None — the refresh re-INVITE's To-tag, if needed, is set by
+    // the in-dialog construction logic elsewhere.
     crate::b2bua::actor::Dialog::rewrite_headers(
-        &mut reinvite, &b_leg.dialog.call_id, &a_leg_from_tag, &b_leg.dialog.local_tag,
+        &mut reinvite,
+        &b_leg.dialog.call_id,
+        &a_leg_from_tag,
+        &b_leg.dialog.local_tag,
+        None,
     );
 
     // Rewrite From URI host to our advertised address (topology hiding)
@@ -8868,7 +8919,11 @@ fn handle_b2bua_reinvite(
         // A→B: forward to winning B-leg, rewrite A-leg → B-leg dialog headers
         if let Some(b_leg) = &winner_b_leg {
             crate::b2bua::actor::Dialog::rewrite_headers(
-                &mut forwarded, &b_leg.dialog.call_id, a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &b_leg.dialog.local_tag,
+                &mut forwarded,
+                &b_leg.dialog.call_id,
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                &b_leg.dialog.local_tag,
+                b_leg.dialog.remote_tag.as_deref(),
             );
             Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
         } else {
@@ -8879,7 +8934,11 @@ fn handle_b2bua_reinvite(
         // B→A: forward to A-leg, rewrite B-leg → A-leg dialog headers
         if let Some(b_leg) = &winner_b_leg {
             crate::b2bua::actor::Dialog::rewrite_headers(
-                &mut forwarded, &a_leg.dialog.call_id, &b_leg.dialog.local_tag, a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                &mut forwarded,
+                &a_leg.dialog.call_id,
+                &b_leg.dialog.local_tag,
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                Some(&a_leg.dialog.local_tag),
             );
         }
         Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
@@ -9153,7 +9212,11 @@ fn handle_b2bua_update(
     let update_target = if from_a_leg {
         if let Some(b_leg) = &winner_b_leg {
             crate::b2bua::actor::Dialog::rewrite_headers(
-                &mut forwarded, &b_leg.dialog.call_id, a_leg.dialog.remote_tag.as_deref().unwrap_or(""), &b_leg.dialog.local_tag,
+                &mut forwarded,
+                &b_leg.dialog.call_id,
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                &b_leg.dialog.local_tag,
+                b_leg.dialog.remote_tag.as_deref(),
             );
             Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
         } else {
@@ -9163,7 +9226,11 @@ fn handle_b2bua_update(
     } else {
         if let Some(b_leg) = &winner_b_leg {
             crate::b2bua::actor::Dialog::rewrite_headers(
-                &mut forwarded, &a_leg.dialog.call_id, &b_leg.dialog.local_tag, a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                &mut forwarded,
+                &a_leg.dialog.call_id,
+                &b_leg.dialog.local_tag,
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                Some(&a_leg.dialog.local_tag),
             );
         }
         Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
