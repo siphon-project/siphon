@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -66,6 +66,52 @@ impl CrlfPongTracker {
 
 /// The double-CRLF ping payload (RFC 5626 §4.4.1).
 const CRLF_PING: &[u8] = b"\r\n\r\n";
+
+/// The single-CRLF pong payload (RFC 5626 §4.4.1).
+const CRLF_PONG: &[u8] = b"\r\n";
+
+/// Drain any leading CRLF keepalive bytes from a stream-transport accumulator.
+///
+/// Behavior (RFC 5626 §4.4.1, RFC 6223 Flow-Timer, RFC 3261 §7.5):
+///   - `\r\n\r\n` at the head is a peer ping → consume 4 bytes, write `\r\n`
+///     pong back over `writer`.  Always responded to regardless of whether
+///     siphon's own keepalive prober is running — the response is part of
+///     the protocol contract, not a feature flag.
+///   - `\r\n` at the head is either a peer pong (response to siphon's
+///     earlier ping) or a stray CRLF before a real SIP message (RFC 3261
+///     §7.5 permits this).  In either case, consume 2 bytes; record the
+///     pong on the tracker when present (idempotent — clearing the missed
+///     counter for a stray CRLF is harmless).
+///
+/// Returns the number of keepalive frames drained.
+pub fn drain_leading_crlf_keepalives(
+    accumulator: &mut BytesMut,
+    connection_id: ConnectionId,
+    writer: &mpsc::Sender<Bytes>,
+    tracker: Option<&Arc<CrlfPongTracker>>,
+) -> usize {
+    let mut drained = 0;
+    loop {
+        if accumulator.len() >= 4 && &accumulator[..4] == CRLF_PING {
+            accumulator.advance(4);
+            // Best-effort: if the per-connection write channel is full
+            // the peer will re-ping; we don't want to back-pressure the
+            // read path on keepalive responses.
+            let _ = writer.try_send(Bytes::from_static(CRLF_PONG));
+            drained += 1;
+            continue;
+        }
+        if accumulator.len() >= 2 && &accumulator[..2] == CRLF_PONG {
+            accumulator.advance(2);
+            if let Some(t) = tracker {
+                t.record_pong(connection_id);
+            }
+            drained += 1;
+            continue;
+        }
+        return drained;
+    }
+}
 
 /// A connection map that the keepalive task iterates.
 type ConnectionMap = Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>;
@@ -228,6 +274,84 @@ mod tests {
             map.get(&id).is_none(),
             "connection should have been evicted after threshold"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_responds_to_peer_ping_with_pong() {
+        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let tracker = Arc::new(CrlfPongTracker::new());
+        let id = ConnectionId(7);
+        let mut buf = BytesMut::from(&b"\r\n\r\n"[..]);
+
+        let drained = drain_leading_crlf_keepalives(&mut buf, id, &tx, Some(&tracker));
+
+        assert_eq!(drained, 1);
+        assert!(buf.is_empty(), "ping bytes must be consumed");
+        let pong = rx.try_recv().expect("pong should have been queued");
+        assert_eq!(&pong[..], CRLF_PONG);
+        // Peer ping is NOT a pong to siphon — tracker must not record one.
+        assert!(!tracker.has_seen_pong(id));
+    }
+
+    #[tokio::test]
+    async fn drain_records_peer_pong_without_writing_back() {
+        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let tracker = Arc::new(CrlfPongTracker::new());
+        let id = ConnectionId(11);
+        // Prime the missed counter so record_pong has something to clear.
+        let _ = tracker.record_ping(id);
+
+        let mut buf = BytesMut::from(&b"\r\n"[..]);
+        let drained = drain_leading_crlf_keepalives(&mut buf, id, &tx, Some(&tracker));
+
+        assert_eq!(drained, 1);
+        assert!(buf.is_empty());
+        assert!(rx.try_recv().is_err(), "peer pong must not trigger a write");
+        assert!(tracker.has_seen_pong(id));
+    }
+
+    #[tokio::test]
+    async fn drain_leaves_sip_message_intact_after_keepalive() {
+        let (tx, _rx) = mpsc::channel::<Bytes>(8);
+        let tracker = Arc::new(CrlfPongTracker::new());
+        let id = ConnectionId(13);
+
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(b"\r\n\r\n");
+        buf.extend_from_slice(b"OPTIONS sip:server SIP/2.0\r\n\r\n");
+
+        let drained = drain_leading_crlf_keepalives(&mut buf, id, &tx, Some(&tracker));
+
+        assert_eq!(drained, 1);
+        assert_eq!(&buf[..], b"OPTIONS sip:server SIP/2.0\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn drain_handles_multiple_back_to_back_pings() {
+        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let tracker = Arc::new(CrlfPongTracker::new());
+        let id = ConnectionId(19);
+
+        let mut buf = BytesMut::from(&b"\r\n\r\n\r\n\r\n\r\n"[..]);
+        let drained = drain_leading_crlf_keepalives(&mut buf, id, &tx, Some(&tracker));
+
+        // Two pings + one trailing pong/stray CRLF
+        assert_eq!(drained, 3);
+        assert!(buf.is_empty());
+        let pong_count = std::iter::from_fn(|| rx.try_recv().ok()).count();
+        assert_eq!(pong_count, 2, "one pong per ping");
+    }
+
+    #[tokio::test]
+    async fn drain_without_tracker_still_responds_to_pings() {
+        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let id = ConnectionId(23);
+        let mut buf = BytesMut::from(&b"\r\n\r\n"[..]);
+
+        let drained = drain_leading_crlf_keepalives(&mut buf, id, &tx, None);
+
+        assert_eq!(drained, 1);
+        assert!(rx.try_recv().is_ok(), "pong should be sent regardless of tracker");
     }
 
     #[tokio::test]

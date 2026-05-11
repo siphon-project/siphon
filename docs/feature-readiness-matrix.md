@@ -99,7 +99,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Fix REGISTER Contact | **Production** | `nat.fix_register: true` | |
 | Fix NATed Contact (script) | **Production** | `request.fix_nated_contact()` | |
 | NAT keepalive (OPTIONS ping) | Implemented | `nat.keepalive` | Configurable interval + failure threshold |
-| CRLF keepalive (RFC 5626 §4.4.1) | Implemented | `nat.crlf_keepalive` | TCP/TLS/WS connection keep-alive |
+| CRLF keepalive (RFC 5626 §4.4.1) | Implemented | `nat.crlf_keepalive` | TCP/TLS/pool connection keep-alive; outbound probe + inbound peer-ping/pong responder |
 | Stale contact eviction on restart | **Production** | Core | Evicts connection-oriented contacts + on_change notify |
 | Outbound flow tokens (RFC 5626) | Implemented | | Via/Route flow tokens |
 

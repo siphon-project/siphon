@@ -778,6 +778,19 @@ impl SiphonServer {
             transport::udp::listen(addr, inbound_tx.clone(), listener_rx, Arc::clone(&transport_acl), tos).await;
         }
 
+        // RFC 5626 §4.4.1 pong tracker — created up front so it can be
+        // wired into TCP/TLS listeners and the outbound pool.  The
+        // keepalive prober is spawned later, once both connection maps
+        // exist; the tracker is shared between the prober and the
+        // per-connection read tasks that record peer pongs.  Always
+        // create the tracker when the config opts in; transport read
+        // tasks answer peer pings unconditionally either way.
+        let crlf_pong_tracker = config
+            .nat
+            .as_ref()
+            .and_then(|nat_config| nat_config.crlf_keepalive.as_ref())
+            .map(|_| Arc::new(transport::crlf_keepalive::CrlfPongTracker::new()));
+
         // TCP
         let tcp_connection_map = Arc::new(dashmap::DashMap::new());
         for entry in &config.listen.tcp {
@@ -794,7 +807,7 @@ impl SiphonServer {
             }
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TCP transport");
-            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos).await;
+            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos, crlf_pong_tracker.clone()).await;
         }
 
         // TLS maps — created before pool so pool can register connections for reuse.
@@ -818,6 +831,7 @@ impl SiphonServer {
             pool_local_addr,
             pool_tos,
             Some(Arc::clone(&tls_addr_map)),
+            crlf_pong_tracker.clone(),
         ));
         if let Some(ref tls_config) = config.tls {
             for entry in &config.listen.tls {
@@ -834,7 +848,7 @@ impl SiphonServer {
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TLS transport");
-                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map), tos, Some(Arc::clone(&connection_pool))).await;
+                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone()).await;
             }
         }
 
@@ -1235,25 +1249,26 @@ impl SiphonServer {
             }
         }
 
-        // --- CRLF keepalive ---
-        let crlf_pong_tracker = if let Some(ref nat_config) = config.nat {
-            if let Some(ref crlf_config) = nat_config.crlf_keepalive {
-                let tracker = Arc::new(transport::crlf_keepalive::CrlfPongTracker::new());
-                transport::crlf_keepalive::spawn(
-                    crlf_config.clone(),
-                    vec![
-                        Arc::clone(&tcp_connection_map),
-                        Arc::clone(&tls_connection_map),
-                    ],
-                    Arc::clone(&tracker),
-                );
-                Some(tracker)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // --- CRLF keepalive prober ---
+        // Tracker was created up front (above) so the listeners and pool
+        // could record peer pongs.  Spawn the periodic ping task here
+        // now that both connection maps are populated.
+        if let (Some(tracker), Some(crlf_config)) = (
+            crlf_pong_tracker.as_ref(),
+            config
+                .nat
+                .as_ref()
+                .and_then(|nat_config| nat_config.crlf_keepalive.as_ref()),
+        ) {
+            transport::crlf_keepalive::spawn(
+                crlf_config.clone(),
+                vec![
+                    Arc::clone(&tcp_connection_map),
+                    Arc::clone(&tls_connection_map),
+                ],
+                Arc::clone(tracker),
+            );
+        }
 
         // Subscribe to registrar events
         let registrar_event_rx = crate::script::api::registrar_arc()
@@ -1287,7 +1302,6 @@ impl SiphonServer {
             ipsec_manager,
             config.ipsec.clone(),
             tls_addr_map,
-            crlf_pong_tracker,
             registrar_event_rx,
             diameter_incoming_rx,
             rtpengine_events_rx,

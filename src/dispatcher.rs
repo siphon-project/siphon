@@ -129,8 +129,6 @@ struct DispatcherState {
     /// Populated by the TLS listener; used by send_to_target to reuse inbound
     /// TLS connections when relaying to registered endpoints (like OpenSIPS).
     tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
-    /// RFC 5626 CRLF pong tracker (None when crlf_keepalive is not configured).
-    crlf_pong_tracker: Option<Arc<crate::transport::crlf_keepalive::CrlfPongTracker>>,
     /// Automatically rewrite Contact URI in responses with the observed source
     /// address (from `nat.fix_contact` config).
     nat_fix_contact: bool,
@@ -316,7 +314,6 @@ pub async fn run(
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     ipsec_config: Option<crate::config::IpsecConfig>,
     tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
-    crlf_pong_tracker: Option<Arc<crate::transport::crlf_keepalive::CrlfPongTracker>>,
     registrar_event_rx: Option<tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>>,
     diameter_incoming_rx: tokio::sync::mpsc::Receiver<(
         crate::diameter::peer::IncomingRequest,
@@ -439,7 +436,6 @@ pub async fn run(
         ipsec_config,
         connection_pool,
         tls_addr_map,
-        crlf_pong_tracker,
         nat_fix_contact: config.nat.as_ref().map(|n| n.fix_contact).unwrap_or(false),
         sdp_name: config.media.as_ref()
             .and_then(|m| m.sdp_name.clone())
@@ -1672,21 +1668,19 @@ fn sweep_stale_entries(state: &DispatcherState) {
 
 /// Handle a single inbound SIP message (request or response).
 fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
-    // RFC 5626 §3.5.1 / §4.4.1: CRLF keep-alive (check raw bytes before parsing).
-    // Real SIP messages start with an uppercase ASCII letter (a method like
-    // "INVITE…" or the response start "SIP/2.0…"). Only do the all-bytes
-    // whitespace scan when the first byte LOOKS like a keepalive — at 30k+
-    // cps a per-message full-buffer scan was a measurable hot path.
+    // Defensive drop of all-whitespace UDP datagrams (RFC 3261 §7.5 — peers
+    // may send stray CRLF as a NAT keepalive ping).  Stream transports
+    // (TCP/TLS/WSS/pool) handle RFC 5626 §4.4.1 ping/pong in their own
+    // read tasks before forwarding to the dispatcher, so this branch only
+    // fires for UDP and shields the parser from logging a warn.
+    //
+    // Fast-path gate: real SIP messages start with an uppercase ASCII
+    // letter, so the all-bytes scan only runs when the first byte already
+    // looks like whitespace.
     if matches!(inbound.data.first(), Some(b'\r' | b'\n' | b' ')) {
         let all_whitespace = inbound.data.iter()
             .all(|b| matches!(b, b'\r' | b'\n' | b' '));
         if all_whitespace {
-            // Record pong for CRLF keepalive tracker (TCP/TLS only).
-            if matches!(inbound.transport, Transport::Tcp | Transport::Tls) {
-                if let Some(ref tracker) = state.crlf_pong_tracker {
-                    tracker.record_pong(inbound.connection_id);
-                }
-            }
             return;
         }
     }

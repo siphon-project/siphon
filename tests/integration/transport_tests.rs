@@ -126,7 +126,7 @@ async fn tcp_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    tcp::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+    tcp::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None).await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect and send OPTIONS
@@ -170,6 +170,78 @@ async fn tcp_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// RFC 5626 §4.4.1 CRLF keepalive — peer pings get a CRLF pong over the wire
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tcp_responds_to_peer_crlf_ping_with_pong() {
+    // RFC 5626 §4.4.1 contract: a peer (typically an iOS/Android UE that
+    // negotiated RFC 6223 Flow-Timer) sends `\r\n\r\n` to keep the NAT
+    // pinhole and connection liveness alive.  The server must answer with
+    // a single `\r\n`.  Verify the bytes leave the wire and that a SIP
+    // message sent after the ping still frames correctly.
+    use siphon::transport::crlf_keepalive::CrlfPongTracker;
+    let addr = free_port();
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+        Arc::new(DashMap::new());
+    let tracker = Arc::new(CrlfPongTracker::new());
+
+    tcp::listen(
+        addr,
+        inbound_tx,
+        outbound_rx,
+        Arc::clone(&connection_map),
+        test_acl(),
+        None,
+        Some(Arc::clone(&tracker)),
+    )
+    .await;
+    tokio::time::sleep(SETTLE).await;
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+
+    // 1) Peer ping → expect single-CRLF pong back.
+    client.write_all(b"\r\n\r\n").await.unwrap();
+
+    let mut pong = [0u8; 2];
+    tokio::time::timeout(TIMEOUT, client.read_exact(&mut pong))
+        .await
+        .expect("timed out waiting for CRLF pong")
+        .expect("read CRLF pong");
+    assert_eq!(&pong, b"\r\n", "server must answer ping with `\\r\\n`");
+
+    // 2) Peer pong → tracker records it; no bytes come back.
+    client.write_all(b"\r\n").await.unwrap();
+    // Wait a short moment so the read task processes the pong before we
+    // check the tracker.  No way to await the tracker directly without
+    // racing — a small sleep is the standard pattern in this file.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // 3) Real SIP message after keepalives still frames correctly.
+    client
+        .write_all(sip_options_request().as_bytes())
+        .await
+        .unwrap();
+    let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
+        .await
+        .expect("timed out waiting for OPTIONS after keepalives")
+        .expect("inbound channel closed");
+    assert_eq!(inbound.transport, Transport::Tcp);
+    let data_str = String::from_utf8_lossy(&inbound.data);
+    assert!(
+        data_str.starts_with("OPTIONS"),
+        "OPTIONS must not be polluted by leading CRLFs: {}",
+        data_str
+    );
+    assert!(
+        tracker.has_seen_pong(inbound.connection_id),
+        "tracker should have recorded the peer pong"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // TLS round-trip
 // ---------------------------------------------------------------------------
 
@@ -188,7 +260,7 @@ async fn tls_roundtrip() {
         Arc::new(DashMap::new());
 
     let addr_map: Arc<DashMap<SocketAddr, ConnectionId>> = Arc::new(DashMap::new());
-    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), addr_map, None, None).await;
+    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), addr_map, None, None, None).await;
     tokio::time::sleep(SETTLE).await;
 
     // Build a TLS client that trusts our self-signed cert
@@ -393,7 +465,7 @@ async fn multi_transport_shared_inbound_channel() {
 
     // Start all three transports with the same inbound_tx
     udp::listen(udp_addr, inbound_tx.clone(), udp_outbound_rx, test_acl(), None).await;
-    tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map), test_acl(), None).await;
+    tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map), test_acl(), None, None).await;
     ws::listen(ws_addr, inbound_tx.clone(), ws_outbound_rx, Arc::clone(&ws_connection_map), test_acl(), None).await;
     drop(inbound_tx); // Only transport workers hold clones now
     tokio::time::sleep(SETTLE).await;

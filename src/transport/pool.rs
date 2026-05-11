@@ -25,6 +25,7 @@ use crate::transport::{
     ConnectionId, InboundMessage, Transport,
     configure_tcp_socket, next_connection_id,
 };
+use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 use crate::transport::tcp::extract_sip_message_length;
 
 /// Idle timeout for pooled outbound connections (shorter than inbound).
@@ -66,6 +67,10 @@ pub struct ConnectionPool {
     /// dispatcher can reuse them for inbound routing (e.g., INVITEs to
     /// registered trunks). Like OpenSIPS connection reuse.
     tls_addr_map: Option<Arc<DashMap<SocketAddr, ConnectionId>>>,
+    /// RFC 5626 §4.4.1 pong tracker — populated when siphon's own keepalive
+    /// prober is running.  Read tasks always answer peer pings regardless
+    /// (RFC contract), but only notify the tracker on pong when it's set.
+    crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
 }
 
 /// Build a permissive TLS client config that accepts any server certificate.
@@ -132,6 +137,7 @@ impl ConnectionPool {
         local_addr: SocketAddr,
         tos: Option<u32>,
         tls_addr_map: Option<Arc<DashMap<SocketAddr, ConnectionId>>>,
+        crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     ) -> Self {
         Self {
             connections: Arc::new(DashMap::new()),
@@ -141,6 +147,7 @@ impl ConnectionPool {
             tos,
             tls_connector: TlsConnector::from(build_outbound_tls_config()),
             tls_addr_map,
+            crlf_pong_tracker,
         }
     }
 
@@ -292,6 +299,8 @@ impl ConnectionPool {
         let conn_map = self.connection_map.clone();
         let connections = self.connections.clone();
         let key_for_cleanup = key;
+        let keepalive_writer = write_tx.clone();
+        let crlf_pong_tracker = self.crlf_pong_tracker.clone();
         tokio::spawn(async move {
             let mut accumulator = BytesMut::with_capacity(65536);
             let mut read_buf = [0u8; 8192];
@@ -307,10 +316,14 @@ impl ConnectionPool {
 
                         // Drain all complete messages from the accumulator.
                         loop {
-                            // Strip leading CRLF keepalives (RFC 3261 §7.5).
-                            while accumulator.len() >= 2 && &accumulator[..2] == b"\r\n" {
-                                let _ = accumulator.split_to(2);
-                            }
+                            // RFC 5626 §4.4.1 keepalive handling + RFC 3261 §7.5
+                            // stray-CRLF stripping in one pass.
+                            drain_leading_crlf_keepalives(
+                                &mut accumulator,
+                                connection_id,
+                                &keepalive_writer,
+                                crlf_pong_tracker.as_ref(),
+                            );
                             if accumulator.is_empty() {
                                 break;
                             }
@@ -447,6 +460,8 @@ impl ConnectionPool {
         let connections = self.connections.clone();
         let tls_addr_map = self.tls_addr_map.clone();
         let key_for_cleanup = key;
+        let keepalive_writer = write_tx.clone();
+        let crlf_pong_tracker = self.crlf_pong_tracker.clone();
         tokio::spawn(async move {
             // SIP-over-TLS framing — see the matching comment in send_tcp's
             // read task above. A raw `reader.read()` on a TLS stream can
@@ -463,9 +478,14 @@ impl ConnectionPool {
                     Ok(size) => {
                         accumulator.extend_from_slice(&read_buf[..size]);
                         loop {
-                            while accumulator.len() >= 2 && &accumulator[..2] == b"\r\n" {
-                                let _ = accumulator.split_to(2);
-                            }
+                            // RFC 5626 §4.4.1 keepalive handling + RFC 3261 §7.5
+                            // stray-CRLF stripping in one pass.
+                            drain_leading_crlf_keepalives(
+                                &mut accumulator,
+                                connection_id,
+                                &keepalive_writer,
+                                crlf_pong_tracker.as_ref(),
+                            );
                             if accumulator.is_empty() {
                                 break;
                             }
@@ -574,6 +594,7 @@ mod tests {
             "127.0.0.1:5060".parse().unwrap(),
             None,
             None,
+            None,
         );
 
         // Send via pool
@@ -625,6 +646,7 @@ mod tests {
             "127.0.0.1:5060".parse().unwrap(),
             None,
             None,
+            None,
         );
 
         let id1 = pool
@@ -664,6 +686,7 @@ mod tests {
             connection_map,
             inbound_tx,
             "127.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
         );
@@ -730,6 +753,7 @@ mod tests {
             connection_map,
             inbound_tx,
             "127.0.0.1:5060".parse().unwrap(),
+            None,
             None,
             None,
         );

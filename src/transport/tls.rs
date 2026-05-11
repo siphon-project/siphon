@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::TlsServerConfig;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
+use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 use crate::transport::pool::ConnectionPool;
 
 /// Live-swappable TLS acceptor — read by every accept loop, replaced
@@ -206,6 +207,7 @@ pub async fn listen(
     addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
     tos: Option<u32>,
     pool: Option<Arc<ConnectionPool>>,
+    crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
 ) {
     let acceptor = build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
@@ -293,6 +295,7 @@ pub async fn listen(
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
                     let addr_map = addr_map.clone();
+                    let crlf_pong_tracker = crlf_pong_tracker.clone();
 
                     configure_tcp_socket(&tcp_stream, tos);
 
@@ -312,10 +315,13 @@ pub async fn listen(
                         let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
                         let (mut reader, mut writer) = tokio::io::split(tls_stream);
 
-                        // Per-connection outbound channel
+                        // Per-connection outbound channel.  Cloned for the read
+                        // task so it can write RFC 5626 §4.4.1 pong (`\r\n`)
+                        // responses back over the same connection.
                         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
-                        connection_map.insert(connection_id, outbound_tx);
+                        connection_map.insert(connection_id, outbound_tx.clone());
                         addr_map.insert(remote_addr, connection_id);
+                        let keepalive_writer = outbound_tx;
 
                         // Read task with idle timeout and SIP stream framing (RFC 3261 §18.3)
                         let inbound_tx_clone = inbound_tx.clone();
@@ -333,10 +339,14 @@ pub async fn listen(
 
                                         // Extract all complete SIP messages from the buffer
                                         loop {
-                                            // Strip leading CRLFs — keepalive pings per RFC 3261 §7.5
-                                            while accumulator.len() >= 2 && &accumulator[..2] == b"\r\n" {
-                                                let _ = accumulator.split_to(2);
-                                            }
+                                            // RFC 5626 §4.4.1 keepalive handling + RFC 3261 §7.5
+                                            // stray-CRLF stripping in one pass.
+                                            drain_leading_crlf_keepalives(
+                                                &mut accumulator,
+                                                connection_id,
+                                                &keepalive_writer,
+                                                crlf_pong_tracker.as_ref(),
+                                            );
                                             if accumulator.is_empty() {
                                                 break;
                                             }
@@ -525,6 +535,7 @@ mod tests {
             Arc::new(DashMap::new()),
             None,
             None,
+            None,
         )
         .await;
 
@@ -572,6 +583,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             Arc::new(DashMap::new()),
+            None,
             None,
             None,
         )
@@ -645,6 +657,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             Arc::clone(&addr_map),
+            None,
             None,
             None,
         )

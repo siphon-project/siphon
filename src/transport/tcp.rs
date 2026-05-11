@@ -18,6 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
+use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 
 /// Spawn a TCP listener. For each accepted connection a task is spawned that:
 ///   1. Reads inbound SIP messages and sends them to `inbound_tx`
@@ -33,6 +34,7 @@ pub async fn listen(
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
+    crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
 ) {
     // Spawn a task that distributes outbound messages to per-connection senders.
     let connection_map_clone = connection_map.clone();
@@ -100,13 +102,17 @@ pub async fn listen(
                     configure_tcp_socket(&socket, tos);
                     debug!("TCP accepted {} as {:?}", remote_addr, connection_id);
 
+                    let crlf_pong_tracker = crlf_pong_tracker.clone();
                     tokio::spawn(async move {
                         let local_addr = socket.local_addr().unwrap_or(local_addr);
                         let (mut reader, mut writer) = socket.into_split();
 
-                        // Per-connection outbound channel
+                        // Per-connection outbound channel.  Cloned for the read
+                        // task so it can write RFC 5626 §4.4.1 pong (`\r\n`)
+                        // responses back over the same connection.
                         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
-                        connection_map.insert(connection_id, outbound_tx);
+                        connection_map.insert(connection_id, outbound_tx.clone());
+                        let keepalive_writer = outbound_tx;
 
                         // Read task with idle timeout and SIP stream framing (RFC 3261 §18.3)
                         let inbound_tx_clone = inbound_tx.clone();
@@ -124,10 +130,14 @@ pub async fn listen(
 
                                         // Extract all complete SIP messages from the buffer
                                         loop {
-                                            // Strip leading CRLFs — keepalive pings per RFC 3261 §7.5
-                                            while accumulator.len() >= 2 && &accumulator[..2] == b"\r\n" {
-                                                let _ = accumulator.split_to(2);
-                                            }
+                                            // RFC 5626 §4.4.1 keepalive handling + RFC 3261 §7.5
+                                            // stray-CRLF stripping in one pass.
+                                            drain_leading_crlf_keepalives(
+                                                &mut accumulator,
+                                                connection_id,
+                                                &keepalive_writer,
+                                                crlf_pong_tracker.as_ref(),
+                                            );
                                             if accumulator.is_empty() {
                                                 break;
                                             }
