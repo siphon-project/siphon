@@ -156,7 +156,32 @@ impl ProxySessionStore {
     }
 
     /// Insert a session, indexing it by all its client keys, server key, and dialog key.
-    pub fn insert(&self, session: ProxySession) {
+    ///
+    /// Returns the shared `Arc<RwLock<ProxySession>>` so the caller can mutate
+    /// the session directly without re-querying the store.  This matters
+    /// because the store entries can be removed (e.g. by `remove_client_key`
+    /// after the final response forwards) between insert and any subsequent
+    /// mutation — a store-side lookup would then miss and silently drop the
+    /// update.
+    ///
+    /// `by_dialog_key` is populated with `or_insert_with` rather than a plain
+    /// `insert` so that the FIRST writer for a given `(Call-ID, From-tag)`
+    /// wins — i.e. the dialog-establishing INVITE.  Subsequent in-dialog
+    /// requests (BYE, re-INVITE, UPDATE) routed through the script's
+    /// `request.relay()` create their own per-transaction `ProxySession`,
+    /// and without this guard their insert would overwrite the INVITE's
+    /// dialog-key entry mid-call.  Under TCP at high CPS, the UAC sends
+    /// ACK and BYE back-to-back; the BYE's `relay_request` can land its
+    /// `session_store.insert(...)` before the in-flight ACK's
+    /// `handle_ack_via_session` finishes its `by_dialog_key` lookup, so
+    /// the ACK then iterates the BYE-session's `client_branches` (which
+    /// holds `placeholder_connection_id = inbound.connection_id`, i.e.
+    /// the UAC's inbound TCP `connection_id`) and routes the ACK back
+    /// over the UAC's own socket.  Sipp logs that as "ACK CSeq value
+    /// does NOT match value of related INVITE CSeq -- aborting call"
+    /// and drops the subsequent BYE 200 OK as un-mappable, surfacing as
+    /// the documented ~0.025 % Proxy/TCP FailedCall rate.
+    pub fn insert(&self, session: ProxySession) -> Arc<RwLock<ProxySession>> {
         let server_key = session.server_key.clone();
         let client_keys: Vec<TransactionKey> = session.client_keys.clone();
         let dialog_key = Self::dialog_key_from_message(&session.original_request);
@@ -168,7 +193,9 @@ impl ProxySessionStore {
         }
 
         if let Some(dk) = dialog_key {
-            self.by_dialog_key.insert(dk, Arc::clone(&session_arc));
+            self.by_dialog_key
+                .entry(dk)
+                .or_insert_with(|| Arc::clone(&session_arc));
         }
 
         self.server_to_clients
@@ -181,6 +208,8 @@ impl ProxySessionStore {
                 }
             })
             .or_insert(client_keys);
+
+        session_arc
     }
 
     /// Pre-insert a session for a fork *before* any branch has been registered.
@@ -196,7 +225,12 @@ impl ProxySessionStore {
         let dialog_key = Self::dialog_key_from_message(&session.original_request);
         let session_arc = Arc::new(RwLock::new(session));
         if let Some(dk) = dialog_key {
-            self.by_dialog_key.insert(dk, Arc::clone(&session_arc));
+            // Same rationale as `insert()` above: do not overwrite an existing
+            // dialog-key entry.  The first INVITE for a `(Call-ID, From-tag)`
+            // owns the dialog; later in-dialog requests must not displace it.
+            self.by_dialog_key
+                .entry(dk)
+                .or_insert_with(|| Arc::clone(&session_arc));
         }
         self.server_to_clients.entry(server_key).or_default();
         session_arc

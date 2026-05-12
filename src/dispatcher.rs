@@ -2594,6 +2594,7 @@ fn relay_request(
     // in) and is updated below for TCP/TLS once the connection is established.
     let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
     let placeholder_connection_id = inbound.connection_id;
+    let mut inserted_session_arc: Option<Arc<RwLock<ProxySession>>> = None;
     let client_key_opt = match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
         Ok((client_key, actions)) => {
             for action in &actions {
@@ -2631,7 +2632,8 @@ fn relay_request(
                 });
                 session.on_reply_callback = on_reply_callback;
                 session.on_failure_callback = on_failure_callback;
-                state.session_store.insert(session);
+                let arc = state.session_store.insert(session);
+                inserted_session_arc = Some(arc);
             }
             Some(client_key)
         }
@@ -2680,16 +2682,24 @@ fn relay_request(
         };
         send_to_target(data, &target, inbound.transport, inbound.connection_id, state)
     };
+    // Patch the session's ClientBranch via the locally-held `Arc` we got
+    // back from `session_store.insert(...)` rather than re-looking up
+    // through the store: at high CPS on TCP loopback the UAS 200 OK can
+    // arrive and trigger `remove_client_key` before `send_to_target`
+    // returns here, dropping the by_client_key / server_to_clients index
+    // entries — a store-side lookup would then miss and the branch would
+    // stay pinned to `placeholder_connection_id` (the inbound UAC's
+    // connection_id), routing every later in-dialog send (ACK, BYE) to
+    // the UAC instead of the UAS.  The `Arc` keeps the session alive
+    // across the index removal, so the write always lands.
     if connection_id != placeholder_connection_id {
-        if let (Some(srv_key), Some(client_key)) = (server_key, client_key_opt.as_ref()) {
-            if let Some(session_arc) = state.session_store.get_by_server_key(srv_key) {
-                if let Ok(mut session) = session_arc.write() {
-                    session.set_client_branch(client_key.clone(), ClientBranch {
-                        destination,
-                        transport: outbound_transport,
-                        connection_id,
-                    });
-                }
+        if let (Some(client_key), Some(arc)) = (client_key_opt.as_ref(), inserted_session_arc.as_ref()) {
+            if let Ok(mut session) = arc.write() {
+                session.set_client_branch(client_key.clone(), ClientBranch {
+                    destination,
+                    transport: outbound_transport,
+                    connection_id,
+                });
             }
         }
     }
@@ -2917,9 +2927,26 @@ fn relay_fork_branch(
     // For TCP/TLS the actual connection_id may differ from the placeholder
     // — patch the session's ClientBranch so retransmits/CANCEL hit the right
     // connection.
+    //
+    // Patch via the local `session_arc` rather than re-looking up through
+    // `state.session_store.update_branch_connection_id(...)`: under TCP
+    // loopback at high CPS, the UAS 200 OK can arrive and be forwarded
+    // (which calls `session_store.remove_client_key`) before
+    // `send_to_target` returns here.  A store-side lookup would then miss
+    // and the branch would stay pinned to `placeholder_connection_id`
+    // (the inbound UAC's connection_id).  Subsequent in-dialog ACK relay
+    // via `handle_ack_via_session` would route on that placeholder and
+    // bounce the ACK back to the UAC — sipp logs it as "ACK CSeq value
+    // does NOT match value of related INVITE CSeq -- aborting call" and
+    // drops the subsequent BYE 200 OK.  The local `session_arc` survives
+    // `remove_client_key`, so this write always lands.
     if connection_id != placeholder_connection_id {
         if let Some(client_key) = client_key_opt.as_ref() {
-            state.session_store.update_branch_connection_id(client_key, connection_id);
+            if let Ok(mut session) = session_arc.write() {
+                if let Some(branch) = session.client_branches.get_mut(client_key) {
+                    branch.connection_id = connection_id;
+                }
+            }
         }
     }
 }
