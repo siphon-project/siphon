@@ -752,8 +752,9 @@ impl PyPendingSA {
             // Fire-and-forget the four UPDSA messages.  See doc-comment
             // for why this is sound — a missed repin can only widen the
             // expiry window, never tighten it past the registrar's grant.
+            let manager_for_repin = Arc::clone(&manager);
             tokio::spawn(async move {
-                if let Err(error) = manager
+                if let Err(error) = manager_for_repin
                     .update_sa_pair_lifetime(&ue_addr, ue_port_c, Some(secs))
                     .await
                 {
@@ -767,6 +768,26 @@ impl PyPendingSA {
                 }
             });
         }
+
+        // Tear down any prior SA pair for this UE address that's still
+        // sitting in the manager under a stale (port_uc, port_us).  The
+        // UE picks a fresh random port_uc on every REGISTER, so a
+        // re-REGISTER from the same UE address always installs its new
+        // pair under a different contact_key than the previous one — and
+        // without explicit cleanup the previous pair's four XFRM
+        // policies leak into the kernel forever.  After enough refresh
+        // cycles a new random port_uc collides with a leaked selector
+        // and the policy add returns EEXIST, breaking the registration.
+        // Fired here (post-200-OK, post-state-transition) because that's
+        // the point where the new binding has been granted by the
+        // registrar of record and the old one is definitionally stale.
+        // Fire-and-forget for the same reason as the lifetime repin —
+        // the activate transition has already committed and a missed
+        // cleanup degrades to "kernel policy table grows by 4 until the
+        // next successful activate", which the next round will catch.
+        tokio::spawn(async move {
+            manager.cleanup_other_pairs_for_ue(&ue_addr, ue_port_c).await;
+        });
 
         Ok(())
     }

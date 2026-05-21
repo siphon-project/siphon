@@ -699,6 +699,88 @@ impl IpsecManager {
         Ok(())
     }
 
+    /// Tear down every SA pair belonging to `ue_addr` other than the one
+    /// keyed by `keep_port_c`.
+    ///
+    /// A UE's `port_uc` is a fresh random port on every REGISTER (3GPP
+    /// TS 24.229 §5.1.1.2 — the IMS UE generates new protected ports for
+    /// each registration).  The manager's `contact_key` includes
+    /// `ue_port_c`, so the previous binding's entry sits in
+    /// `associations` under the old port until something tears it down.
+    /// The kernel reaps the four SAs on hard-lifetime expiry, but XFRM
+    /// policies have no lifetime — they accumulate until a future
+    /// REGISTER picks a `port_uc` that collides with a leaked selector,
+    /// at which point policy install hits `EEXIST` and the new
+    /// registration fails to protect.
+    ///
+    /// Called from `PyPendingSA::activate` once the 200 OK to the auth
+    /// REGISTER has landed: at that point the new binding is granted by
+    /// the registrar of record, the UE has proven possession of the
+    /// fresh keys, and any earlier binding for the same UE address is
+    /// definitionally stale.  Per-victim failures are logged but never
+    /// propagated — the in-memory entry is removed (via
+    /// `delete_sa_pair`'s `remove`-before-kernel-call ordering) even
+    /// when individual kernel deletes fail, so the manager's view stays
+    /// authoritative.
+    ///
+    /// Walks `associations` once (O(N) in active SA count); the inner
+    /// `delete_sa_pair` call deletes four SAs + four policies per
+    /// victim.
+    pub async fn cleanup_other_pairs_for_ue(
+        &self,
+        ue_addr: &IpAddr,
+        keep_port_c: u16,
+    ) {
+        let victim_ports: Vec<u16> = self
+            .associations
+            .iter()
+            .filter_map(|entry| {
+                let sa = entry.value();
+                if sa.ue_addr == *ue_addr && sa.ue_port_c != keep_port_c {
+                    Some(sa.ue_port_c)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if victim_ports.is_empty() {
+            return;
+        }
+
+        debug!(
+            ue = %ue_addr,
+            keep_port_c,
+            victim_count = victim_ports.len(),
+            "IPsec: tearing down stale SA pairs for re-REGISTER"
+        );
+
+        for victim_port_c in victim_ports {
+            if let Err(error) = self.delete_sa_pair(ue_addr, victim_port_c).await {
+                // delete_sa_pair removes the in-memory entry before the
+                // kernel call, so the map is already clean here — just
+                // log the kernel-side failure.  Leaving stale policies
+                // in the kernel for this victim is at worst a no-op:
+                // the new pair's selectors don't collide (different
+                // port_c by construction), and the victim's SAs will
+                // expire on hard-lifetime even if policies linger.
+                tracing::warn!(
+                    ue = %ue_addr,
+                    victim_port_c,
+                    %error,
+                    "IPsec: stale SA pair cleanup — kernel delete failed (in-memory entry already removed)"
+                );
+            } else {
+                info!(
+                    ue = %ue_addr,
+                    victim_port_c,
+                    keep_port_c,
+                    "IPsec: stale SA pair torn down on re-REGISTER"
+                );
+            }
+        }
+    }
+
     /// Re-pin the kernel hard-lifetime on all four SAs of an existing
     /// pair, without rekeying or disturbing selectors / SPIs.
     ///
@@ -1624,5 +1706,145 @@ mod tests {
         // any-protocol selector that covers both transports under one
         // SPI pair.
         assert_eq!(SaProtocol::default(), SaProtocol::Any);
+    }
+
+    /// Construct a `SecurityAssociationPair` for in-memory bookkeeping
+    /// tests.  Uses RFC 5737 documentation addresses so the SPI/port
+    /// quintuples cannot collide with any real-world XFRM state on the
+    /// host running the test suite.
+    fn test_sa_pair(ue_addr: IpAddr, ue_port_c: u16, spi_base: u32) -> SecurityAssociationPair {
+        SecurityAssociationPair {
+            ue_addr,
+            pcscf_addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            ue_port_c,
+            ue_port_s: ue_port_c + 1,
+            pcscf_port_c: 5064,
+            pcscf_port_s: 5066,
+            spi_uc: spi_base,
+            spi_us: spi_base + 1,
+            spi_pc: spi_base + 2,
+            spi_ps: spi_base + 3,
+            ealg: EncryptionAlgorithm::Null,
+            aalg: IntegrityAlgorithm::HmacSha1,
+            encryption_key: String::new(),
+            integrity_key: "00112233445566778899aabbccddeeff".to_string(),
+            hard_lifetime_secs: Some(3600),
+            protocol: SaProtocol::Any,
+        }
+    }
+
+    /// Direct insert into `associations` for tests that exercise the
+    /// manager's bookkeeping without going through `create_sa_pair`
+    /// (which requires `CAP_NET_ADMIN` to talk to the kernel).
+    fn insert_test_pair(manager: &IpsecManager, sa: SecurityAssociationPair) {
+        let key = IpsecManager::contact_key(&sa.ue_addr, sa.ue_port_c);
+        manager.associations.insert(key, sa);
+    }
+
+    /// Regression test for the XFRM-policy leak that surfaced as
+    /// `EEXIST` on policy add after several REGISTER refresh cycles from
+    /// the same UE.
+    ///
+    /// Root cause: `contact_key` includes `ue_port_c`, which the UE
+    /// regenerates on every REGISTER.  A re-REGISTER inserts the new
+    /// pair under a fresh key and never invokes `delete_sa_pair` for the
+    /// previous one — so the previous pair's four policies linger in
+    /// the kernel forever (they have no kernel-side lifetime, unlike
+    /// SAs).  Eventually a new random `port_uc` collides with a leaked
+    /// selector and policy install hits `EEXIST`.
+    ///
+    /// `cleanup_other_pairs_for_ue` is invoked from `PendingSA.activate`
+    /// (once the 200 OK has landed and the new binding is granted by
+    /// the registrar of record) and tears down every prior pair for the
+    /// same UE address other than the one being kept.
+    #[tokio::test]
+    async fn cleanup_other_pairs_removes_stale_entries_for_same_ue() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        let ue: IpAddr = "192.0.2.50".parse().unwrap();
+
+        // Simulate four prior REGISTER cycles for the same UE — each with
+        // a fresh random `port_uc` (mirroring the field trace where the UE
+        // chose 6101 / 6201 / 6301 / 6401 across May 20 18:05–19:49).
+        insert_test_pair(&manager, test_sa_pair(ue, 6101, 10000));
+        insert_test_pair(&manager, test_sa_pair(ue, 6201, 10004));
+        insert_test_pair(&manager, test_sa_pair(ue, 6301, 10008));
+        insert_test_pair(&manager, test_sa_pair(ue, 6401, 10012));
+        // Today's REGISTER lands on the same port_uc the UE happened to
+        // pick back at 18:05 — without cleanup, policy add would EEXIST
+        // against the leaked May-20-18:05 selector.
+        insert_test_pair(&manager, test_sa_pair(ue, 6500, 10016));
+        assert_eq!(manager.active_count(), 5);
+
+        manager.cleanup_other_pairs_for_ue(&ue, 6500).await;
+
+        // Only the kept pair survives; the four prior ones have been
+        // removed from the in-memory map.  Per-victim kernel deletes may
+        // fail in the unit test environment (no CAP_NET_ADMIN, no real
+        // SAs to delete), but `delete_sa_pair` removes from the map
+        // before issuing the kernel call, so observable manager state is
+        // deterministic.
+        assert_eq!(manager.active_count(), 1);
+        assert!(manager.has_sa(&ue, 6500));
+        for port in [6101u16, 6201, 6301, 6401] {
+            assert!(
+                !manager.has_sa(&ue, port),
+                "stale pair for port_c={port} should have been torn down"
+            );
+        }
+    }
+
+    /// Pairs for other UE addresses must be untouched — the cleanup is
+    /// scoped to `ue_addr`, not "all UEs".
+    #[tokio::test]
+    async fn cleanup_other_pairs_leaves_other_ues_untouched() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        let ue_a: IpAddr = "192.0.2.50".parse().unwrap();
+        let ue_b: IpAddr = "192.0.2.51".parse().unwrap();
+
+        insert_test_pair(&manager, test_sa_pair(ue_a, 6101, 10000));
+        insert_test_pair(&manager, test_sa_pair(ue_a, 6201, 10004));
+        insert_test_pair(&manager, test_sa_pair(ue_b, 7001, 10008));
+        insert_test_pair(&manager, test_sa_pair(ue_b, 7101, 10012));
+        assert_eq!(manager.active_count(), 4);
+
+        // Activate cleanup for ue_a, keeping port_c=6201 — must remove
+        // ue_a:6101 only.
+        manager.cleanup_other_pairs_for_ue(&ue_a, 6201).await;
+
+        assert_eq!(manager.active_count(), 3);
+        assert!(manager.has_sa(&ue_a, 6201));
+        assert!(!manager.has_sa(&ue_a, 6101));
+        // ue_b's pairs are untouched.
+        assert!(manager.has_sa(&ue_b, 7001));
+        assert!(manager.has_sa(&ue_b, 7101));
+    }
+
+    /// First REGISTER for a UE (no prior pair in the map) must complete
+    /// the cleanup as a no-op — no kernel calls, no map mutations.
+    #[tokio::test]
+    async fn cleanup_other_pairs_no_op_on_first_register() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        let ue: IpAddr = "192.0.2.50".parse().unwrap();
+
+        insert_test_pair(&manager, test_sa_pair(ue, 6500, 10000));
+        assert_eq!(manager.active_count(), 1);
+
+        manager.cleanup_other_pairs_for_ue(&ue, 6500).await;
+
+        assert_eq!(manager.active_count(), 1);
+        assert!(manager.has_sa(&ue, 6500));
+    }
+
+    /// Cleanup must remain a no-op when called for a UE that has no
+    /// pairs in the map at all — defends against the race where the
+    /// stash TTL fires `cleanup` before `activate` runs.
+    #[tokio::test]
+    async fn cleanup_other_pairs_no_op_when_ue_has_no_pairs() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        let unknown_ue: IpAddr = "192.0.2.99".parse().unwrap();
+
+        manager.cleanup_other_pairs_for_ue(&unknown_ue, 6500).await;
+
+        assert_eq!(manager.active_count(), 0);
     }
 }
