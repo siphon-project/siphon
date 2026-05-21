@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
+use crate::transport::pool::ConnectionPool;
 
 /// Spawn a TCP listener. For each accepted connection a task is spawned that:
 ///   1. Reads inbound SIP messages and sends them to `inbound_tx`
@@ -34,9 +35,16 @@ pub async fn listen(
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
+    pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
 ) {
     // Spawn a task that distributes outbound messages to per-connection senders.
+    // When no existing connection matches (`ConnectionId::default()` from fire-
+    // and-forget UAC sends, or a connection that has since closed), fall back
+    // to the outbound `ConnectionPool` to open a new TCP connection.  Without
+    // this fallback the message would be silently dropped — the bug that left
+    // in-dialog NOTIFY frames built but never written to the wire when the
+    // Route header pointed at a destination with no live inbound connection.
     let connection_map_clone = connection_map.clone();
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
@@ -44,8 +52,29 @@ pub async fn listen(
                 if let Err(e) = sender.send(outbound.data).await {
                     warn!("TCP outbound send failed for connection {:?}: {}", outbound.connection_id, e);
                 }
+            } else if let Some(ref pool) = pool {
+                match pool.send_tcp(outbound.destination, outbound.data).await {
+                    Ok(connection_id) => {
+                        debug!(
+                            destination = %outbound.destination,
+                            connection_id = ?connection_id,
+                            "TCP outbound: sent via pool"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            destination = %outbound.destination,
+                            connection_id = ?outbound.connection_id,
+                            "TCP outbound pool connect failed: {error}"
+                        );
+                    }
+                }
             } else {
-                debug!("TCP outbound: connection {:?} not found (may have closed)", outbound.connection_id);
+                warn!(
+                    destination = %outbound.destination,
+                    connection_id = ?outbound.connection_id,
+                    "TCP outbound dropped: no live connection and no pool available"
+                );
             }
         }
     });

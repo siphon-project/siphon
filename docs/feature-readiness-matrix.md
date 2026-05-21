@@ -31,7 +31,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| TCP | **Production** | `listen.tcp` | AS-facing; RFC 3261 §18.3 stream framing with Content-Length extraction |
+| TCP | **Production** | `listen.tcp` | AS-facing; RFC 3261 §18.3 stream framing with Content-Length extraction; outbound distributor falls back to the `ConnectionPool` when an `OutboundMessage` arrives without a matching inbound connection (covers UAC fire-and-forget paths like in-dialog NOTIFY from `subscribe_state.notify()` whose Route header points at a destination with no live inbound socket — previously the message was built but silently dropped at the connection-map lookup) |
 | TLS | **Production** | `listen.tls` | Subscriber-facing, TLS 1.3 validated; RFC 3261 §18.3 stream framing |
 | TLS 1.3 | **Production** | `tls.method: TLSv1_3` | |
 | TLS 1.2 | Implemented | `tls.method: TLSv1_2` | |

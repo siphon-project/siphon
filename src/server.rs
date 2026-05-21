@@ -793,6 +793,14 @@ impl SiphonServer {
 
         // TCP
         let tcp_connection_map = Arc::new(dashmap::DashMap::new());
+        // Resolve TCP listen addresses up-front so we know the
+        // `pool_local_addr` (first listen address) before constructing the
+        // ConnectionPool — the pool must exist before `tcp::listen` is
+        // spawned, since the TCP outbound distributor needs the pool to
+        // fall back on for fire-and-forget sends that arrive with
+        // `ConnectionId::default()` (e.g. in-dialog NOTIFY from the
+        // subscribe_state module).
+        let mut tcp_entries: Vec<(std::net::SocketAddr, Option<u32>, Option<u8>)> = Vec::new();
         for entry in &config.listen.tcp {
             let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
                 eprintln!("Invalid TCP listen address '{}': {error}", entry.address());
@@ -806,8 +814,7 @@ impl SiphonServer {
                 advertised_addrs.entry(transport::Transport::Tcp).or_insert_with(|| adv.to_string());
             }
             let tos = resolve_tos(entry);
-            info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TCP transport");
-            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos, crlf_pong_tracker.clone()).await;
+            tcp_entries.push((addr, tos, entry.dscp().or(global_dscp)));
         }
 
         // TLS maps — created before pool so pool can register connections for reuse.
@@ -817,8 +824,9 @@ impl SiphonServer {
             Arc::new(dashmap::DashMap::new());
 
         // --- Connection pool ---
-        // Created before TLS listen so outbound TLS messages can use it.
-        // Gets tls_addr_map so pool TLS connections are discoverable by the dispatcher.
+        // Created before TCP/TLS listeners so outbound messages on those
+        // transports can fall back to the pool when no inbound connection
+        // matches the requested `ConnectionId`.
         let pool_tos = global_dscp
             .filter(|&d| d > 0)
             .map(config::dscp_to_tos);
@@ -833,6 +841,13 @@ impl SiphonServer {
             Some(Arc::clone(&tls_addr_map)),
             crlf_pong_tracker.clone(),
         ));
+
+        // Spawn TCP listeners now that the pool exists.
+        for (addr, tos, dscp) in tcp_entries {
+            info!(addr = %addr, dscp = ?dscp, "starting TCP transport");
+            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone()).await;
+        }
+
         if let Some(ref tls_config) = config.tls {
             for entry in &config.listen.tls {
                 let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {

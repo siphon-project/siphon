@@ -126,7 +126,7 @@ async fn tcp_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    tcp::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None).await;
+    tcp::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None, None).await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect and send OPTIONS
@@ -169,6 +169,112 @@ async fn tcp_roundtrip() {
     assert!(response.contains("200 OK"), "expected 200 OK: {}", response);
 }
 
+/// Regression: fire-and-forget outbound TCP with `ConnectionId::default()`
+/// must open a fresh connection via the pool fallback.
+///
+/// Without the pool fallback the TCP outbound distributor silently dropped
+/// any message whose `connection_id` was not present in the connection map
+/// — which is exactly what `UacSender::send_request()` sends (sentinel
+/// id 0) for in-dialog requests originated outside the proxy relay path
+/// (e.g. S-CSCF reg-event NOTIFY).  The build path captured HEP, but the
+/// frame never reached the socket.
+#[tokio::test]
+async fn tcp_outbound_fallback_to_pool_when_no_connection() {
+    use siphon::transport::pool::ConnectionPool;
+
+    // ConnectionPool builds a TlsConnector at construction; rustls needs
+    // a process-wide CryptoProvider for that to succeed even when no TLS
+    // is exercised by this test.  Install once; subsequent calls are
+    // no-ops if another test got here first.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
+    // 1) A target TCP server stands in for the downstream SIP element
+    //    (P-CSCF receiving a NOTIFY from S-CSCF).
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    let received = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+    let received_clone = Arc::clone(&received);
+    tokio::spawn(async move {
+        let (mut socket, _) = target_listener.accept().await.unwrap();
+        let mut buffer = vec![0u8; 4096];
+        let size = socket.read(&mut buffer).await.unwrap();
+        received_clone.lock().await.extend_from_slice(&buffer[..size]);
+    });
+
+    // 2) Build a real ConnectionPool sharing the listener's connection_map
+    //    and inbound_tx — same wiring server.rs does in production.
+    let listen_addr = free_port();
+    let (inbound_tx, _inbound_rx) = flume::unbounded();
+    let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+        Arc::new(DashMap::new());
+    let pool = Arc::new(ConnectionPool::new(
+        Arc::clone(&connection_map),
+        inbound_tx.clone(),
+        listen_addr,
+        None,
+        None,
+        None,
+    ));
+
+    // 3) Start the TCP listener with the pool wired in — this is the
+    //    distributor task that should fall back to the pool when the
+    //    sentinel connection_id misses the map.
+    tcp::listen(
+        listen_addr,
+        inbound_tx,
+        outbound_rx,
+        Arc::clone(&connection_map),
+        test_acl(),
+        None,
+        Some(Arc::clone(&pool)),
+        None,
+    )
+    .await;
+    tokio::time::sleep(SETTLE).await;
+
+    // 4) Fire-and-forget: send the OutboundMessage UacSender::send_request()
+    //    builds — sentinel id 0, no source_local_addr.
+    let notify_bytes = Bytes::from_static(b"NOTIFY sip:bob@example.com SIP/2.0\r\n\
+        Via: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bK-pool-fallback\r\n\
+        From: <sip:scscf@example.com>;tag=notifier\r\n\
+        To: <sip:bob@example.com>;tag=subscriber\r\n\
+        Call-ID: pool-fallback-test\r\n\
+        CSeq: 1 NOTIFY\r\n\
+        Event: reg\r\n\
+        Subscription-State: active;expires=3600\r\n\
+        Content-Length: 0\r\n\
+        \r\n");
+    outbound_tx
+        .send_async(OutboundMessage {
+            connection_id: ConnectionId::default(),
+            transport: Transport::Tcp,
+            destination: target_addr,
+            data: notify_bytes.clone(),
+            source_local_addr: None,
+        })
+        .await
+        .unwrap();
+
+    // 5) Wait until the target server has the bytes — without the pool
+    //    fallback this would time out (the distributor would drop the
+    //    message at the connection_map.get() miss).
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!("timed out waiting for NOTIFY bytes at target server — pool fallback regressed");
+        }
+        if !received.lock().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let buf = received.lock().await.clone();
+    let on_wire = String::from_utf8_lossy(&buf);
+    assert!(on_wire.contains("NOTIFY"), "expected NOTIFY on wire, got: {on_wire}");
+    assert!(on_wire.contains("Event: reg"), "expected Event: reg on wire");
+}
+
 // ---------------------------------------------------------------------------
 // RFC 5626 §4.4.1 CRLF keepalive — peer pings get a CRLF pong over the wire
 // ---------------------------------------------------------------------------
@@ -194,6 +300,7 @@ async fn tcp_responds_to_peer_crlf_ping_with_pong() {
         outbound_rx,
         Arc::clone(&connection_map),
         test_acl(),
+        None,
         None,
         Some(Arc::clone(&tracker)),
     )
@@ -465,7 +572,7 @@ async fn multi_transport_shared_inbound_channel() {
 
     // Start all three transports with the same inbound_tx
     udp::listen(udp_addr, inbound_tx.clone(), udp_outbound_rx, test_acl(), None).await;
-    tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map), test_acl(), None, None).await;
+    tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map), test_acl(), None, None, None).await;
     ws::listen(ws_addr, inbound_tx.clone(), ws_outbound_rx, Arc::clone(&ws_connection_map), test_acl(), None).await;
     drop(inbound_tx); // Only transport workers hold clones now
     tokio::time::sleep(SETTLE).await;
