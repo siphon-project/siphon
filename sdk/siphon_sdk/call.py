@@ -206,6 +206,10 @@ class Call:
         uri: str,
         timeout: int = 30,
         next_hop: Optional[str] = None,
+        header_policy: Optional[str] = None,
+        copy: Optional[list[str]] = None,
+        strip: Optional[list[str]] = None,
+        translate: Optional[list[tuple[str, str]]] = None,
     ) -> None:
         """Dial a single B-leg target.
 
@@ -216,15 +220,49 @@ class Call:
                 INVITE's R-URI is still built from ``uri`` (so the called
                 party / IMPU shape is preserved), but the message is sent
                 to ``next_hop``.  Mirrors ``proxy.send_request(next_hop=...)``.
+            header_policy: Qualified preset name selecting which header
+                policy the framework applies when building the B-leg
+                INVITE and forwarding responses back to the A-leg.
+                Defaults to ``b2bua.default_header_policy`` from
+                ``siphon.yaml`` (which itself defaults to
+                ``"transparent-b2bua@2026"``).  Built-in presets:
+                ``"transparent-b2bua@2026"`` (today's behaviour),
+                ``"ims-intra-trust-domain@2026"`` (intra-trust IMS,
+                passes P-* and end-to-end PRACK / preconditions),
+                ``"ims-trust-domain-boundary@2026"`` (BGCF/IBCF/P-CSCF
+                edge, strict trust-boundary hygiene),
+                ``"sip-trunk-edge@2026"`` (plain SIP trunk).
+            copy: Per-call delta — headers to copy verbatim regardless of
+                the preset's default verb (e.g. ``["X-Operator-Tag"]``).
+            strip: Per-call delta — headers to strip regardless of the
+                preset's default verb (e.g. ``["History-Info"]``).
+            translate: Per-call delta — ``[(header_name, op_name), …]``
+                pairs.  ``op_name`` is one of: ``"rfc7044"`` /
+                ``"diversion-to-history-info"`` (translate ``Diversion``
+                per RFC 7044).  Unknown ops are logged and dropped.
 
         Example::
 
+            # Basic dial (uses configured default policy)
             call.dial("sip:bob@10.0.0.2:5060", timeout=30)
 
-            # IMS edge: stamp canonical IMPU on R-URI, route via I-CSCF.
+            # IMS edge: stamp canonical IMPU on R-URI, route via I-CSCF,
+            # apply the trust-domain-boundary preset for outbound hygiene.
             call.dial(
                 "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
                 next_hop="sip:172.16.0.111:4060",
+                header_policy="ims-trust-domain-boundary@2026",
+                copy=["X-Operator-Tag"],
+                strip=["History-Info"],
+            )
+
+            # Emergency call — keep PAI / Reason / Geolocation through a
+            # trunk edge that would otherwise strip them.
+            call.dial(
+                "sip:911@psap.example.com",
+                header_policy="sip-trunk-edge@2026",
+                copy=["Geolocation", "Geolocation-Routing",
+                      "P-Asserted-Identity", "Reason"],
             )
         """
         self._actions.append(Action(
@@ -232,6 +270,12 @@ class Call:
             targets=[uri],
             timeout=timeout,
             next_hop=next_hop,
+            extras={
+                "header_policy": header_policy,
+                "copy": copy or [],
+                "strip": strip or [],
+                "translate": translate or [],
+            },
         ))
 
     def fork(
@@ -239,6 +283,10 @@ class Call:
         targets: list[Union[str, Contact]],
         strategy: str = "parallel",
         timeout: int = 30,
+        header_policy: Optional[str] = None,
+        copy: Optional[list[str]] = None,
+        strip: Optional[list[str]] = None,
+        translate: Optional[list[tuple[str, str]]] = None,
     ) -> None:
         """Fork to multiple B-leg targets.
 
@@ -247,6 +295,9 @@ class Call:
             strategy: ``"parallel"`` (ring all, first answer wins) or
                       ``"sequential"`` (try in order).
             timeout: Per-branch INVITE timeout in seconds.
+            header_policy / copy / strip / translate: Same semantics as
+                :meth:`dial` — the policy applies to every branch of the
+                fork (per-branch policy is a follow-up).
 
         Example::
 
@@ -259,6 +310,12 @@ class Call:
             targets=uris,
             strategy=strategy,
             timeout=timeout,
+            extras={
+                "header_policy": header_policy,
+                "copy": copy or [],
+                "strip": strip or [],
+                "translate": translate or [],
+            },
         ))
 
     def terminate(self) -> None:

@@ -109,6 +109,15 @@ struct DispatcherState {
     rtpengine_profiles: Option<Arc<crate::rtpengine::ProfileRegistry>>,
     /// RFC 4028 session timer configuration (None when not configured).
     session_timer_config: Option<crate::config::SessionTimerConfig>,
+    /// B2BUA header policy preset library — keyed by qualified name
+    /// (e.g. `"transparent-b2bua@2026"`).  Built once at startup from
+    /// [`crate::b2bua::header_policy::builtin_presets`].
+    header_policy_registry: Arc<std::collections::HashMap<String, Arc<crate::b2bua::header_policy::Preset>>>,
+    /// Default header policy applied when the script doesn't pass
+    /// `header_policy=` on `call.dial()`.  Resolved from
+    /// `config.b2bua.default_header_policy`, falling back to
+    /// `"transparent-b2bua@2026"` if unset.
+    default_header_policy: Arc<crate::b2bua::header_policy::Preset>,
     /// Outbound registration manager (None when registrant is not configured).
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     /// SIPREC recording manager (SRC role — sends recordings to external SRS).
@@ -263,6 +272,21 @@ impl DispatcherState {
             .unwrap_or(self.local_addr.port())
     }
 
+    /// Resolve the header policy for a B2BUA call.  Returns the per-call
+    /// policy when the script attached one via `call.dial(header_policy=…)`,
+    /// otherwise the configured default.
+    fn resolve_header_policy(
+        &self,
+        call_id: &str,
+    ) -> crate::b2bua::header_policy::ResolvedPolicy {
+        if let Some(call) = self.call_actors.get_call(call_id) {
+            if let Some(ref p) = call.resolved_header_policy {
+                return (**p).clone();
+            }
+        }
+        crate::b2bua::header_policy::ResolvedPolicy::from_preset(self.default_header_policy.clone())
+    }
+
     /// Check whether a resolved destination points back to one of our own
     /// listen addresses (loop detection).  Checks the primary `local_addr`
     /// AND every per-transport listen address in `listen_addrs`.
@@ -407,6 +431,27 @@ pub async fn run(
         }
     }
 
+    // B2BUA header policy library — built-in presets only in v1.
+    let header_policy_registry = Arc::new(crate::b2bua::header_policy::builtin_presets());
+    let default_policy_name = config
+        .b2bua
+        .default_header_policy
+        .as_deref()
+        .unwrap_or("transparent-b2bua@2026");
+    let default_header_policy = header_policy_registry
+        .get(default_policy_name)
+        .cloned()
+        .unwrap_or_else(|| {
+            warn!(
+                requested = %default_policy_name,
+                "b2bua.default_header_policy unknown — falling back to transparent-b2bua@2026"
+            );
+            header_policy_registry
+                .get("transparent-b2bua@2026")
+                .cloned()
+                .expect("builtin transparent-b2bua@2026 must exist")
+        });
+
     let state = Arc::new(DispatcherState {
         engine,
         outbound,
@@ -428,6 +473,8 @@ pub async fn run(
         rtpengine_sessions,
         rtpengine_profiles,
         session_timer_config: config.session_timer.clone(),
+        header_policy_registry,
+        default_header_policy,
         registrant_manager,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new(product_name, product_version)),
         li_siprec_srs_uri: config.lawful_intercept.as_ref()
@@ -4435,59 +4482,68 @@ fn flatten_record_route_headers(headers: &[String]) -> Vec<String> {
 /// - Strips User-Agent (UAC header — not for responses), sets Server
 /// - Removes Allow, Allow-Events, Supported, Require
 /// - Strips B-leg-specific P-Asserted-Identity, P-Charging-Vector
+/// Resolve a script-supplied translate-op name (from `call.dial(translate=[(…, "rfc7044")])`)
+/// to a [`crate::b2bua::header_policy::TranslateOp`].  Returns `None` for
+/// unknown names; the caller is expected to log and skip.
+fn parse_translate_op_name(name: &str) -> Option<crate::b2bua::header_policy::TranslateOp> {
+    match name.to_ascii_lowercase().as_str() {
+        "rfc7044" | "diversion-to-history-info" => {
+            Some(crate::b2bua::header_policy::TranslateOp::DiversionToHistoryInfo)
+        }
+        _ => None,
+    }
+}
+
 fn sanitize_b2bua_response(
     response: &mut SipMessage,
     state: &DispatcherState,
     a_leg_transport: Transport,
+    call_id: &str,
 ) {
     // Contact: must point to siphon so in-dialog requests (ACK, BYE, re-INVITE)
     // route through us, not directly to the B-leg.
     // via_host()/via_port() apply advertised_address fallback and substitute the
     // sanitized local_addr when bound to 0.0.0.0/[::] — never leak unspecified.
+    let a_leg_host = state.via_host(&a_leg_transport);
+    let a_leg_port = state.via_port(&a_leg_transport);
     let contact_value = format!(
         "<sip:{}:{};transport={}>",
-        state.via_host(&a_leg_transport),
-        state.via_port(&a_leg_transport),
+        a_leg_host,
+        a_leg_port,
         a_leg_transport.to_string().to_lowercase(),
     );
     response.headers.set("Contact", contact_value);
 
-    // Remove User-Agent — responses use Server, not User-Agent (RFC 3261 §20.35/§20.41).
-    // Leaving it would leak B-leg topology to the A-leg.
-    response.headers.remove("User-Agent");
-    response.headers.remove("Server");
-    if let Some(ref srv) = state.server_header {
-        response.headers.set("Server", srv.clone());
-    }
-
-    // P-Asserted-Identity, P-Charging-Vector, P-Charging-Function-Addresses:
-    // Per RFC 3325 / RFC 3455, these are trust-domain headers that B2BUAs
-    // within the trust domain SHOULD forward. Keep them.
-
-    // Record-Route from the B-leg path must never leak to the A-leg.
-    // Each leg has its own independent dialog and route set (RFC 3261 §16).
+    // Framework-auto strip — `Record-Route` carries the B-leg dialog route
+    // set; leaking it to the A-leg breaks RFC 3261 §16 dialog independence
+    // and topology hiding (two independent reasons).  No preset can opt in.
+    //
+    // `Proxy-Authenticate` is hop-by-hop per RFC 3261 §22.3 and every
+    // built-in preset strips it (transparent-b2bua@2026 included — an
+    // intentional behaviour change vs pre-policy siphon, which passed
+    // it through as a latent bug).  Done as a preset strip rather than
+    // framework-auto so transparent-proxy B2BUAs can opt back in via
+    // `call.dial(copy=["Proxy-Authenticate"])` for the rare case.
     response.headers.remove("Record-Route");
 
-    // Strip B-leg capability headers — siphon terminates the dialog.
-    // These reveal the remote endpoint's feature set and break topology hiding.
-    response.headers.remove("Allow");
-    response.headers.remove("Allow-Events");
-    response.headers.remove("Supported");
-    response.headers.remove("Content-Disposition");
-    // Strip RFC 3262 100rel state from forwarded responses: in "auto-PRACK"
-    // mode the B2BUA terminates the reliable provisional locally on the
-    // B-leg side (sending its own PRACK) and presents an ordinary 1xx to
-    // the A-leg. Without this the A-leg would see a Require: 100rel and
-    // think it has to PRACK back — but the dialog identifiers it would use
-    // belong to the A-leg dialog, not B-leg, so the PRACK could never reach
-    // the originating UAS.
-    response.headers.remove("Require");
-    response.headers.remove("RSeq");
+    // Apply per-call header policy.  Resolves to the per-call preset (when
+    // the script attached one via `call.dial(header_policy=…)`), otherwise
+    // the configured `b2bua.default_header_policy` (defaults to
+    // `transparent-b2bua@2026`, which reproduces siphon's pre-policy
+    // sanitize_b2bua_response strips — Allow/Allow-Events/Supported/Require/
+    // RSeq/Content-Disposition/User-Agent strip + Server rewrite).
+    let policy = state.resolve_header_policy(call_id);
+    let ctx = crate::b2bua::header_policy::PolicyContext {
+        b2bua_host: &a_leg_host,
+        b2bua_port: a_leg_port,
+        user_agent_header: state.user_agent_header.as_deref(),
+        server_header: state.server_header.as_deref(),
+    };
+    crate::b2bua::header_policy::apply_to_response(response, &policy, &ctx);
 
     // Sanitize SDP: mask B-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
-    let sdp_addr = state.via_host(&a_leg_transport);
-    sanitize_sdp_identity(&mut response.body, &state.sdp_name, Some(&sdp_addr));
+    sanitize_sdp_identity(&mut response.body, &state.sdp_name, Some(&a_leg_host));
 
     // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
     if !response.body.is_empty() {
@@ -6308,12 +6364,12 @@ fn handle_b2bua_invite(
     let engine_state = state.engine.state();
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
 
-    let (action, timer_override, credentials, li_record, preserve_call_id) = Python::attach(|python| {
+    let (action, timer_override, credentials, li_record, preserve_call_id, policy_input) = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall: {error}");
-                return (CallAction::None, None, None, false, false);
+                return (CallAction::None, None, None, false, false, None);
             }
         };
 
@@ -6327,7 +6383,7 @@ fn handle_b2bua_invite(
                             return (CallAction::Reject {
                                 code: 500,
                                 reason: "Script Error".to_string(),
-                            }, None, None, false, false);
+                            }, None, None, false, false, None);
                         }
                     }
                 }
@@ -6336,7 +6392,7 @@ fn handle_b2bua_invite(
                     return (CallAction::Reject {
                         code: 500,
                         reason: "Script Error".to_string(),
-                    }, None, None, false, false);
+                    }, None, None, false, false, None);
                 }
             }
         }
@@ -6347,14 +6403,60 @@ fn handle_b2bua_invite(
         let credentials = borrowed.outbound_credentials().map(|(u, p)| (u.to_string(), p.to_string()));
         let li_record = borrowed.li_record();
         let preserve_cid = borrowed.preserve_call_id();
-        (action, timer_override, credentials, li_record, preserve_cid)
+        let policy_input = borrowed.header_policy_input().cloned();
+        (action, timer_override, credentials, li_record, preserve_cid, policy_input)
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
     state.call_actors.set_a_leg_invite(&call_id, Arc::clone(&message_arc));
 
+    // Resolve script-side header policy input into a per-call ResolvedPolicy.
+    // Done outside the call_actors lock so the registry lookup + delta
+    // translation doesn't hold the actor mutex.
+    let resolved_policy = policy_input.map(|input| {
+        let preset = match input.policy_name.as_deref() {
+            Some(name) => match state.header_policy_registry.get(name) {
+                Some(p) => p.clone(),
+                None => {
+                    warn!(
+                        call_id = %call_id,
+                        requested = %name,
+                        "unknown header_policy preset — falling back to default"
+                    );
+                    state.default_header_policy.clone()
+                }
+            },
+            None => state.default_header_policy.clone(),
+        };
+        let mut resolved = crate::b2bua::header_policy::ResolvedPolicy::from_preset(preset);
+        resolved.deltas_copy = input.deltas_copy;
+        resolved.deltas_strip = input.deltas_strip;
+        resolved.deltas_translate = input
+            .deltas_translate
+            .into_iter()
+            .filter_map(|(header, op_name)| {
+                parse_translate_op_name(&op_name)
+                    .map(|op| (header, op))
+                    .or_else(|| {
+                        warn!(
+                            call_id = %call_id,
+                            op = %op_name,
+                            "unknown translate op — entry dropped"
+                        );
+                        None
+                    })
+            })
+            .collect();
+        Arc::new(resolved)
+    });
+
     // Store per-call overrides from script
-    if timer_override.is_some() || credentials.is_some() || li_record || preserve_call_id {
+    if timer_override.is_some()
+        || credentials.is_some()
+        || li_record
+        || preserve_call_id
+        || resolved_policy.is_some()
+    {
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
             if let Some(override_config) = timer_override {
                 call.session_timer_override = Some(override_config);
@@ -6366,6 +6468,9 @@ fn handle_b2bua_invite(
                 call.li_record = true;
             }
             call.preserve_call_id = preserve_call_id;
+            if resolved_policy.is_some() {
+                call.resolved_header_policy = resolved_policy;
+            }
         }
     }
 
@@ -6492,14 +6597,18 @@ fn b2bua_send_b_leg_invite(
 
     let mut b_leg_invite = original_request.clone();
 
-    // B2BUA: strip A-leg headers that must not leak to the B-leg.
-    // Record-Route/Route belong to the A-leg dialog (independent dialog, RFC 3261).
-    // Authorization/Proxy-Authorization are A-leg credentials — forwarding them is
-    // both a security leak and protocol-incorrect (B-leg hasn't challenged us).
+    // Framework-auto strips — `Record-Route` and `Route` carry the A-leg
+    // dialog routing state, independent of B-leg per RFC 3261 §16.  No
+    // preset can opt them in (the dialog model breaks if they cross).
+    //
+    // `Authorization` (RFC 3261 §22.2, end-to-end) and `Proxy-Authorization`
+    // (RFC 3261 §22.3, hop-by-hop) are both policy-managed.  Every built-in
+    // preset strips them by default; scripts can opt in via
+    // `call.dial(copy=[…])` for transparent-federation / transparent-proxy
+    // cases (preset validator rejects combinations that would break
+    // the Digest hash).
     b_leg_invite.headers.remove("Record-Route");
     b_leg_invite.headers.remove("Route");
-    b_leg_invite.headers.remove("Authorization");
-    b_leg_invite.headers.remove("Proxy-Authorization");
 
     // Replace Via with our own (set preserves header position)
     b_leg_invite.headers.set("Via", via_value);
@@ -6580,10 +6689,9 @@ fn b2bua_send_b_leg_invite(
         outbound_transport.to_string().to_lowercase(),
     ));
 
-    // Replace User-Agent with our own
-    if let Some(ref ua) = state.user_agent_header {
-        b_leg_invite.headers.set("User-Agent", ua.clone());
-    }
+    // User-Agent rewrite is policy-managed (see `transparent-b2bua@2026`
+    // → User-Agent: Rewrite(ReplaceWithUserAgentHeader)).  Topology-hiding
+    // presets at trust boundaries do the same.
 
     // Strip any To-tag (B-leg INVITE should not have one) and rewrite the To URI
     // host to match the dial target (topology hiding — A-leg advertised address
@@ -6621,17 +6729,20 @@ fn b2bua_send_b_leg_invite(
     // Decrement Max-Forwards (RFC 7332 — B2BUAs MUST decrement)
     let _ = crate::proxy::core::decrement_max_forwards(&mut b_leg_invite.headers);
 
-    // Rewrite P-Asserted-Identity host to our advertised address (topology hiding).
-    // The PAI user part is kept as-is (it's the asserted identity), but the host
-    // must not leak the A-leg's internal/private IP to the B-leg.
+    // Apply per-call header policy.  Resolves to the per-call preset (when
+    // the script attached one via `call.dial(header_policy=…)`), otherwise
+    // the configured `b2bua.default_header_policy` (defaults to
+    // `transparent-b2bua@2026`, which reproduces siphon's pre-policy B-leg
+    // INVITE construction — Authorization strip + User-Agent/PAI rewrite).
     {
-        let b2bua_host = state.via_host(&outbound_transport);
-        if let Some(pai) = b_leg_invite.headers.get("P-Asserted-Identity") {
-            b_leg_invite.headers.set(
-                "P-Asserted-Identity",
-                crate::b2bua::actor::rewrite_uri_host(&pai, &b2bua_host),
-            );
-        }
+        let policy = state.resolve_header_policy(call_id);
+        let ctx = crate::b2bua::header_policy::PolicyContext {
+            b2bua_host: &b_contact_host,
+            b2bua_port: b_contact_port,
+            user_agent_header: state.user_agent_header.as_deref(),
+            server_header: state.server_header.as_deref(),
+        };
+        crate::b2bua::header_policy::apply_to_request(&mut b_leg_invite, &policy, &ctx);
     }
 
     // Inject RFC 4028 session timer headers if configured.
@@ -7215,7 +7326,7 @@ fn handle_b2bua_response(
             message.headers.set("CSeq", cseq.clone());
         }
 
-        sanitize_b2bua_response(message, state, resp_transport);
+        sanitize_b2bua_response(message, state, resp_transport, call_id);
 
         // RTPEngine: rewrite re-INVITE 2xx response SDP through answer.
         // Mirrors the offer processing done on the request side.
@@ -7433,7 +7544,7 @@ fn handle_b2bua_response(
             message.headers.set("CSeq", cseq.clone());
         }
 
-        sanitize_b2bua_response(message, state, resp_transport);
+        sanitize_b2bua_response(message, state, resp_transport, call_id);
 
         // RTPEngine answer for UPDATE 2xx with SDP body (codec/precondition
         // re-negotiation). Empty-body 2xx (session-timer refresh) bypasses.
@@ -7843,7 +7954,7 @@ fn handle_b2bua_response(
             .unwrap_or_default();
 
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(&mut response, state, a_leg.transport.transport);
+        sanitize_b2bua_response(&mut response, state, a_leg.transport.transport, call_id);
 
         // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).
         // sanitize_b2bua_response strips all Record-Route (B-leg path). The A-leg
@@ -8178,7 +8289,7 @@ fn handle_b2bua_response(
             }
         }
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(message, state, a_leg.transport.transport);
+        sanitize_b2bua_response(message, state, a_leg.transport.transport, call_id);
         send_message(
             message.clone(),
             a_leg.transport.transport,
@@ -8524,7 +8635,7 @@ fn handle_b2bua_response(
             }
         }
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(message, state, a_leg.transport.transport);
+        sanitize_b2bua_response(message, state, a_leg.transport.transport, call_id);
         send_message(
             message.clone(),
             a_leg.transport.transport,

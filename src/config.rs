@@ -90,6 +90,10 @@ pub struct Config {
     /// RFC 4028 session timers for B2BUA mode.
     pub session_timer: Option<SessionTimerConfig>,
 
+    /// B2BUA-wide knobs (header policy, etc.).
+    #[serde(default)]
+    pub b2bua: B2buaConfig,
+
     /// Call Detail Records — billing and accounting.
     pub cdr: Option<CdrYamlConfig>,
 
@@ -147,6 +151,26 @@ pub struct Config {
     /// (when they consume the value directly).
     #[serde(default)]
     pub extensions: Option<IndexMap<String, serde_yml::Value>>,
+}
+
+/// B2BUA-wide configuration knobs.
+///
+/// Currently surfaces the default header policy applied to B2BUA calls when
+/// the script doesn't pass `header_policy=` on `call.dial()`.  The built-in
+/// presets ship with siphon — operators just pin the qualified name (e.g.
+/// `"transparent-b2bua@2026"`).  An unset/empty value falls back to
+/// `transparent-b2bua@2026`, which reproduces siphon's pre-policy B2BUA
+/// behaviour (modulo the intentional `Proxy-Authenticate` strip).
+///
+/// ```yaml
+/// b2bua:
+///   default_header_policy: "ims-trust-domain-boundary@2026"
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct B2buaConfig {
+    /// Qualified preset name (`"<name>@<version>"`).  When `None`, falls
+    /// back to `"transparent-b2bua@2026"`.
+    pub default_header_policy: Option<String>,
 }
 
 /// Configuration for ``proxy.subscribe_state`` — generic SUBSCRIBE

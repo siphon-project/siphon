@@ -4,9 +4,16 @@
 //! registrar lookups for routing B2BUA calls, and transaction key handling.
 
 use siphon::b2bua::actor::{
-    CallActorStore, CallEvent, CallState, Leg, LegActor, LegMessage, TransportInfo,
+    CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor, LegMessage, TransportInfo,
     SessionTimerState, generate_call_id, generate_tag,
 };
+use siphon::b2bua::header_policy::{
+    apply_to_request, apply_to_response, builtin_presets, validate_preset,
+    DirectionPolicy, HeaderPattern, PolicyContext, Preset, PresetError,
+    ResolvedPolicy, RewriteOp, Verb,
+};
+use siphon::sip::message::SipMessage;
+use siphon::sip::parser::parse_sip_message;
 use siphon::dialog::{Dialog, DialogId, DialogStore, DialogState};
 use siphon::registrar::Registrar;
 use siphon::sip::builder::SipMessageBuilder;
@@ -1409,4 +1416,262 @@ fn per_leg_contact_on_call_actor_store() {
     // For in-dialog BYE B→A:
     //   RURI = A-leg remote_contact = "sip:alice@10.0.0.1:5060"
     //   Contact = A-leg local_contact = "<sip:203.0.113.1:5060;transport=udp>"
+}
+
+// ---------------------------------------------------------------------------
+// Header policy — integration with CallActor + preset library
+// ---------------------------------------------------------------------------
+
+fn make_invite(extras: &[(&str, &str)]) -> SipMessage {
+    let mut raw = String::from("INVITE sip:bob@biloxi.com SIP/2.0\r\n");
+    raw.push_str("Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK1\r\n");
+    raw.push_str("From: <sip:alice@atlanta.com>;tag=a\r\n");
+    raw.push_str("To: <sip:bob@biloxi.com>\r\n");
+    raw.push_str("Call-ID: hp-int-test@example.com\r\n");
+    raw.push_str("CSeq: 1 INVITE\r\n");
+    raw.push_str("Max-Forwards: 70\r\n");
+    for (n, v) in extras {
+        raw.push_str(&format!("{}: {}\r\n", n, v));
+    }
+    raw.push_str("Content-Length: 0\r\n\r\n");
+    parse_sip_message(&raw).expect("test fixture must parse").1
+}
+
+fn make_response_200(extras: &[(&str, &str)]) -> SipMessage {
+    let mut raw = String::from("SIP/2.0 200 OK\r\n");
+    raw.push_str("Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK1\r\n");
+    raw.push_str("From: <sip:alice@atlanta.com>;tag=a\r\n");
+    raw.push_str("To: <sip:bob@biloxi.com>;tag=b\r\n");
+    raw.push_str("Call-ID: hp-int-test@example.com\r\n");
+    raw.push_str("CSeq: 1 INVITE\r\n");
+    for (n, v) in extras {
+        raw.push_str(&format!("{}: {}\r\n", n, v));
+    }
+    raw.push_str("Content-Length: 0\r\n\r\n");
+    parse_sip_message(&raw).expect("test fixture must parse").1
+}
+
+fn test_ctx() -> PolicyContext<'static> {
+    PolicyContext {
+        b2bua_host: "192.0.2.1",
+        b2bua_port: 5060,
+        user_agent_header: Some("siphon-test/1.0"),
+        server_header: Some("siphon-test/1.0"),
+    }
+}
+
+#[test]
+fn preset_library_contains_four_built_in_presets() {
+    let presets = builtin_presets();
+    for name in &[
+        "transparent-b2bua@2026",
+        "ims-intra-trust-domain@2026",
+        "ims-trust-domain-boundary@2026",
+        "sip-trunk-edge@2026",
+    ] {
+        assert!(presets.contains_key(*name), "missing preset: {name}");
+    }
+    assert_eq!(presets.len(), 4);
+}
+
+#[test]
+fn call_actor_can_carry_resolved_header_policy() {
+    let leg = make_a_leg("policy-attach@test");
+    let mut call = CallActor::new(leg);
+    assert!(call.resolved_header_policy.is_none());
+
+    let preset = builtin_presets()
+        .get("ims-trust-domain-boundary@2026")
+        .unwrap()
+        .clone();
+    let resolved = ResolvedPolicy::from_preset(preset);
+    call.resolved_header_policy = Some(Arc::new(resolved));
+
+    assert!(call.resolved_header_policy.is_some());
+    let attached = call.resolved_header_policy.as_ref().unwrap();
+    assert_eq!(attached.preset.qualified_name(), "ims-trust-domain-boundary@2026");
+}
+
+#[test]
+fn bgcf_mtc_trace_headers_stripped_by_trust_boundary_preset() {
+    // The exact headers that leaked through to the Samsung S21 MT INVITE in
+    // the BGCF/FreeSWITCH trace that motivated the opt-in policy work.
+    let mut invite = make_invite(&[
+        ("Alert-Info", "<urn:alert:service:call-waiting>"),
+        ("Diversion", "<sip:+3197010267609@sip.didww.com>;reason=unconditional"),
+        ("P-Hint", "inbound"),
+        ("X-FS-Support", "update_display,send_info"),
+    ]);
+
+    let preset = builtin_presets()
+        .get("ims-trust-domain-boundary@2026")
+        .unwrap()
+        .clone();
+    let policy = ResolvedPolicy::from_preset(preset);
+    apply_to_request(&mut invite, &policy, &test_ctx());
+
+    // Alert-Info, P-Hint, X-FS-Support: stripped (not on safe-set)
+    assert!(!invite.headers.has("Alert-Info"));
+    assert!(!invite.headers.has("P-Hint"));
+    assert!(!invite.headers.has("X-FS-Support"));
+    // Diversion: translated to History-Info (RFC 7044)
+    assert!(!invite.headers.has("Diversion"));
+    let hi = invite
+        .headers
+        .get("History-Info")
+        .expect("Diversion should have been translated to History-Info");
+    assert!(hi.contains("+3197010267609@sip.didww.com"));
+    assert!(hi.contains("cause%3D302")); // unconditional → SIP 302
+}
+
+#[test]
+fn intra_trust_preset_preserves_end_to_end_prack_headers() {
+    // RFC 3262 §6 / RFC 3312 / RFC 4032 — PRACK + IMS preconditions require
+    // Require/RSeq/Supported to flow end-to-end across intra-trust hops.
+    // Pre-policy siphon stripped them unconditionally on every B2BUA hop,
+    // which silently broke IMS preconditions across S-CSCF ↔ AS bridges.
+    let mut response = make_response_200(&[
+        ("Require", "100rel"),
+        ("RSeq", "1"),
+        ("Supported", "100rel, precondition"),
+    ]);
+
+    let preset = builtin_presets()
+        .get("ims-intra-trust-domain@2026")
+        .unwrap()
+        .clone();
+    let policy = ResolvedPolicy::from_preset(preset);
+    apply_to_response(&mut response, &policy, &test_ctx());
+
+    assert!(response.headers.has("Require"));
+    assert!(response.headers.has("RSeq"));
+    assert!(response.headers.has("Supported"));
+}
+
+#[test]
+fn intentional_proxy_authenticate_strip_works_for_every_preset() {
+    // RFC 3261 §22.3 — Proxy-Authenticate is hop-by-hop.  Pre-policy siphon
+    // passed it through B2BUA hops, which was broken (A's resulting
+    // Proxy-Authorization would target the wrong realm).  Every shipped
+    // preset must strip it on B→A responses.  Lives in the preset rather
+    // than as framework-auto so transparent-proxy B2BUAs can opt back in
+    // via `call.dial(copy=["Proxy-Authenticate"])` for the rare case.
+    for preset_name in &[
+        "transparent-b2bua@2026",
+        "ims-intra-trust-domain@2026",
+        "ims-trust-domain-boundary@2026",
+        "sip-trunk-edge@2026",
+    ] {
+        let mut response = make_response_200(&[(
+            "Proxy-Authenticate",
+            "Digest realm=\"b-leg.example.com\"",
+        )]);
+
+        let preset = builtin_presets().get(*preset_name).unwrap().clone();
+        let policy = ResolvedPolicy::from_preset(preset);
+        apply_to_response(&mut response, &policy, &test_ctx());
+
+        assert!(
+            !response.headers.has("Proxy-Authenticate"),
+            "preset {preset_name} must strip Proxy-Authenticate on B→A responses"
+        );
+    }
+}
+
+#[test]
+fn transparent_proxy_b2bua_can_opt_in_to_proxy_authenticate_passthrough() {
+    // Rare transparent-proxy B2BUA case: A and C share auth domain and
+    // the B2BUA wants A to handle the 401 itself.  Per-call delta restores
+    // the header that every preset strips by default.
+    let mut response = make_response_200(&[(
+        "Proxy-Authenticate",
+        "Digest realm=\"trusted.example.com\"",
+    )]);
+
+    let preset = builtin_presets().get("transparent-b2bua@2026").unwrap().clone();
+    let mut policy = ResolvedPolicy::from_preset(preset);
+    policy.deltas_copy.push("Proxy-Authenticate".to_string());
+
+    apply_to_response(&mut response, &policy, &test_ctx());
+
+    assert!(
+        response.headers.has("Proxy-Authenticate"),
+        "delta copy must override preset strip for transparent-proxy use case"
+    );
+}
+
+#[test]
+fn per_call_delta_overrides_preset_strip_for_emergency_call() {
+    // Emergency-call use case: the sip-trunk-edge preset strips P-*
+    // headers defensively, but an emergency call needs P-Asserted-Identity
+    // and Geolocation to reach the PSAP.  Per-call copy delta restores them.
+    let mut invite = make_invite(&[
+        ("P-Asserted-Identity", "<sip:+15551234@example.com>"),
+        ("Geolocation", "<cid:geo1@example.com>"),
+        ("X-Internal-Tag", "should-still-be-stripped"),
+    ]);
+
+    let preset = builtin_presets().get("sip-trunk-edge@2026").unwrap().clone();
+    let mut policy = ResolvedPolicy::from_preset(preset);
+    policy.deltas_copy.push("P-Asserted-Identity".to_string());
+    policy.deltas_copy.push("Geolocation".to_string());
+
+    apply_to_request(&mut invite, &policy, &test_ctx());
+
+    assert!(invite.headers.has("P-Asserted-Identity"), "delta copy should restore PAI");
+    assert!(invite.headers.has("Geolocation"), "delta copy should restore Geolocation");
+    assert!(!invite.headers.has("X-Internal-Tag"), "X-* still stripped by preset");
+}
+
+#[test]
+fn validator_rejects_authorization_copy_combined_with_pai_rewrite() {
+    // Digest auth (RFC 7616) signs the R-URI / To URI / etc.  Any preset
+    // that copies Authorization through (transparent-auth case-c) AND
+    // rewrites a Digest-protected field would silently break the hash.
+    // The validator must reject this at preset construction time.
+    let bad_preset = Preset {
+        name: "bad".to_string(),
+        version: "test".to_string(),
+        request: DirectionPolicy {
+            default: Verb::Copy,
+            overrides: vec![
+                (HeaderPattern::Exact("Authorization".to_string()), Verb::Copy),
+                (
+                    HeaderPattern::Exact("P-Asserted-Identity".to_string()),
+                    Verb::Rewrite(RewriteOp::HostToAdvertised),
+                ),
+            ],
+        },
+        response: DirectionPolicy {
+            default: Verb::Copy,
+            overrides: vec![],
+        },
+    };
+
+    let err = validate_preset(&bad_preset).expect_err("should reject");
+    match err {
+        PresetError::AuthorizationCopyWithDigestProtectedRewrite(name) => {
+            assert!(name.contains("bad"), "error should name the bad preset: {name}");
+        }
+        other => panic!("wrong error variant: {other:?}"),
+    }
+}
+
+#[test]
+fn validator_accepts_intra_trust_with_per_call_authorization_copy() {
+    // The supported transparent-auth case-c pattern: use a preset without
+    // R-URI / PAI rewrites (ims-intra-trust-domain), then add Authorization
+    // to deltas_copy at dial time.  Validator is preset-level so the
+    // delta is fine; preset must still validate cleanly.
+    let preset = (**builtin_presets().get("ims-intra-trust-domain@2026").unwrap()).clone();
+    validate_preset(&preset).expect("intra-trust preset must validate clean");
+
+    // And a ResolvedPolicy carrying the Authorization delta still works.
+    let mut policy = ResolvedPolicy::from_preset(Arc::new(preset));
+    policy.deltas_copy.push("Authorization".to_string());
+
+    let mut invite = make_invite(&[("Authorization", "Digest username=\"alice\", realm=\"c.example.com\"")]);
+    apply_to_request(&mut invite, &policy, &test_ctx());
+    // Authorization copied through (case-c transparent auth)
+    assert!(invite.headers.has("Authorization"));
 }

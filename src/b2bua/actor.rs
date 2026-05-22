@@ -584,6 +584,10 @@ pub struct CallActor {
     /// Pre-built ACK for the winning B-leg, deferred until A-leg ACKs (late ACK pattern).
     /// Contains (ACK message, transport, destination address).
     pub pending_b_leg_ack: Option<(SipMessage, crate::transport::Transport, std::net::SocketAddr)>,
+    /// Resolved header policy for this call (preset + per-call deltas) — set
+    /// when the script calls `call.dial(header_policy=…)`.  When `None`, the
+    /// dispatcher falls back to the configured `b2bua.default_header_policy`.
+    pub resolved_header_policy: Option<std::sync::Arc<super::header_policy::ResolvedPolicy>>,
 }
 
 impl CallActor {
@@ -608,6 +612,7 @@ impl CallActor {
             li_record: false,
             preserve_call_id: false,
             pending_b_leg_ack: None,
+            resolved_header_policy: None,
         }
     }
 

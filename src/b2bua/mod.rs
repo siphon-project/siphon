@@ -9,7 +9,10 @@
 //!   `LegRegistry`, dialog state, and intercommunication messages.
 //! - [`fork`]: Forking state machine (parallel/sequential B-leg strategies).
 //! - [`transfer`]: REFER/Replaces call transfer handling.
+//! - [`header_policy`]: Versioned per-call header policy (which headers
+//!   cross the trust boundary, which are stripped, rewritten, or translated).
 
 pub mod actor;
 pub mod fork;
+pub mod header_policy;
 pub mod transfer;

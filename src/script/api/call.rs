@@ -158,6 +158,30 @@ pub struct PyCall {
     li_record_flag: bool,
     /// When true, copy the A-leg Call-ID to B-leg instead of generating a new one.
     preserve_call_id_flag: bool,
+    /// Per-call header policy input captured from `call.dial(header_policy=…, …)`
+    /// or `call.fork(…)`.  The dispatcher resolves `policy_name` against
+    /// the preset registry and applies deltas to produce a
+    /// [`crate::b2bua::header_policy::ResolvedPolicy`] on the call actor.
+    header_policy_input: Option<HeaderPolicyInput>,
+}
+
+/// Per-call header policy input from `call.dial(header_policy=…, copy=…, strip=…, translate=…)`.
+/// Held on [`PyCall`] during the script handler; the dispatcher resolves
+/// `policy_name` against the preset registry and stitches deltas into a
+/// [`crate::b2bua::header_policy::ResolvedPolicy`] on the call actor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeaderPolicyInput {
+    /// Qualified preset name (e.g. `"ims-trust-domain-boundary@2026"`).
+    /// `None` → use `b2bua.default_header_policy`.
+    pub policy_name: Option<String>,
+    /// Headers to copy verbatim regardless of preset.
+    pub deltas_copy: Vec<String>,
+    /// Headers to strip regardless of preset.
+    pub deltas_strip: Vec<String>,
+    /// Per-call translates: `(header_name, op_name)` — the op name is
+    /// resolved against the engine's [`TranslateOp`](crate::b2bua::header_policy::TranslateOp)
+    /// catalogue.  Unknown ops are logged and dropped.
+    pub deltas_translate: Vec<(String, String)>,
 }
 
 impl PyCall {
@@ -179,7 +203,36 @@ impl PyCall {
             outbound_credentials: None,
             li_record_flag: false,
             preserve_call_id_flag: false,
+            header_policy_input: None,
         }
+    }
+
+    /// Per-call header policy input (preset name + deltas) — read by the
+    /// dispatcher after the script handler returns so the resolved policy
+    /// can be attached to the [`crate::b2bua::actor::CallActor`].
+    pub fn header_policy_input(&self) -> Option<&HeaderPolicyInput> {
+        self.header_policy_input.as_ref()
+    }
+
+    /// Internal helper — called from `dial()` and `fork()` to record the
+    /// header policy arguments.  Skipped entirely when no policy-related
+    /// kwarg was supplied, so existing scripts pay zero cost.
+    fn update_header_policy_input(
+        &mut self,
+        header_policy: Option<&str>,
+        copy: Vec<String>,
+        strip: Vec<String>,
+        translate: Vec<(String, String)>,
+    ) {
+        if header_policy.is_none() && copy.is_empty() && strip.is_empty() && translate.is_empty() {
+            return;
+        }
+        self.header_policy_input = Some(HeaderPolicyInput {
+            policy_name: header_policy.map(String::from),
+            deltas_copy: copy,
+            deltas_strip: strip,
+            deltas_translate: translate,
+        });
     }
 
     /// Get the action the script chose.
@@ -565,29 +618,67 @@ impl PyCall {
     /// is preserved), but the message is sent to `next_hop`.  Mirrors the
     /// `next_hop` parameter on `proxy.send_request`.
     ///
+    /// `header_policy` (optional) selects which versioned built-in preset
+    /// the framework applies when building the B-leg INVITE and forwarding
+    /// responses back to the A-leg.  Defaults to `b2bua.default_header_policy`
+    /// from `siphon.yaml` (which itself defaults to `"transparent-b2bua@2026"` —
+    /// behaviour-equivalent to siphon's pre-policy B2BUA).
+    ///
+    /// `copy` / `strip` / `translate` (optional) layer per-call deltas on
+    /// top of the preset.  Use them for per-route exceptions (emergency calls,
+    /// aggregator-specific headers, etc.) that the YAML preset can't express.
+    /// `translate` entries are `(header_name, op_name)` tuples — `op_name` is
+    /// looked up against the engine's `TranslateOp` catalogue (`"rfc7044"` /
+    /// `"diversion-to-history-info"` in v1).
+    ///
     /// Example:
-    ///     # IMS edge: stamp canonical IMPU on R-URI, route via I-CSCF.
     ///     call.dial(
-    ///         f"sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
+    ///         "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
     ///         next_hop="sip:172.16.0.111:4060",
+    ///         header_policy="ims-trust-domain-boundary@2026",
+    ///         copy=["X-Operator-Tag"],
+    ///         strip=["History-Info"],
     ///     )
-    #[pyo3(signature = (uri, timeout=30, next_hop=None))]
-    fn dial(&mut self, uri: &str, timeout: u32, next_hop: Option<&str>) {
+    #[pyo3(signature = (uri, timeout=30, next_hop=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new()))]
+    fn dial(
+        &mut self,
+        uri: &str,
+        timeout: u32,
+        next_hop: Option<&str>,
+        header_policy: Option<&str>,
+        copy: Vec<String>,
+        strip: Vec<String>,
+        translate: Vec<(String, String)>,
+    ) {
         self.action = CallAction::Dial {
             target: uri.to_string(),
             next_hop: next_hop.map(String::from),
             timeout,
         };
+        self.update_header_policy_input(header_policy, copy, strip, translate);
     }
 
     /// Fork to multiple targets.
-    #[pyo3(signature = (targets, strategy="parallel", timeout=30))]
-    fn fork(&mut self, targets: Vec<String>, strategy: &str, timeout: u32) {
+    ///
+    /// `header_policy` / `copy` / `strip` / `translate` apply to every
+    /// branch of the fork — per-branch policy is a follow-up enhancement.
+    #[pyo3(signature = (targets, strategy="parallel", timeout=30, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new()))]
+    fn fork(
+        &mut self,
+        targets: Vec<String>,
+        strategy: &str,
+        timeout: u32,
+        header_policy: Option<&str>,
+        copy: Vec<String>,
+        strip: Vec<String>,
+        translate: Vec<(String, String)>,
+    ) {
         self.action = CallAction::Fork {
             targets,
             strategy: strategy.to_string(),
             timeout,
         };
+        self.update_header_policy_input(header_policy, copy, strip, translate);
     }
 
     /// Terminate the call (send BYE to both legs).
@@ -809,7 +900,7 @@ mod tests {
     fn call_dial() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
-        call.dial("sip:bob@10.0.0.2:5060", 30, None);
+        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, vec![], vec![], vec![]);
         assert_eq!(
             call.action(),
             &CallAction::Dial {
@@ -818,6 +909,8 @@ mod tests {
                 timeout: 30,
             }
         );
+        // No policy kwargs → no input captured (existing scripts pay zero cost)
+        assert!(call.header_policy_input().is_none());
     }
 
     #[test]
@@ -828,6 +921,10 @@ mod tests {
             "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
             30,
             Some("sip:172.16.0.111:4060"),
+            None,
+            vec![],
+            vec![],
+            vec![],
         );
         assert_eq!(
             call.action(),
@@ -840,6 +937,29 @@ mod tests {
     }
 
     #[test]
+    fn call_dial_with_header_policy_and_deltas() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.dial(
+            "sip:bob@10.0.0.2:5060",
+            30,
+            None,
+            Some("ims-trust-domain-boundary@2026"),
+            vec!["X-Operator-Tag".to_string()],
+            vec!["History-Info".to_string()],
+            vec![("Diversion".to_string(), "rfc7044".to_string())],
+        );
+        let input = call.header_policy_input().expect("policy input must be captured");
+        assert_eq!(input.policy_name.as_deref(), Some("ims-trust-domain-boundary@2026"));
+        assert_eq!(input.deltas_copy, vec!["X-Operator-Tag".to_string()]);
+        assert_eq!(input.deltas_strip, vec!["History-Info".to_string()]);
+        assert_eq!(
+            input.deltas_translate,
+            vec![("Diversion".to_string(), "rfc7044".to_string())]
+        );
+    }
+
+    #[test]
     fn call_fork() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
@@ -847,6 +967,10 @@ mod tests {
             vec!["sip:bob@10.0.0.2".to_string(), "sip:bob@10.0.0.3".to_string()],
             "parallel",
             30,
+            None,
+            vec![],
+            vec![],
+            vec![],
         );
         assert_eq!(
             call.action(),
@@ -856,6 +980,24 @@ mod tests {
                 timeout: 30,
             }
         );
+    }
+
+    #[test]
+    fn call_fork_with_header_policy() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.fork(
+            vec!["sip:bob@10.0.0.2".to_string(), "sip:bob@10.0.0.3".to_string()],
+            "parallel",
+            30,
+            Some("sip-trunk-edge@2026"),
+            vec![],
+            vec!["X-Internal-Tag".to_string()],
+            vec![],
+        );
+        let input = call.header_policy_input().expect("policy input must be captured");
+        assert_eq!(input.policy_name.as_deref(), Some("sip-trunk-edge@2026"));
+        assert_eq!(input.deltas_strip, vec!["X-Internal-Tag".to_string()]);
     }
 
     #[test]
