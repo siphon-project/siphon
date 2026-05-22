@@ -596,17 +596,27 @@ pub mod hex {
     }
 }
 
-// ── MSISDN encoding (TBCD) ────────────────────────────────────────────────
+// ── TBCD / ISDN-AddressString encoding (3GPP TS 29.002 §17.7.8 + TS 23.003 §3.1) ──
 
-/// Encode MSISDN as TBCD (Telephony Binary Coded Decimal) for Diameter.
-/// E.g. "33612345678" → [0x33, 0x16, 0x32, 0x54, 0x76, 0xf8]
-pub fn encode_msisdn_tbcd(msisdn: &str) -> Vec<u8> {
-    let digits: Vec<u8> = msisdn.bytes().filter_map(|b| {
-        if b.is_ascii_digit() { Some(b - b'0') } else { None }
-    }).collect();
+/// ISDN-AddressString ToN/NPI byte for "International, E.164" — the only
+/// value emitted by the SMSC / IMS core for MT-SMS routing AVPs today.
+/// Bit 7 (extension) = 1, ToN = 001 (international), NPI = 0001 (E.164).
+pub const TON_NPI_INTERNATIONAL_E164: u8 = 0x91;
 
-    let mut result = Vec::with_capacity(digits.len().div_ceil(2));
-    for chunk in digits.chunks(2) {
+/// Encode a digit string as TBCD-STRING per 3GPP TS 29.002 §17.7.8 /
+/// TS 23.003 §3.1 — each octet holds two digits packed low-nibble first,
+/// odd-length strings padded with 0xF in the final high nibble.
+///
+/// E.g. `"31"` → `[0x13]`, `"3197010267609"` →
+/// `[0x13, 0x79, 0x10, 0x20, 0x76, 0x06, 0xF9]`.
+pub fn encode_tbcd_digits(digits: &str) -> Vec<u8> {
+    let parsed: Vec<u8> = digits
+        .bytes()
+        .filter_map(|b| if b.is_ascii_digit() { Some(b - b'0') } else { None })
+        .collect();
+
+    let mut result = Vec::with_capacity(parsed.len().div_ceil(2));
+    for chunk in parsed.chunks(2) {
         let lo = chunk[0];
         let hi = if chunk.len() > 1 { chunk[1] } else { 0x0f };
         result.push((hi << 4) | lo);
@@ -614,16 +624,54 @@ pub fn encode_msisdn_tbcd(msisdn: &str) -> Vec<u8> {
     result
 }
 
-/// Decode TBCD-encoded MSISDN back to string.
-pub fn decode_msisdn_tbcd(data: &[u8]) -> String {
+/// Decode TBCD-STRING bytes back to a digit string. Stops at the first
+/// 0xF filler nibble (TS 23.003 §3.1: F is the only valid filler in the
+/// trailing high nibble of an odd-length string).
+pub fn decode_tbcd_digits(data: &[u8]) -> String {
     let mut s = String::with_capacity(data.len() * 2);
     for &byte in data {
         let lo = byte & 0x0f;
         let hi = (byte >> 4) & 0x0f;
-        if lo <= 9 { s.push((b'0' + lo) as char); }
-        if hi <= 9 { s.push((b'0' + hi) as char); }
+        if lo <= 9 {
+            s.push((b'0' + lo) as char);
+        }
+        if hi <= 9 {
+            s.push((b'0' + hi) as char);
+        }
     }
     s
+}
+
+/// Encode an E.164 number as an ISDN-AddressString per 3GPP TS 29.002
+/// §17.7.8 — one ToN/NPI octet followed by the TBCD digit string.
+///
+/// Used for MSISDN (701, TS 29.336 §6.4.5), SC-Address (3300, TS 29.336
+/// §6.4.6 / TS 29.338 §6.3.2.3), SGSN-Number (1489, TS 29.272 §7.3.102),
+/// and MME-Number-for-MT-SMS (1645, TS 29.272 §7.3.146). A leading `+`
+/// on the input is stripped — international form is signalled via the
+/// ToN/NPI byte, not the literal character.
+pub fn encode_isdn_address_string(digits: &str, ton_npi: u8) -> Vec<u8> {
+    let tbcd = encode_tbcd_digits(digits);
+    let mut result = Vec::with_capacity(1 + tbcd.len());
+    result.push(ton_npi);
+    result.extend_from_slice(&tbcd);
+    result
+}
+
+/// Decode an ISDN-AddressString back to a plain digit string. The leading
+/// ToN/NPI octet is consumed but not surfaced (callers route on the digit
+/// part — siphon does not distinguish international vs national today).
+///
+/// Be lenient on the receive side: some non-conformant peers omit the
+/// ToN/NPI byte and ship raw TBCD. Detection rule — the first byte of an
+/// ISDN-AddressString always has bit 7 set (RFC: extension bit), while a
+/// TBCD digit-pair byte never does (digits are 0x0-0x9). If bit 7 is
+/// clear, treat the whole buffer as TBCD-only.
+pub fn decode_isdn_address_string(data: &[u8]) -> String {
+    match data.first() {
+        Some(&first) if first & 0x80 != 0 => decode_tbcd_digits(&data[1..]),
+        _ => decode_tbcd_digits(data),
+    }
 }
 
 #[cfg(test)]
@@ -652,7 +700,7 @@ mod tests {
 
     #[test]
     fn encode_decode_avp_3gpp() {
-        let msisdn = encode_msisdn_tbcd("33612345678");
+        let msisdn = encode_tbcd_digits("33612345678");
         let avp = encode_avp_octet_3gpp(dictionary::avp::MSISDN, &msisdn);
         let decoded = decode_avps(&avp);
         assert!(decoded.get("MSISDN").is_some());
@@ -708,19 +756,69 @@ mod tests {
     }
 
     #[test]
-    fn msisdn_tbcd_roundtrip() {
+    fn tbcd_roundtrip_even_length() {
         let original = "33612345678";
-        let encoded = encode_msisdn_tbcd(original);
-        let decoded = decode_msisdn_tbcd(&encoded);
+        let encoded = encode_tbcd_digits(original);
+        let decoded = decode_tbcd_digits(&encoded);
         assert_eq!(decoded, original);
     }
 
     #[test]
-    fn msisdn_tbcd_odd_length() {
+    fn tbcd_roundtrip_odd_length() {
         let original = "3361234567";
-        let encoded = encode_msisdn_tbcd(original);
-        let decoded = decode_msisdn_tbcd(&encoded);
+        let encoded = encode_tbcd_digits(original);
+        let decoded = decode_tbcd_digits(&encoded);
         assert_eq!(decoded, original);
+    }
+
+    /// Anchor the exact wire bytes for the bug-report trace's MSISDN.
+    /// `"3197010267609"` (13 digits) → TBCD `[0x13, 0x79, 0x10, 0x20,
+    /// 0x76, 0x06, 0xF9]` (7 octets); ISDN-AddressString `[0x91, …]`
+    /// (8 octets). Compare against pre-fix behaviour where siphon shipped
+    /// 13 raw ASCII bytes (`0x33 0x31 0x39 …`).
+    #[test]
+    fn isdn_address_string_matches_ts_29002_wire_format() {
+        let tbcd = encode_tbcd_digits("3197010267609");
+        assert_eq!(
+            tbcd,
+            vec![0x13, 0x79, 0x10, 0x20, 0x76, 0x06, 0xF9],
+            "TBCD-encoded MSISDN must nibble-swap each digit pair and \
+             pad odd length with 0xF (TS 23.003 §3.1)"
+        );
+
+        let isdn = encode_isdn_address_string("3197010267609", TON_NPI_INTERNATIONAL_E164);
+        assert_eq!(
+            isdn,
+            vec![0x91, 0x13, 0x79, 0x10, 0x20, 0x76, 0x06, 0xF9],
+            "ISDN-AddressString prepends ToN/NPI 0x91 to the TBCD digits \
+             (TS 29.002 §17.7.8)"
+        );
+
+        // Leading '+' is conveyed via ToN/NPI, not the literal character.
+        let plus = encode_isdn_address_string("+3197010267609", TON_NPI_INTERNATIONAL_E164);
+        assert_eq!(plus, isdn);
+    }
+
+    #[test]
+    fn isdn_address_string_roundtrip() {
+        for raw in [
+            "31612345678",
+            "3197010267609",
+            "1",
+            "12345",
+            "316000000000000",
+        ] {
+            let encoded = encode_isdn_address_string(raw, TON_NPI_INTERNATIONAL_E164);
+            assert_eq!(decode_isdn_address_string(&encoded), raw);
+        }
+    }
+
+    #[test]
+    fn decode_isdn_address_string_tolerates_missing_ton_npi() {
+        // Some implementations ship raw TBCD without the ToN/NPI byte.
+        // First byte 0x13 has bit 7 clear → treat as TBCD-only.
+        let raw_tbcd = vec![0x13, 0x79, 0x10, 0x20, 0x76, 0x06, 0xF9];
+        assert_eq!(decode_isdn_address_string(&raw_tbcd), "3197010267609");
     }
 
     #[test]

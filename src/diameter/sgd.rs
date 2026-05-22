@@ -43,6 +43,15 @@ fn octet_string_as_utf8(avps: &serde_json::Value, name: &str) -> Option<String> 
         })
 }
 
+/// Decode an ISDN-AddressString OctetString AVP (TS 29.002 §17.7.8) —
+/// strip the optional ToN/NPI prefix and TBCD-decode the remainder.
+fn octet_string_as_isdn_address(avps: &serde_json::Value, name: &str) -> Option<String> {
+    avps.get(name)
+        .and_then(|v| v.as_str())
+        .and_then(|hex_str| codec::hex::decode(hex_str))
+        .map(|bytes| codec::decode_isdn_address_string(&bytes))
+}
+
 /// Decode an OctetString AVP into raw bytes (no UTF-8 assumption — for
 /// SM-RP-UI which carries TPDUs).
 fn octet_string_as_bytes(avps: &serde_json::Value, name: &str) -> Option<Vec<u8>> {
@@ -140,7 +149,7 @@ pub fn build_mt_forward_short_message_request(
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, user_name));
     avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
         avp::SC_ADDRESS,
-        sc_address.as_bytes(),
+        &codec::encode_isdn_address_string(sc_address, codec::TON_NPI_INTERNATIONAL_E164),
     ));
     avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(avp::SM_RP_UI, sm_rp_ui));
     if let Some(mti) = sm_rp_mti {
@@ -229,8 +238,11 @@ pub fn parse_ofr(incoming: &IncomingRequest) -> Option<MoForwardShortMessageRequ
         origin_host: required_str(avps, "Origin-Host")?,
         origin_realm: required_str(avps, "Origin-Realm")?,
         user_name: optional_str(avps, "User-Name"),
+        // SMS-GMSC-Address is dictionary-typed Address (IPv4/IPv6) — leave
+        // the UTF-8 fallback; the ISDN-AddressString variant of this AVP
+        // is not the one used on standard SGd.
         sms_gmsc_address: octet_string_as_utf8(avps, "SMS-GMSC-Address"),
-        sc_address: octet_string_as_utf8(avps, "SC-Address"),
+        sc_address: octet_string_as_isdn_address(avps, "SC-Address"),
         sm_rp_ui: octet_string_as_bytes(avps, "SM-RP-UI"),
     })
 }
@@ -327,6 +339,35 @@ mod tests {
         assert_eq!(codec::hex::decode(sm_rp_ui_hex).unwrap(), pdu);
     }
 
+    /// SC-Address on the TFR wire must be ISDN-AddressString — same fix
+    /// class as the S6c SRR. Asserts the exact bytes so a regression
+    /// reintroducing the raw-ASCII encoder fails loudly.
+    #[test]
+    fn tfr_encodes_sc_address_as_isdn_address_string() {
+        let wire = build_mt_forward_short_message_request(
+            &config(),
+            "test;1;1",
+            "001010000000001",
+            "31611111111",
+            &[0u8; 4],
+            None,
+            None,
+            1,
+            1,
+        );
+        let decoded = codec::decode_diameter(&wire).unwrap();
+        let sc_bytes = codec::hex::decode(
+            decoded.avps.get("SC-Address").unwrap().as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sc_bytes,
+            // "31611111111": (31)(61)(11)(11)(11)(1F) → nibble-swapped
+            // 0x13 0x16 0x11 0x11 0x11 0xF1, with 0x91 ToN/NPI prefix.
+            vec![0x91, 0x13, 0x16, 0x11, 0x11, 0x11, 0xF1],
+        );
+    }
+
     #[test]
     fn tfr_with_correlation_id_carries_grouped_avp() {
         let wire = build_mt_forward_short_message_request(
@@ -377,7 +418,10 @@ mod tests {
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "mme1.example.com"));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, "001010000000001"));
-        avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(avp::SC_ADDRESS, b"31611111111"));
+        avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
+            avp::SC_ADDRESS,
+            &codec::encode_isdn_address_string("31611111111", codec::TON_NPI_INTERNATIONAL_E164),
+        ));
         avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(avp::SM_RP_UI, &pdu));
 
         let wire = encode_diameter_message(
