@@ -78,6 +78,27 @@ impl AbortCause {
     }
 }
 
+// ── Flow Usage (TS 29.214 §7.3.10) ─────────────────────────────────────
+
+/// What an IP flow carries — separates RTCP/AF-signalling from media.
+///
+/// `NoInformation` is the default: the PCRF cannot make any assumption.
+/// `Rtcp` flags an RTCP companion flow so the PCRF/PCEF doesn't gate it
+/// like media; `AfSignalling` is for signalling-bearer flows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum FlowUsage {
+    NoInformation = 0,
+    Rtcp = 1,
+    AfSignalling = 2,
+}
+
+impl FlowUsage {
+    fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
 // ── Specific-Action (TS 29.214 §7.3.13) ────────────────────────────────
 
 /// Events the AF subscribes to via Specific-Action in AAR.
@@ -124,10 +145,11 @@ pub struct MediaFlow {
     pub flow_number: u32,
     pub descriptions: Vec<String>,
     pub status: Option<FlowStatus>,
+    pub usage: Option<FlowUsage>,
 }
 
 impl MediaFlow {
-    fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let mut inner = Vec::new();
         inner.extend_from_slice(&encode_avp_u32_3gpp(avp::FLOW_NUMBER, self.flow_number));
         for description in &self.descriptions {
@@ -138,6 +160,9 @@ impl MediaFlow {
         }
         if let Some(status) = self.status {
             inner.extend_from_slice(&encode_avp_u32_3gpp(avp::FLOW_STATUS, status.as_u32()));
+        }
+        if let Some(usage) = self.usage {
+            inner.extend_from_slice(&encode_avp_u32_3gpp(avp::FLOW_USAGE, usage.as_u32()));
         }
         encode_avp_grouped_3gpp(avp::MEDIA_SUB_COMPONENT, &inner)
     }
@@ -156,7 +181,7 @@ pub struct MediaComponent {
 }
 
 impl MediaComponent {
-    fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let mut inner = Vec::new();
         inner.extend_from_slice(&encode_avp_u32_3gpp(avp::MEDIA_COMPONENT_NUMBER, self.number));
         inner.extend_from_slice(&encode_avp_u32_3gpp(avp::MEDIA_TYPE, self.media_type.as_u32()));
@@ -183,6 +208,9 @@ impl MediaComponent {
 
 /// Parameters for an AA-Request (P-CSCF → PCRF).
 pub struct RxSessionRequest<'a> {
+    /// Reuse an existing Rx session ID (modification AAR per TS 29.214
+    /// §4.4.5).  `None` allocates a fresh one — the initial AAR.
+    pub session_id: Option<&'a str>,
     pub af_application_id: &'a [u8],
     pub media_components: &'a [MediaComponent],
     pub specific_actions: &'a [SpecificAction],
@@ -236,7 +264,10 @@ pub async fn send_aar(
     let config = peer.config();
     let hbh = peer.next_hbh();
     let e2e = peer.next_e2e();
-    let session_id = peer.new_session_id();
+    let session_id = params
+        .session_id
+        .map(String::from)
+        .unwrap_or_else(|| peer.new_session_id());
 
     let mut payload = Vec::with_capacity(512);
     payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session_id));
@@ -513,6 +544,7 @@ mod tests {
                 "permit in ip from 10.45.1.100 49152 to 10.45.1.200 50000".into(),
             ],
             status: Some(FlowStatus::Enabled),
+            usage: None,
         };
         let encoded = flow.encode();
         let code = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
@@ -529,6 +561,7 @@ mod tests {
                 "permit out ip from 10.45.1.200 50000 to 10.45.1.100 49152".into(),
             ],
             status: Some(FlowStatus::Enabled),
+            usage: None,
         };
         let encoded = flow.encode();
         assert!(encoded.len() > 100); // Must be larger with two descriptions
@@ -540,9 +573,37 @@ mod tests {
             flow_number: 3,
             descriptions: vec!["permit in ip from any to any".into()],
             status: None,
+            usage: None,
         };
         let encoded = flow.encode();
         assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn rtcp_flow_encoding_includes_flow_usage() {
+        // RTCP companion flow — Flow-Usage = 1 (TS 29.214 §7.3.10).
+        let flow = MediaFlow {
+            flow_number: 2,
+            descriptions: vec![
+                "permit out 17 from 10.0.0.1 50001 to 10.0.0.2 30001".into(),
+                "permit in 17 from 10.0.0.2 30001 to 10.0.0.1 50001".into(),
+            ],
+            status: None,
+            usage: Some(FlowUsage::Rtcp),
+        };
+        let encoded = flow.encode();
+        // The inner-most u32 representation of FlowUsage::Rtcp is 1, but
+        // verifying that bytes for the AVP code 512 appear is what
+        // actually matters — search for it.
+        let code_bytes = avp::FLOW_USAGE.to_be_bytes();
+        let mut found = false;
+        for window in encoded.windows(4) {
+            if window == code_bytes {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "Flow-Usage AVP (512) must be present in RTCP sub-component");
     }
 
     // ── Media component encoding ────────────────────────────────────────
@@ -560,6 +621,7 @@ mod tests {
                         "permit out ip from 10.45.1.200 50000 to 10.45.1.100 49152".into(),
                     ],
                     status: Some(FlowStatus::Enabled),
+                    usage: None,
                 },
                 MediaFlow {
                     flow_number: 2,
@@ -568,6 +630,7 @@ mod tests {
                         "permit out ip from 10.45.1.200 50001 to 10.45.1.100 49153".into(),
                     ],
                     status: Some(FlowStatus::Enabled),
+                    usage: Some(FlowUsage::Rtcp),
                 },
             ],
             max_bandwidth_ul: Some(64000),

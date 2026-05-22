@@ -482,13 +482,13 @@ class TestMockPcrf:
 
     def test_accept_all(self):
         self.harness.pcrf.accept_all()
-        result = self.harness.diameter.rx_aar(media_type="audio")
+        result = self.harness.diameter.rx_aar()
         assert result is not None
         assert result["result_code"] == 2001
 
     def test_reject_all(self):
         self.harness.pcrf.reject_all(result_code=5003)
-        result = self.harness.diameter.rx_aar(media_type="audio")
+        result = self.harness.diameter.rx_aar()
         assert result is not None
         assert result["result_code"] == 5003
 
@@ -544,7 +544,7 @@ class TestMockDiameterCx:
         assert result["server_name"] == "sip:scscf2:6060"
 
     def test_rx_aar_default(self):
-        result = self.diameter.rx_aar(media_type="audio")
+        result = self.diameter.rx_aar()
         assert result is not None
         assert result["result_code"] == 2001
         assert "session_id" in result

@@ -34,7 +34,7 @@ Config: examples/ims_pcscf.yaml
 """
 import secrets
 
-from siphon import proxy, registrar, ipsec, diameter, log, Transform
+from siphon import proxy, registrar, ipsec, diameter, qos, log, Transform
 
 REALM = "ims.example.com"
 PCSCF_URI = f"sip:{REALM};lr"
@@ -77,13 +77,26 @@ def on_invite_reply(request, reply):
     if diameter.peer_count() == 0:
         return
 
+    if not request.has_body("application/sdp") or not reply.has_body("application/sdp"):
+        return
+
     call_id = request.call_id
     source_ip = request.source_ip
 
+    # Translate the SDP offer/answer into per-m= IPFilterRules covering
+    # RTP + RTCP in both directions (TS 29.214 §5.3.7).  The PCRF then
+    # has the full 5-tuple to install precise gates on the dedicated
+    # bearer; the previous "permit in 17 from <UE> to any" wildcard left
+    # any real PCEF free to drop or open everything.
+    components = qos.media_flows_from_sdp(
+        offer=request.body,
+        answer=reply.body,
+        direction="orig",
+    )
+
     result = diameter.rx_aar(
-        media_type="audio",
         framed_ip=source_ip,
-        flow_description=f"permit in 17 from {source_ip} to any",
+        media_components=components,
     )
     if result:
         rx_sessions[call_id] = result["session_id"]

@@ -19,6 +19,7 @@ pub mod log;
 pub mod metrics;
 pub mod presence;
 pub mod proxy_utils;
+pub mod qos;
 pub mod registrant;
 pub mod registrar;
 pub mod reply;
@@ -63,6 +64,7 @@ pub const BUILT_IN_NAMESPACE_NAMES: &[&str] = &[
     "srs",
     "subscribe_state",
     "ipsec",
+    "qos",
 ];
 
 /// Host-registered Python namespaces. Populated by `SiphonServer` at
@@ -102,6 +104,9 @@ static METRICS_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// SDP namespace singleton — always available (stateless parser, no config needed).
 static SDP_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// QoS namespace singleton — always available (stateless SDP→IPFilterRule helper).
+static QOS_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Optional ISC singleton — always available (iFC store for per-user + global rules).
 static ISC_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
@@ -324,6 +329,17 @@ pub fn set_sdp_singleton(python: Python<'_>) -> Result<()> {
         .map_err(|error| SiphonError::Script(format!("Py::new(sdp): {error}")))?
         .into_any();
     let _ = SDP_SINGLETON.set(sdp_py);
+    Ok(())
+}
+
+/// Store the QoS namespace singleton for injection into the siphon module.
+///
+/// Always available — stateless SDP→IPFilterRule helper, no config needed.
+pub fn set_qos_singleton(python: Python<'_>) -> Result<()> {
+    let qos_py: Py<PyAny> = Py::new(python, qos::PyQosNamespace::new())
+        .map_err(|error| SiphonError::Script(format!("Py::new(qos): {error}")))?
+        .into_any();
+    let _ = QOS_SINGLETON.set(qos_py);
     Ok(())
 }
 
@@ -610,6 +626,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("sdp", sdp_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr sdp: {error}")))?;
+    }
+
+    // Inject QoS namespace singleton (always available — stateless helper).
+    if let Some(qos_py) = QOS_SINGLETON.get() {
+        module
+            .setattr("qos", qos_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr qos: {error}")))?;
     }
 
     // Inject timer namespace singleton (always available — runtime scheduler).

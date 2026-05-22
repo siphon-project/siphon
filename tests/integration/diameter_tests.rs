@@ -350,6 +350,102 @@ fn ro_and_rf_different_app_ids_same_ims_data() {
     );
 }
 
+/// Build an Rx AAR whose Media-Component-Description matches the shape the
+/// new `diameter.rx_aar` Python binding emits: per-m= component with paired
+/// RTP + RTCP sub-components carrying full 5-tuple Flow-Descriptions and a
+/// Flow-Usage AVP on the RTCP sub-component.
+fn build_aar_wire_structured() -> Vec<u8> {
+    use siphon::diameter::rx::{FlowStatus, FlowUsage, MediaComponent, MediaFlow, MediaType};
+
+    let component = MediaComponent {
+        number: 1,
+        media_type: MediaType::Audio,
+        flows: vec![
+            MediaFlow {
+                flow_number: 1,
+                descriptions: vec![
+                    "permit out 17 from 100.65.0.2 50000 to 100.64.0.10 30000".into(),
+                    "permit in 17 from 100.64.0.10 30000 to 100.65.0.2 50000".into(),
+                ],
+                status: None,
+                usage: None,
+            },
+            MediaFlow {
+                flow_number: 2,
+                descriptions: vec![
+                    "permit out 17 from 100.65.0.2 50001 to 100.64.0.10 30001".into(),
+                    "permit in 17 from 100.64.0.10 30001 to 100.65.0.2 50001".into(),
+                ],
+                status: None,
+                usage: Some(FlowUsage::Rtcp),
+            },
+        ],
+        max_bandwidth_ul: Some(64000),
+        max_bandwidth_dl: Some(64000),
+        flow_status: Some(FlowStatus::Enabled),
+        codec_data: None,
+    };
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "pcrf;aar;structured;1"));
+    payload.extend_from_slice(&encode_avp_utf8(
+        avp::ORIGIN_HOST,
+        "pcscf.ims.mnc001.mcc001.3gppnetwork.org",
+    ));
+    payload.extend_from_slice(&encode_avp_utf8(
+        avp::ORIGIN_REALM,
+        "ims.mnc001.mcc001.3gppnetwork.org",
+    ));
+    payload.extend_from_slice(&encode_avp_utf8(
+        avp::DESTINATION_REALM,
+        "ims.mnc001.mcc001.3gppnetwork.org",
+    ));
+    payload.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, dictionary::RX_APP_ID));
+    payload.extend_from_slice(&component.encode());
+
+    encode_diameter_message(
+        FLAG_REQUEST | FLAG_PROXIABLE,
+        dictionary::CMD_AA,
+        dictionary::RX_APP_ID,
+        103,
+        203,
+        &payload,
+    )
+}
+
+#[test]
+fn rx_aar_structured_components_roundtrip() {
+    let wire = build_aar_wire_structured();
+    let decoded = decode_diameter(&wire).unwrap();
+    // The high-level decode resolves the grouped MCD container by name.
+    // Duplicate-named children inside a grouped AVP flatten in the helper
+    // map, so we don't depend on the decoded child shape for assertions —
+    // the wire bytes are the ground truth.
+    assert!(decoded.avps.get("Media-Component-Description").is_some());
+
+    // Spec-critical: the wire MUST carry at least one Flow-Usage AVP for
+    // the RTCP companion sub-component — without it the PCEF cannot gate
+    // RTCP differently from RTP (TS 29.214 §7.3.10).
+    let flow_usage_code = avp::FLOW_USAGE.to_be_bytes();
+    assert!(
+        wire.windows(4).any(|w| w == flow_usage_code),
+        "AAR wire must include a Flow-Usage AVP (RTCP marker)"
+    );
+
+    // And the wire must carry the full 5-tuple, not a wildcard.
+    let rtp_rule = b"permit out 17 from 100.65.0.2 50000 to 100.64.0.10 30000";
+    assert!(
+        wire.windows(rtp_rule.len()).any(|w| w == rtp_rule),
+        "AAR wire must include the 5-tuple RTP Flow-Description"
+    );
+
+    let rtcp_rule = b"permit out 17 from 100.65.0.2 50001 to 100.64.0.10 30001";
+    assert!(
+        wire.windows(rtcp_rule.len()).any(|w| w == rtcp_rule),
+        "AAR wire must include the 5-tuple RTCP Flow-Description"
+    );
+}
+
 // ── Rx AAR encode → decode ─────────────────────────────────────────────
 
 #[test]

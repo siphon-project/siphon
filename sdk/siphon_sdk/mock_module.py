@@ -2701,16 +2701,24 @@ class MockDiameter:
     # -- Rx: PCRF integration (P-CSCF) --
 
     def rx_aar(self, session_id: Optional[str] = None,
-               media_type: str = "audio",
                framed_ip: Optional[str] = None,
-               flow_description: Optional[str] = None) -> Optional[dict]:
+               framed_ipv6=None,
+               media_components: Optional[list] = None,
+               af_application_id: str = "IMS Services",
+               subscription_id=None) -> Optional[dict]:
         """Send an Rx AA-Request for QoS resource reservation.
 
         Args:
-            session_id: Rx session identifier.
-            media_type: Media type (``"audio"``, ``"video"``).
-            framed_ip: UE's IP address.
-            flow_description: IPFilterRule for the media flow.
+            session_id: Reuse an existing Rx session ID (modification AAR
+                per TS 29.214 §4.4.5).  ``None`` allocates a new session.
+            framed_ip: UE IPv4 address (Framed-IP-Address AVP).
+            framed_ipv6: UE IPv6 address (str or bytes).
+            media_components: list of media-component dicts shaped per
+                TS 29.214 §5.3.7 (see project docs for the full schema).
+            af_application_id: AF-Application-Identifier (default
+                ``"IMS Services"``).
+            subscription_id: Optional ``(data, type)`` tuple identifying
+                the IMS subscriber (RFC 4006 §8.47).
 
         Returns:
             Dict with ``result_code`` and ``session_id``, or ``None``.
@@ -4203,27 +4211,26 @@ class MockSbi:
         self._next_session_id: int = 1
         self._authorized: bool = True
 
-    def create_session(self, af_app_id: Optional[str] = None,
+    def create_session(self, af_app_id: str = "IMS Services",
                        sip_call_id: Optional[str] = None,
                        supi: Optional[str] = None,
                        ue_ipv4: Optional[str] = None,
                        ue_ipv6: Optional[str] = None,
                        dnn: Optional[str] = None,
                        notif_uri: Optional[str] = None,
-                       media_type: str = "AUDIO",
-                       flow_status: str = "ENABLED") -> Optional[dict]:
+                       media_components: Optional[list] = None) -> Optional[dict]:
         """Create an N5 app session for QoS policy authorization.
 
         Args:
-            af_app_id: Application Function identifier.
+            af_app_id: AF-Application identifier (default ``"IMS Services"``).
             sip_call_id: SIP Call-ID for correlation.
             supi: Subscription Permanent Identifier.
             ue_ipv4: UE IPv4 address.
             ue_ipv6: UE IPv6 address.
             dnn: Data Network Name.
             notif_uri: Notification URI for PCF events.
-            media_type: Media type (default ``"AUDIO"``).
-            flow_status: Flow status (default ``"ENABLED"``).
+            media_components: list of media-component dicts (same shape as
+                ``diameter.rx_aar``'s ``media_components``).
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or ``None``.
@@ -4248,14 +4255,13 @@ class MockSbi:
         return self._sessions.pop(session_id, None) is not None
 
     def update_session(self, session_id: str,
-                       media_type: str = "AUDIO",
-                       flow_status: str = "ENABLED") -> Optional[dict]:
+                       media_components: Optional[list] = None) -> Optional[dict]:
         """Update an N5 app session (media renegotiation).
 
         Args:
             session_id: The app session ID to update.
-            media_type: Media type (default ``"AUDIO"``).
-            flow_status: Flow status (default ``"ENABLED"``).
+            media_components: list of media-component dicts (same shape as
+                ``create_session``).
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or ``None``.
@@ -4737,6 +4743,224 @@ from siphon_sdk.sdp import MockSdpNamespace
 _sdp = MockSdpNamespace()
 
 
+# ---------------------------------------------------------------------------
+# QoS namespace — SDP → IPFilterRule helper
+# ---------------------------------------------------------------------------
+
+class MockQos:
+    """Mock ``qos`` namespace — turns SDP offer/answer pairs into the
+    ``media_components`` structure consumed by ``diameter.rx_aar`` and
+    ``sbi.create_session``.
+
+    The mock parses SDP just enough to produce a usable
+    ``media_components`` list with RTP + RTCP sub-components for each
+    ``m=`` section.  Disabled streams (port 0) are skipped and
+    ``a=rtcp-mux`` collapses RTCP into the RTP sub-component.
+
+    Example::
+
+        from siphon import qos, diameter
+
+        components = qos.media_flows_from_sdp(
+            offer=request.body, answer=reply.body, direction="orig",
+        )
+        diameter.rx_aar(framed_ip=request.source_ip, media_components=components)
+    """
+
+    def media_flows_from_sdp(self, *, offer, answer, direction: str = "orig") -> list[dict]:
+        """Translate an SDP offer/answer pair into a ``media_components`` list.
+
+        Args:
+            offer: the original (offer) SDP — ``str``, ``bytes``, or a
+                Request/Reply/Call mock with a ``body`` attribute.
+            answer: the answer SDP (typically post ``rtpengine.answer()``).
+            direction: ``"orig"`` (UE is offerer — UE addr from ``offer``,
+                remote from ``answer``) or ``"term"`` (UE is answerer —
+                addresses flipped).
+
+        Returns:
+            list[dict]: one entry per non-disabled ``m=`` section.
+        """
+        if direction not in ("orig", "term", "originating", "terminating"):
+            raise ValueError(
+                f"direction must be 'orig' or 'term', got {direction!r}"
+            )
+
+        offer_sdp = _MiniSdp(_extract_sdp_text(offer))
+        answer_sdp = _MiniSdp(_extract_sdp_text(answer))
+
+        if len(offer_sdp.media) != len(answer_sdp.media):
+            raise ValueError(
+                f"offer/answer m= section count mismatch: "
+                f"offer={len(offer_sdp.media)} answer={len(answer_sdp.media)}"
+            )
+
+        results: list[dict] = []
+        component_number = 0
+        for offer_m, answer_m in zip(offer_sdp.media, answer_sdp.media):
+            if offer_m.port == 0 or answer_m.port == 0:
+                continue
+
+            offer_ip = offer_m.connection_ip or offer_sdp.connection_ip
+            answer_ip = answer_m.connection_ip or answer_sdp.connection_ip
+            if offer_ip is None or answer_ip is None:
+                raise ValueError(
+                    f"m={offer_m.media_type} {offer_m.port} missing connection address"
+                )
+
+            if direction in ("orig", "originating"):
+                ue_ip, ue_port = offer_ip, offer_m.port
+                remote_ip, remote_port = answer_ip, answer_m.port
+                ue_media, remote_media = offer_m, answer_m
+            else:
+                ue_ip, ue_port = answer_ip, answer_m.port
+                remote_ip, remote_port = offer_ip, offer_m.port
+                ue_media, remote_media = answer_m, offer_m
+
+            proto = _ip_proto(offer_m.protocol)
+
+            component_number += 1
+            component: dict = {
+                "number": component_number,
+                "media_type": _media_type_alias(offer_m.media_type),
+                "flows": [
+                    {
+                        "number": 1,
+                        "descriptions": [
+                            f"permit out {proto} from {ue_ip} {ue_port} to {remote_ip} {remote_port}",
+                            f"permit in {proto} from {remote_ip} {remote_port} to {ue_ip} {ue_port}",
+                        ],
+                    },
+                ],
+            }
+
+            status = _ue_flow_status(ue_media)
+            if status is not None:
+                component["flow_status"] = status
+
+            mux_agreed = "rtcp-mux" in ue_media.flags and "rtcp-mux" in remote_media.flags
+            if not mux_agreed:
+                ue_rtcp = ue_media.rtcp_port or ue_port + 1
+                remote_rtcp = remote_media.rtcp_port or remote_port + 1
+                component["flows"].append({
+                    "number": 2,
+                    "usage": "rtcp",
+                    "descriptions": [
+                        f"permit out {proto} from {ue_ip} {ue_rtcp} to {remote_ip} {remote_rtcp}",
+                        f"permit in {proto} from {remote_ip} {remote_rtcp} to {ue_ip} {ue_rtcp}",
+                    ],
+                })
+
+            results.append(component)
+
+        return results
+
+
+def _extract_sdp_text(source) -> str:
+    if isinstance(source, str):
+        return source
+    if isinstance(source, (bytes, bytearray)):
+        return bytes(source).decode("utf-8", errors="replace")
+    # Mock Request/Reply/Call: pull `body` attribute.
+    body = getattr(source, "body", None)
+    if body is None:
+        raise ValueError("source has no SDP body")
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body).decode("utf-8", errors="replace")
+    return str(body)
+
+
+class _MiniSdpMedia:
+    __slots__ = ("media_type", "port", "protocol", "connection_ip", "flags", "rtcp_port")
+
+    def __init__(self, line: str) -> None:
+        parts = line.split()
+        # m=audio 50000 RTP/AVP 0 8 97
+        self.media_type = parts[0][2:] if parts[0].startswith("m=") else parts[0]
+        self.port = int(parts[1]) if len(parts) > 1 else 0
+        self.protocol = parts[2] if len(parts) > 2 else "RTP/AVP"
+        self.connection_ip: Optional[str] = None
+        self.flags: set[str] = set()
+        self.rtcp_port: Optional[int] = None
+
+
+class _MiniSdp:
+    """Just enough SDP parsing for the mock helper."""
+
+    def __init__(self, text: str) -> None:
+        self.connection_ip: Optional[str] = None
+        self.media: list[_MiniSdpMedia] = []
+        current: Optional[_MiniSdpMedia] = None
+        for raw in text.splitlines():
+            line = raw.rstrip("\r")
+            if line.startswith("m="):
+                current = _MiniSdpMedia(line)
+                self.media.append(current)
+            elif line.startswith("c=") and current is not None:
+                current.connection_ip = _parse_c_line(line)
+            elif line.startswith("c=") and current is None:
+                self.connection_ip = _parse_c_line(line)
+            elif line.startswith("a=") and current is not None:
+                attr = line[2:]
+                if ":" in attr:
+                    name, value = attr.split(":", 1)
+                    name = name.strip()
+                    value = value.strip()
+                    if name == "rtcp":
+                        token = value.split()[0] if value.split() else ""
+                        try:
+                            current.rtcp_port = int(token)
+                        except ValueError:
+                            pass
+                    else:
+                        current.flags.add(name)
+                else:
+                    current.flags.add(attr.strip())
+
+
+def _parse_c_line(line: str) -> Optional[str]:
+    # c=IN IP4 10.0.0.1 / c=IN IP6 ::1
+    parts = line[2:].split()
+    if len(parts) < 3:
+        return None
+    addr = parts[2].split("/")[0].strip()
+    return addr or None
+
+
+def _ip_proto(sdp_protocol: str) -> int:
+    upper = sdp_protocol.upper()
+    if upper.startswith("TCP") or "/TCP/" in upper:
+        return 6
+    if upper.startswith("SCTP") or "/SCTP/" in upper:
+        return 132
+    return 17
+
+
+def _media_type_alias(sdp_media_type: str) -> str:
+    mapping = {
+        "audio": "audio",
+        "video": "video",
+        "application": "application",
+        "text": "text",
+        "message": "message",
+        "image": "data",
+    }
+    return mapping.get(sdp_media_type.lower(), "other")
+
+
+def _ue_flow_status(media: _MiniSdpMedia) -> Optional[str]:
+    if "inactive" in media.flags:
+        return "disabled"
+    if "sendonly" in media.flags:
+        return "enabled-up"
+    if "recvonly" in media.flags:
+        return "enabled-down"
+    return None
+
+
+_qos = MockQos()
+
+
 def install() -> ModuleType:
     """Install the mock ``siphon`` module into ``sys.modules``.
 
@@ -4771,6 +4995,7 @@ def install() -> ModuleType:
     mod.sbi = _sbi  # type: ignore[attr-defined]
     mod.ipsec = _ipsec  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
+    mod.qos = _qos  # type: ignore[attr-defined]
 
     # IPsec types — exposed at top level so scripts can do
     # `from siphon import Transform, SecurityOffer, …` (matching the

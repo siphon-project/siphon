@@ -633,15 +633,16 @@ class _SbiNamespace:
         Requires ``sbi:`` configuration with ``npcf_url``.
 
         Args:
-            af_app_id: Application Function identifier.
+            af_app_id: AF-Application identifier (default "IMS Services").
             sip_call_id: SIP Call-ID for correlation.
             supi: Subscription Permanent Identifier.
             ue_ipv4: UE IPv4 address.
             ue_ipv6: UE IPv6 address.
             dnn: Data Network Name.
             notif_uri: Notification URI for PCF events.
-            media_type: Media type (default "AUDIO").
-            flow_status: Flow status (default "ENABLED").
+            media_components: list of media-component dicts.  See the
+                project docs for the full shape (mirrors
+                ``diameter.rx_aar``).
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or None.
@@ -668,8 +669,8 @@ class _SbiNamespace:
 
         Args:
             session_id: The app session ID to update.
-            media_type: Media type (default "AUDIO").
-            flow_status: Flow status (default "ENABLED").
+            media_components: list of media-component dicts (same shape as
+                ``create_session``).
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or None.
@@ -876,3 +877,28 @@ class _SdpNamespace:
 
 
 sdp = _SdpNamespace()
+
+
+# ---------------------------------------------------------------------------
+# QoS namespace (stub — replaced by Rust at startup)
+# ---------------------------------------------------------------------------
+
+class _QosNamespace:
+    """SDP → IPFilterRule helper (stub).
+
+    Usage:
+        from siphon import qos
+
+        components = qos.media_flows_from_sdp(
+            offer=request.body, answer=reply.body, direction="orig",
+        )
+        diameter.rx_aar(framed_ip=request.source_ip, media_components=components)
+    """
+
+    def media_flows_from_sdp(self, *, offer, answer, direction="orig"):
+        raise NotImplementedError(
+            "qos.media_flows_from_sdp() not available — QoS namespace not initialized"
+        )
+
+
+qos = _QosNamespace()

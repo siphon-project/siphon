@@ -432,6 +432,14 @@ impl SiphonServer {
             }
         });
 
+        // --- Initialize QoS namespace for Python scripts ---
+        // Stateless SDP→IPFilterRule helper — always available, no config needed.
+        pyo3::Python::attach(|python| {
+            if let Err(error) = crate::script::api::set_qos_singleton(python) {
+                error!("failed to store qos singleton: {error}");
+            }
+        });
+
         // --- Initialize timer namespace for Python scripts ---
         // Runtime scheduler for timer.set / timer.cancel — always available.
         pyo3::Python::attach(|python| {

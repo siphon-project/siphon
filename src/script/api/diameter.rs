@@ -21,9 +21,22 @@
 //! # Cx: locate serving S-CSCF for non-REGISTER requests (I-CSCF)
 //! result = diameter.cx_lir("sip:alice@ims.example.com")
 //!
-//! # Rx: request QoS resources from PCRF (P-CSCF)
-//! result = diameter.rx_aar(session_id="rx-sess-1", media_type="audio",
-//!                          framed_ip="10.0.0.1", flow_description="permit in 17 from any")
+//! # Rx: request QoS resources from PCRF (P-CSCF).  See the project docs for
+//! # the full media_components shape; here's a minimal one-component example.
+//! result = diameter.rx_aar(
+//!     framed_ip="10.0.0.1",
+//!     media_components=[{
+//!         "number": 1,
+//!         "media_type": "audio",
+//!         "flows": [{
+//!             "number": 1,
+//!             "descriptions": [
+//!                 "permit out 17 from 10.0.0.1 50000 to 10.0.0.2 30000",
+//!                 "permit in 17 from 10.0.0.2 30000 to 10.0.0.1 50000",
+//!             ],
+//!         }],
+//!     }],
+//! )
 //! if result:
 //!     log.info(f"Rx AAR result: {result['result_code']}")
 //!
@@ -58,6 +71,251 @@ fn extract_references(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
         return Ok(vec![single]);
     }
     obj.extract::<Vec<u32>>()
+}
+
+fn media_type_from_str(s: &str) -> PyResult<crate::diameter::rx::MediaType> {
+    use crate::diameter::rx::MediaType;
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "audio" => MediaType::Audio,
+        "video" => MediaType::Video,
+        "data" => MediaType::Data,
+        "application" => MediaType::Application,
+        "control" => MediaType::Control,
+        "text" => MediaType::Text,
+        "message" => MediaType::Message,
+        "other" => MediaType::Other,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown media_type {other:?} (expected audio|video|data|application|control|text|message|other)"
+            )));
+        }
+    })
+}
+
+fn flow_status_from_str(s: &str) -> PyResult<crate::diameter::rx::FlowStatus> {
+    use crate::diameter::rx::FlowStatus;
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "enabled" => FlowStatus::Enabled,
+        "disabled" => FlowStatus::Disabled,
+        "removed" => FlowStatus::Removed,
+        "enabled-up" | "enabled_uplink" | "enabled-uplink" => FlowStatus::EnabledUplink,
+        "enabled-down" | "enabled_downlink" | "enabled-downlink" => FlowStatus::EnabledDownlink,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown flow_status {other:?} (expected enabled|disabled|removed|enabled-up|enabled-down)"
+            )));
+        }
+    })
+}
+
+fn flow_usage_from_str(s: &str) -> PyResult<crate::diameter::rx::FlowUsage> {
+    use crate::diameter::rx::FlowUsage;
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "no_information" | "no-information" | "none" => FlowUsage::NoInformation,
+        "rtcp" => FlowUsage::Rtcp,
+        "af_signalling" | "af-signalling" | "signalling" => FlowUsage::AfSignalling,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown flow usage {other:?} (expected no_information|rtcp|af_signalling)"
+            )));
+        }
+    })
+}
+
+/// Parse a Python list of dicts into a `Vec<MediaComponent>`.  Shape:
+///
+/// ```text
+/// {
+///   "number":              int       (required)
+///   "media_type":          str       (required)
+///   "max_bandwidth_ul":    int       (optional)
+///   "max_bandwidth_dl":    int       (optional)
+///   "flow_status":         str       (optional)
+///   "codec_data":          bytes     (optional)
+///   "flows":               [ ... ]   (optional, default [])
+/// }
+/// ```
+fn parse_media_components(
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<Vec<crate::diameter::rx::MediaComponent>> {
+    use crate::diameter::rx::{MediaComponent, MediaFlow};
+    use pyo3::types::{PyDict, PyList};
+
+    let list = obj.cast::<PyList>().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err("media_components must be a list of dicts")
+    })?;
+
+    let mut out = Vec::with_capacity(list.len());
+    for (idx, item) in list.iter().enumerate() {
+        let component_dict = item.cast::<PyDict>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "media_components[{idx}] must be a dict"
+            ))
+        })?;
+
+        let number: u32 = component_dict
+            .get_item("number")?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "media_components[{idx}] missing 'number'"
+                ))
+            })?
+            .extract()?;
+
+        let media_type_str: String = component_dict
+            .get_item("media_type")?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "media_components[{idx}] missing 'media_type'"
+                ))
+            })?
+            .extract()?;
+        let media_type = media_type_from_str(&media_type_str)?;
+
+        let max_bandwidth_ul: Option<u32> = component_dict
+            .get_item("max_bandwidth_ul")?
+            .map(|v| v.extract())
+            .transpose()?;
+        let max_bandwidth_dl: Option<u32> = component_dict
+            .get_item("max_bandwidth_dl")?
+            .map(|v| v.extract())
+            .transpose()?;
+
+        let flow_status = match component_dict.get_item("flow_status")? {
+            Some(v) => {
+                let s: String = v.extract()?;
+                Some(flow_status_from_str(&s)?)
+            }
+            None => None,
+        };
+
+        let codec_data: Option<Vec<u8>> = component_dict
+            .get_item("codec_data")?
+            .map(|v| v.extract())
+            .transpose()?;
+
+        let mut flows: Vec<MediaFlow> = Vec::new();
+        if let Some(flows_obj) = component_dict.get_item("flows")? {
+            let flows_list = flows_obj.cast::<PyList>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "media_components[{idx}].flows must be a list"
+                ))
+            })?;
+            for (fidx, flow_item) in flows_list.iter().enumerate() {
+                let flow_dict = flow_item.cast::<PyDict>().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "media_components[{idx}].flows[{fidx}] must be a dict"
+                    ))
+                })?;
+
+                let flow_number: u32 = flow_dict
+                    .get_item("number")?
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyKeyError::new_err(format!(
+                            "media_components[{idx}].flows[{fidx}] missing 'number'"
+                        ))
+                    })?
+                    .extract()?;
+
+                let descriptions: Vec<String> = match flow_dict.get_item("descriptions")? {
+                    Some(v) => v.extract()?,
+                    None => Vec::new(),
+                };
+
+                let status = match flow_dict.get_item("status")? {
+                    Some(v) => {
+                        let s: String = v.extract()?;
+                        Some(flow_status_from_str(&s)?)
+                    }
+                    None => None,
+                };
+
+                let usage = match flow_dict.get_item("usage")? {
+                    Some(v) => {
+                        let s: String = v.extract()?;
+                        Some(flow_usage_from_str(&s)?)
+                    }
+                    None => None,
+                };
+
+                flows.push(MediaFlow {
+                    flow_number,
+                    descriptions,
+                    status,
+                    usage,
+                });
+            }
+        }
+
+        out.push(MediaComponent {
+            number,
+            media_type,
+            flows,
+            max_bandwidth_ul,
+            max_bandwidth_dl,
+            flow_status,
+            codec_data,
+        });
+    }
+
+    Ok(out)
+}
+
+/// Accepts an IPv6 string ("2001:db8::1") or raw bytes (the
+/// Framed-IPv6-Prefix AVP carries a length-prefixed octet string per
+/// RFC 3162 §2.3; if the caller passes raw bytes, trust them verbatim).
+fn extract_ipv6_prefix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(raw) = obj.extract::<Vec<u8>>() {
+        return Ok(raw);
+    }
+    let text: String = obj.extract().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err("framed_ipv6 must be str or bytes")
+    })?;
+    let addr: std::net::Ipv6Addr = text.parse().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "framed_ipv6 is not a valid IPv6 address: {text}"
+        ))
+    })?;
+    // RFC 3162 §2.3 — Framed-IPv6-Prefix is reserved + prefix-length + bytes.
+    // For a /128 host address, prefix_len = 128 and all 16 bytes follow.
+    let mut bytes = Vec::with_capacity(18);
+    bytes.push(0); // reserved
+    bytes.push(128); // prefix length
+    bytes.extend_from_slice(&addr.octets());
+    Ok(bytes)
+}
+
+/// Accepts ``(data, type)`` where ``type`` is an int (RFC 4006 §8.47) or
+/// a string alias.
+fn extract_subscription_id(obj: &Bound<'_, PyAny>) -> PyResult<(String, u32)> {
+    let tuple: (String, Bound<'_, PyAny>) = obj.extract().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(
+            "subscription_id must be (data: str, type: int|str)",
+        )
+    })?;
+    let (data, type_obj) = tuple;
+    let type_num: u32 = if let Ok(int_value) = type_obj.extract::<u32>() {
+        int_value
+    } else {
+        let alias: String = type_obj.extract().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "subscription_id[1] must be int or str alias",
+            )
+        })?;
+        match alias.to_ascii_lowercase().as_str() {
+            "e164" | "e.164" => 0,
+            "imsi" => 1,
+            "sip_uri" | "sip-uri" | "sip" => 2,
+            "nai" => 3,
+            "private" => 4,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown subscription_id type alias {other:?}"
+                )));
+            }
+        }
+    };
+    Ok((data, type_num))
 }
 
 /// Python-visible Diameter namespace.
@@ -484,30 +742,54 @@ impl PyDiameter {
         }
     }
 
-    /// Send an Rx AA-Request to the PCRF for QoS resource reservation.
+    /// Send an Rx AA-Request to authorize an IMS media session.
     ///
     /// Used by the P-CSCF when SDP is negotiated during session setup
-    /// (INVITE 200 OK) to request dedicated bearer resources.
+    /// (INVITE / 200 OK / UPDATE) to request dedicated bearer resources.
     ///
     /// Args:
-    ///     session_id: Rx session identifier (or None to auto-generate).
-    ///     media_type: Media type string (``"audio"``, ``"video"``).
-    ///     framed_ip: UE's IP address for the media flow.
-    ///     flow_description: IPFilterRule for the media flow
-    ///         (e.g. ``"permit in 17 from any to 10.0.0.1 49170"``).
+    ///     session_id: Reuse an existing Rx session ID (modification AAR per
+    ///         TS 29.214 §4.4.5).  ``None`` allocates a new session.
+    ///     framed_ip: UE IPv4 address (Framed-IP-Address AVP).
+    ///     framed_ipv6: UE IPv6 address (Framed-IPv6-Prefix AVP, raw bytes).
+    ///     media_components: List of media-component dicts.  Each dict
+    ///         mirrors :class:`MediaComponent` (TS 29.214 §5.3.7) — see
+    ///         the project docs for the full shape.
+    ///     af_application_id: AF-Application-Identifier (default
+    ///         ``"IMS Services"``).
+    ///     subscription_id: Optional ``(data, type)`` tuple. ``type`` is an
+    ///         int per RFC 4006 §8.47 — 0=E.164, 1=IMSI, 2=SIP_URI, 3=NAI,
+    ///         4=PRIVATE — or a string alias (``"sip_uri"`` / ``"e164"`` /
+    ///         ``"imsi"`` / ``"nai"`` / ``"private"``).
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``session_id`` (str),
     ///     or ``None`` if no Rx peer is connected.
-    #[pyo3(signature = (session_id=None, media_type="audio", framed_ip=None, flow_description=None))]
+    #[pyo3(signature = (
+        session_id=None,
+        framed_ip=None,
+        framed_ipv6=None,
+        media_components=None,
+        af_application_id="IMS Services",
+        subscription_id=None,
+    ))]
     fn rx_aar<'py>(
         &self,
         python: Python<'py>,
         session_id: Option<&str>,
-        media_type: &str,
         framed_ip: Option<&str>,
-        flow_description: Option<&str>,
+        framed_ipv6: Option<&Bound<'py, PyAny>>,
+        media_components: Option<&Bound<'py, PyAny>>,
+        af_application_id: &str,
+        subscription_id: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        use crate::diameter::codec::{
+            encode_avp_grouped, encode_avp_octet, encode_avp_octet_3gpp, encode_avp_u32,
+            encode_avp_utf8, encode_diameter_message, FLAG_PROXIABLE, FLAG_REQUEST,
+        };
+        use crate::diameter::dictionary::{self, avp};
+        use crate::diameter::rx::MediaComponent;
+
         let client = match self.manager.any_client() {
             Some(client) => client,
             None => {
@@ -516,19 +798,20 @@ impl PyDiameter {
             }
         };
 
-        let media_type_num: u32 = match media_type {
-            "audio" => 0,
-            "video" => 1,
-            "data" => 2,
-            "application" => 3,
-            "control" => 4,
-            "text" => 5,
-            "message" => 6,
-            _ => 0xFFFFFFFF,
+        let components: Vec<MediaComponent> = match media_components {
+            Some(obj) => parse_media_components(obj)?,
+            None => Vec::new(),
         };
 
-        use crate::diameter::codec::*;
-        use crate::diameter::dictionary::{self, avp};
+        let framed_ipv6_bytes: Option<Vec<u8>> = match framed_ipv6 {
+            Some(obj) => Some(extract_ipv6_prefix(obj)?),
+            None => None,
+        };
+
+        let subscription_parsed: Option<(String, u32)> = match subscription_id {
+            Some(obj) => Some(extract_subscription_id(obj)?),
+            None => None,
+        };
 
         let peer = client.peer();
         let hbh = peer.next_hbh();
@@ -540,7 +823,10 @@ impl PyDiameter {
 
         let mut payload = Vec::with_capacity(512);
         payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session));
-        payload.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, dictionary::RX_APP_ID));
+        payload.extend_from_slice(&encode_avp_u32(
+            avp::AUTH_APPLICATION_ID,
+            dictionary::RX_APP_ID,
+        ));
         payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
         payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
         payload.extend_from_slice(&encode_avp_utf8(
@@ -548,34 +834,40 @@ impl PyDiameter {
             &config.destination_realm,
         ));
 
-        // Media-Component-Description
-        let mut mcd_inner = Vec::new();
-        mcd_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::MEDIA_COMPONENT_NUMBER, 1));
-        mcd_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::MEDIA_TYPE, media_type_num));
-
-        if let Some(flow) = flow_description {
-            let mut msc_inner = Vec::new();
-            msc_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::FLOW_NUMBER, 1));
-            msc_inner.extend_from_slice(&encode_avp_octet_3gpp(
-                avp::FLOW_DESCRIPTION,
-                flow.as_bytes(),
-            ));
-            mcd_inner
-                .extend_from_slice(&encode_avp_grouped_3gpp(avp::MEDIA_SUB_COMPONENT, &msc_inner));
-        }
-
-        payload.extend_from_slice(&encode_avp_grouped_3gpp(
-            avp::MEDIA_COMPONENT_DESCRIPTION,
-            &mcd_inner,
+        // AF-Application-Identifier — TS 29.214 §5.3.4
+        payload.extend_from_slice(&encode_avp_octet_3gpp(
+            avp::AF_APPLICATION_IDENTIFIER,
+            af_application_id.as_bytes(),
         ));
 
+        // One Media-Component-Description per SDP m= section
+        for component in &components {
+            payload.extend_from_slice(&component.encode());
+        }
+
         if let Some(ip) = framed_ip {
-            if let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() {
-                payload.extend_from_slice(&encode_avp_octet(
+            match ip.parse::<std::net::Ipv4Addr>() {
+                Ok(addr) => payload.extend_from_slice(&encode_avp_octet(
                     avp::FRAMED_IP_ADDRESS,
                     &addr.octets(),
-                ));
+                )),
+                Err(_) => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "framed_ip is not a valid IPv4 address: {ip}"
+                    )));
+                }
             }
+        }
+
+        if let Some(bytes) = framed_ipv6_bytes.as_deref() {
+            payload.extend_from_slice(&encode_avp_octet(avp::FRAMED_IPV6_PREFIX, bytes));
+        }
+
+        if let Some((data, type_num)) = subscription_parsed.as_ref() {
+            let mut sub_inner = Vec::new();
+            sub_inner.extend_from_slice(&encode_avp_u32(avp::SUBSCRIPTION_ID_TYPE, *type_num));
+            sub_inner.extend_from_slice(&encode_avp_utf8(avp::SUBSCRIPTION_ID_DATA, data));
+            payload.extend_from_slice(&encode_avp_grouped(avp::SUBSCRIPTION_ID, &sub_inner));
         }
 
         let wire = encode_diameter_message(
@@ -2226,13 +2518,127 @@ mod tests {
     }
 
     #[test]
+    fn parse_media_components_full_shape() {
+        use pyo3::types::{PyDict, PyList};
+
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let component = PyDict::new(python);
+            component.set_item("number", 1u32).unwrap();
+            component.set_item("media_type", "audio").unwrap();
+            component.set_item("max_bandwidth_ul", 64000u32).unwrap();
+            component.set_item("max_bandwidth_dl", 64000u32).unwrap();
+            component.set_item("flow_status", "enabled").unwrap();
+            component
+                .set_item("codec_data", b"uplink\noffer\nm=audio 50000 RTP/AVP 0".to_vec())
+                .unwrap();
+
+            let flows = PyList::empty(python);
+
+            let rtp = PyDict::new(python);
+            rtp.set_item("number", 1u32).unwrap();
+            rtp.set_item(
+                "descriptions",
+                vec![
+                    "permit out 17 from 10.0.0.1 50000 to 10.0.0.2 30000",
+                    "permit in 17 from 10.0.0.2 30000 to 10.0.0.1 50000",
+                ],
+            )
+            .unwrap();
+            flows.append(rtp).unwrap();
+
+            let rtcp = PyDict::new(python);
+            rtcp.set_item("number", 2u32).unwrap();
+            rtcp.set_item("usage", "rtcp").unwrap();
+            rtcp.set_item(
+                "descriptions",
+                vec![
+                    "permit out 17 from 10.0.0.1 50001 to 10.0.0.2 30001",
+                    "permit in 17 from 10.0.0.2 30001 to 10.0.0.1 50001",
+                ],
+            )
+            .unwrap();
+            flows.append(rtcp).unwrap();
+
+            component.set_item("flows", flows).unwrap();
+
+            let list = PyList::empty(python);
+            list.append(component).unwrap();
+
+            let parsed = parse_media_components(list.as_any()).unwrap();
+            assert_eq!(parsed.len(), 1);
+            let mc = &parsed[0];
+            assert_eq!(mc.number, 1);
+            assert_eq!(mc.max_bandwidth_ul, Some(64000));
+            assert_eq!(mc.max_bandwidth_dl, Some(64000));
+            assert_eq!(mc.flows.len(), 2);
+            assert_eq!(mc.flows[0].flow_number, 1);
+            assert_eq!(mc.flows[0].descriptions.len(), 2);
+            assert_eq!(mc.flows[1].flow_number, 2);
+            assert!(matches!(
+                mc.flows[1].usage,
+                Some(crate::diameter::rx::FlowUsage::Rtcp)
+            ));
+
+            // Encoded wire form must carry the Flow-Description bytes verbatim
+            // plus a Flow-Usage AVP for the RTCP sub-component.  This is what
+            // distinguishes the new structured form from the previous
+            // wildcard placeholder.
+            let encoded = mc.encode();
+            let rule = b"permit out 17 from 10.0.0.1 50000 to 10.0.0.2 30000";
+            assert!(
+                encoded.windows(rule.len()).any(|w| w == rule),
+                "encoded MCD must contain the full 5-tuple Flow-Description"
+            );
+            let flow_usage_code = crate::diameter::dictionary::avp::FLOW_USAGE.to_be_bytes();
+            assert!(
+                encoded.windows(4).any(|w| w == flow_usage_code),
+                "RTCP sub-component must carry a Flow-Usage AVP"
+            );
+        });
+    }
+
+    #[test]
+    fn parse_media_components_missing_number_errors() {
+        use pyo3::types::{PyDict, PyList};
+
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let component = PyDict::new(python);
+            component.set_item("media_type", "audio").unwrap();
+            let list = PyList::empty(python);
+            list.append(component).unwrap();
+            let error = parse_media_components(list.as_any()).unwrap_err();
+            assert!(error.to_string().contains("number"));
+        });
+    }
+
+    #[test]
+    fn extract_subscription_id_string_alias() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let tuple = pyo3::types::PyTuple::new(
+                python,
+                [
+                    "sip:alice@example.com".into_pyobject(python).unwrap().into_any(),
+                    "sip_uri".into_pyobject(python).unwrap().into_any(),
+                ],
+            )
+            .unwrap();
+            let (data, type_num) = extract_subscription_id(tuple.as_any()).unwrap();
+            assert_eq!(data, "sip:alice@example.com");
+            assert_eq!(type_num, 2);
+        });
+    }
+
+    #[test]
     fn rx_aar_returns_none_without_peer() {
         pyo3::Python::initialize();
         let manager = Arc::new(DiameterManager::new());
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
             let result = py_diameter
-                .rx_aar(python, None, "audio", None, None)
+                .rx_aar(python, None, None, None, None, "IMS Services", None)
                 .unwrap();
             assert!(result.is_none());
         });
