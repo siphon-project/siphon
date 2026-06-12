@@ -79,6 +79,11 @@ pub struct RecordingSession {
     pub original_from_tag: Option<String>,
     /// Original call's To-tag (for RTPEngine subscribe correlation).
     pub original_to_tag: Option<String>,
+    /// When this recording session was created.  Used by the orphan
+    /// backstop sweep ([`RecordingManager::sweep_stale`]) to reap sessions
+    /// whose call ended without `stop_recording` ever firing.  Normal
+    /// recordings are cleaned on BYE; this only catches orphans.
+    pub created_at: std::time::Instant,
 }
 
 /// Manages all active recording sessions.
@@ -269,6 +274,7 @@ impl RecordingManager {
             original_sip_call_id: original_sip_call_id.map(|s| s.to_string()),
             original_from_tag: original_tags.map(|(ft, _)| ft.to_string()),
             original_to_tag: original_tags.map(|(_, tt)| tt.to_string()),
+            created_at: std::time::Instant::now(),
         };
 
         self.sessions.insert(session_id.clone(), session);
@@ -587,6 +593,42 @@ impl RecordingManager {
         self.sessions.iter()
             .filter(|session| session.state == RecordingState::Active)
             .count()
+    }
+
+    /// Orphan backstop: remove recording sessions older than `max_age` along
+    /// with their `call_sessions` / `branch_to_session` aliases.
+    ///
+    /// Normal recordings are torn down by [`Self::stop_recording`] on BYE;
+    /// this only reaps sessions whose call ended without a stop ever firing
+    /// (e.g. the B2BUA call was abandoned without a teardown path).  Ages
+    /// strictly by creation time so an active recording is never dropped
+    /// while its call is still alive.  Returns the number of sessions reaped.
+    pub fn sweep_stale(&self, max_age: std::time::Duration) -> usize {
+        let now = std::time::Instant::now();
+        let stale_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|session| now.duration_since(session.created_at) > max_age)
+            .map(|session| session.session_id.clone())
+            .collect();
+
+        for session_id in &stale_ids {
+            // Drop the primary record.
+            self.sessions.remove(session_id);
+            // Drop the branch alias(es) pointing at this session.
+            self.branch_to_session.retain(|_, value| value != session_id);
+            // Drop the session id from its call's list; remove now-empty lists.
+            self.call_sessions.retain(|_, ids| {
+                ids.retain(|id| id != session_id);
+                !ids.is_empty()
+            });
+        }
+
+        let reaped = stale_ids.len();
+        if reaped > 0 {
+            info!(reaped, "SIPREC: orphan backstop swept stale recording sessions");
+        }
+        reaped
     }
 }
 
@@ -1901,5 +1943,77 @@ mod tests {
         // Direction flipped to sendonly.
         assert!(raw.contains("a=sendonly"));
         assert!(!raw.contains("a=recvonly"));
+    }
+
+    #[test]
+    fn sweep_stale_reaps_old_session_keeps_fresh() {
+        let manager = RecordingManager::new("SIPhon", "0.1.0");
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 10000 RTP/AVP 0\r\n",
+            "a=sendrecv\r\n",
+        );
+
+        // One session that we'll age into staleness.
+        let (old_id, old_message, _, _) = manager.start_recording(
+            "old-call",
+            "sip:srs@10.0.0.5:5060",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            sdp.as_bytes(),
+            "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ).unwrap();
+
+        // One fresh session that must survive the sweep.
+        let (fresh_id, _, _, _) = manager.start_recording(
+            "fresh-call",
+            "sip:srs@10.0.0.5:5060",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            sdp.as_bytes(),
+            "10.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ).unwrap();
+
+        // Capture the old session's branch so we can assert its alias is cleared.
+        let old_raw = String::from_utf8_lossy(&old_message.to_bytes()).into_owned();
+        let old_branch = old_raw
+            .lines()
+            .find(|line| line.starts_with("Via:"))
+            .and_then(|line| line.split("branch=").nth(1))
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+            .unwrap();
+
+        // Force the old session to look 48 h old.
+        manager
+            .sessions
+            .get_mut(&old_id)
+            .unwrap()
+            .created_at -= std::time::Duration::from_secs(48 * 3600);
+
+        let reaped = manager.sweep_stale(std::time::Duration::from_secs(24 * 3600));
+        assert_eq!(reaped, 1, "exactly the aged session should be reaped");
+
+        // Old session and all its aliases are gone.
+        assert!(manager.sessions.get(&old_id).is_none());
+        assert!(manager.call_sessions.get("old-call").is_none());
+        assert!(manager.session_for_branch(&old_branch).is_none());
+
+        // Fresh session and its aliases are untouched.
+        assert!(manager.sessions.get(&fresh_id).is_some());
+        assert!(manager.call_sessions.get("fresh-call").is_some());
     }
 }

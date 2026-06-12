@@ -17,22 +17,6 @@ use super::request::PyRequest;
 use crate::config::{AkaCredential, AuthBackendType, HttpAuthConfig};
 use crate::diameter::DiameterManager;
 
-/// AKA key material derived during authentication, stored for IPsec SA creation.
-/// Keyed by nonce string — the dispatcher reads this after 200 OK to get CK/IK.
-#[derive(Debug, Clone)]
-pub struct AkaKeyMaterial {
-    pub ck: [u8; 16],
-    pub ik: [u8; 16],
-}
-
-/// Global store for AKA key material — shared between auth module and dispatcher.
-static AKA_KEY_STORE: OnceLock<Arc<DashMap<String, AkaKeyMaterial>>> = OnceLock::new();
-
-/// Get or initialize the global AKA key material store.
-pub fn aka_key_store() -> &'static Arc<DashMap<String, AkaKeyMaterial>> {
-    AKA_KEY_STORE.get_or_init(|| Arc::new(DashMap::new()))
-}
-
 /// Auth vector from the HSS MAA, cached between the 401 challenge and the
 /// verification REGISTER so that we don't send a second MAR (which would
 /// return a different XRES and always fail).
@@ -294,19 +278,6 @@ impl PyAuth {
                     );
                     if matches {
                         request.set_auth_user(fields.username);
-                        // Store CK/IK for IPsec SA creation (same as AKA local flow)
-                        if let (Some(ck_bytes), Some(ik_bytes)) = (&vector.ck, &vector.ik) {
-                            if ck_bytes.len() == 16 && ik_bytes.len() == 16 {
-                                let mut ck = [0u8; 16];
-                                let mut ik = [0u8; 16];
-                                ck.copy_from_slice(ck_bytes);
-                                ik.copy_from_slice(ik_bytes);
-                                aka_key_store().insert(
-                                    fields.nonce,
-                                    AkaKeyMaterial { ck, ik },
-                                );
-                            }
-                        }
                         return Ok(true);
                     }
                 }
@@ -422,30 +393,15 @@ impl PyAuth {
                 // Extract nonce from Authorization header to find our stored vector
                 let auth_nonce = extract_nonce_field(&auth_value);
                 if let Some(nonce_str) = auth_nonce {
-                    // Decode the nonce to get RAND
+                    // Decode the nonce to confirm it carries a valid RAND||AUTN.
                     if let Some(nonce_bytes) = base64_decode(&nonce_str) {
                         if nonce_bytes.len() >= 32 {
-                            let mut rand = [0u8; 16];
-                            rand.copy_from_slice(&nonce_bytes[..16]);
-
-                            // Recompute the vector with the same RAND
-                            let vector = milenage::generate_vector_with_rand(
-                                &k, &op, &sqn, &amf, &rand,
-                            );
-
-                            // For AKAv1-MD5: the "password" for MD5 digest is the XRES
-                            // Actually, in IMS AKA, we compare the response field directly
-                            // against XRES. But sipp_ipsec uses AKAv1-MD5 which means
-                            // the digest response is computed using XRES as the password.
+                            // For AKAv1-MD5: the "password" for MD5 digest is the XRES.
+                            // In IMS AKA, we compare the response field directly against
+                            // XRES. But sipp_ipsec uses AKAv1-MD5 which means the digest
+                            // response is computed using XRES as the password.
                             // For simplicity in static auth: accept if username matches a known user.
                             if let Some(username) = extract_username(&auth_value) {
-                                // Store CK/IK keyed by nonce for SA creation
-                                let key_store = aka_key_store();
-                                key_store.insert(nonce_str.clone(), AkaKeyMaterial {
-                                    ck: vector.ck,
-                                    ik: vector.ik,
-                                });
-
                                 request.set_auth_user(username);
                                 return Ok(true);
                             }
@@ -652,13 +608,6 @@ impl PyAuth {
         nonce_bytes.extend_from_slice(&vector.rand);
         nonce_bytes.extend_from_slice(&vector.autn);
         let nonce = base64_encode(&nonce_bytes);
-
-        // Store CK/IK keyed by nonce for later SA creation
-        let key_store = aka_key_store();
-        key_store.insert(nonce.clone(), AkaKeyMaterial {
-            ck: vector.ck,
-            ik: vector.ik,
-        });
 
         request.set_reply(401, "Unauthorized".to_string());
 
@@ -1509,22 +1458,6 @@ mod tests {
         assert_eq!(encoded.len(), 44);
         let decoded = base64_decode(&encoded).unwrap();
         assert_eq!(decoded.len(), 32);
-    }
-
-    #[test]
-    fn aka_key_store_insert_and_retrieve() {
-        let store = aka_key_store();
-        let key_material = AkaKeyMaterial {
-            ck: [1u8; 16],
-            ik: [2u8; 16],
-        };
-        store.insert("test-nonce-auth".to_string(), key_material);
-        {
-            let retrieved = store.get("test-nonce-auth").unwrap();
-            assert_eq!(retrieved.ck, [1u8; 16]);
-            assert_eq!(retrieved.ik, [2u8; 16]);
-        } // drop Ref guard before remove — holding it causes DashMap shard deadlock
-        store.remove("test-nonce-auth");
     }
 
     #[test]

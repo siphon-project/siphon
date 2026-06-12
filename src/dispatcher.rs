@@ -195,6 +195,11 @@ pub(crate) struct ProxyRfState {
     /// the STOP path so a single found-by-X lookup can clean up all
     /// the aliases without scanning the map.
     storage_keys: Vec<String>,
+    /// When this record was created.  Used by the orphan backstop sweep
+    /// (`sweep_stale_entries`) to reap Rf sessions whose ACR-STOP never
+    /// fired (call torn down without a BYE reaching the dispatcher).
+    /// Normal calls are reaped on BYE; this only catches orphans.
+    created_at: std::time::Instant,
 }
 
 impl ProxyRfState {
@@ -1705,8 +1710,18 @@ fn process_timer_actions(
     }
 }
 
+/// Backstop TTL for call-lifetime stores (rtpengine sessions, B2BUA call
+/// actors, proxy Rf charging sessions, SIPREC recordings).
+///
+/// Normal calls reap their entries on BYE / teardown within seconds-to-minutes;
+/// this only catches truly-orphaned entries whose teardown path never fired.
+/// A call still alive after 24 h is abnormal/nonexistent, so ageing strictly
+/// by creation time at this TTL never drops an active call.
+const ORPHAN_CALL_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 /// Sweep stale proxy sessions.
 fn sweep_stale_entries(state: &DispatcherState) {
+    let now = std::time::Instant::now();
     let ttl = state.transaction_timeout;
     let expired_sessions = state.session_store.sweep_stale(ttl) as u64;
 
@@ -1725,6 +1740,40 @@ fn sweep_stale_entries(state: &DispatcherState) {
         Some(store) => (store.sweep_stale() as u64, store.local_count()),
         None => (0, 0),
     };
+
+    // ── Orphan backstop sweeps (call-lifetime stores) ──────────────────────
+    // These are reaped promptly on BYE for normal calls; the backstop only
+    // catches entries whose teardown path never fired. Age strictly by
+    // creation with a long TTL so active calls are never disturbed.
+
+    // RTPEngine media sessions — ages by MediaSession::created_at, returns ().
+    if let Some(store) = &state.rtpengine_sessions {
+        store.sweep_stale(ORPHAN_CALL_TTL);
+    }
+
+    // B2BUA call actors — ages by CallActor::created_at (set once at creation,
+    // never refreshed), returns the number reaped.
+    let expired_calls = state.call_actors.sweep_stale(ORPHAN_CALL_TTL) as u64;
+
+    // Proxy Rf charging sessions — one Arc may be filed under several keys
+    // (storage_keys aliases), so retain on the value's age to drop every alias
+    // of an orphan in one pass.
+    let rf_before = state.rf_sessions.len();
+    state
+        .rf_sessions
+        .retain(|_, st| now.duration_since(st.created_at) < ORPHAN_CALL_TTL);
+    let expired_rf = rf_before.saturating_sub(state.rf_sessions.len()) as u64;
+
+    // SIPREC recording sessions — ages by RecordingSession::created_at, and
+    // clears the call_sessions / branch_to_session aliases too.
+    let expired_recordings = state.recording_manager.sweep_stale(ORPHAN_CALL_TTL) as u64;
+
+    // Expire stale presence documents/subscriptions from the L1 store (no TTL
+    // reaper of its own; only removes already-expired entries, so it's safe).
+    if let Some(presence) = crate::presence::global_store() {
+        presence.expire_stale();
+    }
+
     if let Some(metrics) = crate::metrics::try_metrics() {
         metrics.uac_pending_requests.set(uac_pending as i64);
         metrics.proxy_dialog_sessions.set(dialog_sessions as i64);
@@ -1737,11 +1786,20 @@ fn sweep_stale_entries(state: &DispatcherState) {
     crate::metrics::update_memory_stats();
     crate::metrics::update_python_stats();
 
-    if expired_sessions > 0 || expired_uac > 0 || expired_subs > 0 {
+    if expired_sessions > 0
+        || expired_uac > 0
+        || expired_subs > 0
+        || expired_calls > 0
+        || expired_rf > 0
+        || expired_recordings > 0
+    {
         info!(
             expired_sessions,
             expired_uac,
             expired_subs,
+            expired_calls,
+            expired_rf,
+            expired_recordings,
             uac_pending,
             sessions = state.session_store.session_count(),
             transactions = state.transaction_manager.count(),
@@ -5342,6 +5400,7 @@ fn spawn_rf_proxy_start_if_invite(
                         ims_data: ims_term,
                         user_name: Some(term_user_for_record),
                         storage_keys: term_keys_for_spawn.clone(),
+                        created_at: std::time::Instant::now(),
                     });
                     for key in term_keys_for_spawn {
                         rf_sessions_term.insert(key, Arc::clone(&entry));
@@ -5383,6 +5442,7 @@ fn spawn_rf_proxy_start_if_invite(
             ims_data: ims_primary,
             user_name: primary_user_name,
             storage_keys: primary_keys.clone(),
+            created_at: std::time::Instant::now(),
         });
         for key in primary_keys {
             rf_sessions.insert(key, Arc::clone(&entry));
@@ -5595,6 +5655,7 @@ fn spawn_rf_b2bua_start(
                 ims_data,
                 user_name,
                 storage_keys: vec![key],
+                created_at: std::time::Instant::now(),
             }),
         );
     });

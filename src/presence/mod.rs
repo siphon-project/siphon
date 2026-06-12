@@ -12,10 +12,27 @@ pub mod winfo;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tracing::{debug, warn};
+
+/// Process-wide presence store, installed at startup so background tasks
+/// (the dispatcher cleanup tick) can reach it to expire stale documents and
+/// subscriptions without going through the Python namespace singleton.
+/// Mirrors [`crate::subscribe_state`]'s global handle.
+static GLOBAL_STORE: OnceLock<Arc<PresenceStore>> = OnceLock::new();
+
+/// Install the global presence store. Idempotent (first writer wins).
+pub fn set_global_store(store: Arc<PresenceStore>) {
+    let _ = GLOBAL_STORE.set(store);
+}
+
+/// Borrow the installed global presence store, if any.
+pub fn global_store() -> Option<Arc<PresenceStore>> {
+    GLOBAL_STORE.get().cloned()
+}
 
 /// Subscription dialog state per RFC 3265 §3.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

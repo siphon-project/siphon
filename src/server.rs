@@ -384,6 +384,9 @@ impl SiphonServer {
 
         // --- Presence singleton ---
         let presence_store = Arc::new(crate::presence::PresenceStore::new());
+        // Install the global handle so the dispatcher's cleanup tick can expire
+        // stale presence documents/subscriptions (L1 has no TTL reaper of its own).
+        crate::presence::set_global_store(Arc::clone(&presence_store));
         pyo3::Python::attach(|python| {
             let py_presence = crate::script::api::presence::PyPresence::new(Arc::clone(&presence_store));
             if let Err(error) = crate::script::api::set_presence_singleton(python, py_presence) {
