@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 use regex::Regex;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
 use crate::error::{Result, SiphonError};
@@ -597,9 +597,13 @@ fn default_diameter_route_algorithm() -> String { "failover".to_string() }
 /// each application interface.
 #[derive(Debug, Deserialize, Clone)]
 pub struct DiameterConfig {
-    /// Origin-Host identity for this SIPhon node (used in all CER messages).
+    /// Origin-Host identity for this SIPhon node (used in all client-mode CER
+    /// messages). Optional for pure DRA deployments, which carry identity
+    /// per-tenant under `tenants.<name>.identity` instead.
+    #[serde(default)]
     pub origin_host: String,
     /// Origin-Realm for this SIPhon node.
+    #[serde(default)]
     pub origin_realm: String,
     /// Product-Name advertised in CER/CEA. When unset, falls back to the
     /// product name resolved by `SiphonServer::product()` (default "SIPhon").
@@ -620,6 +624,102 @@ pub struct DiameterConfig {
     /// Application → peer routing table.
     #[serde(default)]
     pub routes: Vec<DiameterRouteEntry>,
+
+    // ── Server-mode (DRA) — all opt-in, additive ────────────────────────────
+    /// Inbound listener addresses. Presence enables server (DRA) mode.
+    #[serde(default)]
+    pub listen: Option<DiameterListenConfig>,
+    /// Multi-tenant identity + per-tenant peer tables + opaque routes.
+    #[serde(default)]
+    pub tenants: std::collections::HashMap<String, DiameterTenant>,
+    /// Generic event sink for Python-emitted signalling events.
+    #[serde(default)]
+    pub event_sink: Option<EventSinkConfig>,
+}
+
+/// Inbound Diameter listener addresses for server (DRA) mode.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterListenConfig {
+    /// TCP bind address, e.g. "0.0.0.0:3868".
+    #[serde(default)]
+    pub tcp: Option<String>,
+    /// SCTP bind address, e.g. "0.0.0.0:3868".
+    #[serde(default)]
+    pub sctp: Option<String>,
+}
+
+/// A DRA tenant: its advertised identity, inbound clients, outbound servers,
+/// and an opaque routing table consumed by the Python dispatch script.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterTenant {
+    pub identity: DiameterTenantIdentity,
+    #[serde(default)]
+    pub clients: Vec<DiameterClientEntry>,
+    #[serde(default)]
+    pub servers: Vec<DiameterServerEntry>,
+    /// Outbound connections siphon **initiates** but **serves** inbound
+    /// requests on — e.g. an HSS dialling a DRA, then answering the AIR/ULR
+    /// the DRA relays back over that same connection. siphon sends the CER
+    /// (this tenant's identity) and routes inbound requests to
+    /// `@diameter.on_request`, exactly like the listener path. The transport
+    /// direction is independent of the request direction (RFC 6733 §2.1).
+    #[serde(default)]
+    pub connect_to: Vec<DiameterServerEntry>,
+    /// Opaque to siphon — surfaced verbatim to scripts via `diameter.config`.
+    #[serde(default)]
+    pub routes: serde_json::Value,
+}
+
+/// The (origin_host, origin_realm) a tenant advertises in its CEA.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterTenantIdentity {
+    #[serde(default)]
+    pub origin_host: String,
+    #[serde(default)]
+    pub origin_realm: String,
+}
+
+/// An inbound (client) peer the DRA accepts connections from.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterClientEntry {
+    pub name: String,
+    /// Source IPs / CIDRs allowed to connect as this peer (ACL gate).
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    /// Optional asserted-Origin-Host validator (exact match).
+    #[serde(default)]
+    pub expected_origin_host: Option<String>,
+}
+
+/// An outbound (server) peer the DRA relays to, using the tenant's identity.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterServerEntry {
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_diameter_port")]
+    pub port: u16,
+    #[serde(default = "default_diameter_transport")]
+    pub transport: String,
+}
+
+/// Generic batched event sink (Python-emitted signalling events).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct EventSinkConfig {
+    /// "file" | "none" (v1). "clickhouse" / "kafka" are feature-gated stubs.
+    #[serde(default = "default_event_sink_backend")]
+    pub backend: String,
+    #[serde(default)]
+    pub file: Option<EventSinkFileConfig>,
+}
+
+/// File backend for the event sink (newline-delimited JSON).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct EventSinkFileConfig {
+    pub path: String,
+}
+
+fn default_event_sink_backend() -> String {
+    "none".to_string()
 }
 
 /// A named Diameter peer endpoint.
@@ -671,6 +771,8 @@ pub enum DiameterApplication {
     S6c,
     /// SGd (TS 29.338) — SMSC ↔ MME/SGSN for SMS-over-NAS delivery.
     Sgd,
+    /// S6a (TS 29.272) — MME ↔ HSS for LTE attach/auth.
+    S6a,
 }
 
 impl DiameterApplication {
@@ -685,6 +787,7 @@ impl DiameterApplication {
             Self::Rf => (0, dictionary::RF_APP_ID),
             Self::S6c => (dictionary::VENDOR_3GPP, dictionary::S6C_APP_ID),
             Self::Sgd => (dictionary::VENDOR_3GPP, dictionary::SGD_APP_ID),
+            Self::S6a => (dictionary::VENDOR_3GPP, dictionary::S6A_APP_ID),
         }
     }
 }
@@ -3474,6 +3577,102 @@ script:
 "#;
         let config = Config::from_str(yaml).unwrap();
         assert_eq!(config.listen.dscp, Some(46));
+    }
+
+    #[test]
+    fn dra_server_config_parses() {
+        let yaml = r#"
+listen:
+  udp:
+    - "127.0.0.1:5099"
+domain:
+  local:
+    - "epc.mnc001.mcc001.3gppnetwork.org"
+script:
+  path: "examples/dra.py"
+diameter:
+  listen:
+    tcp: "0.0.0.0:3868"
+    sctp: "0.0.0.0:3868"
+  event_sink:
+    backend: file
+    file:
+      path: "/tmp/dra.jsonl"
+  tenants:
+    default:
+      identity:
+        origin_host: "dra.epc.mnc001.mcc001.3gppnetwork.org"
+        origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
+      clients:
+        - name: mme
+          allowed_ips: ["172.16.0.0/24"]
+          expected_origin_host: "mme.epc.example.org"
+      servers:
+        - { name: hss, host: "172.16.0.61", port: 3868, transport: tcp }
+      routes:
+        - { application: s6c, destinations: ["hss"] }
+"#;
+        let config = Config::from_str(yaml).expect("DRA config should parse");
+        let diameter = config.diameter.expect("diameter section");
+        let listen = diameter.listen.expect("listen");
+        assert_eq!(listen.tcp.as_deref(), Some("0.0.0.0:3868"));
+        assert_eq!(listen.sctp.as_deref(), Some("0.0.0.0:3868"));
+        // Flat client-only fields default cleanly when omitted.
+        assert!(diameter.origin_host.is_empty());
+
+        let tenant = diameter.tenants.get("default").expect("default tenant");
+        assert_eq!(tenant.identity.origin_host, "dra.epc.mnc001.mcc001.3gppnetwork.org");
+        assert_eq!(tenant.clients[0].name, "mme");
+        assert_eq!(tenant.clients[0].allowed_ips, vec!["172.16.0.0/24"]);
+        assert_eq!(tenant.servers[0].name, "hss");
+        assert_eq!(tenant.servers[0].port, 3868);
+
+        // Opaque routes survive as JSON and re-serialize (for diameter.config).
+        let snapshot = serde_json::json!({ "tenants": &diameter.tenants }).to_string();
+        assert!(snapshot.contains("\"application\":\"s6c\""));
+        assert!(snapshot.contains("hss"));
+
+        let event_sink = diameter.event_sink.expect("event_sink");
+        assert_eq!(event_sink.backend, "file");
+    }
+
+    #[test]
+    fn hss_connect_to_dra_config_parses() {
+        // An HSS that dials a DRA: no listener, a tenant with connect_to.
+        let yaml = r#"
+listen:
+  udp:
+    - "127.0.0.1:5099"
+domain:
+  local:
+    - "epc.mnc001.mcc001.3gppnetwork.org"
+script:
+  path: "examples/hss_s6a.py"
+diameter:
+  tenants:
+    default:
+      identity:
+        origin_host: "hss.epc.example.org"
+        origin_realm: "epc.example.org"
+      connect_to:
+        - { name: dra, host: "172.16.0.10", port: 3868, transport: sctp }
+"#;
+        let config = Config::from_str(yaml).expect("HSS connect_to config should parse");
+        let diameter = config.diameter.expect("diameter section");
+        assert!(diameter.listen.is_none(), "HSS dials out, no listener");
+        let tenant = diameter.tenants.get("default").unwrap();
+        assert_eq!(tenant.connect_to.len(), 1);
+        assert_eq!(tenant.connect_to[0].name, "dra");
+        assert_eq!(tenant.connect_to[0].transport, "sctp");
+    }
+
+    #[test]
+    fn example_dra_yaml_loads() {
+        // The shipped example must always parse (acceptance artifact).
+        let config = Config::from_file("examples/dra.yaml").expect("examples/dra.yaml must parse");
+        let diameter = config.diameter.expect("diameter section");
+        assert!(diameter.listen.is_some());
+        assert!(diameter.tenants.contains_key("default"));
     }
 
     #[test]

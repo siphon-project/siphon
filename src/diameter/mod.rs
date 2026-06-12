@@ -10,14 +10,20 @@
 //! Transport supports both TCP and SCTP with automatic CER/CEA capability
 //! exchange and DWR/DWA watchdog keepalives.
 
+pub mod auth;
 pub mod codec;
 pub mod cx;
 pub mod dictionary;
+pub mod event_sink;
+pub mod forward;
 pub mod peer;
+pub mod pool;
+pub mod server;
 pub mod rf;
 pub mod rf_service;
 pub mod ro;
 pub mod rx;
+pub mod s6a;
 pub mod s6c;
 pub mod sgd;
 pub mod sh;
@@ -365,6 +371,73 @@ impl DiameterClient {
         self.peer.send_request(wire).await
     }
 
+    /// Send an S6a Authentication-Information-Request (MME → HSS) and return
+    /// the AIA carrying E-UTRAN authentication vectors.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_air(
+        &self,
+        imsi: &str,
+        visited_plmn_id: &[u8],
+        num_vectors: u32,
+        immediate_response_preferred: bool,
+        resync_info: Option<&[u8]>,
+    ) -> Result<codec::DiameterMessage, String> {
+        let session_id = self.peer.new_session_id();
+        let wire = s6a::build_authentication_information_request(
+            self.peer.config(),
+            &session_id,
+            imsi,
+            visited_plmn_id,
+            num_vectors,
+            immediate_response_preferred,
+            resync_info,
+            self.peer.next_hbh(),
+            self.peer.next_e2e(),
+        );
+        self.peer.send_request(wire).await
+    }
+
+    /// Send an S6a Update-Location-Request (MME → HSS) and return the ULA.
+    pub async fn send_ulr(
+        &self,
+        imsi: &str,
+        rat_type: u32,
+        ulr_flags: u32,
+        visited_plmn_id: &[u8],
+    ) -> Result<codec::DiameterMessage, String> {
+        let session_id = self.peer.new_session_id();
+        let wire = s6a::build_update_location_request(
+            self.peer.config(),
+            &session_id,
+            imsi,
+            rat_type,
+            ulr_flags,
+            visited_plmn_id,
+            self.peer.next_hbh(),
+            self.peer.next_e2e(),
+        );
+        self.peer.send_request(wire).await
+    }
+
+    /// Send an S6a Purge-UE-Request (MME → HSS) and return the PUA. Named
+    /// `send_purge_ue` to avoid clashing with the Sh `send_pur` (Profile-Update).
+    pub async fn send_purge_ue(
+        &self,
+        imsi: &str,
+        pur_flags: Option<u32>,
+    ) -> Result<codec::DiameterMessage, String> {
+        let session_id = self.peer.new_session_id();
+        let wire = s6a::build_purge_ue_request(
+            self.peer.config(),
+            &session_id,
+            imsi,
+            pur_flags,
+            self.peer.next_hbh(),
+            self.peer.next_e2e(),
+        );
+        self.peer.send_request(wire).await
+    }
+
     /// Shutdown the underlying peer connection.
     pub fn shutdown(&self) {
         self.peer.shutdown();
@@ -405,6 +478,29 @@ impl DiameterManager {
     /// Get a client by peer name.
     pub fn client(&self, name: &str) -> Option<Arc<DiameterClient>> {
         self.clients.get(name).map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Get a client by peer name only if its connection is `Open`.
+    ///
+    /// This is the "state-as-truth" liveness check the peer pool uses: a
+    /// reconnect overwrites the entry under the same key with a fresh `Open`
+    /// peer, and a disconnect flips the existing peer's state to `Closed`, so
+    /// no separate deregister step is needed for routing correctness.
+    pub fn live_client(&self, name: &str) -> Option<Arc<DiameterClient>> {
+        self.clients.get(name).and_then(|entry| {
+            let client = entry.value();
+            if client.peer().is_open() {
+                Some(Arc::clone(client))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Remove a peer entirely. Only used on config removal — disconnects rely
+    /// on state-as-truth, not removal.
+    pub fn deregister(&self, name: &str) -> Option<Arc<DiameterClient>> {
+        self.clients.remove(name).map(|(_, client)| client)
     }
 
     /// Get the first available client (for single-peer setups).

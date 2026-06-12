@@ -347,7 +347,6 @@ impl SiphonServer {
         // their pinned free-threaded-CPython mimalloc heap (~2 MB each) — the
         // anonymous-heap leak under steady SIP signalling.  See
         // `script::py_executor` for the full story.
-        //
         // Default to 2× CPUs: the hot inbound path runs here, and the elastic
         // `spawn_blocking` pool this replaces absorbed bursts by spawning extra
         // threads.  A fixed pool sized to just `num_cpus` adds queue latency at
@@ -1147,6 +1146,22 @@ impl SiphonServer {
         // Do NOT drop diameter_incoming_tx here — the reconnect tasks hold clones
         // and the channel must stay open for the lifetime of the process.
 
+        // --- Diameter Routing Agent (server mode) ---
+        // Opt-in via `diameter.listen`: connects tenant backends, binds the
+        // inbound listeners, and dispatches inbound requests to
+        // `@diameter.on_request`.
+        if let Some(ref diameter_config) = config.diameter {
+            if let Some(ref manager) = diameter_manager {
+                crate::script::dra::spawn(
+                    diameter_config,
+                    Arc::clone(manager),
+                    Arc::clone(&engine),
+                    product_name,
+                    product_version,
+                );
+            }
+        }
+
         // --- Outbound registration ---
         let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, Arc::clone(&tls_addr_map), product_name, product_version);
 
@@ -1791,12 +1806,37 @@ fn init_li(config: &Config) -> Option<LiState> {
 }
 
 fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::DiameterManager>> {
-    config.diameter.as_ref()?;
+    let diameter_config = config.diameter.as_ref()?;
 
     let manager = Arc::new(crate::diameter::DiameterManager::new());
 
+    // Server-mode (DRA) runtime: a JSON snapshot of tenants/listen for
+    // `diameter.config`, plus the event sink behind `diameter.event_sink`.
+    // Only built when the deployment opts into DRA mode (listen/tenants set).
+    let dra_enabled =
+        diameter_config.listen.is_some() || !diameter_config.tenants.is_empty();
+    let event_sink = diameter_config
+        .event_sink
+        .as_ref()
+        .map(|cfg| Arc::new(crate::diameter::event_sink::EventSink::spawn(cfg)));
+    let config_json = if dra_enabled {
+        Some(
+            serde_json::json!({
+                "tenants": &diameter_config.tenants,
+                "listen": &diameter_config.listen,
+            })
+            .to_string(),
+        )
+    } else {
+        None
+    };
+
     pyo3::Python::attach(|python| {
         let py_diameter = crate::script::api::diameter::PyDiameter::new(Arc::clone(&manager));
+        let py_diameter = match config_json {
+            Some(json) => py_diameter.with_dra_runtime(json, event_sink),
+            None => py_diameter,
+        };
         if let Err(error) = crate::script::api::set_diameter_singleton(python, py_diameter) {
             warn!("failed to set Diameter Python singleton: {error}");
         } else {

@@ -507,12 +507,17 @@ mod tests {
         init().unwrap();
         let metrics = metrics().unwrap();
 
-        assert_eq!(metrics.diameter_peers_connected.get(), 0);
+        // The gauge is a process-global singleton; other tests that open real
+        // connections may have moved it, so assert deltas from a baseline
+        // rather than absolute values (parallel-test safe).
+        let baseline = metrics.diameter_peers_connected.get();
         metrics.diameter_peers_connected.inc();
         metrics.diameter_peers_connected.inc();
-        assert_eq!(metrics.diameter_peers_connected.get(), 2);
+        assert_eq!(metrics.diameter_peers_connected.get(), baseline + 2);
         metrics.diameter_peers_connected.dec();
-        assert_eq!(metrics.diameter_peers_connected.get(), 1);
+        assert_eq!(metrics.diameter_peers_connected.get(), baseline + 1);
+        // Restore the baseline so we don't perturb other tests.
+        metrics.diameter_peers_connected.dec();
 
         let output = encode_metrics();
         assert!(output.contains("siphon_diameter_peers_connected"));

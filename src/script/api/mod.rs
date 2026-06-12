@@ -11,6 +11,7 @@ pub mod cache;
 pub mod call;
 pub mod cdr;
 pub mod diameter;
+pub mod diameter_server;
 pub mod gateway;
 pub mod ipsec;
 pub mod isc;

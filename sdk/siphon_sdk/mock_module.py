@@ -2586,6 +2586,156 @@ class MockRegistration:
 # Diameter
 # ---------------------------------------------------------------------------
 
+class MockEventSink:
+    """Mock ``diameter.event_sink`` — records emitted rows for assertions."""
+
+    def __init__(self) -> None:
+        self.rows: list = []
+
+    def emit(self, row: Any) -> None:
+        self.rows.append(row)
+
+
+class MockPeer:
+    """A backend peer handle returned by :class:`MockPeerPool` picks."""
+
+    def __init__(self, name: str, tenant: str, connected: bool = True) -> None:
+        self.name = name
+        self.tenant = tenant
+        self.addr = f"{name}.example.org:3868"
+        self.transport = "tcp"
+        self._connected = connected
+
+    def __bool__(self) -> bool:
+        return self._connected
+
+
+class MockPeerPool:
+    """Mock backend pool. Picks return a :class:`MockPeer` for the first
+    connected member; round-robin advances a cursor."""
+
+    def __init__(self, diameter: "MockDiameter", tenant: str, names: list) -> None:
+        self._diameter = diameter
+        self._tenant = tenant
+        self._names = list(names)
+        self._cursor = 0
+        self._sticky: dict = {}
+
+    def _live(self) -> list:
+        return [n for n in self._names if self._diameter._peers.get(n, False)]
+
+    def pick_round_robin(self) -> Optional[MockPeer]:
+        live = self._live()
+        if not live:
+            return None
+        name = live[self._cursor % len(live)]
+        self._cursor += 1
+        return MockPeer(name, self._tenant)
+
+    def pick_weighted(self, weights: dict) -> Optional[MockPeer]:
+        return self.pick_round_robin()
+
+    def pick_sticky(self, key: str, ttl_secs: float = 300.0) -> Optional[MockPeer]:
+        name = self._sticky.get(key)
+        if name is not None and self._diameter._peers.get(name, False):
+            return MockPeer(name, self._tenant)
+        peer = self.pick_round_robin()
+        if peer is not None:
+            self._sticky[key] = peer.name
+        return peer
+
+    @property
+    def live_count(self) -> int:
+        return len(self._live())
+
+
+class MockDiameterAnswer:
+    """Mock ``DiameterAnswer`` — the value a handler returns / forwards."""
+
+    def __init__(self, result_code: int = 2001, command_code: int = 0,
+                 avps: Optional[dict] = None) -> None:
+        self.result_code = result_code
+        self.command_code = command_code
+        self._avps = dict(avps or {})
+
+    @property
+    def is_error(self) -> bool:
+        rc = self.result_code
+        return (3000 <= rc < 4000) or (5000 <= rc < 6000)
+
+    def get_avp(self, code: int, vendor: int = 0):
+        return self._avps.get((code, vendor))
+
+    def set_avp(self, code_or_name, value, vendor: int = 0) -> None:
+        self._avps[(code_or_name, vendor)] = value
+
+    def remove_avp(self, code: int, vendor: int = 0) -> int:
+        return 1 if self._avps.pop((code, vendor), None) is not None else 0
+
+    def iter_avps(self) -> list:
+        return [(code, vendor, value) for (code, vendor), value in self._avps.items()]
+
+
+class MockDiameterRequest:
+    """Mock ``DiameterRequest`` passed to ``@diameter.on_request`` in tests.
+
+    Construct one in your test and invoke your handler with it.
+    """
+
+    def __init__(self, *, application_name: str = "S6c", command_code: int = 0,
+                 command_name: str = "", session_id: Optional[str] = None,
+                 dest_realm: Optional[str] = None, dest_host: Optional[str] = None,
+                 origin_host: Optional[str] = None, origin_realm: Optional[str] = None,
+                 peer: Optional[MockPeer] = None, avps: Optional[dict] = None,
+                 application_id: int = 0) -> None:
+        self.application_id = application_id
+        self.application_name = application_name
+        self.command_code = command_code
+        self.command_name = command_name
+        self.session_id = session_id
+        self.dest_realm = dest_realm
+        self.dest_host = dest_host
+        self.origin_host = origin_host
+        self.origin_realm = origin_realm
+        self.is_request = True
+        self.is_proxiable = True
+        self.peer = peer or MockPeer("client", "default")
+        self._avps = dict(avps or {})
+
+    def get_avp(self, code: int, vendor: int = 0):
+        return self._avps.get((code, vendor))
+
+    def set_avp(self, code_or_name, value, vendor: int = 0) -> None:
+        self._avps[(code_or_name, vendor)] = value
+
+    def insert_avp(self, code_or_name, value, vendor: int = 0) -> None:
+        self._avps[(code_or_name, vendor)] = value
+
+    def remove_avp(self, code: int, vendor: int = 0) -> int:
+        return 1 if self._avps.pop((code, vendor), None) is not None else 0
+
+    def iter_avps(self) -> list:
+        return [(code, vendor, value) for (code, vendor), value in self._avps.items()]
+
+    def extract_imsi(self) -> Optional[str]:
+        return self._avps.get((1, 0))
+
+    def answer(self, result_code: int = 2001, error_message: Optional[str] = None) -> MockDiameterAnswer:
+        """Build a local answer to serve this request (HSS-style). Populate it
+        with :meth:`MockDiameterAnswer.set_avp`, including grouped AVPs (pass a
+        list of ``(code, value[, vendor])`` child tuples as the value)."""
+        return MockDiameterAnswer(result_code=result_code, command_code=self.command_code)
+
+    def reject(self, result_code: int, error_message: Optional[str] = None) -> MockDiameterAnswer:
+        return MockDiameterAnswer(result_code=result_code, command_code=self.command_code)
+
+    async def forward_to(self, peer: MockPeer, identity=None,
+                         timeout_secs: float = 10.0) -> MockDiameterAnswer:
+        """Mock relay — returns a 2001 success answer (override in tests by
+        monkeypatching if a different result is needed)."""
+        return MockDiameterAnswer(result_code=2001, command_code=self.command_code)
+
+
 class MockDiameter:
     """Mock Diameter namespace for testing scripts that use ``from siphon import diameter``.
 
@@ -3113,88 +3263,149 @@ class MockDiameter:
         """Reset the captured-ACR list between tests."""
         self._rf_acrs.clear()
 
+
+    # -- Server-mode (DRA — Diameter Routing Agent) --
+
     @staticmethod
-    def on_rtr(fn: Any) -> Any:
-        """Register a handler for incoming RTR (Registration-Termination-Request).
+    def on_inbound_cer(fn: Any) -> Any:
+        """Register the server-mode (DRA) CER identity callback.
 
-        Handler receives ``(public_identity, reason_code, reason_info)``.
-
-        Reason codes: 0=PERMANENT_TERMINATION, 1=NEW_SERVER_ASSIGNED,
-                      2=SERVER_CHANGE, 3=REMOVE_SCSCF.
+        Called for an already-authenticated peer (both Rust auth gates have
+        passed) with ``(peer_addr, peer_name, asserted_origin_host)``. Return
+        ``(origin_host, origin_realm)`` to accept, or ``None`` to reject.
 
         Example::
 
-            @diameter.on_rtr
-            def handle_rtr(public_identity, reason_code, reason_info):
-                registrar.remove(public_identity)
+            @diameter.on_inbound_cer
+            def cer_received(peer_addr, peer_name, asserted_origin_host):
+                identity = diameter.config["tenants"]["default"]["identity"]
+                return identity["origin_host"], identity["origin_realm"]
         """
         return fn
 
     @staticmethod
-    def on_rar(fn: Any) -> Any:
-        """Register a handler for incoming RAR (Re-Auth-Request) from PCRF.
+    def on_request(fn: Any) -> Any:
+        """Register the server-mode (DRA) inbound-request dispatcher.
 
-        Handler receives ``(session_id, abort_cause, specific_actions)``.
-        ``specific_actions`` is a list of int values (TS 29.214 Specific-Action).
+        Called for every inbound request (R-bit set). Return
+        ``req.reject(code)``, ``await req.forward_to(peer, ...)``, or ``None``
+        (→ the DRA answers DIAMETER_UNABLE_TO_DELIVER, 3002).
 
         Example::
 
-            @diameter.on_rar
-            def handle_rar(session_id, abort_cause, specific_actions):
-                if 2 in specific_actions:
-                    log.warn(f"Bearer lost for session {session_id}")
+            @diameter.on_request
+            async def handle(req):
+                pool = diameter.peer_pool(req.peer.tenant, ["hss"])
+                peer = pool.pick_round_robin()
+                if peer is None:
+                    return req.reject(3002)
+                return await req.forward_to(peer)
         """
         return fn
 
     @staticmethod
-    def on_asr(fn: Any) -> Any:
-        """Register a handler for incoming ASR (Abort-Session-Request) from PCRF.
+    def on_request_completed(fn: Any) -> Any:
+        """Register the server-mode (DRA) post-answer hook.
 
-        Handler receives ``(session_id, abort_cause, origin_host)``.
-
-        Example::
-
-            @diameter.on_asr
-            def handle_asr(session_id, abort_cause, origin_host):
-                log.info(f"Session abort from {origin_host}: {session_id}")
+        Called after the answer is sent upstream with
+        ``(req, answer, latency_us)`` — typically to emit an event.
         """
         return fn
+
+    def peer_pool(self, tenant: str, target: Any) -> "MockPeerPool":
+        """Build a mock backend peer pool. ``target`` is a peer name or list
+        of names. Register backends with :meth:`add_peer(connected=True)`."""
+        names = [target] if isinstance(target, str) else list(target)
+        return MockPeerPool(self, tenant, names)
 
     @staticmethod
-    def on_pnr(fn: Any) -> Any:
-        """Register a handler for incoming Sh PNR (Push-Notification-Request).
+    def ip_in_cidr(addr: str, cidr: str) -> bool:
+        """Whether ``addr`` falls within ``cidr`` (mirrors the Rust helper)."""
+        import ipaddress
 
-        Handler receives ``(public_identity, user_data_xml)``. Siphon auto-sends
-        PNA (result 2001) after the handler returns.
-
-        Example::
-
-            @diameter.on_pnr
-            def handle_pnr(public_identity, user_data_xml):
-                cache.put("simservs", public_identity, user_data_xml)
-        """
-        return fn
+        return ipaddress.ip_address(addr) in ipaddress.ip_network(cidr, strict=False)
 
     @staticmethod
-    def on_alr(fn: Any) -> Any:
-        """Register a handler for incoming S6c ALR (Alert-Service-Centre).
+    def fnmatch(value: str, pattern: str) -> bool:
+        """Shell-style glob match (``*``/``?``)."""
+        import fnmatch as _fnmatch
 
-        Handler receives ``(public_identity, msisdn)``. Siphon auto-sends
-        ALA (result 2001) after the handler returns. The HSS sends ALR
-        when a previously-unreachable UE has registered or moved into
-        coverage — drain pending MT-SMS here.
-        """
-        return fn
+        return _fnmatch.fnmatchcase(value, pattern)
 
     @staticmethod
-    def on_ofr(fn: Any) -> Any:
-        """Register a handler for incoming SGd OFR (MO-Forward-Short-Message).
+    def now_us() -> int:
+        """Wall-clock microseconds since the Unix epoch."""
+        import time
 
-        Handler receives ``(user_name, sc_address, sm_rp_ui)``. ``sm_rp_ui``
-        is the raw SMS-SUBMIT TPDU bytes (`bytes`). Siphon auto-sends OFA
-        (result 2001) after the handler returns.
-        """
-        return fn
+        return int(time.time() * 1_000_000)
+
+    @property
+    def config(self) -> dict:
+        """Read-only view of the parsed ``diameter`` config (tenants/listen).
+
+        Set it in tests with ``diameter.set_config({...})``."""
+        return getattr(self, "_dra_config", {})
+
+    def set_config(self, config: dict) -> None:
+        """Test helper: set the dict returned by :attr:`config`."""
+        self._dra_config = dict(config)
+
+    @property
+    def event_sink(self) -> "MockEventSink":
+        """The generic event sink (``diameter.event_sink.emit(row)``)."""
+        if not hasattr(self, "_event_sink"):
+            self._event_sink = MockEventSink()
+        return self._event_sink
+
+    # -- S6a (TS 29.272) — MME ↔ HSS for LTE attach/auth --
+
+    def s6a_air(self, imsi: str, visited_plmn_id: bytes, num_vectors: int = 1,
+                immediate_response_preferred: bool = True,
+                resync_info: Optional[bytes] = None,
+                peer: Optional[str] = None) -> Optional[dict]:
+        """Mock Authentication-Information. Returns canned E-UTRAN vectors;
+        configure with :meth:`set_air_response`."""
+        if getattr(self, "_air_response", None) is not None:
+            return dict(self._air_response)
+        return {
+            "result_code": 2001,
+            "vectors": [
+                {
+                    "rand": b"\x11" * 16,
+                    "xres": b"\x22" * 8,
+                    "autn": b"\x33" * 16,
+                    "kasme": b"\x44" * 32,
+                }
+                for _ in range(num_vectors)
+            ],
+        }
+
+    def set_air_response(self, *, result_code: int = 2001,
+                          vectors: Optional[list] = None) -> None:
+        self._air_response = {"result_code": result_code, "vectors": vectors or []}
+
+    def s6a_ulr(self, imsi: str, visited_plmn_id: bytes, rat_type: int = 1004,
+                ulr_flags: int = 0, peer: Optional[str] = None) -> Optional[dict]:
+        """Mock Update-Location. Returns a 2001 with subscription data present."""
+        return getattr(self, "_ulr_response", None) or {
+            "result_code": 2001,
+            "ula_flags": 0,
+            "has_subscription_data": True,
+        }
+
+    def set_ulr_response(self, *, result_code: int = 2001,
+                          ula_flags: Optional[int] = 0,
+                          has_subscription_data: bool = True) -> None:
+        self._ulr_response = {
+            "result_code": result_code,
+            "ula_flags": ula_flags,
+            "has_subscription_data": has_subscription_data,
+        }
+
+    def s6a_purge_ue(self, imsi: str, pur_flags: Optional[int] = None,
+                     peer: Optional[str] = None) -> Optional[dict]:
+        """Mock Purge-UE. Returns a 2001."""
+        return {"result_code": 2001}
 
     # -- S6c (TS 29.336) --
 
@@ -3321,19 +3532,6 @@ class MockDiameter:
             self._generic_responses = {}
         self._generic_responses[(command, application)] = answer
 
-    @staticmethod
-    def on_command(command: str, application: str) -> Any:
-        """Decorator factory matching Rust ``@diameter.on_command``.
-
-        In tests, scripts can use this to mark a handler — the mock
-        treats it as an identity decorator (returns the function
-        unmodified). Test code can then dispatch by calling the function
-        directly.
-        """
-        del command, application
-        def _decorator(fn: Any) -> Any:
-            return fn
-        return _decorator
 
     def set_udr_response(self, public_identity: str,
                          result_code: int = 2001,

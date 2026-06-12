@@ -74,18 +74,12 @@ pub enum HandlerKind {
         name: String,
         jitter_secs: u64,
     },
-    /// `@diameter.on_rtr` — incoming Registration-Termination-Request from HSS.
-    DiameterOnRtr,
-    /// `@diameter.on_rar` — incoming Re-Auth-Request from PCRF (policy change).
-    DiameterOnRar,
-    /// `@diameter.on_asr` — incoming Abort-Session-Request from PCRF.
-    DiameterOnAsr,
-    /// `@diameter.on_pnr` — incoming Sh Push-Notification-Request from HSS.
-    DiameterOnPnr,
-    /// `@diameter.on_alr` — incoming S6c Alert-Service-Centre-Request from HSS.
-    DiameterOnAlr,
-    /// `@diameter.on_ofr` — incoming SGd MO-Forward-Short-Message-Request from MME.
-    DiameterOnOfr,
+    /// `@diameter.on_inbound_cer` — server-mode (DRA) CER identity decision.
+    DiameterOnInboundCer,
+    /// `@diameter.on_request` — server-mode (DRA) inbound request dispatch.
+    DiameterOnRequest,
+    /// `@diameter.on_request_completed` — server-mode (DRA) post-answer hook.
+    DiameterOnRequestCompleted,
     /// `@sbi.on_event` — incoming PCF event notification (N5).
     SbiOnEvent,
     /// `@rtpengine.on_dtmf` — inbound DTMF event from rtpengine.
@@ -759,12 +753,9 @@ fn extract_handlers(
             "registration.on_change" => HandlerKind::RegistrantOnChange,
             "srs.on_invite" => HandlerKind::SrsOnInvite,
             "srs.on_session_end" => HandlerKind::SrsOnSessionEnd,
-            "diameter.on_rtr" => HandlerKind::DiameterOnRtr,
-            "diameter.on_rar" => HandlerKind::DiameterOnRar,
-            "diameter.on_asr" => HandlerKind::DiameterOnAsr,
-            "diameter.on_pnr" => HandlerKind::DiameterOnPnr,
-            "diameter.on_alr" => HandlerKind::DiameterOnAlr,
-            "diameter.on_ofr" => HandlerKind::DiameterOnOfr,
+            "diameter.on_inbound_cer" => HandlerKind::DiameterOnInboundCer,
+            "diameter.on_request" => HandlerKind::DiameterOnRequest,
+            "diameter.on_request_completed" => HandlerKind::DiameterOnRequestCompleted,
             "sbi.on_event" => HandlerKind::SbiOnEvent,
             "timer.every" => {
                 let meta = metadata.as_ref().ok_or_else(|| {
