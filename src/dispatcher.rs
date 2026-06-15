@@ -4621,6 +4621,7 @@ fn sanitize_b2bua_response(
     response: &mut SipMessage,
     state: &DispatcherState,
     a_leg_transport: Transport,
+    a_leg_supports_100rel: bool,
     call_id: &str,
 ) {
     // Contact: must point to siphon so in-dialog requests (ACK, BYE, re-INVITE)
@@ -4648,6 +4649,22 @@ fn sanitize_b2bua_response(
     // framework-auto so transparent-proxy B2BUAs can opt back in via
     // `call.dial(copy=["Proxy-Authenticate"])` for the rare case.
     response.headers.remove("Record-Route");
+
+    // Framework-auto strip — never present a `100rel` reliability contract to
+    // an A-leg that didn't advertise it.  The B-leg's reliable provisional is
+    // PRACKed locally (RFC 3262 auto-PRACK, handle_b2bua_response); leaking
+    // `Require: 100rel` / `RSeq` to a non-100rel A-leg (e.g. a plain PSTN
+    // trunk) makes it CANCEL the call rather than PRACK.  This is a
+    // correctness invariant, not topology hygiene, so it runs preset-independent
+    // here rather than as a preset override.  Done before `apply_to_response`:
+    // a `Copy`/`Rewrite` preset can't resurrect the removed `RSeq`, and the
+    // `Require` edit leaves any surviving option-tags for `Copy` to preserve.
+    // A 100rel-capable A-leg (gate true) still gets the reliable provisional
+    // end-to-end (RFC 3262 §3).
+    crate::sip::headers::rseq::strip_100rel_for_unsupported_peer(
+        &mut response.headers,
+        a_leg_supports_100rel,
+    );
 
     // Apply per-call header policy.  Resolves to the per-call preset (when
     // the script attached one via `call.dial(header_policy=…)`), otherwise
@@ -7191,11 +7208,26 @@ fn handle_b2bua_response(
         }
     };
 
+    // The A-leg's advertised reliable-provisional capability (RFC 3262 §3),
+    // read from the stored original INVITE's `Supported`/`Require`.  Drives the
+    // framework-auto `100rel` strip in `sanitize_b2bua_response` so we never
+    // forward a reliable provisional to an A-leg (e.g. a PSTN trunk) that can't
+    // PRACK it.  Computed once and passed to every sanitize call: the responses
+    // sanitized below all flow to the A-leg (or, for the B→A re-INVITE/UPDATE
+    // direction, are produced by the A-leg — so a non-100rel A-leg never emits
+    // the markers and the strip is a no-op there anyway).
+    let a_leg_supports_100rel = a_leg_invite
+        .as_ref()
+        .and_then(|arc| arc.lock().ok())
+        .map(|invite| crate::sip::headers::rseq::supports_100rel(&invite.headers))
+        .unwrap_or(false);
+
     // RFC 3262 auto-PRACK for the B-leg side: when the B-leg sends a
     // reliable provisional response (`Require: 100rel` + `RSeq: <n>`),
     // the B2BUA must answer with a PRACK. We do that locally here using
-    // the B-leg dialog state so the A-leg sees an ordinary 1xx (the
-    // `Require`/`RSeq` headers are stripped in `sanitize_b2bua_response`).
+    // the B-leg dialog state so a non-100rel A-leg sees an ordinary 1xx (the
+    // `Require`/`RSeq` headers are stripped in `sanitize_b2bua_response` when
+    // the A-leg didn't advertise 100rel — preset-independent).
     // We don't track a client transaction for the PRACK — the B-leg's
     // 200 OK PRACK that comes back will hit the response handler with no
     // matching session and be dropped, which is the correct behavior here.
@@ -7475,7 +7507,7 @@ fn handle_b2bua_response(
             message.headers.set("CSeq", cseq.clone());
         }
 
-        sanitize_b2bua_response(message, state, resp_transport, call_id);
+        sanitize_b2bua_response(message, state, resp_transport, a_leg_supports_100rel, call_id);
 
         // RTPEngine: rewrite re-INVITE 2xx response SDP through answer.
         // Mirrors the offer processing done on the request side.
@@ -7693,7 +7725,7 @@ fn handle_b2bua_response(
             message.headers.set("CSeq", cseq.clone());
         }
 
-        sanitize_b2bua_response(message, state, resp_transport, call_id);
+        sanitize_b2bua_response(message, state, resp_transport, a_leg_supports_100rel, call_id);
 
         // RTPEngine answer for UPDATE 2xx with SDP body (codec/precondition
         // re-negotiation). Empty-body 2xx (session-timer refresh) bypasses.
@@ -8103,7 +8135,7 @@ fn handle_b2bua_response(
             .unwrap_or_default();
 
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(&mut response, state, a_leg.transport.transport, call_id);
+        sanitize_b2bua_response(&mut response, state, a_leg.transport.transport, a_leg_supports_100rel, call_id);
 
         // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).
         // sanitize_b2bua_response strips all Record-Route (B-leg path). The A-leg
@@ -8436,7 +8468,7 @@ fn handle_b2bua_response(
             }
         }
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(message, state, a_leg.transport.transport, call_id);
+        sanitize_b2bua_response(message, state, a_leg.transport.transport, a_leg_supports_100rel, call_id);
         send_message(
             message.clone(),
             a_leg.transport.transport,
@@ -8782,7 +8814,7 @@ fn handle_b2bua_response(
             }
         }
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(message, state, a_leg.transport.transport, call_id);
+        sanitize_b2bua_response(message, state, a_leg.transport.transport, a_leg_supports_100rel, call_id);
         send_message(
             message.clone(),
             a_leg.transport.transport,

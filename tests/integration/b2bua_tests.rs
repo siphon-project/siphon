@@ -1579,6 +1579,60 @@ fn intentional_proxy_authenticate_strip_works_for_every_preset() {
 }
 
 #[test]
+fn framework_auto_100rel_strip_is_preset_independent() {
+    // RFC 3262 — a B2BUA that PRACKs a B-leg's reliable provisional locally
+    // must not leak the `100rel` contract to an A-leg that never advertised it
+    // (a plain trunk would CANCEL the call rather than PRACK).  The strip is a
+    // correctness invariant applied framework-auto in sanitize_b2bua_response,
+    // NOT a preset override — so it must hold even under presets (like
+    // sip-trunk-edge@2026) whose response policy is `default → Copy` and would
+    // otherwise pass `Require`/`RSeq` straight through.
+    let preset = builtin_presets()
+        .get("sip-trunk-edge@2026")
+        .unwrap()
+        .clone();
+    let policy = ResolvedPolicy::from_preset(preset);
+
+    // First confirm the preset itself leaves the markers (this is the bug the
+    // framework-auto strip exists to backstop).
+    let mut passed_through = make_response_200(&[
+        ("Require", "100rel"),
+        ("RSeq", "1"),
+        ("Supported", "timer, 100rel"),
+    ]);
+    apply_to_response(&mut passed_through, &policy, &test_ctx());
+    assert!(
+        passed_through.headers.has("Require") && passed_through.headers.has("RSeq"),
+        "sip-trunk-edge@2026 Copy policy is expected to leave Require/RSeq — \
+         the framework-auto strip is what removes them"
+    );
+
+    // Non-100rel A-leg: framework-auto strip removes the contract on top of any
+    // preset's output.
+    let removed = siphon::sip::headers::rseq::strip_100rel_for_unsupported_peer(
+        &mut passed_through.headers,
+        false,
+    );
+    assert!(removed);
+    assert!(!passed_through.headers.has("Require"));
+    assert!(!passed_through.headers.has("RSeq"));
+
+    // 100rel-capable A-leg: the reliable provisional still flows end-to-end.
+    let mut for_capable_peer = make_response_200(&[
+        ("Require", "100rel"),
+        ("RSeq", "1"),
+    ]);
+    apply_to_response(&mut for_capable_peer, &policy, &test_ctx());
+    let removed = siphon::sip::headers::rseq::strip_100rel_for_unsupported_peer(
+        &mut for_capable_peer.headers,
+        true,
+    );
+    assert!(!removed);
+    assert!(for_capable_peer.headers.has("Require"));
+    assert!(for_capable_peer.headers.has("RSeq"));
+}
+
+#[test]
 fn transparent_proxy_b2bua_can_opt_in_to_proxy_authenticate_passthrough() {
     // Rare transparent-proxy B2BUA case: A and C share auth domain and
     // the B2BUA wants A to handle the 401 itself.  Per-call delta restores

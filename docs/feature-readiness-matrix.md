@@ -25,7 +25,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | In-dialog sequential routing | **Production** | `request.loose_route()` | |
 | Call transfer (REFER, RFC 3515) | Implemented | B2BUA `@b2bua.on_refer` | |
 | Session timers (RFC 4028) | Implemented | `session_timer:` | UAC/UAS/B2BUA refresher modes |
-| PRACK (RFC 3262) | Implemented | Core | Reliable provisional responses |
+| PRACK (RFC 3262) | Implemented | Core | Reliable provisional responses; B2BUA terminates 100rel per-leg — auto-PRACKs a reliable-provisional B-leg and strips `Require:100rel`/`RSeq` toward a non-100rel A-leg (framework-auto, preset-independent) |
 
 ## Transports
 

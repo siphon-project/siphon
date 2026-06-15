@@ -141,6 +141,16 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-early-media up --abort-on-container-exit --exit-code-from sipp-b2bua-early-media-uac sipp-b2bua-early-media-uac sipp-b2bua-early-media-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-early-media rm -sf sipp-b2bua-early-media-uac sipp-b2bua-early-media-uas 2>/dev/null || true
 
+  echo "=== B2BUA reliable-provisional interworking test (100rel B-leg → non-100rel A-leg) ==="
+  # Dedicated siphon instance pinned to sip-trunk-edge@2026 (does NOT strip
+  # Require/RSeq via preset) — proves the 100rel strip is framework-auto.
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov build siphon-b2bua-trunk-edge
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov up -d --wait siphon-b2bua-trunk-edge
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov run --rm sipp-b2bua-trunk-edge-register
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov rm -sf sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uas 2>/dev/null || true
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov stop siphon-b2bua-trunk-edge 2>/dev/null || true
+
   echo "=== B2BUA session timer test (Session-Expires negotiation) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-session-timer up --abort-on-container-exit --exit-code-from sipp-b2bua-st-uac sipp-b2bua-st-uac sipp-b2bua-st-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-session-timer rm -sf sipp-b2bua-st-uac sipp-b2bua-st-uas 2>/dev/null || true
