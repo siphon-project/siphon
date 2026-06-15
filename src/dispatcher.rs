@@ -6348,6 +6348,14 @@ fn handle_b2bua_invite(
         .and_then(|v| v.branch)
         .unwrap_or_default();
 
+    // Snapshot the A-leg peer's reliable-provisional capability from the
+    // on-wire INVITE, BEFORE the `@b2bua.on_invite` handler runs.  The script
+    // may add `Supported: 100rel` to the shared INVITE to advertise reliable
+    // provisionals toward the B-leg (IR.92 UEs need it to alert) — that must
+    // not poison the gate that decides whether to strip `Require:100rel`/`RSeq`
+    // from provisionals relayed back to this A-leg.  See CallActor.a_leg_supports_100rel.
+    let a_leg_supports_100rel = crate::sip::headers::rseq::supports_100rel(&message.headers);
+
     // Guard against INVITE retransmissions: if we already have a call for this
     // SIP Call-ID, this is a retransmission — absorb it silently.
     // Without this check, each UDP retransmission would create a new call and
@@ -6493,6 +6501,10 @@ fn handle_b2bua_invite(
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<CallEvent>(64);
     if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
         call.event_tx = Some(event_tx);
+        // Persist the pre-handler on-wire 100rel capability (immutable for the
+        // call's life) so the reliable-1xx strip gate can't be defeated by the
+        // script mutating the shared INVITE for B-leg header shaping.
+        call.a_leg_supports_100rel = a_leg_supports_100rel;
     }
     state.call_event_receivers.insert(call_id.clone(), event_rx);
 
@@ -7183,7 +7195,7 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, call_state, outbound_credentials, li_record, b_leg_handle_tx, b_leg_stored_invite, b_leg_local_cseq) = match state.call_actors.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, call_state, outbound_credentials, li_record, b_leg_handle_tx, b_leg_stored_invite, b_leg_local_cseq, a_leg_supports_100rel) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
@@ -7200,7 +7212,7 @@ fn handle_b2bua_response(
                 .map(|h| h.tx.clone());
             let stored_invite = matching_b.and_then(|b| b.b_leg_invite.clone());
             let local_cseq = matching_b.map(|b| b.dialog.local_cseq).unwrap_or(2);
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, stored_cseq, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx, stored_invite, local_cseq)
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, stored_cseq, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx, stored_invite, local_cseq, call.a_leg_supports_100rel)
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -7208,19 +7220,16 @@ fn handle_b2bua_response(
         }
     };
 
-    // The A-leg's advertised reliable-provisional capability (RFC 3262 §3),
-    // read from the stored original INVITE's `Supported`/`Require`.  Drives the
-    // framework-auto `100rel` strip in `sanitize_b2bua_response` so we never
-    // forward a reliable provisional to an A-leg (e.g. a PSTN trunk) that can't
-    // PRACK it.  Computed once and passed to every sanitize call: the responses
-    // sanitized below all flow to the A-leg (or, for the B→A re-INVITE/UPDATE
-    // direction, are produced by the A-leg — so a non-100rel A-leg never emits
-    // the markers and the strip is a no-op there anyway).
-    let a_leg_supports_100rel = a_leg_invite
-        .as_ref()
-        .and_then(|arc| arc.lock().ok())
-        .map(|invite| crate::sip::headers::rseq::supports_100rel(&invite.headers))
-        .unwrap_or(false);
+    // The A-leg peer's advertised reliable-provisional capability (RFC 3262 §3),
+    // snapshotted from the on-wire INVITE at receipt (CallActor.a_leg_supports_100rel)
+    // — NOT re-derived from `a_leg_invite`, which the `@b2bua.on_invite` script
+    // can mutate via `call.set_header` to advertise 100rel toward the B-leg.
+    // Drives the framework-auto `100rel` strip in `sanitize_b2bua_response` so we
+    // never forward a reliable provisional to an A-leg (e.g. a PSTN trunk) that
+    // can't PRACK it.  Passed to every sanitize call: the responses sanitized
+    // below all flow to the A-leg (or, for the B→A re-INVITE/UPDATE direction,
+    // are produced by the A-leg — so a non-100rel A-leg never emits the markers
+    // and the strip is a no-op there anyway).
 
     // RFC 3262 auto-PRACK for the B-leg side: when the B-leg sends a
     // reliable provisional response (`Require: 100rel` + `RSeq: <n>`),

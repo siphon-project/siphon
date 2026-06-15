@@ -588,6 +588,15 @@ pub struct CallActor {
     /// when the script calls `call.dial(header_policy=…)`.  When `None`, the
     /// dispatcher falls back to the configured `b2bua.default_header_policy`.
     pub resolved_header_policy: Option<std::sync::Arc<super::header_policy::ResolvedPolicy>>,
+    /// Whether the A-leg *peer* advertised `100rel` on the wire (RFC 3262 §3),
+    /// snapshotted at INVITE receipt **before** the `@b2bua.on_invite` handler
+    /// runs.  Drives the reliable-1xx strip in `sanitize_b2bua_response`.  This
+    /// MUST NOT be re-derived from `a_leg_invite`: the script can mutate that
+    /// shared message via `call.set_header("Supported", "…100rel")` to advertise
+    /// reliable provisionals toward the B-leg (IR.92 UEs need it to alert), and
+    /// reading it back would falsely conclude the A-leg trunk supports `100rel`,
+    /// leaking the reliable provisional to a peer that CANCELs it.
+    pub a_leg_supports_100rel: bool,
 }
 
 impl CallActor {
@@ -613,6 +622,7 @@ impl CallActor {
             preserve_call_id: false,
             pending_b_leg_ack: None,
             resolved_header_policy: None,
+            a_leg_supports_100rel: false,
         }
     }
 

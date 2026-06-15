@@ -1633,6 +1633,64 @@ fn framework_auto_100rel_strip_is_preset_independent() {
 }
 
 #[test]
+fn a_leg_100rel_capability_is_snapshotted_not_re_derived_from_mutable_invite() {
+    // Regression: the A-leg's reliable-provisional capability MUST be captured
+    // from the on-wire INVITE before the @b2bua.on_invite script runs and stored
+    // immutably on the call — NOT re-derived from `a_leg_invite`, which the script
+    // can mutate via `call.set_header("Supported", "…100rel")` to advertise
+    // reliable provisionals toward the B-leg (IR.92).  Re-deriving from the
+    // mutated message falsely reports the A-leg trunk as 100rel-capable, defeats
+    // the reliable-1xx strip, and the trunk CANCELs the call.
+    let raw = concat!(
+        "INVITE sip:bob@biloxi.com SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP trunk.example.com;branch=z9hG4bK-onwire\r\n",
+        "From: <sip:alice@trunk.example.com>;tag=a\r\n",
+        "To: <sip:bob@biloxi.com>\r\n",
+        "Call-ID: gate-poison@test\r\n",
+        "CSeq: 1 INVITE\r\n",
+        "Supported: timer, path, replaces\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+    let invite = parse_sip_message(raw).expect("fixture parses").1;
+
+    // siphon snapshots the on-wire capability before the script runs.
+    let snapshot = siphon::sip::headers::rseq::supports_100rel(&invite.headers);
+    assert!(!snapshot, "on-wire trunk INVITE must not advertise 100rel");
+
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("gate-poison@test"));
+    {
+        let mut call = store.get_call_mut(&call_id).unwrap();
+        call.a_leg_supports_100rel = snapshot;
+    }
+
+    // Script mutates the SHARED INVITE to advertise 100rel toward the B-leg.
+    let invite_arc = Arc::new(Mutex::new(invite));
+    store.set_a_leg_invite(&call_id, Arc::clone(&invite_arc));
+    invite_arc
+        .lock()
+        .unwrap()
+        .headers
+        .set("Supported", "timer, 100rel".to_string());
+
+    let call = store.get_call(&call_id).unwrap();
+    // The mutated INVITE now *reads* as 100rel-capable — exactly what poisoned
+    // the old gate that re-derived from `a_leg_invite`.
+    assert!(
+        siphon::sip::headers::rseq::supports_100rel(
+            &call.a_leg_invite.as_ref().unwrap().lock().unwrap().headers
+        ),
+        "the script-mutated INVITE reads as 100rel-capable"
+    );
+    // The snapshot stays false — the gate is immune to script header shaping.
+    assert!(
+        !call.a_leg_supports_100rel,
+        "snapshotted capability must reflect the on-wire INVITE, not the mutated one"
+    );
+}
+
+#[test]
 fn transparent_proxy_b2bua_can_opt_in_to_proxy_authenticate_passthrough() {
     // Rare transparent-proxy B2BUA case: A and C share auth domain and
     // the B2BUA wants A to handle the 401 itself.  Per-call delta restores

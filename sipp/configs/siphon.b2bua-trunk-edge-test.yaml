@@ -2,7 +2,11 @@
 # the `sip-trunk-edge@2026` header policy (the BGCF/trunk-edge setup).
 #
 # Used with: sipp/docker-compose.yaml (b2bua-reliable-prov profile)
-# Script:    scripts/b2bua_default.py
+# Script:    scripts/b2bua_100rel_advertise.py  (IR.92-style — adds
+#            `Supported: 100rel` to the shared INVITE for the B-leg, which is
+#            the regression guard for the gate-poisoning bug: the A-leg's
+#            on-wire 100rel capability must be snapshotted before the script
+#            runs, so the reliable-1xx strip toward the non-100rel trunk holds)
 # Tests:     reliable-provisional (100rel) interworking — a B-leg reliable 183
 #            must NOT leak Require:100rel / RSeq to a non-100rel A-leg.
 #
@@ -22,7 +26,7 @@ domain:
     - "127.0.0.1"
 
 script:
-  path: "scripts/b2bua_default.py"
+  path: "scripts/b2bua_100rel_advertise.py"
   reload: auto
 
 advertised_address: "172.20.0.58"
