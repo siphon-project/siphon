@@ -4586,6 +4586,17 @@ fn flatten_record_route_headers(headers: &[String]) -> Vec<String> {
     routes
 }
 
+/// Compute the UAC-side dialog route set (RFC 3261 §12.1.2) from a response's
+/// Record-Route header lines: flatten multi-URI lines (RFC 3261 §7.3.1) into one
+/// URI per entry, then reverse (the UAC route set is the responder's Record-Route
+/// in reverse order). Used for the early dialog (reliable 1xx, RFC 3262 §4) and
+/// the confirmed dialog (2xx).
+fn uac_route_set_from_record_routes(record_routes: &[String]) -> Vec<String> {
+    let mut routes = flatten_record_route_headers(record_routes);
+    routes.reverse();
+    routes
+}
+
 /// Sanitize a B2BUA response before forwarding it to the A-leg.
 ///
 /// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
@@ -7211,6 +7222,28 @@ fn handle_b2bua_response(
                 // We DO want to fall through to the rest of the function so
                 // the 1xx still reaches the A-leg.
             } else {
+            // RFC 3262 §4 + RFC 3261 §12.1.2: a reliable provisional response
+            // establishes the early dialog, whose route set is THIS response's
+            // Record-Route reversed (UAC side). The confirmed-dialog route set
+            // isn't captured until the 200 OK, so without this the PRACK is built
+            // with no Route header and sent to the cached INVITE next-hop (e.g. an
+            // IMS I-CSCF that doesn't Record-Route and rejects the in-dialog PRACK
+            // with 406). Establish it once (§12.1.2 — not updated by later
+            // responses), so build_b2bua_prack and resolve_in_dialog_destination
+            // both pick the route-set first hop (the S-CSCF).
+            let early_routes = uac_route_set_from_record_routes(
+                &message.headers.get_all("Record-Route").cloned().unwrap_or_default(),
+            );
+            if !early_routes.is_empty() {
+                if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                    if let Some(leg) = call.b_legs.get_mut(idx) {
+                        if leg.dialog.route_set.is_empty() {
+                            leg.dialog.route_set = early_routes;
+                        }
+                    }
+                }
+            }
+
             // Pull CSeq num + method from the 1xx (it echoes the INVITE's).
             let response_cseq_num: u32 = message.headers.cseq()
                 .and_then(|c| c.split_whitespace().next())
@@ -7237,10 +7270,11 @@ fn handle_b2bua_response(
                 if let Some(prack) = prack {
                     if let Some((dest, transport)) = b_leg_dest {
                         // PRACK follows the early-dialog route set (RFC 3262 §4
-                        // + RFC 3261 §12.2.1.1). At reliable-1xx time the
-                        // confirmed-dialog route set (set on 200 OK) is
-                        // typically still empty; resolve_in_dialog_destination
-                        // falls back to the cached destination in that case.
+                        // + RFC 3261 §12.2.1.1), captured from this reliable
+                        // 1xx's Record-Route just above. When the 1xx carried no
+                        // Record-Route (direct B-leg, no proxies) the set is
+                        // empty and resolve_in_dialog_destination falls back to
+                        // the cached destination, which is correct there.
                         let leg_route_set = state.call_actors.get_call(call_id)
                             .and_then(|call| {
                                 call.b_legs.get(idx).map(|leg| leg.dialog.route_set.clone())
@@ -8088,8 +8122,7 @@ fn handle_b2bua_response(
             // B-leg route set from B-leg 200 OK Record-Route, reversed per RFC 3261
             // §12.1.1. Reversal MUST happen after flattening — multiple URIs sharing one
             // header line stay in wire order until then.
-            let mut b_routes = flatten_record_route_headers(&b_leg_record_routes);
-            b_routes.reverse();
+            let b_routes = uac_route_set_from_record_routes(&b_leg_record_routes);
             // A-leg route set from stored INVITE's Record-Route (in order for UAS)
             let a_routes = a_leg_invite.as_ref()
                 .and_then(|arc| arc.lock().ok())
@@ -8143,8 +8176,7 @@ fn handle_b2bua_response(
 
                 // Build B-leg Route set from Record-Route (reversed per RFC 3261 §12.2.1.1).
                 // Flatten BEFORE reversing — see flatten_record_route_headers comment.
-                let mut b_leg_routes = flatten_record_route_headers(&b_leg_record_routes);
-                b_leg_routes.reverse();
+                let b_leg_routes = uac_route_set_from_record_routes(&b_leg_record_routes);
 
                 let mut ack_builder = SipMessageBuilder::new()
                     .request(Method::Ack, ack_uri)
@@ -10428,6 +10460,48 @@ mod tests {
         ];
         let uri = first_route_uri(&route_set);
         assert_eq!(uri.as_deref(), Some("sip:scscf.example.com:6060;lr;transport=udp"));
+    }
+
+    #[test]
+    fn uac_route_set_from_record_routes_flattens_and_reverses() {
+        // Mix of one-URI-per-line and a comma-joined multi-URI line (RFC 3261
+        // §7.3.1). The UAC route set is the responder's Record-Route in reverse
+        // wire order (RFC 3261 §12.1.2), computed after flattening.
+        let record_routes = vec![
+            "<sip:p1.example.com;lr>, <sip:p2.example.com;lr>".to_string(),
+            "<sip:p3.example.com;lr>".to_string(),
+        ];
+        let route_set = uac_route_set_from_record_routes(&record_routes);
+        assert_eq!(
+            route_set,
+            vec![
+                "<sip:p3.example.com;lr>".to_string(),
+                "<sip:p2.example.com;lr>".to_string(),
+                "<sip:p1.example.com;lr>".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn uac_route_set_from_record_routes_empty() {
+        assert!(uac_route_set_from_record_routes(&[]).is_empty());
+    }
+
+    #[test]
+    fn early_dialog_route_set_first_hop_is_proxy_not_cached_next_hop() {
+        // Regression for the B2BUA auto-PRACK 406: a reliable 183 arrives via the
+        // S-CSCF, which Record-Routes. The early-dialog route set must be derived
+        // from THIS response's Record-Route so the PRACK's Route header and
+        // resolve_in_dialog_destination both target the S-CSCF — not the cached
+        // INVITE next-hop (an IMS I-CSCF that doesn't Record-Route and rejects the
+        // in-dialog PRACK with 406, killing the 100rel handshake).
+        let record_routes = vec!["<sip:scscf.ims.example.com:6060;lr;transport=udp>".to_string()];
+        let route_set = uac_route_set_from_record_routes(&record_routes);
+        assert_eq!(
+            first_route_uri(&route_set).as_deref(),
+            Some("sip:scscf.ims.example.com:6060;lr;transport=udp"),
+            "PRACK must follow the early-dialog route set to the S-CSCF",
+        );
     }
 
     #[test]
