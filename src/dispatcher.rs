@@ -2316,6 +2316,24 @@ fn handle_request(
     match &action {
         RequestAction::None => {
             debug!("silent drop (no action from script)");
+            // Reap the server transaction created for this request. A NIST/IST
+            // whose TU never sends a final response never reaches Terminated
+            // (RFC 3261 §17.2 has no absolute server-side timeout — it assumes
+            // the TU always responds), so a silent drop would otherwise strand
+            // it in the transaction map forever, each entry holding a full
+            // SipMessage clone. Under unhandled-request churn (e.g. SUBSCRIBE to
+            // a call-only B2BUA) or a scanner / rate-limit flood that is an
+            // unbounded leak — and a memory-DoS vector. A dropped request has
+            // nothing to retransmit-absorb; a later UDP retransmit just
+            // recreates a fresh transaction and re-runs the handler (which drops
+            // again). Also drop the auto-100 timer so the wheel entry is freed
+            // immediately and the drop stays silent (no synthesized 100 Trying).
+            if let Some(ref key) = server_key {
+                state.transaction_manager.remove(key);
+                state
+                    .timer_wheel
+                    .remove(&format!("{}:{:?}", key, TimerName::Trying100));
+            }
         }
         RequestAction::Reply { code, reason, reliable } => {
             let mut response = build_response(&message_guard, *code, reason, state.server_header.as_deref(), &reply_headers);
