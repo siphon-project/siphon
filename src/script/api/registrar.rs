@@ -829,14 +829,16 @@ impl PyRegistrar {
     /// against an unregistered user — TS 24.229 §5.4.2.1.2 keeps AS
     /// records' lifetime tied to the registration).
     ///
-    /// Example::
+    /// Example:
     ///
-    ///     @proxy.on_reply
-    ///     def on_reply(request, reply):
-    ///         if request.method == "REGISTER" and reply.status_code == 200:
-    ///             impu = str(request.to_uri)
-    ///             registrar.save_as_contact(impu, reply)
-    ///         reply.relay()
+    /// ```python,ignore
+    /// @proxy.on_reply
+    /// def on_reply(request, reply):
+    ///     if request.method == "REGISTER" and reply.status_code == 200:
+    ///         impu = str(request.to_uri)
+    ///         registrar.save_as_contact(impu, reply)
+    ///     reply.relay()
+    /// ```
     #[pyo3(signature = (aor, reply, expires_secs=None))]
     fn save_as_contact(
         &self,

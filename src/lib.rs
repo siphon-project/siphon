@@ -34,6 +34,7 @@ pub mod li;
 pub mod sbi;
 pub mod server;
 pub mod siprec;
+pub mod stir;
 pub mod srs;
 pub mod subscribe_state;
 

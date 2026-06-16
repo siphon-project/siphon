@@ -29,6 +29,7 @@ pub mod sbi;
 pub mod sdp;
 pub mod sip_uri;
 pub mod srs;
+pub mod stir;
 pub mod subscribe_state;
 pub mod timer;
 
@@ -65,6 +66,7 @@ pub const BUILT_IN_NAMESPACE_NAMES: &[&str] = &[
     "subscribe_state",
     "ipsec",
     "qos",
+    "stir",
 ];
 
 /// Host-registered Python namespaces. Populated by `SiphonServer` at
@@ -120,6 +122,9 @@ static SUBSCRIBE_STATE_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Optional IPsec singleton — set only when `ipsec` is configured (P-CSCF role).
 static IPSEC_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// Optional STIR/SHAKEN singleton — set only when `stir` is configured.
+static STIR_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// The IfcStore Arc — stored so the backend can wire Redis persistence.
 static IFC_STORE_ARC: OnceLock<std::sync::Arc<crate::ifc::IfcStore>> = OnceLock::new();
@@ -381,6 +386,18 @@ pub fn set_ipsec_singleton(
         .map_err(|error| SiphonError::Script(format!("Py::new(ipsec): {error}")))?
         .into_any();
     let _ = IPSEC_SINGLETON.set(ipsec_py);
+    Ok(())
+}
+
+/// Store the STIR/SHAKEN singleton for injection into the siphon module.
+///
+/// Called at startup only when `stir` is configured. Wires the shared
+/// [`crate::stir::StirService`] into the Python `stir` namespace.
+pub fn set_stir_singleton(python: Python<'_>, py_stir: stir::PyStir) -> Result<()> {
+    let stir_py: Py<PyAny> = Py::new(python, py_stir)
+        .map_err(|error| SiphonError::Script(format!("Py::new(stir): {error}")))?
+        .into_any();
+    let _ = STIR_SINGLETON.set(stir_py);
     Ok(())
 }
 
@@ -661,6 +678,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("ipsec", ipsec_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr ipsec: {error}")))?;
+    }
+
+    // Inject optional STIR/SHAKEN singleton.
+    if let Some(stir_py) = STIR_SINGLETON.get() {
+        module
+            .setattr("stir", stir_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr stir: {error}")))?;
     }
 
     // Inject host-registered user namespaces. These were validated against

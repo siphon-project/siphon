@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import uuid
 from types import ModuleType
 from typing import Any, Callable, Optional, Union
 
@@ -4735,6 +4736,240 @@ _ipsec = MockIpsec()
 
 
 # ---------------------------------------------------------------------------
+# STIR/SHAKEN namespace (RFC 8224/8225/8226, ATIS-1000074)
+# ---------------------------------------------------------------------------
+
+class MockStirResult:
+    """Result of :meth:`MockStir.verify` — mirrors the Rust ``StirResult``.
+
+    Attributes:
+        verstat: ``"TN-Validation-Passed"`` | ``"TN-Validation-Failed"`` |
+            ``"No-TN-Validation"`` (ATIS-1000074 §5.3.1).
+        passed: ``True`` only when the SHAKEN PASSporT validated end to end.
+        attestation: ``"A"`` / ``"B"`` / ``"C"`` from the SHAKEN PASSporT.
+        origid: ``origid`` (UUID) from the SHAKEN PASSporT.
+        orig_tn: originating TN from the SHAKEN PASSporT.
+        reason: human-readable diagnostic / failure cause.
+        passports: decoded PASSporT claim dicts.
+    """
+
+    def __init__(
+        self,
+        verstat: str = "No-TN-Validation",
+        passed: bool = False,
+        attestation: Optional[str] = None,
+        origid: Optional[str] = None,
+        orig_tn: Optional[str] = None,
+        reason: str = "",
+        passports: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        self.verstat = verstat
+        self.passed = passed
+        self.attestation = attestation
+        self.origid = origid
+        self.orig_tn = orig_tn
+        self.reason = reason
+        self._passports = passports or []
+
+    @property
+    def passports(self) -> list[dict[str, Any]]:
+        """Decoded claim sets of every PASSporT that parsed."""
+        return list(self._passports)
+
+    def __repr__(self) -> str:
+        return (
+            f"StirResult(verstat={self.verstat!r}, passed={self.passed}, "
+            f"attestation={self.attestation!r}, reason={self.reason!r})"
+        )
+
+
+class MockStir:
+    """Mock ``stir`` namespace — STIR/SHAKEN signing and verification.
+
+    Scripts use::
+
+        from siphon import stir
+
+        @proxy.on_request("INVITE")
+        def on_invite(request):
+            origid = stir.sign(request, attestation="A")   # add Identity header
+            request.relay()
+
+        @proxy.on_request("INVITE")
+        def verify_inbound(request):
+            result = stir.verify(request)
+            if result.verstat == "TN-Validation-Failed":
+                request.reply(438, "Invalid Identity Header")
+                return
+            stir.apply_verstat(request, result)
+            request.relay()
+
+    Test helpers: set :attr:`signing_enabled` / :attr:`verification_enabled`
+    to simulate config; call :meth:`set_verify_result` to pin the next
+    :meth:`verify` outcome; inspect :attr:`signed` / :attr:`applied_verstats`.
+    """
+
+    def __init__(self) -> None:
+        self.signing_enabled: bool = True
+        self.verification_enabled: bool = True
+        self._next_result: Optional[MockStirResult] = None
+        self.signed: list[dict[str, Any]] = []
+        self.applied_verstats: list[str] = []
+
+    @staticmethod
+    def _uri_user(uri: Any) -> Optional[str]:
+        return getattr(uri, "user", None) if uri is not None else None
+
+    def sign(
+        self,
+        request: Any,
+        attestation: str = "A",
+        origid: Optional[str] = None,
+        orig_tn: Optional[str] = None,
+        dest_tn: Optional[str] = None,
+    ) -> str:
+        """Build a SHAKEN ``Identity`` header and add it to ``request``.
+
+        Args:
+            request: The outbound SIP request.
+            attestation: ``"A"`` / ``"B"`` / ``"C"`` (full / partial / gateway).
+            origid: UUID origin identifier; a fresh v4 is generated if ``None``.
+            orig_tn: Originating TN; defaults to the From user part.
+            dest_tn: Destination TN; defaults to the To / R-URI user part.
+
+        Returns:
+            The ``origid`` used.
+
+        Raises:
+            RuntimeError: if signing is not configured.
+            ValueError: if the orig/dest TN cannot be determined.
+        """
+        if not self.signing_enabled:
+            raise RuntimeError("STIR signing is not configured")
+        if attestation.upper() not in ("A", "B", "C"):
+            raise ValueError(f"invalid attestation level {attestation!r}")
+        orig = orig_tn or self._uri_user(getattr(request, "from_uri", None))
+        dest = dest_tn or self._uri_user(getattr(request, "to_uri", None)) \
+            or self._uri_user(getattr(request, "ruri", None))
+        if not orig:
+            raise ValueError("could not determine originating TN (pass orig_tn=)")
+        if not dest:
+            raise ValueError("could not determine destination TN (pass dest_tn=)")
+        used_origid = origid or str(uuid.uuid4())
+        # A structurally-valid-looking (but mock) Identity header value.
+        header = (
+            "eyJtb2NrIjoiaGVhZGVyIn0.eyJtb2NrIjoiY2xhaW1zIn0.bW9ja3NpZw"
+            ";info=<https://mock.invalid/sti.pem>;alg=ES256;ppt=shaken"
+        )
+        request.set_header("Identity", header)
+        self.signed.append(
+            {
+                "attestation": attestation.upper(),
+                "origid": used_origid,
+                "orig_tn": orig,
+                "dest_tn": dest,
+                "ppt": "shaken",
+            }
+        )
+        return used_origid
+
+    def sign_div(
+        self,
+        request: Any,
+        orig_tn: Optional[str] = None,
+        dest_tn: Optional[str] = None,
+        div_tn: Optional[str] = None,
+    ) -> None:
+        """Build a diverted-call (``div``) ``Identity`` header (RFC 8946).
+
+        Args:
+            request: The outbound (retargeted) SIP request.
+            orig_tn: Originating TN; defaults to the From user part.
+            dest_tn: New destination TN; defaults to the To / R-URI user part.
+            div_tn: Diverting TN; defaults to the History-Info / Diversion user.
+        """
+        if not self.signing_enabled:
+            raise RuntimeError("STIR signing is not configured")
+        orig = orig_tn or self._uri_user(getattr(request, "from_uri", None))
+        dest = dest_tn or self._uri_user(getattr(request, "to_uri", None)) \
+            or self._uri_user(getattr(request, "ruri", None))
+        if not orig:
+            raise ValueError("could not determine originating TN")
+        if not dest:
+            raise ValueError("could not determine destination TN")
+        if not div_tn:
+            raise ValueError("could not determine diverting TN (pass div_tn=)")
+        request.set_header("Identity", (
+            "eyJtb2NrIjoiZGl2In0.eyJtb2NrIjoiZGl2In0.bW9ja2Rpdg"
+            ";info=<https://mock.invalid/sti.pem>;alg=ES256;ppt=div"
+        ))
+        self.signed.append(
+            {"orig_tn": orig, "dest_tn": dest, "div_tn": div_tn, "ppt": "div"}
+        )
+
+    def verify(self, request: Any) -> MockStirResult:
+        """Verify the ``Identity`` header(s) on ``request``.
+
+        Returns a :class:`MockStirResult`. By default returns a passing result
+        when an ``Identity`` header is present, else ``No-TN-Validation``;
+        override with :meth:`set_verify_result`.
+
+        Raises:
+            RuntimeError: if verification is not configured.
+        """
+        if not self.verification_enabled:
+            raise RuntimeError("STIR verification is not configured")
+        if self._next_result is not None:
+            return self._next_result
+        if request.get_header("Identity"):
+            orig = self._uri_user(getattr(request, "from_uri", None))
+            return MockStirResult(
+                verstat="TN-Validation-Passed",
+                passed=True,
+                attestation="A",
+                orig_tn=orig,
+                reason="ok",
+            )
+        return MockStirResult(
+            verstat="No-TN-Validation",
+            passed=False,
+            reason="no Identity header present",
+        )
+
+    def apply_verstat(self, request: Any, result: MockStirResult) -> None:
+        """Stamp the ``verstat`` parameter onto the asserted identity
+        (P-Asserted-Identity if present, else From) per ATIS-1000074 §5.3.1."""
+        self.applied_verstats.append(result.verstat)
+
+    # -- Test helpers -------------------------------------------------------
+
+    def set_verify_result(
+        self,
+        verstat: str = "TN-Validation-Passed",
+        passed: bool = True,
+        attestation: Optional[str] = None,
+        origid: Optional[str] = None,
+        orig_tn: Optional[str] = None,
+        reason: str = "ok",
+        passports: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        """Pin the result returned by the next :meth:`verify` call(s)."""
+        self._next_result = MockStirResult(
+            verstat, passed, attestation, origid, orig_tn, reason, passports
+        )
+
+    def clear(self) -> None:
+        self._next_result = None
+        self.signed.clear()
+        self.applied_verstats.clear()
+        self.signing_enabled = True
+        self.verification_enabled = True
+
+
+_stir = MockStir()
+
+
+# ---------------------------------------------------------------------------
 # SDP namespace
 # ---------------------------------------------------------------------------
 
@@ -4994,6 +5229,7 @@ def install() -> ModuleType:
     mod.isc = _isc  # type: ignore[attr-defined]
     mod.sbi = _sbi  # type: ignore[attr-defined]
     mod.ipsec = _ipsec  # type: ignore[attr-defined]
+    mod.stir = _stir  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
     mod.qos = _qos  # type: ignore[attr-defined]
 
@@ -5039,6 +5275,7 @@ def reset() -> None:
     _metrics.clear()
     _isc.clear()
     _ipsec.clear()
+    _stir.clear()
     _auth._allow = False
     _auth._credentials.clear()
     _proxy._utils._rate_limit_allow = True
@@ -5135,3 +5372,8 @@ def get_isc() -> MockIsc:
 def get_ipsec() -> MockIpsec:
     """Access the mock IPsec singleton."""
     return _ipsec
+
+
+def get_stir() -> MockStir:
+    """Access the mock STIR/SHAKEN singleton."""
+    return _stir

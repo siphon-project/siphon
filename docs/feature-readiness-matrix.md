@@ -78,6 +78,21 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | SHA-256 digest (RFC 7616) | Implemented | | |
 | Anti-spoofing (from=auth check) | **Production** | Script logic | `auth_user == from_uri.user` |
 
+## STIR/SHAKEN (Caller-ID Attestation)
+
+| Feature | Readiness | Config | Notes |
+|---------|-----------|--------|-------|
+| Sign — Authentication Service | Implemented | `stir.sign()`, `stir:` signing block | ES256 PASSporT + RFC 8224 Identity header (RFC 8225, ATIS-1000074) |
+| Verify — Verification Service | Implemented | `stir.verify()`, `stir:` verification block | x5u fetch + full cert-chain validation to STI-CA anchors, sets `verstat` |
+| Attestation levels A/B/C | Implemented | `stir.sign(attestation=…)` | ATIS-1000074 §5.2.3; default via `default_attestation` |
+| Diverted-call PASSporT (`div`) | Implemented | `stir.sign_div()` | RFC 8946 — forwarded/retargeted calls |
+| Cert chain + freshness | Implemented | `stir.verification.freshness_secs`, `trust_anchors` | EC P-256 chain to STI-CA root; PASSporT `iat` window |
+| Permissive rollout mode | Implemented | `stir.verification.permissive` | x5u/infra failures → `No-TN-Validation` instead of `…-Failed` |
+| x5u certificate cache | Implemented | `stir.verification.cache_ttl_secs` | In-memory; honours `Cache-Control: max-age` |
+| `verstat` stamping | Implemented | `stir.apply_verstat()` | ATIS-1000074 §5.3.1 — P-Asserted-Identity / From |
+| RCD (Rich Call Data) | Planned | | Caller name/logo PASSporT — follow-up |
+| OCSP/CRL revocation, RSA STI-CA | Planned | | EC P-256 chains only in v1 |
+
 ## Security
 
 | Feature | Readiness | Config | Notes |

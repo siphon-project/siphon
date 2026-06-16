@@ -80,6 +80,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 # Crypto (Milenage AKA key derivation for IMS IPsec)
 aes = "0.8"
 
+# STIR/SHAKEN — ES256 PASSporT signing/verification (RFC 8224/8225/8226,
+# ATIS-1000074). RustCrypto, pure-Rust, no OpenSSL — fits the rustls posture.
+# ECDSA signing uses RFC 6979 deterministic nonces, so no RNG plumbing on the
+# sign path.
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }  # ES256 sign/verify + key load
+x509-cert = { version = "0.2", features = ["pem"] }               # cert parse, SPKI, extensions, validity
+base64 = "0.22"                                                    # base64url (URL_SAFE_NO_PAD) for JWS
+
 # Utilities
 md5 = "0.7"
 sha2 = "0.10"

@@ -53,3 +53,6 @@ mod srs_tests;
 
 #[path = "integration/ipsec_tests.rs"]
 mod ipsec_tests;
+
+#[path = "integration/stir_tests.rs"]
+mod stir_tests;

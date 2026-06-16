@@ -627,6 +627,46 @@ impl SiphonServer {
             None
         };
 
+        // --- STIR/SHAKEN namespace (siphon.stir) ---
+        //
+        // Must be wired BEFORE `ScriptEngine::new()` so the script's top-level
+        // `from siphon import stir` resolves.  Loads the signing key + STI-CA
+        // trust anchors from disk and builds the x5u HTTP client; a bad path /
+        // unparseable key fails startup loudly rather than at first call.
+        if let Some(ref stir_config) = config.stir {
+            if stir_config.enabled
+                && (stir_config.signing.is_some() || stir_config.verification.is_some())
+            {
+                match crate::stir::StirService::from_config(stir_config) {
+                    Ok(service) => {
+                        let signing = service.signing_enabled();
+                        let verification = service.verification_enabled();
+                        pyo3::Python::attach(|python| {
+                            let py_stir = crate::script::api::stir::PyStir::new(service);
+                            if let Err(error) =
+                                crate::script::api::set_stir_singleton(python, py_stir)
+                            {
+                                error!("failed to store STIR singleton: {error}");
+                            } else {
+                                info!(
+                                    signing,
+                                    verification,
+                                    "stir namespace registered for injection (STIR/SHAKEN)"
+                                );
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        error!("failed to initialize STIR/SHAKEN service: {error}");
+                        eprintln!("STIR/SHAKEN configuration error: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                info!("stir block present but disabled or empty — STIR/SHAKEN not wired");
+            }
+        }
+
         // --- Subscribe-state namespace (proxy.subscribe_state) ---
         //
         // Must run BEFORE `ScriptEngine::new()` so that

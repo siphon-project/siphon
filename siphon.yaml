@@ -652,6 +652,34 @@ auth:
 #   ifc_xml_path: "/etc/siphon/ifc.xml"     # path to ServiceProfile XML
 #   # ifc_xml: "<ServiceProfile>...</ServiceProfile>"  # inline XML (alternative)
 #   ifc_key_prefix: "siphon:ifc:"            # Redis key prefix (default)
+
+# ---------------------------------------------------------------------------
+# STIR/SHAKEN — caller-ID attestation (RFC 8224/8225/8226, ATIS-1000074)
+# ---------------------------------------------------------------------------
+# Drives the `stir` Python namespace: stir.sign() / stir.sign_div() add the
+# Identity header to outbound INVITEs (Authentication Service); stir.verify()
+# validates inbound Identity headers (Verification Service).  Either side may
+# be omitted.  Script-driven — the script owns attestation logic and the
+# reject-on-fail policy.
+#
+# stir:
+#   enabled: true                  # default true when the block is present
+#   signing:                       # omit to disable the AS side
+#     private_key: "/etc/siphon/stir/sti.key"   # PEM EC P-256 private key
+#     x5u: "https://cert.example.com/sti.pem"    # public cert URL (Identity info=)
+#     default_attestation: "A"     # A (full) | B (partial) | C (gateway)
+#     # origid: "…"                # fixed UUID; per-call v4 if unset
+#   verification:                  # omit to disable the VS side
+#     trust_anchors:               # STI-CA root certificate files (PEM)
+#       - "/etc/siphon/stir/sti-ca-root.pem"
+#     # trust_anchor_dir: "/etc/siphon/stir/anchors"  # optional dir of PEM roots
+#     freshness_secs: 60           # PASSporT iat freshness window (ATIS-1000074)
+#     permissive: false            # log-only rollout: x5u/infra failures →
+#                                  #   No-TN-Validation instead of …-Failed
+#     cache_ttl_secs: 3600         # x5u cert cache TTL (Cache-Control overrides)
+#     max_cert_bytes: 65536        # x5u response size cap
+#     require_tnauthlist: false    # require RFC 8226 TNAuthList on the leaf
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
