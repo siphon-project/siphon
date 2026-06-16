@@ -6241,6 +6241,34 @@ fn handle_ack_via_session(
 // ProxySession-based CANCEL handling
 // ---------------------------------------------------------------------------
 
+/// Build the topmost `Via` value for a CANCEL forwarded on a proxy client
+/// branch.
+///
+/// RFC 3261 §9.1 makes CANCEL the one request that MUST share the topmost
+/// `Via` branch of the request it cancels; §16.10 has a stateful proxy
+/// generate, for each pending branch, a CANCEL whose single `Via` equals the
+/// top `Via` of the INVITE it forwarded on that branch.  The downstream
+/// UAS/proxy matches CANCEL→INVITE on that branch + sent-by (RFC 3261 §9.2 /
+/// §17.2.3) to find the in-progress INVITE server transaction.
+///
+/// The proxy's client transaction key already holds exactly the branch and
+/// sent-by siphon stamped on that INVITE's topmost `Via` (see
+/// [`TransactionManager::key_from_message`]), so we reuse them verbatim —
+/// reusing `sent_by` also keeps the CANCEL aligned with the INVITE in the
+/// IPsec / flow / `force_send_via` cases where the advertised sent-by differs
+/// from the default per-transport `via_host`.  Minting a fresh branch here
+/// (as siphon did before) makes the forwarded CANCEL unmatchable downstream:
+/// it is dropped, the INVITE leg below is never torn down, and the callee
+/// keeps ringing after the caller abandons during alerting.
+fn cancel_via_for_client_branch(client_key: &TransactionKey, transport: Transport) -> String {
+    format!(
+        "SIP/2.0/{} {};branch={}",
+        format!("{transport}").to_uppercase(),
+        client_key.sent_by,
+        client_key.branch,
+    )
+}
+
 /// Handle CANCEL using ProxySession — forwards CANCEL to all client branches
 /// and sends 487 Request Terminated upstream.
 fn handle_cancel_via_session(
@@ -6274,17 +6302,16 @@ fn handle_cancel_via_session(
     for client_key in &session.client_keys {
         if let Some(client_branch) = session.get_client_branch(client_key) {
             let mut cancel_downstream = message.clone();
-            // CANCEL gets its own branch (different transaction) but we derive it
-            // from the client branch so it's traceable.
-            let cancel_branch = TransactionKey::generate_branch();
-            let transport_str = format!("{}", client_branch.transport);
-            let via_value = format!(
-                "SIP/2.0/{} {}:{};branch={}",
-                transport_str.to_uppercase(),
-                state.via_host(&client_branch.transport),
-                state.via_port(&client_branch.transport),
-                cancel_branch,
-            );
+            // RFC 3261 §9.1 / §16.10: the forwarded CANCEL MUST carry the SAME
+            // topmost Via branch (and sent-by) as the INVITE siphon sent on
+            // this branch, so the downstream matches CANCEL→INVITE (RFC 3261
+            // §9.2 / §17.2.3) and tears the alerting branch down.  Minting a
+            // fresh branch makes the CANCEL unmatchable: it's dropped, the
+            // INVITE leg below is never cancelled, and the callee keeps
+            // ringing after the caller abandons.  `headers.set` collapses the
+            // inbound CANCEL's Via stack to this single Via (§9.1 — a proxy
+            // CANCEL carries exactly one Via).
+            let via_value = cancel_via_for_client_branch(client_key, client_branch.transport);
             cancel_downstream.headers.set("Via", via_value);
 
             let data = Bytes::from(cancel_downstream.to_bytes());
@@ -11843,6 +11870,70 @@ a=rtpmap:8 PCMA/8000\r\n";
         // Defensive: build_cancel_from_invite must reject responses.
         let response = build_response(&b_leg_invite_sample(), 100, "Trying", None, &[]);
         assert!(build_cancel_from_invite(&response).is_none());
+    }
+
+    // --- Proxy-forwarded CANCEL Via (RFC 3261 §9.1 / §16.10) ---
+    //
+    // Regression: handle_cancel_via_session used to mint a fresh branch
+    // (TransactionKey::generate_branch()) for the forwarded CANCEL, so the
+    // downstream proxy/UAS could not match CANCEL→INVITE and dropped it — the
+    // INVITE leg below was never torn down and the callee kept ringing after
+    // the caller abandoned during alerting.
+
+    #[test]
+    fn proxy_cancel_via_reuses_invite_branch_and_sent_by() {
+        // The proxy forwarded an INVITE on this client branch; its transaction
+        // key holds exactly the branch + sent-by siphon stamped on that
+        // INVITE's topmost Via.
+        let client_key = TransactionKey::new(
+            "z9hG4bK-invite-branch-B".to_string(),
+            Method::Invite,
+            "172.16.0.111:4060".to_string(),
+        );
+        let via = cancel_via_for_client_branch(&client_key, Transport::Udp);
+        assert_eq!(
+            via, "SIP/2.0/UDP 172.16.0.111:4060;branch=z9hG4bK-invite-branch-B",
+            "forwarded CANCEL must reuse the INVITE's top Via branch + sent-by (RFC 3261 §9.1)",
+        );
+    }
+
+    #[test]
+    fn proxy_cancel_via_branch_is_deterministic_not_fresh() {
+        // Guards the exact regression: TransactionKey::generate_branch() would
+        // yield a different (and non-matching) branch on every call.
+        let client_key = TransactionKey::new(
+            "z9hG4bK-stored-branch".to_string(),
+            Method::Invite,
+            "10.0.0.1:5060".to_string(),
+        );
+        let via_first = cancel_via_for_client_branch(&client_key, Transport::Tcp);
+        let via_second = cancel_via_for_client_branch(&client_key, Transport::Tcp);
+        assert_eq!(
+            via_first, via_second,
+            "forwarded CANCEL Via must derive from the stored client branch, \
+             never a freshly generated one",
+        );
+        assert!(
+            via_first.ends_with(";branch=z9hG4bK-stored-branch"),
+            "CANCEL branch must equal the stored INVITE branch: {via_first}",
+        );
+    }
+
+    #[test]
+    fn proxy_cancel_via_preserves_transport_and_ipv6_sent_by() {
+        // sent_by is reused verbatim from the client key — this covers the
+        // IPsec / flow / force_send_via cases where the advertised sent-by
+        // (here an IPv6 literal with a non-default protected port) differs
+        // from the default per-transport via_host.
+        let client_key = TransactionKey::new(
+            "z9hG4bK-tls-branch".to_string(),
+            Method::Invite,
+            "[2001:db8::1]:5061".to_string(),
+        );
+        let via = cancel_via_for_client_branch(&client_key, Transport::Tls);
+        assert_eq!(
+            via, "SIP/2.0/TLS [2001:db8::1]:5061;branch=z9hG4bK-tls-branch",
+        );
     }
 
     // --- Transaction integration tests ---
