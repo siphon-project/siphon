@@ -423,6 +423,25 @@ pub struct SecurityAssociationPair {
     pub expires_at: Instant,
 }
 
+/// A row of the SA-liveness snapshot ([`IpsecManager::liveness_snapshot`]):
+/// the inbound SPIs (the SAs the UE's own keepalive and MO requests land on)
+/// keyed to the UE's address and ports.  The registrar idle reaper correlates
+/// a UDP+IPsec binding to its SA via `ue_addr` and checks `spi_ps` / `spi_pc`
+/// against the kernel use-time map.
+#[derive(Debug, Clone)]
+pub struct SaLivenessRow {
+    /// UE IP address (matches a binding's `source_addr.ip()`).
+    pub ue_addr: IpAddr,
+    /// UE client port.
+    pub ue_port_c: u16,
+    /// UE server port.
+    pub ue_port_s: u16,
+    /// Inbound SA #1 SPI (UE:port_uc → PCSCF:port_ps).
+    pub spi_ps: u32,
+    /// Inbound SA #4 SPI (UE:port_us → PCSCF:port_pc).
+    pub spi_pc: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Security-Client header (3GPP TS 33.203)
 // ---------------------------------------------------------------------------
@@ -969,6 +988,36 @@ impl IpsecManager {
         self.associations.len()
     }
 
+    /// Dump the kernel XFRM SAs' last-active times (`spi → last_active_secs`,
+    /// seconds since the UNIX epoch) for the registrar's UDP+IPsec
+    /// idle-liveness sweep.
+    ///
+    /// Always reads via netlink GETSA regardless of the configured write
+    /// backend (both talk to the same kernel XFRM tables).  Linux-only;
+    /// returns an empty map on other platforms or on any netlink error, so
+    /// the caller needs no `cfg` gating — an empty map simply means "no idle
+    /// signal available this sweep", and the other liveness paths
+    /// (flow-failure, abandoned-SA sweep) still run.
+    pub async fn dump_sa_use_times(&self) -> std::collections::HashMap<u32, u64> {
+        #[cfg(target_os = "linux")]
+        {
+            match netlink::dump_sa_use_times().await {
+                Ok(map) => map,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "IPsec: SA use-time dump failed; skipping idle-liveness this sweep"
+                    );
+                    std::collections::HashMap::new()
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::collections::HashMap::new()
+        }
+    }
+
     /// Collect the contact keys of every SA pair whose sweep deadline
     /// (`expires_at`) has already passed.
     ///
@@ -1013,12 +1062,25 @@ impl IpsecManager {
     /// even when the kernel objects were already reaped on hard-lifetime
     /// (the common case, since the kernel deadline precedes the grace).
     pub async fn sweep_expired(&self) -> usize {
+        self.sweep_expired_reaped().await.len()
+    }
+
+    /// Like [`sweep_expired`](Self::sweep_expired) but returns the
+    /// `(ue_addr, ue_port_c)` of every pair reaped, so the caller can also
+    /// clear the registrar binding tied to that UE.
+    ///
+    /// This is registrar-liveness Part B.4 (SA teardown → binding removal):
+    /// when an abandoned SA pair ages out of the kernel, the matching SIP
+    /// registration should go with it rather than linger to its own
+    /// `Expires`.  The IPsec module stays free of a registrar dependency —
+    /// the dispatcher correlates the returned UE addresses back to AoRs.
+    pub async fn sweep_expired_reaped(&self) -> Vec<(IpAddr, u16)> {
         let victims = self.expired_keys(Instant::now());
         if victims.is_empty() {
-            return 0;
+            return Vec::new();
         }
 
-        let mut reaped = 0usize;
+        let mut reaped: Vec<(IpAddr, u16)> = Vec::new();
         for key in victims {
             // Re-read the entry to recover the UE address/port for
             // delete_sa_pair; if it vanished between snapshot and now
@@ -1038,11 +1100,14 @@ impl IpsecManager {
                     "IPsec: abandoned SA sweep — kernel delete failed (in-memory entry already removed)"
                 );
             }
-            reaped += 1;
+            reaped.push((ue_addr, ue_port_c));
         }
 
-        if reaped > 0 {
-            info!(reaped, "IPsec: swept abandoned SA pairs past their hard lifetime");
+        if !reaped.is_empty() {
+            info!(
+                reaped = reaped.len(),
+                "IPsec: swept abandoned SA pairs past their hard lifetime"
+            );
         }
         reaped
     }
@@ -1081,6 +1146,33 @@ impl IpsecManager {
             }
         }
         None
+    }
+
+    /// Snapshot the inbound SPIs of every active SA pair for the registrar's
+    /// UDP+IPsec idle-liveness sweep.
+    ///
+    /// One pass over the DashMap; the caller (the dispatcher's 30 s sweep)
+    /// builds whatever index it needs — typically keyed by `ue_addr` — and
+    /// checks each row's `spi_ps` / `spi_pc` against the kernel use-time map
+    /// from [`netlink::dump_sa_use_times`].  These two are the **inbound**
+    /// SAs (UE → P-CSCF, SA #1 and #4 in [`SecurityAssociationPair`]), which
+    /// the UE's RFC 6223 keepalive and every MO request land on — so their
+    /// `curlft.use_time` is the UE's liveness heartbeat.  Returning a flat
+    /// snapshot avoids the per-binding O(N) `find_sa_by_ue` walk.
+    pub fn liveness_snapshot(&self) -> Vec<SaLivenessRow> {
+        self.associations
+            .iter()
+            .map(|entry| {
+                let sa = entry.value();
+                SaLivenessRow {
+                    ue_addr: sa.ue_addr,
+                    ue_port_c: sa.ue_port_c,
+                    ue_port_s: sa.ue_port_s,
+                    spi_ps: sa.spi_ps,
+                    spi_pc: sa.spi_pc,
+                }
+            })
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -2114,5 +2206,40 @@ mod tests {
 
         assert_eq!(manager.sweep_expired().await, 0);
         assert_eq!(manager.active_count(), 1);
+    }
+
+    /// `liveness_snapshot` exposes each active pair's inbound SPIs and UE
+    /// ports so the registrar idle reaper can correlate a binding to its SA.
+    #[test]
+    fn liveness_snapshot_exposes_inbound_spis() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        let ue1: IpAddr = "192.0.2.70".parse().unwrap();
+        let ue2: IpAddr = "192.0.2.71".parse().unwrap();
+        insert_test_pair(&manager, test_sa_pair(ue1, 6900, 20000));
+        insert_test_pair(&manager, test_sa_pair(ue2, 6910, 20100));
+
+        let rows = manager.liveness_snapshot();
+        assert_eq!(rows.len(), 2);
+        let row = rows.iter().find(|r| r.ue_addr == ue1).expect("ue1 row");
+        // test_sa_pair: spi_pc = base + 2, spi_ps = base + 3.
+        assert_eq!(row.spi_ps, 20003);
+        assert_eq!(row.spi_pc, 20002);
+        assert_eq!(row.ue_port_c, 6900);
+        assert_eq!(row.ue_port_s, 6901);
+    }
+
+    /// `sweep_expired_reaped` returns the identity of each reaped pair so the
+    /// dispatcher can clear the matching registrar binding (Part B.4).
+    #[tokio::test]
+    async fn sweep_expired_reaped_returns_reaped_ue() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        let abandoned: IpAddr = "192.0.2.72".parse().unwrap();
+        let mut stale = test_sa_pair(abandoned, 6920, 20200);
+        stale.expires_at = Instant::now() - Duration::from_secs(1);
+        insert_test_pair(&manager, stale);
+
+        let reaped = manager.sweep_expired_reaped().await;
+        assert_eq!(reaped, vec![(abandoned, 6920)]);
+        assert!(!manager.has_sa(&abandoned, 6920));
     }
 }

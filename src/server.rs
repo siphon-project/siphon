@@ -874,6 +874,35 @@ impl SiphonServer {
             .and_then(|nat_config| nat_config.crlf_keepalive.as_ref())
             .map(|_| Arc::new(transport::crlf_keepalive::CrlfPongTracker::new()));
 
+        // RFC 5626 §4.2.2 flow-failure deregistration.  When registration
+        // liveness is enabled, a closed stream connection (peer FIN/RST, read
+        // error, idle timeout, or CRLF-keepalive failure) deregisters the
+        // bindings that arrived on it.  Each stream listener (TCP/TLS/WS/WSS)
+        // is handed `close_tx` and enqueues the dead `ConnectionId.0`; this
+        // task drains the channel and calls `Registrar::unregister_flow`.
+        // Left `None` when liveness is disabled so transports never enqueue
+        // (an unbounded channel with no receiver would otherwise grow).
+        let connection_close_tx: Option<flume::Sender<u64>> =
+            if config.registrar.liveness.enabled {
+                let (close_tx, close_rx) = flume::unbounded::<u64>();
+                tokio::spawn(async move {
+                    while let Ok(connection_id) = close_rx.recv_async().await {
+                        if let Some(registrar) = crate::script::api::registrar_arc() {
+                            let removed = registrar.unregister_flow(connection_id);
+                            if removed > 0 {
+                                tracing::debug!(
+                                    connection_id,
+                                    removed, "flow-failure deregistration"
+                                );
+                            }
+                        }
+                    }
+                });
+                Some(close_tx)
+            } else {
+                None
+            };
+
         // TCP
         let tcp_connection_map = Arc::new(dashmap::DashMap::new());
         // Resolve TCP listen addresses up-front so we know the
@@ -928,7 +957,7 @@ impl SiphonServer {
         // Spawn TCP listeners now that the pool exists.
         for (addr, tos, dscp) in tcp_entries {
             info!(addr = %addr, dscp = ?dscp, "starting TCP transport");
-            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone()).await;
+            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
         }
 
         if let Some(ref tls_config) = config.tls {
@@ -946,7 +975,7 @@ impl SiphonServer {
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TLS transport");
-                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone()).await;
+                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
             }
         }
 
@@ -966,7 +995,7 @@ impl SiphonServer {
             }
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WS transport");
-            transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl), tos).await;
+            transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl), tos, connection_close_tx.clone()).await;
         }
 
         // WSS
@@ -986,7 +1015,7 @@ impl SiphonServer {
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WSS transport");
-                transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl), tos).await;
+                transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl), tos, connection_close_tx.clone()).await;
             }
         }
 

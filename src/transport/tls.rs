@@ -208,6 +208,7 @@ pub async fn listen(
     tos: Option<u32>,
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
+    close_tx: Option<flume::Sender<u64>>,
 ) {
     let acceptor = build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
@@ -296,6 +297,7 @@ pub async fn listen(
                     let connection_map = connection_map.clone();
                     let addr_map = addr_map.clone();
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
+                    let close_tx = close_tx.clone();
 
                     configure_tcp_socket(&tcp_stream, tos);
 
@@ -398,6 +400,12 @@ pub async fn listen(
 
                         connection_map.remove(&connection_id);
                         addr_map.remove(&remote_addr);
+                        // RFC 5626 §4.2.2 flow failure: notify the registrar so
+                        // it can deregister any binding that arrived on this
+                        // connection.  Best-effort.
+                        if let Some(close_tx) = &close_tx {
+                            let _ = close_tx.send(connection_id.0);
+                        }
                         debug!("TLS connection {:?} cleaned up", connection_id);
                     });
                 }
@@ -536,6 +544,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -583,6 +592,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             Arc::new(DashMap::new()),
+            None,
             None,
             None,
             None,
@@ -657,6 +667,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             Arc::clone(&addr_map),
+            None,
             None,
             None,
             None,

@@ -464,17 +464,23 @@ impl PyRegistrar {
         let source_addr = request.source_socket_addr();
         let source_transport = Some(request.transport_name().to_string());
 
-        // Capture the inbound flow when the script asked for token-keyed MT
-        // routing.  Without `flow_token`, the FlowCapture is empty and the
-        // resulting Contact behaves like any pre-feature binding.
-        let flow_capture = if flow_token.is_some() {
-            crate::registrar::FlowCapture {
-                flow_token: flow_token.clone(),
-                inbound_local_addr: request.inbound_local_addr(),
-                inbound_connection_id: request.inbound_connection_id_u64(),
-            }
-        } else {
-            crate::registrar::FlowCapture::default()
+        // Capture the inbound flow.  `inbound_local_addr` is only needed for
+        // token-keyed MT routing (it drives flow-relay), so it stays gated on
+        // `flow_token` to keep `Contact.flow` behaviour unchanged for ordinary
+        // bindings.  `inbound_connection_id` is captured **always**, though:
+        // it's what RFC 5626 §4.2.2 flow-failure deregistration
+        // (`registrar.liveness`) uses to find this binding when its stream
+        // connection closes.  Harmless for UDP — `unregister_flow` and the
+        // connection index both gate on a stream transport, so a UDP binding's
+        // deterministic id is never acted on.
+        let flow_capture = crate::registrar::FlowCapture {
+            flow_token: flow_token.clone(),
+            inbound_local_addr: if flow_token.is_some() {
+                request.inbound_local_addr()
+            } else {
+                None
+            },
+            inbound_connection_id: request.inbound_connection_id_u64(),
         };
 
         // Extract expires from Expires header or default
@@ -683,18 +689,18 @@ impl PyRegistrar {
         let source_addr = request.source_socket_addr();
         let source_transport = Some(request.transport_name().to_string());
 
-        // Capture the inbound flow for token-keyed MT routing.  Same
-        // semantics as `save(flow_token=...)` — empty FlowCapture when
-        // the script didn't pass a token, so existing callers behave
-        // identically.
-        let flow_capture = if flow_token.is_some() {
-            crate::registrar::FlowCapture {
-                flow_token: flow_token.clone(),
-                inbound_local_addr: request.inbound_local_addr(),
-                inbound_connection_id: request.inbound_connection_id_u64(),
-            }
-        } else {
-            crate::registrar::FlowCapture::default()
+        // Capture the inbound flow.  `inbound_local_addr` stays gated on
+        // `flow_token` (token-keyed MT routing only); `inbound_connection_id`
+        // is captured always so RFC 5626 §4.2.2 flow-failure deregistration
+        // can find this binding when its stream connection closes.
+        let flow_capture = crate::registrar::FlowCapture {
+            flow_token: flow_token.clone(),
+            inbound_local_addr: if flow_token.is_some() {
+                request.inbound_local_addr()
+            } else {
+                None
+            },
+            inbound_connection_id: request.inbound_connection_id_u64(),
         };
 
         let cseq_seq = request_msg
@@ -1275,6 +1281,42 @@ mod tests {
         assert!(contacts[0].uri().contains("10.0.0.1"));
         assert_eq!(contacts[0].q(), 1.0);
         assert!(contacts[0].expires() > 3500);
+    }
+
+    #[test]
+    fn save_without_token_captures_connection_id_for_flow_failure() {
+        // RFC 5626 §4.2.2: an ordinary stream registration (no flow_token)
+        // must still record its inbound connection id so a connection close
+        // can deregister it via Registrar::unregister_flow.
+        let registrar = make_registrar();
+        let uri = SipUri::new("example.com".to_string());
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, uri)
+            .via("SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK-reg".to_string())
+            .to("<sip:alice@example.com>".to_string())
+            .from("<sip:alice@example.com>;tag=reg-tag".to_string())
+            .call_id("reg-call@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header("Contact", "<sip:alice@10.0.0.1:5060;transport=tcp>".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let mut request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "tcp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+        );
+        request.set_inbound_flow("127.0.0.1:5060".parse().unwrap(), 4242);
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        // No flow_token passed — the residential/general registrar path.
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+        assert!(registrar.is_registered("sip:alice@example.com"));
+
+        // A flow failure on connection 4242 deregisters the binding.
+        assert_eq!(registrar.unregister_flow(4242), 1);
+        assert!(!registrar.is_registered("sip:alice@example.com"));
     }
 
     #[test]

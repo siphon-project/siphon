@@ -37,6 +37,7 @@ pub async fn listen(
     tos: Option<u32>,
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
+    close_tx: Option<flume::Sender<u64>>,
 ) {
     // Spawn a task that distributes outbound messages to per-connection senders.
     // When no existing connection matches (`ConnectionId::default()` from fire-
@@ -132,6 +133,7 @@ pub async fn listen(
                     debug!("TCP accepted {} as {:?}", remote_addr, connection_id);
 
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
+                    let close_tx = close_tx.clone();
                     tokio::spawn(async move {
                         let local_addr = socket.local_addr().unwrap_or(local_addr);
                         let (mut reader, mut writer) = socket.into_split();
@@ -217,6 +219,14 @@ pub async fn listen(
                         }
 
                         connection_map.remove(&connection_id);
+                        // RFC 5626 §4.2.2 flow failure: tell the registrar the
+                        // inbound flow is gone so it can deregister any binding
+                        // that arrived on this connection.  Best-effort; the
+                        // drain task no-ops for connections that never
+                        // registered.
+                        if let Some(close_tx) = &close_tx {
+                            let _ = close_tx.send(connection_id.0);
+                        }
                         debug!("TCP connection {:?} cleaned up", connection_id);
                     });
                 }

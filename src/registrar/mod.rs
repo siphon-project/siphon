@@ -64,6 +64,20 @@ pub fn normalize_aor(uri: &str) -> Aor {
     }
 }
 
+/// Whether a contact's `source_transport` is a connection-oriented (stream)
+/// transport whose socket close is a flow-failure signal (RFC 5626 §4.2.2).
+///
+/// Only stream transports are tracked in the `connection_index` and eligible
+/// for `unregister_flow`: UDP `ConnectionId`s are deterministic `(local,remote)`
+/// hashes with no closable socket, so a "connection closed" notification never
+/// arrives for them.
+pub(crate) fn is_stream_transport(transport: Option<&str>) -> bool {
+    matches!(
+        transport.map(|t| t.to_ascii_lowercase()).as_deref(),
+        Some("tcp") | Some("tls") | Some("ws") | Some("wss")
+    )
+}
+
 /// What kind of registration the contact represents.
 ///
 /// `Ue` is the default — a UE-side binding that came in on a REGISTER and
@@ -261,6 +275,19 @@ pub struct Registrar {
     /// `rebuild_token_index` on `restore_from_backend` /
     /// `evict_connection_oriented`.
     tokens: DashMap<String, Aor>,
+    /// `ConnectionId.0` → AoRs whose binding arrived on that stream
+    /// connection (TCP/TLS/WS/WSS).  Reverse index for RFC 5626 §4.2.2
+    /// flow-failure deregistration: when a stream connection closes, the
+    /// transport layer notifies `unregister_flow(connection_id)`, which uses
+    /// this index to drop only the affected bindings in O(bindings-for-that-id)
+    /// instead of scanning every AoR on every connection close (scanner
+    /// churn).  UDP bindings are deliberately **excluded** — UDP
+    /// `ConnectionId`s are deterministic `(local,remote)` hashes that survive
+    /// restart and don't correspond to a closable socket.  Maintained inline
+    /// by every add/remove path that touches `bindings`; process-local, so a
+    /// restart correctly starts empty (stream contacts are dropped on restart
+    /// by `evict_connection_oriented`).
+    connection_index: DashMap<u64, Vec<Aor>>,
     pub config: RegistrarConfig,
     /// Broadcast channel for registration change events.
     event_sender: broadcast::Sender<RegistrationEvent>,
@@ -292,6 +319,7 @@ impl Registrar {
             associated_uris: DashMap::new(),
             aliases: DashMap::new(),
             tokens: DashMap::new(),
+            connection_index: DashMap::new(),
             config,
             event_sender,
             backend_writer: OnceLock::new(),
@@ -571,6 +599,11 @@ impl Registrar {
             inbound_local_addr,
             inbound_connection_id,
         } = flow;
+        // Captured before `source_transport` is moved into the Contact below;
+        // drive the stream-only connection reverse index (`inbound_connection_id`
+        // is `Copy`, so it stays usable after the struct takes it).
+        let new_connection_id = inbound_connection_id;
+        let new_is_stream = is_stream_transport(source_transport.as_deref());
         let contact = Contact {
             uri: uri.clone(),
             q,
@@ -603,12 +636,21 @@ impl Registrar {
         // keep the index update outside the bindings shard guard, but still
         // before any await/IO so concurrent readers see a consistent view.
         let mut tokens_to_remove: Vec<String> = Vec::new();
+        // Stream connection ids whose binding we drop in this critical section;
+        // pruned from `connection_index` after `drop(entry)` (same ordering as
+        // `tokens_to_remove`).
+        let mut conns_to_deindex: Vec<u64> = Vec::new();
 
-        // Remove expired contacts; harvest their tokens.
+        // Remove expired contacts; harvest their tokens + connection ids.
         contacts.retain(|c| {
             if c.is_expired() {
                 if let Some(token) = &c.flow_token {
                     tokens_to_remove.push(token.clone());
+                }
+                if is_stream_transport(c.source_transport.as_deref()) {
+                    if let Some(id) = c.inbound_connection_id {
+                        conns_to_deindex.push(id);
+                    }
                 }
                 false
             } else {
@@ -626,6 +668,11 @@ impl Registrar {
                 if c.kind == ContactKind::Ue && c.uri.to_string() == uri_string {
                     if let Some(token) = &c.flow_token {
                         tokens_to_remove.push(token.clone());
+                    }
+                    if is_stream_transport(c.source_transport.as_deref()) {
+                        if let Some(id) = c.inbound_connection_id {
+                            conns_to_deindex.push(id);
+                        }
                     }
                     false
                 } else {
@@ -657,6 +704,9 @@ impl Registrar {
             for token in &tokens_to_remove {
                 self.tokens.remove(token);
             }
+            for id in &conns_to_deindex {
+                self.deindex_connection(*id, aor);
+            }
             self.persist_aor(aor, remaining);
             if aor_empty {
                 if let Some(metrics) = crate::metrics::try_metrics() {
@@ -680,10 +730,18 @@ impl Registrar {
 
         let is_refresh = replace_idx.is_some();
         if let Some(idx) = replace_idx {
-            // Harvest the displaced contact's token so a re-REGISTER with
-            // a fresh token cleanly retires the old entry from the index.
+            // Harvest the displaced contact's token + stream connection id so a
+            // re-REGISTER (possibly over a new connection) cleanly retires the
+            // old entry from both reverse indexes.  The new binding is
+            // re-indexed below; if the connection is unchanged the deindex +
+            // reindex nets to a no-op.
             if let Some(old_token) = &contacts[idx].flow_token {
                 tokens_to_remove.push(old_token.clone());
+            }
+            if is_stream_transport(contacts[idx].source_transport.as_deref()) {
+                if let Some(id) = contacts[idx].inbound_connection_id {
+                    conns_to_deindex.push(id);
+                }
             }
             contacts[idx] = contact;
         } else {
@@ -721,6 +779,15 @@ impl Registrar {
             self.tokens.insert(token.clone(), aor_owned.clone());
         }
 
+        // Maintain the stream connection reverse index: retire the ids of any
+        // contacts dropped above (expired/displaced), then index the new
+        // binding.  Order matters when a refresh reuses the same connection —
+        // deindex first, reindex second nets to the binding staying indexed.
+        for id in &conns_to_deindex {
+            self.deindex_connection(*id, &aor_owned);
+        }
+        self.index_connection(new_connection_id, new_is_stream, &aor_owned);
+
         self.persist_aor(aor, stored);
         if is_refresh {
             self.emit_event(RegistrationEvent::Refreshed { aor: aor_owned });
@@ -743,8 +810,15 @@ impl Registrar {
         let removed = self.bindings.remove(aor);
         let had_bindings = removed.is_some();
         if let Some((_, contacts)) = removed {
-            for token in contacts.into_iter().filter_map(|c| c.flow_token) {
-                self.tokens.remove(&token);
+            for contact in contacts {
+                if let Some(token) = contact.flow_token {
+                    self.tokens.remove(&token);
+                }
+                if is_stream_transport(contact.source_transport.as_deref()) {
+                    if let Some(id) = contact.inbound_connection_id {
+                        self.deindex_connection(id, aor);
+                    }
+                }
             }
         }
         if let Some(writer) = self.backend_writer.get() {
@@ -768,8 +842,15 @@ impl Registrar {
         let primary = self.resolve_alias(aor);
         let aor = primary.as_str();
         if let Some((_, contacts)) = self.bindings.remove(aor) {
-            for token in contacts.into_iter().filter_map(|c| c.flow_token) {
-                self.tokens.remove(&token);
+            for contact in contacts {
+                if let Some(token) = contact.flow_token {
+                    self.tokens.remove(&token);
+                }
+                if is_stream_transport(contact.source_transport.as_deref()) {
+                    if let Some(id) = contact.inbound_connection_id {
+                        self.deindex_connection(id, aor);
+                    }
+                }
             }
         }
         if let Some(writer) = self.backend_writer.get() {
@@ -791,6 +872,7 @@ impl Registrar {
         // guard across the tokens DashMap write (different shards, but
         // explicit ordering keeps reasoning easy).
         let mut tokens_to_remove: Vec<String> = Vec::new();
+        let mut conns_to_deindex: Vec<(u64, String)> = Vec::new();
 
         for aor in aors {
             let before;
@@ -807,6 +889,11 @@ impl Registrar {
                     if evict {
                         if let Some(token) = &c.flow_token {
                             tokens_to_remove.push(token.clone());
+                        }
+                        if is_stream_transport(c.source_transport.as_deref()) {
+                            if let Some(id) = c.inbound_connection_id {
+                                conns_to_deindex.push((id, aor.clone()));
+                            }
                         }
                     }
                     !evict
@@ -850,6 +937,9 @@ impl Registrar {
 
         for token in &tokens_to_remove {
             self.tokens.remove(token);
+        }
+        for (id, aor) in &conns_to_deindex {
+            self.deindex_connection(*id, aor);
         }
 
         evicted
@@ -978,12 +1068,18 @@ impl Registrar {
         let primary = self.resolve_alias(aor);
         let aor = primary.as_str();
         let mut tokens_to_remove: Vec<String> = Vec::new();
+        let mut conns_to_deindex: Vec<u64> = Vec::new();
         if let Some(mut entry) = self.bindings.get_mut(aor) {
             let before = entry.value().len();
             entry.value_mut().retain(|c| {
                 if c.uri.to_string() == contact_uri {
                     if let Some(token) = &c.flow_token {
                         tokens_to_remove.push(token.clone());
+                    }
+                    if is_stream_transport(c.source_transport.as_deref()) {
+                        if let Some(id) = c.inbound_connection_id {
+                            conns_to_deindex.push(id);
+                        }
                     }
                     false
                 } else {
@@ -998,6 +1094,9 @@ impl Registrar {
             }
             for token in &tokens_to_remove {
                 self.tokens.remove(token);
+            }
+            for id in &conns_to_deindex {
+                self.deindex_connection(*id, aor);
             }
             if removed {
                 if aor_empty {
@@ -1048,8 +1147,24 @@ impl Registrar {
         let contacts = entry.value_mut();
 
         // Drop expired entries first so we don't race against a UE
-        // binding that is technically gone.
-        contacts.retain(|c| !c.is_expired());
+        // binding that is technically gone; harvest stream connection ids so
+        // the reverse index doesn't strand entries for the dropped bindings.
+        let mut conns_to_deindex: Vec<u64> = Vec::new();
+        contacts.retain(|c| {
+            if c.is_expired() {
+                if is_stream_transport(c.source_transport.as_deref()) {
+                    if let Some(id) = c.inbound_connection_id {
+                        conns_to_deindex.push(id);
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        });
+        for id in &conns_to_deindex {
+            self.deindex_connection(*id, aor);
+        }
 
         if expires_secs == 0 {
             // Targeted AS-contact removal — same URI, AS-kind only.
@@ -1255,6 +1370,133 @@ impl Registrar {
         }
     }
 
+    /// Add `aor` to the reverse connection index for a stream binding's
+    /// `connection_id`.  No-op for non-stream transports (UDP `ConnectionId`s
+    /// aren't backed by a closable socket) or when `connection_id` is `None`.
+    /// Idempotent — re-indexing the same `(id, aor)` does not duplicate it.
+    fn index_connection(&self, connection_id: Option<u64>, is_stream: bool, aor: &str) {
+        if !is_stream {
+            return;
+        }
+        if let Some(id) = connection_id {
+            let mut entry = self.connection_index.entry(id).or_default();
+            if !entry.iter().any(|a| a == aor) {
+                entry.push(aor.to_string());
+            }
+        }
+    }
+
+    /// Remove the `(connection_id → aor)` mapping from the reverse connection
+    /// index, dropping the id entry entirely once no AoRs remain under it.
+    fn deindex_connection(&self, connection_id: u64, aor: &str) {
+        if let Some(mut entry) = self.connection_index.get_mut(&connection_id) {
+            entry.retain(|a| a != aor);
+            if entry.is_empty() {
+                drop(entry);
+                self.connection_index.remove(&connection_id);
+            }
+        }
+    }
+
+    /// Deregister every UE binding that arrived on a now-dead stream
+    /// connection (RFC 5626 §4.2.2 flow failure).
+    ///
+    /// Called by the transport layer when a TCP/TLS/WS/WSS connection closes
+    /// — peer FIN/RST, read error, idle timeout, or a CRLF-keepalive failure
+    /// (`CrlfPongTracker`).  Removes only contacts whose
+    /// `inbound_connection_id` matches `connection_id` **and** whose transport
+    /// is stream (so a UDP binding that happens to carry a colliding id is
+    /// never touched); cascade-clears orphaned AS capability records once the
+    /// last UE binding for an AoR is gone (TS 24.229 §5.4.2.1.2); prunes the
+    /// `tokens` and `connection_index` reverse indexes; writes through to the
+    /// backend; updates the `registrations_active` gauge; and emits
+    /// `Deregistered` so `@registrar.on_change` fires the terminated
+    /// reg-event NOTIFY cascade.
+    ///
+    /// Returns the number of contacts removed.  O(bindings-for-that-connection);
+    /// an unknown id is an O(1) no-op — scanner/transient connections never
+    /// registered, so they were never indexed.
+    pub fn unregister_flow(&self, connection_id: u64) -> usize {
+        let aors = match self.connection_index.remove(&connection_id) {
+            Some((_, aors)) => aors,
+            None => return 0,
+        };
+
+        let mut removed_total = 0usize;
+        let mut tokens_to_remove: Vec<String> = Vec::new();
+        let mut deregistered: Vec<String> = Vec::new();
+        let mut emptied_count: i64 = 0;
+        // The index may list an AoR more than once if an earlier removal path
+        // didn't prune it; process each AoR at most once.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for aor in aors {
+            if !seen.insert(aor.clone()) {
+                continue;
+            }
+            let stored: Vec<backend::StoredContact>;
+            let emptied: bool;
+            let changed: bool;
+            {
+                let mut entry = match self.bindings.get_mut(&aor) {
+                    Some(entry) => entry,
+                    // Stale index entry — the binding was already removed by
+                    // another path.  Harmless: nothing to deregister.
+                    None => continue,
+                };
+                let before = entry.value().len();
+                entry.value_mut().retain(|c| {
+                    let drop_contact = c.inbound_connection_id == Some(connection_id)
+                        && is_stream_transport(c.source_transport.as_deref());
+                    if drop_contact {
+                        if let Some(token) = &c.flow_token {
+                            tokens_to_remove.push(token.clone());
+                        }
+                    }
+                    !drop_contact
+                });
+                removed_total += before - entry.value().len();
+                changed = entry.value().len() < before;
+                // Cascade-clear orphaned AS records once no UE binding survives.
+                let any_ue_left = entry
+                    .value()
+                    .iter()
+                    .any(|c| c.kind == ContactKind::Ue && !c.is_expired());
+                if !any_ue_left {
+                    entry.value_mut().clear();
+                }
+                emptied = entry.value().is_empty();
+                stored = entry
+                    .value()
+                    .iter()
+                    .map(backend::StoredContact::from_contact)
+                    .collect();
+            }
+            if emptied {
+                self.bindings.remove(&aor);
+                emptied_count += 1;
+            }
+            self.persist_aor(&aor, stored);
+            if changed || emptied {
+                deregistered.push(aor);
+            }
+        }
+
+        for token in &tokens_to_remove {
+            self.tokens.remove(token);
+        }
+        if emptied_count > 0 {
+            if let Some(metrics) = crate::metrics::try_metrics() {
+                metrics.registrations_active.sub(emptied_count);
+            }
+        }
+        for aor in deregistered {
+            self.emit_event(RegistrationEvent::Deregistered { aor });
+        }
+
+        removed_total
+    }
+
     /// Look up contacts by `+sip.instance` for an AoR (GRUU resolution).
     pub fn lookup_by_instance(&self, aor: &str, sip_instance: &str) -> Vec<Contact> {
         let instance = sip_instance
@@ -1422,12 +1664,19 @@ impl Registrar {
     pub fn expire_stale(&self) -> usize {
         let mut empty_aors = Vec::new();
         let mut tokens_to_remove: Vec<String> = Vec::new();
+        let mut conns_to_deindex: Vec<(u64, String)> = Vec::new();
         for mut entry in self.bindings.iter_mut() {
+            let aor_key = entry.key().clone();
             let before = entry.value().len();
             entry.value_mut().retain(|c| {
                 if c.is_expired() {
                     if let Some(token) = &c.flow_token {
                         tokens_to_remove.push(token.clone());
+                    }
+                    if is_stream_transport(c.source_transport.as_deref()) {
+                        if let Some(id) = c.inbound_connection_id {
+                            conns_to_deindex.push((id, aor_key.clone()));
+                        }
                     }
                     false
                 } else {
@@ -1450,6 +1699,9 @@ impl Registrar {
         }
         for token in &tokens_to_remove {
             self.tokens.remove(token);
+        }
+        for (id, aor) in &conns_to_deindex {
+            self.deindex_connection(*id, aor);
         }
         if !empty_aors.is_empty() {
             if let Some(metrics) = crate::metrics::try_metrics() {
@@ -1502,6 +1754,160 @@ mod tests {
 
     fn contact_uri(user: &str, host: &str) -> SipUri {
         SipUri::new(host.to_string()).with_user(user.to_string())
+    }
+
+    /// Save a binding tagged with a transport + inbound connection id, the way
+    /// a REGISTER arriving over a stream transport (or UDP) populates the flow
+    /// reverse indexes.
+    #[allow(clippy::too_many_arguments)]
+    fn save_flow(
+        registrar: &Registrar,
+        aor: &str,
+        user: &str,
+        host: &str,
+        transport: &str,
+        connection_id: Option<u64>,
+        call_id: &str,
+    ) {
+        registrar
+            .save_full(
+                aor,
+                contact_uri(user, host),
+                3600,
+                1.0,
+                call_id.into(),
+                1,
+                Some("192.0.2.10:5060".parse().unwrap()),
+                Some(transport.to_string()),
+                None,
+                None,
+                vec![],
+                FlowCapture {
+                    flow_token: None,
+                    inbound_local_addr: None,
+                    inbound_connection_id: connection_id,
+                },
+                Vec::new(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn unregister_flow_removes_only_matching_connection() {
+        let registrar = Registrar::default();
+        // Two AoRs share inbound connection 7 (e.g. a PBX trunk multiplexing
+        // registrations over one TCP socket); a third is on connection 8.
+        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
+        save_flow(&registrar, "sip:b@example.com", "b", "10.0.0.2", "tcp", Some(7), "c-b");
+        save_flow(&registrar, "sip:c@example.com", "c", "10.0.0.3", "tcp", Some(8), "c-c");
+
+        let removed = registrar.unregister_flow(7);
+        assert_eq!(removed, 2);
+        assert!(!registrar.is_registered("sip:a@example.com"));
+        assert!(!registrar.is_registered("sip:b@example.com"));
+        // Connection 8's binding is untouched.
+        assert!(registrar.is_registered("sip:c@example.com"));
+        // Index entry for 7 is consumed; a repeat call is a no-op.
+        assert_eq!(registrar.unregister_flow(7), 0);
+    }
+
+    #[test]
+    fn unregister_flow_ignores_udp_binding_with_colliding_id() {
+        let registrar = Registrar::default();
+        // A UDP binding whose deterministic ConnectionId happens to equal a
+        // stream connection id must never be torn down by flow failure — UDP
+        // has no closable socket.
+        save_flow(&registrar, "sip:stream@example.com", "s", "10.0.0.1", "tcp", Some(7), "c-s");
+        save_flow(&registrar, "sip:udp@example.com", "u", "10.0.0.2", "udp", Some(7), "c-u");
+
+        let removed = registrar.unregister_flow(7);
+        assert_eq!(removed, 1);
+        assert!(!registrar.is_registered("sip:stream@example.com"));
+        assert!(registrar.is_registered("sip:udp@example.com"));
+    }
+
+    #[test]
+    fn unregister_flow_unknown_id_is_noop() {
+        let registrar = Registrar::default();
+        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
+        assert_eq!(registrar.unregister_flow(999), 0);
+        assert!(registrar.is_registered("sip:a@example.com"));
+    }
+
+    #[test]
+    fn unregister_flow_emits_deregistered_event() {
+        let registrar = Registrar::default();
+        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tls", Some(42), "c-a");
+        // Subscribe after the save so we only observe the deregistration.
+        let mut events = registrar.subscribe_events();
+        assert_eq!(registrar.unregister_flow(42), 1);
+        match events.try_recv() {
+            Ok(RegistrationEvent::Deregistered { aor }) => {
+                assert_eq!(aor, "sip:a@example.com");
+            }
+            other => panic!("expected Deregistered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unregister_flow_removes_one_contact_keeps_siblings() {
+        let registrar = Registrar::default();
+        // Same AoR, two devices on two different connections.
+        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-1");
+        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.2", "tcp", Some(8), "c-2");
+
+        assert_eq!(registrar.unregister_flow(7), 1);
+        let contacts = registrar.lookup("sip:a@example.com");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].uri.host, "10.0.0.2");
+        // Connection 8 still indexed.
+        assert_eq!(registrar.unregister_flow(8), 1);
+        assert!(!registrar.is_registered("sip:a@example.com"));
+    }
+
+    #[test]
+    fn connection_index_pruned_by_remove_all() {
+        let registrar = Registrar::default();
+        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
+        registrar.remove_all("sip:a@example.com");
+        // Index pruned: a later flow failure for the same id finds nothing.
+        assert_eq!(registrar.unregister_flow(7), 0);
+    }
+
+    #[test]
+    fn connection_index_pruned_by_remove_contact() {
+        let registrar = Registrar::default();
+        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
+        registrar.remove_contact("sip:a@example.com", &contact_uri("a", "10.0.0.1").to_string());
+        assert_eq!(registrar.unregister_flow(7), 0);
+    }
+
+    #[test]
+    fn connection_index_pruned_by_expire_stale() {
+        let registrar = Registrar::default();
+        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
+        // Age the binding out without sleeping.
+        if let Some(mut entry) = registrar.bindings.get_mut("sip:a@example.com") {
+            for contact in entry.value_mut().iter_mut() {
+                contact.expires = Duration::ZERO;
+            }
+        }
+        assert_eq!(registrar.expire_stale(), 1);
+        assert_eq!(registrar.unregister_flow(7), 0);
+    }
+
+    #[test]
+    fn connection_index_follows_refresh_to_new_connection() {
+        let registrar = Registrar::default();
+        // Same +sip.instance re-registers over a new connection (id 7 → 8).
+        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
+        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(8), "c-a");
+        // The old connection's failure no longer deregisters the refreshed binding.
+        assert_eq!(registrar.unregister_flow(7), 0);
+        assert!(registrar.is_registered("sip:a@example.com"));
+        // The new connection's failure does.
+        assert_eq!(registrar.unregister_flow(8), 1);
+        assert!(!registrar.is_registered("sip:a@example.com"));
     }
 
     #[test]

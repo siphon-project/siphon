@@ -31,6 +31,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     remote_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    close_tx: Option<flume::Sender<u64>>,
 ) {
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
         Ok(stream) => stream,
@@ -120,6 +121,11 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     }
 
     connection_map.remove(&connection_id);
+    // RFC 5626 §4.2.2 flow failure: notify the registrar so it can deregister
+    // any binding that arrived on this WS/WSS connection.  Best-effort.
+    if let Some(close_tx) = &close_tx {
+        let _ = close_tx.send(connection_id.0);
+    }
     info!("WS connection {:?} cleaned up", connection_id);
 }
 
@@ -176,6 +182,7 @@ pub async fn listen(
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
+    close_tx: Option<flume::Sender<u64>>,
 ) {
     spawn_outbound_dispatcher(outbound_rx, connection_map.clone(), "WS");
 
@@ -198,6 +205,7 @@ pub async fn listen(
                     let connection_id = next_connection_id();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
+                    let close_tx = close_tx.clone();
 
                     configure_tcp_socket(&tcp_stream, tos);
                     info!("WS accepted {} as {:?}", remote_addr, connection_id);
@@ -212,6 +220,7 @@ pub async fn listen(
                             remote_addr,
                             inbound_tx,
                             connection_map,
+                            close_tx,
                         )
                         .await;
                     });
@@ -234,6 +243,7 @@ pub async fn listen_secure(
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
+    close_tx: Option<flume::Sender<u64>>,
 ) {
     let acceptor = crate::transport::tls::build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor for WSS: {error}");
@@ -262,6 +272,7 @@ pub async fn listen_secure(
                     let acceptor = (**acceptor.load()).clone();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
+                    let close_tx = close_tx.clone();
 
                     configure_tcp_socket(&tcp_stream, tos);
 
@@ -287,6 +298,7 @@ pub async fn listen_secure(
                             remote_addr,
                             inbound_tx,
                             connection_map,
+                            close_tx,
                         )
                         .await;
                     });
@@ -322,7 +334,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Connect as a WebSocket client
@@ -373,7 +385,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -416,7 +428,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -456,7 +468,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Build a TLS client config that trusts our self-signed cert

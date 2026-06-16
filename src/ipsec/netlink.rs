@@ -27,6 +27,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 
@@ -40,6 +41,10 @@ use super::{EncryptionAlgorithm, IntegrityAlgorithm, IpsecError};
 
 const XFRM_MSG_NEWSA: u16 = 0x10;
 const XFRM_MSG_DELSA: u16 = 0x11;
+/// Get/dump SAs.  With `NLM_F_DUMP` the kernel routes to `xfrm_dump_sa`,
+/// streaming every SA back as a sequence of `XFRM_MSG_NEWSA` messages
+/// terminated by `NLMSG_DONE`.
+const XFRM_MSG_GETSA: u16 = 0x12;
 const XFRM_MSG_NEWPOLICY: u16 = 0x13;
 const XFRM_MSG_DELPOLICY: u16 = 0x14;
 /// Update an existing SA's mutable fields (notably `lft` lifetime config).
@@ -77,6 +82,19 @@ const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_EXCL: u16 = 0x200;
+/// Dump flag (`NLM_F_ROOT | NLM_F_MATCH`) — request the whole table.
+const NLM_F_DUMP: u16 = 0x300;
+
+// Field offsets within `struct xfrm_usersa_info` (x86_64 ABI, 224 bytes):
+//   selector(56) + id(24){ daddr(16) + spi(4, BE) + proto(1) + pad(3) }
+//   + saddr(16) + lft(64)
+//   + curlft(32){ u64 bytes; u64 packets; u64 add_time; u64 use_time }
+//   + stats(12) + seq(4) + reqid(4) + family(2) + mode + replay + flags + pad.
+const SA_INFO_SPI_OFFSET: usize = 72;
+const SA_INFO_ADD_TIME_OFFSET: usize = 176;
+const SA_INFO_USE_TIME_OFFSET: usize = 184;
+/// Minimum bytes of an `xfrm_usersa_info` body we must see to read `use_time`.
+const SA_INFO_MIN_LEN: usize = SA_INFO_USE_TIME_OFFSET + 8;
 
 // Netlink message types <16 are control / errors.
 const NLMSG_ERROR: u16 = 2;
@@ -715,6 +733,135 @@ fn parse_ack(buffer: &[u8]) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// SA liveness — dump every SA's last-active time for the registrar's
+// UDP+IPsec idle reaper.  Pull-based (the kernel emits no idle notification),
+// run on the existing 30 s sweep so there is no per-packet hot-path cost.
+// ---------------------------------------------------------------------------
+
+/// Dump every XFRM SA and return `spi → last_active_secs`, where
+/// `last_active = max(curlft.add_time, curlft.use_time)` in seconds since the
+/// UNIX epoch (`ktime_get_real_seconds`).
+///
+/// Taking the max means a freshly installed SA that has not yet carried a
+/// packet (`use_time == 0`) reports its install time rather than looking
+/// infinitely idle — without this a brand-new binding would be reaped before
+/// its first keepalive.  One netlink round-trip (multipart dump); the caller
+/// reuses the map across every UE binding in a liveness sweep instead of
+/// querying per-SA.
+pub async fn dump_sa_use_times() -> Result<HashMap<u32, u64>, IpsecError> {
+    let result = tokio::task::spawn_blocking(move || -> io::Result<HashMap<u32, u64>> {
+        let socket = Socket::new(NETLINK_XFRM)?;
+        let kernel_addr = SocketAddr::new(0, 0);
+        socket.connect(&kernel_addr)?;
+
+        // Header-only GETSA dump request: no XFRMA_ADDRESS_FILTER attribute,
+        // so the kernel dumps every SA.
+        let mut request = Vec::with_capacity(NLMSG_HDR_LEN);
+        request.extend_from_slice(&(NLMSG_HDR_LEN as u32).to_ne_bytes()); // nlmsg_len
+        request.extend_from_slice(&XFRM_MSG_GETSA.to_ne_bytes());
+        request.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        request.extend_from_slice(&0u32.to_ne_bytes()); // seq
+        request.extend_from_slice(&0u32.to_ne_bytes()); // pid (kernel fills in)
+        let sent = socket.send(&request, 0)?;
+        if sent != request.len() {
+            return Err(io::Error::other(format!(
+                "netlink: short send ({}/{})",
+                sent,
+                request.len()
+            )));
+        }
+
+        let mut use_times: HashMap<u32, u64> = HashMap::new();
+        let mut response = vec![0u8; 64 * 1024];
+        'recv: loop {
+            let received = socket.recv(&mut &mut response[..], 0)?;
+            if received == 0 {
+                break;
+            }
+            let mut offset = 0usize;
+            while offset + NLMSG_HDR_LEN <= received {
+                let len = u32::from_ne_bytes([
+                    response[offset],
+                    response[offset + 1],
+                    response[offset + 2],
+                    response[offset + 3],
+                ]) as usize;
+                let msg_type = u16::from_ne_bytes([response[offset + 4], response[offset + 5]]);
+                if len < NLMSG_HDR_LEN || offset + len > received {
+                    return Err(io::Error::other("netlink: malformed dump reply"));
+                }
+                match msg_type {
+                    NLMSG_DONE => break 'recv,
+                    NLMSG_ERROR => {
+                        let errno = if len >= NLMSG_HDR_LEN + 4 {
+                            i32::from_ne_bytes([
+                                response[offset + NLMSG_HDR_LEN],
+                                response[offset + NLMSG_HDR_LEN + 1],
+                                response[offset + NLMSG_HDR_LEN + 2],
+                                response[offset + NLMSG_HDR_LEN + 3],
+                            ])
+                        } else {
+                            0
+                        };
+                        if errno != 0 {
+                            return Err(io::Error::from_raw_os_error(-errno));
+                        }
+                        break 'recv; // errno 0 terminates the dump
+                    }
+                    XFRM_MSG_NEWSA => {
+                        let body = offset + NLMSG_HDR_LEN;
+                        if let Some((spi, last_active)) =
+                            parse_sa_use_time(&response[body..offset + len])
+                        {
+                            use_times.insert(spi, last_active);
+                        }
+                    }
+                    _ => {}
+                }
+                offset += align_to(len, NLMSG_ALIGNTO);
+            }
+        }
+        Ok(use_times)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(map)) => Ok(map),
+        Ok(Err(error)) => Err(IpsecError::Command(format!("xfrm GETSA dump: {error}"))),
+        Err(join_error) => Err(IpsecError::Command(format!(
+            "xfrm GETSA dump task panic: {join_error}"
+        ))),
+    }
+}
+
+/// Extract `(spi, last_active_secs)` from a `struct xfrm_usersa_info` body
+/// (the netlink message payload after the 16-byte header).  `last_active` is
+/// `max(curlft.add_time, curlft.use_time)`.  Returns `None` when the slice is
+/// shorter than the fields we read (defensive against a truncated reply).
+fn parse_sa_use_time(info: &[u8]) -> Option<(u32, u64)> {
+    if info.len() < SA_INFO_MIN_LEN {
+        return None;
+    }
+    let spi = u32::from_be_bytes([
+        info[SA_INFO_SPI_OFFSET],
+        info[SA_INFO_SPI_OFFSET + 1],
+        info[SA_INFO_SPI_OFFSET + 2],
+        info[SA_INFO_SPI_OFFSET + 3],
+    ]);
+    let add_time = u64::from_ne_bytes(
+        info[SA_INFO_ADD_TIME_OFFSET..SA_INFO_ADD_TIME_OFFSET + 8]
+            .try_into()
+            .ok()?,
+    );
+    let use_time = u64::from_ne_bytes(
+        info[SA_INFO_USE_TIME_OFFSET..SA_INFO_USE_TIME_OFFSET + 8]
+            .try_into()
+            .ok()?,
+    );
+    Some((spi, add_time.max(use_time)))
+}
+
+// ---------------------------------------------------------------------------
 // Tests — byte-level correctness of the marshalling, no kernel needed.
 // ---------------------------------------------------------------------------
 
@@ -1159,5 +1306,53 @@ mod tests {
         // 24 id + 2 family + 16 saddr + 4 reqid + 1 mode + 1 share + 1 opt + 1 pad
         // + 4 aalgos + 4 ealgos + 4 calgos = 62.  The kernel pads to 64.
         assert_eq!(out.len(), 64);
+    }
+
+    /// The hand-coded `xfrm_usersa_info` field offsets used by the liveness
+    /// SA dump must track the repr(C) struct layout (selector 56 + id 24 +
+    /// saddr 16 + lft 64, then curlft{ bytes, packets, add_time, use_time }).
+    #[test]
+    fn sa_info_offsets_match_struct_layout() {
+        assert_eq!(SA_INFO_SPI_OFFSET, 56 + 16); // selector + id.daddr
+        assert_eq!(SA_INFO_ADD_TIME_OFFSET, 56 + 24 + 16 + 64 + 16); // + curlft{bytes,packets}
+        assert_eq!(SA_INFO_USE_TIME_OFFSET, SA_INFO_ADD_TIME_OFFSET + 8);
+        assert_eq!(SA_INFO_MIN_LEN, SA_INFO_USE_TIME_OFFSET + 8);
+    }
+
+    #[test]
+    fn parse_sa_use_time_reads_spi_and_uses_max_of_add_and_use() {
+        let mut info = vec![0u8; 224];
+        let spi: u32 = 0x10203040;
+        info[SA_INFO_SPI_OFFSET..SA_INFO_SPI_OFFSET + 4].copy_from_slice(&spi.to_be_bytes());
+        let add_time: u64 = 1_700_000_000;
+        let use_time: u64 = 1_700_000_090;
+        info[SA_INFO_ADD_TIME_OFFSET..SA_INFO_ADD_TIME_OFFSET + 8]
+            .copy_from_slice(&add_time.to_ne_bytes());
+        info[SA_INFO_USE_TIME_OFFSET..SA_INFO_USE_TIME_OFFSET + 8]
+            .copy_from_slice(&use_time.to_ne_bytes());
+
+        let (parsed_spi, last_active) = parse_sa_use_time(&info).expect("should parse");
+        assert_eq!(parsed_spi, spi);
+        assert_eq!(last_active, use_time, "use_time > add_time → last_active = use_time");
+    }
+
+    #[test]
+    fn parse_sa_use_time_falls_back_to_add_time_when_never_used() {
+        let mut info = vec![0u8; 224];
+        let spi: u32 = 0xDEAD_BEEF;
+        info[SA_INFO_SPI_OFFSET..SA_INFO_SPI_OFFSET + 4].copy_from_slice(&spi.to_be_bytes());
+        let add_time: u64 = 1_700_000_500;
+        info[SA_INFO_ADD_TIME_OFFSET..SA_INFO_ADD_TIME_OFFSET + 8]
+            .copy_from_slice(&add_time.to_ne_bytes());
+        // use_time stays 0 — SA installed but no packet seen yet.
+        let (parsed_spi, last_active) = parse_sa_use_time(&info).expect("should parse");
+        assert_eq!(parsed_spi, spi);
+        assert_eq!(last_active, add_time, "use_time == 0 → fall back to add_time");
+    }
+
+    #[test]
+    fn parse_sa_use_time_rejects_short_body() {
+        let info = vec![0u8; SA_INFO_MIN_LEN - 1];
+        assert!(parse_sa_use_time(&info).is_none());
     }
 }

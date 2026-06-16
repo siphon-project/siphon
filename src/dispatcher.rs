@@ -132,6 +132,10 @@ struct DispatcherState {
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     /// IPsec config (P-CSCF ports).
     ipsec_config: Option<crate::config::IpsecConfig>,
+    /// Registrar liveness knobs (network-initiated deregistration).  Cloned
+    /// from `config.registrar.liveness`; `enabled == false` (the default)
+    /// makes the whole UDP+IPsec idle sweep a no-op.
+    registrar_liveness: crate::config::RegistrarLivenessConfig,
     /// Outbound TCP/TLS connection pool for relay to new destinations.
     connection_pool: Arc<ConnectionPool>,
     /// Reverse map: TLS remote SocketAddr → ConnectionId for connection reuse.
@@ -493,6 +497,7 @@ pub async fn run(
             .map(|srs_config| Arc::new(crate::srs::SrsManager::new(srs_config.clone()))),
         ipsec_manager,
         ipsec_config,
+        registrar_liveness: config.registrar.liveness.clone(),
         connection_pool,
         tls_addr_map,
         nat_fix_contact: config.nat.as_ref().map(|n| n.fix_contact).unwrap_or(false),
@@ -1790,9 +1795,25 @@ async fn sweep_stale_entries(state: &DispatcherState) {
     // (new expires_at) before this deadline, so only truly-abandoned UEs are
     // reaped. None when no P-CSCF/ipsec role is configured.
     let (expired_ipsec_sas, ipsec_sa_pairs) = match crate::ipsec::global_manager() {
-        Some(manager) => (manager.sweep_expired().await as u64, manager.active_count()),
+        Some(manager) => {
+            let reaped = manager.sweep_expired_reaped().await;
+            // Registrar-liveness Part B.4: an abandoned UE's SA pair just
+            // aged out of the kernel — its SIP registration should go with it
+            // rather than linger to its own Expires.  Only when liveness is on.
+            if state.registrar_liveness.enabled && !reaped.is_empty() {
+                liveness_dereg_reaped_sas(state, &reaped).await;
+            }
+            (reaped.len() as u64, manager.active_count())
+        }
         None => (0, 0),
     };
+
+    // Registrar-liveness Part B: UDP+IPsec idle detection (kernel SA use-time
+    // poll → one OPTIONS probe → deregister on no answer).  No-op unless
+    // enabled and a P-CSCF IPsec role is configured.
+    if state.registrar_liveness.enabled {
+        sweep_registrar_liveness(state).await;
+    }
 
     if let Some(metrics) = crate::metrics::try_metrics() {
         metrics.uac_pending_requests.set(uac_pending as i64);
@@ -1831,6 +1852,348 @@ async fn sweep_stale_entries(state: &DispatcherState) {
             "stale entry cleanup"
         );
     }
+}
+
+// ===========================================================================
+// Registrar liveness — UDP+IPsec idle detection + network-initiated dereg.
+// (TCP/TLS flow-failure dereg is handled at the transport layer via the
+// connection-close channel → Registrar::unregister_flow.)
+// ===========================================================================
+
+/// Everything a detached liveness-dereg task needs, cloned out of
+/// `DispatcherState` so the task is `'static`.
+#[derive(Clone)]
+struct LivenessDeregCtx {
+    registrar: Arc<Registrar>,
+    ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
+    uac_sender: Arc<UacSender>,
+    dns_resolver: Arc<SipResolver>,
+    dereg_mode: crate::config::LivenessDeregMode,
+}
+
+impl LivenessDeregCtx {
+    fn from_state(state: &DispatcherState, registrar: Arc<Registrar>) -> Self {
+        Self {
+            registrar,
+            ipsec_manager: state.ipsec_manager.clone(),
+            uac_sender: Arc::clone(&state.uac_sender),
+            dns_resolver: Arc::clone(&state.dns_resolver),
+            dereg_mode: state.registrar_liveness.dereg_mode,
+        }
+    }
+}
+
+/// Part B.4 — an abandoned UE's SA pair was just reaped from the kernel;
+/// remove the matching registrar binding(s) so the registration doesn't
+/// linger to its own `Expires`.  Runs synchronously in the sweep because the
+/// reaped set is small and the dereg is local + (optionally) one upstream
+/// REGISTER.
+async fn liveness_dereg_reaped_sas(state: &DispatcherState, reaped: &[(std::net::IpAddr, u16)]) {
+    let registrar = match crate::script::api::registrar_arc() {
+        Some(registrar) => Arc::clone(registrar),
+        None => return,
+    };
+    let context = LivenessDeregCtx::from_state(state, registrar);
+    let reaped_ips: std::collections::HashSet<std::net::IpAddr> =
+        reaped.iter().map(|(ip, _)| *ip).collect();
+    let port_for: std::collections::HashMap<std::net::IpAddr, u16> =
+        reaped.iter().map(|(ip, port)| (*ip, *port)).collect();
+
+    for (aor, contact) in context.registrar.all_contacts() {
+        let ue_ip = match contact.source_addr {
+            Some(addr) => addr.ip(),
+            None => continue,
+        };
+        if !reaped_ips.contains(&ue_ip) {
+            continue;
+        }
+        let ue_port_c = port_for.get(&ue_ip).copied();
+        liveness_dereg_contact(&context, &aor, &contact, ue_port_c).await;
+    }
+}
+
+/// Part B — UDP+IPsec idle-liveness sweep.  Polls the kernel SA use-times,
+/// flags bindings whose SA has been silent beyond
+/// `idle_multiplier × keepalive_interval`, and spawns a one-shot OPTIONS
+/// probe that deregisters on no answer.  A live UE's response is itself
+/// inbound protected traffic, so it refreshes the SA use-time and clears the
+/// suspect state on the next sweep.
+async fn sweep_registrar_liveness(state: &DispatcherState) {
+    let manager = match &state.ipsec_manager {
+        Some(manager) => manager,
+        None => return, // no P-CSCF IPsec role → no UDP+IPsec bindings to age
+    };
+    let registrar = match crate::script::api::registrar_arc() {
+        Some(registrar) => Arc::clone(registrar),
+        None => return,
+    };
+
+    let use_times = manager.dump_sa_use_times().await;
+    if use_times.is_empty() {
+        return; // no SAs, or the dump is unavailable on this platform
+    }
+    let snapshot = manager.liveness_snapshot();
+    if snapshot.is_empty() {
+        return;
+    }
+    // One registration per UE IP in an IPsec P-CSCF — index the SA rows by IP.
+    let mut sa_by_ip: std::collections::HashMap<std::net::IpAddr, crate::ipsec::SaLivenessRow> =
+        std::collections::HashMap::with_capacity(snapshot.len());
+    for row in snapshot {
+        sa_by_ip.insert(row.ue_addr, row);
+    }
+
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_secs(),
+        Err(_) => return,
+    };
+    let liveness = &state.registrar_liveness;
+    let idle_window =
+        liveness.keepalive_interval_secs as u64 * liveness.idle_multiplier.max(1) as u64;
+    let probe_timeout = std::time::Duration::from_millis(liveness.probe_timeout_ms);
+    let context = LivenessDeregCtx::from_state(state, registrar);
+
+    for (aor, contact) in context.registrar.all_contacts() {
+        // UDP only — stream transports are covered by flow-failure dereg.
+        if !contact
+            .source_transport
+            .as_deref()
+            .is_some_and(|transport| transport.eq_ignore_ascii_case("udp"))
+        {
+            continue;
+        }
+        let ue_addr = match contact.source_addr {
+            Some(addr) => addr,
+            None => continue,
+        };
+        let row = match sa_by_ip.get(&ue_addr.ip()) {
+            Some(row) => row,
+            None => continue, // not an IPsec-protected UE
+        };
+
+        // Most recent inbound activity across the two inbound SAs (the SAs the
+        // UE's keepalive / MO requests land on).
+        let last_active = use_times
+            .get(&row.spi_ps)
+            .copied()
+            .unwrap_or(0)
+            .max(use_times.get(&row.spi_pc).copied().unwrap_or(0));
+        if last_active == 0 {
+            // Neither inbound SA is currently in the kernel dump — likely a
+            // dump/snapshot race or an SA mid-teardown.  Genuine teardown is
+            // handled by the abandoned-SA sweep (Part B.4); skip here to avoid
+            // false deregistration.
+            continue;
+        }
+        if now.saturating_sub(last_active) <= idle_window {
+            continue; // recently active
+        }
+
+        // Suspect.  Resolve the IPsec egress pin (source addr/transport) now,
+        // then detach the probe so a slow UE can't stall the sweep.
+        let (source_local_addr, transport) =
+            crate::script::api::ipsec::outbound_for(ue_addr, Transport::Udp).unwrap_or_else(|| {
+                (
+                    contact.inbound_local_addr.unwrap_or(ue_addr),
+                    Transport::Udp,
+                )
+            });
+        let context = context.clone();
+        let aor = aor.clone();
+        let contact = contact.clone();
+        let ue_port_c = row.ue_port_c;
+        tokio::spawn(async move {
+            liveness_probe_then_dereg(
+                context,
+                aor,
+                contact,
+                ue_port_c,
+                source_local_addr,
+                transport,
+                probe_timeout,
+            )
+            .await;
+        });
+    }
+}
+
+/// Send one OPTIONS over the captured flow (with a single retry); if the UE
+/// answers, leave the binding alone — its response refreshed the SA use-time.
+/// On no answer, run the dereg funnel.
+async fn liveness_probe_then_dereg(
+    context: LivenessDeregCtx,
+    aor: String,
+    contact: crate::registrar::Contact,
+    ue_port_c: u16,
+    source_local_addr: SocketAddr,
+    transport: Transport,
+    probe_timeout: std::time::Duration,
+) {
+    let destination = match contact.source_addr {
+        Some(addr) => addr,
+        None => return,
+    };
+    let request_uri = contact.uri.clone();
+
+    for attempt in 0..2 {
+        let receiver = context.uac_sender.send_options_over_flow(
+            destination,
+            source_local_addr,
+            transport,
+            ConnectionId::default(),
+            request_uri.clone(),
+        );
+        if let Ok(Ok(crate::uac::UacResult::Response(_))) =
+            tokio::time::timeout(probe_timeout, receiver).await
+        {
+            debug!(aor = %aor, attempt, "registrar liveness: UE answered OPTIONS probe — keeping binding");
+            return;
+        }
+    }
+
+    debug!(aor = %aor, ue = %destination, "registrar liveness: UE silent + unprobeable — deregistering");
+    liveness_dereg_contact(&context, &aor, &contact, Some(ue_port_c)).await;
+}
+
+/// The shared dereg funnel for both the idle-probe path and the SA-teardown
+/// path.  Removes the local binding (which emits `Deregistered` →
+/// `@registrar.on_change` → the terminated reg-event NOTIFY), tears down the
+/// UE's IPsec SA, and — for a P-CSCF cache binding under `network_dereg` —
+/// synthesizes a de-REGISTER (`Expires: 0`) toward the S-CSCF so the
+/// registrar of record clears the binding too.
+async fn liveness_dereg_contact(
+    context: &LivenessDeregCtx,
+    aor: &str,
+    contact: &crate::registrar::Contact,
+    ue_port_c: Option<u16>,
+) {
+    let contact_uri = contact.uri.to_string();
+
+    // 1. P-CSCF network de-REGISTER (before dropping local state, while the
+    //    Service-Route is still available).  Only for a proxy-cached binding
+    //    (one carrying a flow_token) under network-dereg mode.
+    if context.dereg_mode == crate::config::LivenessDeregMode::NetworkDereg
+        && contact.flow_token.is_some()
+    {
+        send_liveness_network_dereg(context, aor, &contact_uri).await;
+    }
+
+    // 2. Drop the local binding — emits Deregistered → on_change cascade.
+    context.registrar.remove_contact(aor, &contact_uri);
+
+    // 3. Tear down the UE's IPsec SA so the kernel state goes with the binding.
+    if let (Some(manager), Some(ue_addr), Some(ue_port_c)) =
+        (&context.ipsec_manager, contact.source_addr, ue_port_c)
+    {
+        if let Err(error) = manager.delete_sa_pair(&ue_addr.ip(), ue_port_c).await {
+            debug!(aor = %aor, %error, "registrar liveness: IPsec SA teardown failed (may already be gone)");
+        }
+    }
+}
+
+/// Synthesize and fire-and-forget a de-REGISTER (`Expires: 0`) toward the
+/// S-CSCF via the binding's stored Service-Route, on the UE's behalf.
+async fn send_liveness_network_dereg(context: &LivenessDeregCtx, aor: &str, contact_uri: &str) {
+    let routes = context.registrar.service_routes(aor);
+    let top_route = match routes.first() {
+        Some(route) => route.clone(),
+        None => {
+            debug!(aor = %aor, "registrar liveness: no Service-Route — skipping network de-REGISTER");
+            return;
+        }
+    };
+
+    // Resolve the top Service-Route to a next hop.
+    let route_uri = match parse_route_uri(&top_route) {
+        Some(uri) => uri,
+        None => {
+            warn!(aor = %aor, route = %top_route, "registrar liveness: unparseable Service-Route");
+            return;
+        }
+    };
+    let scheme = if route_uri.scheme == "sips" { "sips" } else { "sip" };
+    let targets = context
+        .dns_resolver
+        .resolve(&route_uri.host, route_uri.port, scheme, Some("udp"))
+        .await;
+    let destination = match targets.first() {
+        Some(target) => target.address,
+        None => {
+            warn!(aor = %aor, host = %route_uri.host, "registrar liveness: Service-Route did not resolve");
+            return;
+        }
+    };
+
+    let register = match build_dereg_register(aor, contact_uri, &routes, destination) {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(aor = %aor, %error, "registrar liveness: failed to build de-REGISTER");
+            return;
+        }
+    };
+    debug!(aor = %aor, %destination, "registrar liveness: sending network de-REGISTER (Expires: 0)");
+    context
+        .uac_sender
+        .send_request(register, destination, Transport::Udp);
+}
+
+/// Parse a Route/Service-Route header value (`<sip:host:port;lr>`) into a
+/// `SipUri`.
+fn parse_route_uri(route: &str) -> Option<SipUri> {
+    let trimmed = route.trim();
+    let inner = trimmed
+        .strip_prefix('<')
+        .and_then(|rest| rest.split('>').next())
+        .unwrap_or(trimmed);
+    parse_uri_standalone(inner).ok()
+}
+
+/// Build a de-REGISTER (REGISTER with `Expires: 0`) on the UE's behalf,
+/// routed to the S-CSCF via the stored Service-Route(s).
+///
+/// - R-URI is the registrar domain (the AoR's host).
+/// - To/From are the AoR; Contact is the UE's binding with `;expires=0`.
+/// - `Route` carries the Service-Route set so the request reaches the same
+///   S-CSCF that granted the registration.
+fn build_dereg_register(
+    aor: &str,
+    contact_uri: &str,
+    routes: &[String],
+    destination: SocketAddr,
+) -> Result<SipMessage, String> {
+    let aor_uri = parse_uri_standalone(aor).ok();
+    let domain = aor_uri
+        .as_ref()
+        .map(|uri| uri.host.clone())
+        .unwrap_or_else(|| destination.ip().to_string());
+    let request_uri = SipUri::new(domain);
+
+    let branch = format!("z9hG4bK-liveness-{}", uuid::Uuid::new_v4());
+    let via = format!(
+        "SIP/2.0/UDP {}:{};branch={}",
+        destination.ip(),
+        destination.port(),
+        branch
+    );
+    let from_tag = uuid::Uuid::new_v4();
+    let call_id = format!("liveness-dereg-{}", uuid::Uuid::new_v4());
+
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Register, request_uri)
+        .via(via)
+        .from(format!("<{aor}>;tag=liveness-{from_tag}"))
+        .to(format!("<{aor}>"))
+        .call_id(call_id)
+        .cseq("1 REGISTER".to_string())
+        .max_forwards(70)
+        .header("Contact", format!("<{contact_uri}>;expires=0"))
+        .header("Expires", "0".to_string());
+
+    for route in routes {
+        builder = builder.header("Route", route.clone());
+    }
+
+    builder.content_length(0).build()
 }
 
 /// Handle a single inbound SIP message (request or response).
@@ -10813,6 +11176,53 @@ mod tests {
     use crate::sip::message::Method;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    #[test]
+    fn build_dereg_register_has_expires_zero_routes_and_aor() {
+        let destination = "192.0.2.5:6060".parse().unwrap();
+        let routes = vec!["<sip:scscf.example.com:6060;lr>".to_string()];
+        let message = build_dereg_register(
+            "sip:alice@example.com",
+            "sip:alice@10.0.0.1:5060",
+            &routes,
+            destination,
+        )
+        .expect("de-REGISTER builds");
+        let wire = String::from_utf8(message.to_bytes()).unwrap();
+
+        // R-URI is the registrar domain (AoR host), not the contact.
+        assert!(
+            wire.starts_with("REGISTER sip:example.com SIP/2.0\r\n"),
+            "request line wrong:\n{wire}"
+        );
+        assert!(wire.contains("Expires: 0\r\n"), "missing Expires: 0:\n{wire}");
+        assert!(
+            wire.contains("Contact: <sip:alice@10.0.0.1:5060>;expires=0"),
+            "missing deregistering Contact:\n{wire}"
+        );
+        assert!(
+            wire.contains("Route: <sip:scscf.example.com:6060;lr>"),
+            "missing Service-Route:\n{wire}"
+        );
+        assert!(wire.contains("To: <sip:alice@example.com>"), "missing To:\n{wire}");
+        assert!(
+            wire.contains("From: <sip:alice@example.com>;tag=liveness-"),
+            "missing From with liveness tag:\n{wire}"
+        );
+        assert!(wire.contains("CSeq: 1 REGISTER"), "missing CSeq:\n{wire}");
+    }
+
+    #[test]
+    fn parse_route_uri_strips_brackets_and_keeps_hostport() {
+        let uri = parse_route_uri("<sip:scscf.example.com:6060;lr>").expect("parses");
+        assert_eq!(uri.host, "scscf.example.com");
+        assert_eq!(uri.port, Some(6060));
+
+        let secure = parse_route_uri("  <sips:scscf2.example.com;lr>  ").expect("parses");
+        assert_eq!(secure.scheme, "sips");
+        assert_eq!(secure.host, "scscf2.example.com");
+        assert_eq!(secure.port, None);
+    }
 
     #[test]
     fn drain_state_default_counts_zero_when_managers_unset() {

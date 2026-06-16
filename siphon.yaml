@@ -113,6 +113,28 @@ registrar:
   #   url: "postgres://user:pass@localhost/siphon"
   #   table: "registrar"
 
+  # Registration liveness — network-initiated deregistration when a UE
+  # vanishes without a SIP de-REGISTER (default off until proven in the field).
+  # With it off, siphon behaves exactly as before (Expires-only).
+  #   - TCP/TLS/WS/WSS: the binding is removed when its inbound connection
+  #     closes (peer FIN/RST, read error, idle timeout, or CRLF-keepalive
+  #     failure) — RFC 5626 §4.2.2 flow failure.
+  #   - UDP+IPsec (Gm): an idle binding is detected by polling the kernel XFRM
+  #     SA inbound use-time (no per-packet cost; the UE's RFC 6223 keepalive
+  #     keeps the SA warm). Silence beyond idle_multiplier × keepalive_interval
+  #     triggers one OPTIONS probe; no answer → deregister.
+  # liveness:
+  #   enabled: false               # master switch
+  #   keepalive_interval_secs: 30  # RFC 6223 Flow-Timer / NAT keepalive cadence
+  #   idle_multiplier: 3           # grace = idle_multiplier × keepalive (~90 s)
+  #   probe_timeout_ms: 2000       # per-attempt OPTIONS probe timeout
+  #   dereg_mode: network_dereg    # network_dereg | local_only
+  #     # network_dereg: a P-CSCF cache binding also synthesizes a de-REGISTER
+  #     #   (Expires: 0) toward the S-CSCF via the stored Service-Route, so the
+  #     #   registrar of record clears the binding too.
+  #     # local_only: drop local state + emit on_change only (use on the box
+  #     #   that IS the registrar of record).
+
 # ---------------------------------------------------------------------------
 # Registrant — Outbound REGISTER Client (Carrier Trunk Registration)
 # ---------------------------------------------------------------------------

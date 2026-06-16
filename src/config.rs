@@ -451,6 +451,11 @@ pub struct RegistrarConfig {
     pub max_contacts: Option<u32>,
     pub redis: Option<RedisBackendConfig>,
     pub postgres: Option<PostgresBackendConfig>,
+    /// Registration liveness — network-initiated deregistration when a UE
+    /// vanishes without a SIP de-REGISTER (flow failure on TCP/TLS, idle
+    /// IPsec SA on UDP).  Default off.
+    #[serde(default)]
+    pub liveness: RegistrarLivenessConfig,
 }
 
 impl Default for RegistrarConfig {
@@ -463,8 +468,71 @@ impl Default for RegistrarConfig {
             max_contacts: None,
             redis: None,
             postgres: None,
+            liveness: RegistrarLivenessConfig::default(),
         }
     }
+}
+
+/// Registration-liveness configuration (network-initiated deregistration).
+///
+/// When `enabled`, siphon clears a registration on its own initiative once it
+/// detects the UE is gone, instead of waiting for the SIP `Expires` timer
+/// (often hours):
+///   - **TCP/TLS/WS/WSS**: the binding is removed when its inbound connection
+///     closes (peer FIN/RST, read error, idle timeout, or CRLF-keepalive
+///     failure) — RFC 5626 §4.2.2 flow failure.
+///   - **UDP+IPsec**: an idle binding is detected by polling the kernel XFRM
+///     SA inbound use-time; the UE's RFC 6223 keepalive (~every 30 s) keeps
+///     the SA warm, so silence beyond `idle_multiplier × keepalive_interval`
+///     marks the binding suspect.  A single OPTIONS probe confirms before the
+///     binding is deregistered.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct RegistrarLivenessConfig {
+    /// Master switch.  Default `false` until the feature is proven in the
+    /// field; with it off, siphon behaves exactly as before (Expires-only).
+    pub enabled: bool,
+    /// Negotiated UE keepalive cadence in seconds (RFC 6223 Flow-Timer / NAT
+    /// keepalive).  Used as the base unit for the UDP+IPsec idle window.
+    pub keepalive_interval_secs: u32,
+    /// Grace multiplier: a UDP+IPsec binding is suspect after
+    /// `idle_multiplier × keepalive_interval_secs` of SA silence.  Default 3
+    /// (~90 s against a 30 s keepalive) survives a brief radio blip or a
+    /// single dropped keepalive without false-deregistering a live UE.
+    pub idle_multiplier: u32,
+    /// Per-attempt timeout (milliseconds) for the one-shot OPTIONS liveness
+    /// probe sent to a suspect UDP+IPsec binding before deregistration.
+    pub probe_timeout_ms: u64,
+    /// What to do once a binding is declared dead.
+    pub dereg_mode: LivenessDeregMode,
+}
+
+impl Default for RegistrarLivenessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keepalive_interval_secs: 30,
+            idle_multiplier: 3,
+            probe_timeout_ms: 2000,
+            dereg_mode: LivenessDeregMode::NetworkDereg,
+        }
+    }
+}
+
+/// How siphon clears a binding once liveness detection declares the UE dead.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LivenessDeregMode {
+    /// Authoritative registrar (S-CSCF / single box): drop the binding locally
+    /// and emit the `@registrar.on_change` cascade.  P-CSCF cache: additionally
+    /// synthesize a de-REGISTER (`Expires: 0`) on the UE's behalf toward the
+    /// S-CSCF so the registrar of record also clears the binding.
+    NetworkDereg,
+    /// Drop local state only (binding + IPsec SA) and emit the local
+    /// `on_change` event; never synthesize an upstream de-REGISTER.  Use on a
+    /// box that is the registrar of record, where the reg-event NOTIFY already
+    /// propagates the teardown.
+    LocalOnly,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
