@@ -8699,6 +8699,52 @@ fn handle_b2bua_response(
                 if let Some(challenge_value) = challenge_header {
                     if let Some(challenge) = crate::auth::parse_challenge(challenge_value) {
                         if let (Some(target_uri), Some(stored_invite_arc)) = (&b_leg_target, &b_leg_stored_invite) {
+                            // RFC 3261 §17.1.1.3: the INVITE client transaction
+                            // MUST ACK every non-2xx final response on the branch
+                            // it arrived on — the first 401/407 AND every
+                            // retransmit. The trunk's server transaction keeps
+                            // retransmitting the challenge until this ACK lands;
+                            // skipping it (the old behaviour — this path returned
+                            // before the non-2xx ACK below) leaves the trunk
+                            // retransmitting until Timer B and feeds the re-retry
+                            // bug guarded against next.
+                            if let Some((b_dest, b_transport)) = b_leg_dest {
+                                let ack = build_b2bua_ack_for_non2xx(
+                                    message,
+                                    branch,
+                                    b_leg_target.as_deref(),
+                                    b_transport,
+                                    state.local_addr,
+                                );
+                                send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                            }
+
+                            // Only the FIRST challenge on this leg drives a retry.
+                            // A retransmitted 401/407 on the same branch is the
+                            // trunk re-sending its non-2xx (we just re-ACKed it),
+                            // NOT a fresh challenge. Re-challenging would emit a
+                            // second authenticated INVITE at the same CSeq on a
+                            // new branch; the trunk sees a merged request
+                            // (RFC 3261 §8.2.2.2) and replies 482, and we end up
+                            // with two outstanding UAC branches where the real
+                            // 2xx lands on the first while our state tracks the
+                            // second — the 2xx then never gets ACKed and the
+                            // trunk BYEs the call. A chained re-challenge (stale
+                            // nonce) lands on the *retry* leg's branch, a distinct
+                            // B-leg, so legitimate re-auth still proceeds.
+                            let first_challenge = b_leg_index
+                                .map(|idx| state.call_actors.try_mark_auth_challenged(call_id, idx))
+                                .unwrap_or(true);
+                            if !first_challenge {
+                                debug!(
+                                    call_id = %call_id,
+                                    branch = %branch,
+                                    status = status_code,
+                                    "B2BUA: absorbing retransmitted challenge (auth retry already sent on this leg)"
+                                );
+                                return;
+                            }
+
                             // RFC 7616 §3.3: nc starts at 1 for a fresh server
                             // nonce and increments on every reuse. The
                                 // per-call NonceCounter resets internally when
@@ -11246,6 +11292,55 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         // SDP body untouched (rtpengine had already anchored ports/crypto).
         assert_eq!(retry.body, original.body);
+    }
+
+    /// The B2BUA must ACK a 401/407 on the outbound leg before (and while)
+    /// retrying with credentials — RFC 3261 §17.1.1.3. Prior to the fix the
+    /// 401-retry path returned without ever building this ACK, so the trunk
+    /// kept retransmitting the challenge. The ACK must reuse the original
+    /// INVITE's Via branch (hop-by-hop) and carry the UAS To-tag from the 401.
+    #[test]
+    fn build_b2bua_ack_for_401_uses_invite_branch_and_response_to_tag() {
+        let response = SipMessageBuilder::new()
+            .response(401, "Unauthorized".to_string())
+            .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-orig".to_string())
+            .from("<sip:alice@siphon.example.org>;tag=b-leg-from".to_string())
+            .to("<sip:bob@trunk.example.net>;tag=uas-12345".to_string())
+            .call_id("b2b-aaaa-bbbb".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let local_addr: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+        let ack = build_b2bua_ack_for_non2xx(
+            &response,
+            "z9hG4bK-orig",
+            Some("sip:bob@trunk.example.net"),
+            Transport::Udp,
+            local_addr,
+        );
+
+        // Method line is ACK to the dial target.
+        match &ack.start_line {
+            StartLine::Request(rl) => {
+                assert_eq!(rl.method, Method::Ack);
+                assert_eq!(rl.request_uri.host, "trunk.example.net");
+            }
+            _ => panic!("expected an ACK request line"),
+        }
+
+        // Same Via branch as the INVITE it acknowledges (RFC 3261 §17.1.1.3).
+        assert_eq!(
+            ack.headers.via().unwrap(),
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-orig"
+        );
+        // To header carries the UAS tag from the 401 — without it the trunk's
+        // server transaction would not match the ACK.
+        assert!(ack.headers.to().unwrap().contains("tag=uas-12345"));
+        // CSeq number echoes the INVITE; method becomes ACK.
+        assert_eq!(ack.headers.cseq().unwrap(), "1 ACK");
+        assert_eq!(ack.headers.call_id().unwrap(), "b2b-aaaa-bbbb");
     }
 
     fn test_resolver() -> SipResolver {

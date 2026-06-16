@@ -354,6 +354,15 @@ pub struct Leg {
     /// CANCEL is emitted immediately so RFC 3261 §9.1 correlation
     /// (same Via branch + CSeq seq as the INVITE being cancelled) holds.
     pub pending_cancel: bool,
+    /// Whether a 401/407 digest challenge on this leg has already driven an
+    /// auth retry (B-leg only). The trunk's INVITE server transaction
+    /// retransmits the challenge until it is ACKed (RFC 3261 §17.1.1.3); each
+    /// retransmit re-enters the response handler on this same branch. Without
+    /// this guard every retransmit would emit a fresh authenticated INVITE at
+    /// the same CSeq on a new branch, which the trunk sees as a merged request
+    /// (RFC 3261 §8.2.2.2) and rejects 482. Set once on the first challenge;
+    /// subsequent challenges on this branch are absorbed (re-ACKed only).
+    pub auth_challenged: bool,
 }
 
 impl Leg {
@@ -377,6 +386,7 @@ impl Leg {
             prack_acked_rseq: None,
             b_leg_invite: None,
             pending_cancel: false,
+            auth_challenged: false,
         }
     }
 
@@ -401,6 +411,7 @@ impl Leg {
             prack_acked_rseq: None,
             b_leg_invite: None,
             pending_cancel: false,
+            auth_challenged: false,
         }
     }
 }
@@ -992,6 +1003,29 @@ impl CallActorStore {
             return false;
         }
         leg.prack_acked_rseq = Some(rseq);
+        true
+    }
+
+    /// 401/407 auth-retry dedup: returns `true` exactly once for the first
+    /// digest challenge seen on the given B-leg, and `false` for retransmits
+    /// of that challenge on the same branch. The trunk retransmits the 401/407
+    /// until it is ACKed (RFC 3261 §17.1.1.3); without this guard each
+    /// retransmit would emit a second authenticated INVITE at the same CSeq on
+    /// a new branch, which the trunk rejects as a merged request (§8.2.2.2 →
+    /// 482). A chained re-challenge (e.g. stale nonce) lands on the *retry*
+    /// leg's branch, which is a distinct B-leg with its own flag, so legitimate
+    /// re-authentication still proceeds.
+    pub fn try_mark_auth_challenged(&self, call_id: &str, b_leg_index: usize) -> bool {
+        let Some(mut call) = self.calls.get_mut(call_id) else {
+            return false;
+        };
+        let Some(leg) = call.b_legs.get_mut(b_leg_index) else {
+            return false;
+        };
+        if leg.auth_challenged {
+            return false;
+        }
+        leg.auth_challenged = true;
         true
     }
 
@@ -1728,6 +1762,34 @@ mod tests {
         assert!(!store.try_mark_prack_acked(&call_id, 0, 1));
         // Higher RSeq (next reliable 1xx, e.g. 180 after 183) — PRACK it.
         assert!(store.try_mark_prack_acked(&call_id, 0, 43));
+    }
+
+    /// 401/407 auth-retry dedup: the first challenge on a B-leg returns true
+    /// (drive the retry); every retransmit of that challenge on the same
+    /// branch returns false (absorb — ACK only, no second authenticated
+    /// INVITE → no 482 merged request). A chained re-challenge arrives on the
+    /// retry leg's own branch, which is a distinct B-leg that has not yet been
+    /// challenged, so it returns true once on its own.
+    #[test]
+    fn try_mark_auth_challenged_dedupes_per_leg() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+
+        // First 401 on the original B-leg → retry.
+        assert!(store.try_mark_auth_challenged(&call_id, 0));
+        // Retransmitted 401 on the same branch → absorbed.
+        assert!(!store.try_mark_auth_challenged(&call_id, 0));
+        assert!(!store.try_mark_auth_challenged(&call_id, 0));
+
+        // The auth retry adds a new B-leg with a fresh branch. A chained
+        // re-challenge (stale nonce) on that leg is a legitimate new challenge.
+        store.add_b_leg(&call_id, make_b_leg(1));
+        assert!(store.try_mark_auth_challenged(&call_id, 1));
+        assert!(!store.try_mark_auth_challenged(&call_id, 1));
+
+        // Out-of-range index returns false (no leg to mark).
+        assert!(!store.try_mark_auth_challenged(&call_id, 99));
     }
 
     #[test]
