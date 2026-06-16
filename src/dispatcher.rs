@@ -3220,8 +3220,42 @@ fn handle_response(
 
     // RFC 3261 §16.7 step 3: a proxy MUST NOT forward 100 Trying upstream.
     // It is hop-by-hop; the proxy already sends its own 100 Trying to the UAC.
+    //
+    // BUT the 100 still has to drive the *client* transaction: RFC 3261
+    // §17.1.1.2 says the first provisional moves an INVITE client transaction
+    // Calling -> Proceeding and cancels Timer A (the INVITE retransmit timer).
+    // Returning here without feeding the FSM (the old behaviour) leaves Timer A
+    // armed, so the proxy spuriously retransmits the forwarded INVITE at ~T1
+    // (~500 ms) even though it already holds a 100 — wasted signalling, and on a
+    // lossy/slow trunk the duplicate can trip the peer's merged-request/loop
+    // detection (482). Feed the transaction here (cancelling Timer A / capping
+    // Timer E for NICT), then absorb without forwarding.
+    //
+    // For a B2BUA leg there is no client transaction registered under this key
+    // (the B2BUA manages its own legs and does not arm Timer A here), so
+    // process_client_event returns Err and this is a harmless no-op.
     if status_code == 100 {
-        debug!("absorbing 100 Trying from downstream");
+        // Drive only the INVITE client transaction (cancel Timer A). A
+        // non-INVITE client transaction (NICT) treats a provisional as a
+        // Timer-E cap rather than a stop, and 100 Trying is INVITE-specific in
+        // practice, so for non-INVITE we keep the historical absorb-only
+        // behaviour to avoid disturbing the NICT retransmit timer's pinned
+        // destination.
+        if let Ok(key) = TransactionManager::key_from_message(&message) {
+            if key.method == crate::sip::message::Method::Invite {
+                if let Ok(actions) = state.transaction_manager.process_client_event(
+                    &key,
+                    ClientEvent::Ict(IctEvent::Provisional(message.clone())),
+                ) {
+                    for action in &actions {
+                        if let Action::CancelTimer(name) = action {
+                            state.timer_wheel.remove(&format!("{}:{:?}", key, name));
+                        }
+                    }
+                }
+            }
+        }
+        debug!("absorbing 100 Trying from downstream (cancelled INVITE client Timer A; not forwarded)");
         return;
     }
 
@@ -11580,6 +11614,72 @@ a=rtpmap:8 PCMA/8000\r\n";
         assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
         assert!(actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::B, _))));
         assert!(actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::A, _))));
+    }
+
+    /// Regression for the spurious-INVITE-retransmit bug: a forwarded INVITE
+    /// arms Timer A, and the downstream 100 Trying MUST cancel it (RFC 3261
+    /// §17.1.1.2). The historical bug was the dispatcher `return`ing on
+    /// status==100 (RFC 3261 §16.7 "don't forward 100 upstream") *before*
+    /// feeding the client transaction, so Timer A stayed armed and the proxy
+    /// retransmitted the INVITE ~T1 (~500 ms) despite holding a provisional.
+    ///
+    /// Two properties must hold for the dispatcher's absorb-the-100 path
+    /// (which now feeds the FSM) to actually stop the retransmit:
+    ///   1. the key derived from the echoed 100 matches the key the client
+    ///      transaction was registered under (RFC 3261 §17.1.3), and
+    ///   2. feeding that 100 as a Provisional emits CancelTimer(A).
+    #[test]
+    fn provisional_100_cancels_invite_client_timer_a() {
+        let manager = TransactionManager::default();
+        let invite = SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("biloxi.com".to_string()).with_user("bob".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-timera".to_string())
+            .to("Bob <sip:bob@biloxi.com>".to_string())
+            .from("Alice <sip:alice@atlanta.com>;tag=99".to_string())
+            .call_id("timera-call@10.0.0.1".to_string())
+            .cseq("1 INVITE".to_string())
+            .max_forwards(70)
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let (key, start_actions) = manager
+            .new_client_transaction(invite, crate::transaction::state::Transport::Udp)
+            .unwrap();
+        assert!(
+            start_actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::A, _))),
+            "UDP INVITE client transaction must arm Timer A"
+        );
+
+        // Downstream 100 Trying echoing the forwarded INVITE's top Via verbatim.
+        let trying = SipMessageBuilder::new()
+            .response(100, "Trying".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-timera".to_string())
+            .to("Bob <sip:bob@biloxi.com>".to_string())
+            .from("Alice <sip:alice@atlanta.com>;tag=99".to_string())
+            .call_id("timera-call@10.0.0.1".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        // (1) The 100 must map to the same transaction key the ICT was
+        //     registered under — else the dispatcher's process_client_event
+        //     lookup misses and Timer A is never cancelled.
+        let response_key = TransactionManager::key_from_message(&trying).unwrap();
+        assert_eq!(response_key, key, "100 response key must match the ICT key");
+
+        // (2) Feeding the 100 as a provisional cancels Timer A.
+        let actions = manager
+            .process_client_event(&response_key, ClientEvent::Ict(IctEvent::Provisional(trying)))
+            .unwrap();
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::CancelTimer(TimerName::A))),
+            "100 Trying must cancel the INVITE retransmit Timer A"
+        );
     }
 
     #[test]
