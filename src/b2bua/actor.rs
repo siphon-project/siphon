@@ -608,6 +608,14 @@ pub struct CallActor {
     /// reading it back would falsely conclude the A-leg trunk supports `100rel`,
     /// leaking the reliable provisional to a peer that CANCELs it.
     pub a_leg_supports_100rel: bool,
+    /// Number of credentialed outbound INVITEs already sent on the 401/407
+    /// auto-retry path for this call. Capped (see `MAX_B2BUA_AUTH_RETRIES` in
+    /// the dispatcher): once the cap is hit, a further challenge is treated as a
+    /// persistent auth failure and surfaced upstream rather than re-authed.
+    /// Counts committed retries only (one per retry leg) — retransmitted
+    /// challenges are absorbed by the per-leg [`Leg::auth_challenged`] guard
+    /// before they reach the counter, so the cap reflects real attempts.
+    pub auth_retry_count: u32,
 }
 
 impl CallActor {
@@ -634,6 +642,7 @@ impl CallActor {
             pending_b_leg_ack: None,
             resolved_header_policy: None,
             a_leg_supports_100rel: false,
+            auth_retry_count: 0,
         }
     }
 
@@ -1027,6 +1036,27 @@ impl CallActorStore {
         }
         leg.auth_challenged = true;
         true
+    }
+
+    /// Current count of credentialed outbound INVITEs sent on the 401/407
+    /// auto-retry path for this call (0 if the call is unknown). Read by the
+    /// dispatcher's retry cap before deciding whether to re-auth or surface the
+    /// failure.
+    pub fn auth_retry_count(&self, call_id: &str) -> u32 {
+        self.calls.get(call_id).map_or(0, |call| call.auth_retry_count)
+    }
+
+    /// Increment and return the per-call credentialed-retry counter. Called
+    /// once per committed retry (after the per-leg dedup), so retransmitted
+    /// challenges don't inflate it.
+    pub fn incr_auth_retry_count(&self, call_id: &str) -> u32 {
+        match self.calls.get_mut(call_id) {
+            Some(mut call) => {
+                call.auth_retry_count = call.auth_retry_count.saturating_add(1);
+                call.auth_retry_count
+            }
+            None => 0,
+        }
     }
 
     /// Set the `pending_reinvite` flag on the A-leg or the winning B-leg.
@@ -1790,6 +1820,26 @@ mod tests {
 
         // Out-of-range index returns false (no leg to mark).
         assert!(!store.try_mark_auth_challenged(&call_id, 99));
+    }
+
+    /// The per-call credentialed-retry counter backs the dispatcher's auth
+    /// retry cap: it starts at 0, increments once per committed retry, and is
+    /// readable without mutation. Unknown calls read 0 and increment to 0.
+    #[test]
+    fn auth_retry_count_increments_and_caps() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+
+        assert_eq!(store.auth_retry_count(&call_id), 0);
+        assert_eq!(store.incr_auth_retry_count(&call_id), 1);
+        assert_eq!(store.incr_auth_retry_count(&call_id), 2);
+        // Reading does not mutate.
+        assert_eq!(store.auth_retry_count(&call_id), 2);
+        assert_eq!(store.incr_auth_retry_count(&call_id), 3);
+
+        // Unknown call: read 0, increment is a no-op returning 0.
+        assert_eq!(store.auth_retry_count("nope"), 0);
+        assert_eq!(store.incr_auth_retry_count("nope"), 0);
     }
 
     #[test]

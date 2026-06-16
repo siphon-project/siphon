@@ -7299,6 +7299,13 @@ fn handle_registrant_response(
     }
 }
 
+/// Maximum credentialed outbound INVITEs the B2BUA will send on the 401/407
+/// digest auto-retry path per call before treating further challenges as a
+/// persistent auth failure and surfacing the response upstream. RFC has no
+/// fixed number; 2 covers the normal single-challenge (and one stale-nonce
+/// re-challenge) case while bounding a misconfigured-credentials loop.
+const MAX_B2BUA_AUTH_RETRIES: u32 = 2;
+
 /// Handle a response to a B2BUA B-leg INVITE.
 fn handle_b2bua_response(
     call_id: &str,
@@ -8723,7 +8730,45 @@ fn handle_b2bua_response(
         // and only patching Via / RURI / Authorization (the old behaviour)
         // leaks every other A-leg header back to the B-leg.
         if status_code == 401 || status_code == 407 {
-            if let Some((username, password)) = &outbound_credentials {
+            // Cap credentialed retries per call. The per-leg dedup below stops a
+            // *retransmitted* challenge from spawning a duplicate INVITE, but a
+            // trunk that rejects every *fresh* credentialed attempt (wrong
+            // password, or a new nonce each time) would otherwise re-auth
+            // forever — each retry lands on a new branch, so there's no 482 to
+            // self-terminate the loop (that was the pre-dedup failure mode).
+            // Once MAX_B2BUA_AUTH_RETRIES credentialed INVITEs have gone out,
+            // treat a further challenge as a persistent auth failure: ACK it and
+            // surface the response upstream (fall through to @b2bua.on_failure +
+            // forward to the A-leg) instead of looping. The per-leg dedup makes
+            // this one-shot — retransmits of the surfaced challenge are absorbed.
+            if outbound_credentials.is_some()
+                && state.call_actors.auth_retry_count(call_id) >= MAX_B2BUA_AUTH_RETRIES
+            {
+                if let Some((b_dest, b_transport)) = b_leg_dest {
+                    let ack = build_b2bua_ack_for_non2xx(
+                        message,
+                        branch,
+                        b_leg_target.as_deref(),
+                        b_transport,
+                        state.local_addr,
+                    );
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                }
+                let first = b_leg_index
+                    .map(|idx| state.call_actors.try_mark_auth_challenged(call_id, idx))
+                    .unwrap_or(true);
+                if !first {
+                    // Retransmit of an already-surfaced challenge — absorb.
+                    return;
+                }
+                warn!(
+                    call_id = %call_id,
+                    status = status_code,
+                    limit = MAX_B2BUA_AUTH_RETRIES,
+                    "B2BUA: outbound auth retry limit reached — surfacing {status_code} upstream instead of re-authing"
+                );
+                // fall through to the failure path (on_failure + forward to A-leg)
+            } else if let Some((username, password)) = &outbound_credentials {
                 let challenge_header = if status_code == 401 {
                     message.headers.get("WWW-Authenticate")
                 } else {
@@ -8778,6 +8823,12 @@ fn handle_b2bua_response(
                                 );
                                 return;
                             }
+
+                            // Count this committed credentialed retry against the
+                            // per-call cap checked at the top of the 401/407
+                            // block. Placed after the per-leg dedup so retransmits
+                            // (which returned above) never inflate the count.
+                            state.call_actors.incr_auth_retry_count(call_id);
 
                             // RFC 7616 §3.3: nc starts at 1 for a fresh server
                             // nonce and increments on every reuse. The
