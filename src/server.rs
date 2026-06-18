@@ -884,15 +884,24 @@ impl SiphonServer {
         // (an unbounded channel with no receiver would otherwise grow).
         let connection_close_tx: Option<flume::Sender<u64>> =
             if config.registrar.liveness.enabled {
+                let liveness = &config.registrar.liveness;
+                tracing::info!(
+                    keepalive_interval_secs = liveness.keepalive_interval_secs,
+                    idle_multiplier = liveness.idle_multiplier,
+                    probe_timeout_ms = liveness.probe_timeout_ms,
+                    dereg_mode = ?liveness.dereg_mode,
+                    "registrar liveness ENABLED — flow-failure dereg (TCP/TLS/WS/WSS) + UDP+IPsec idle sweep active"
+                );
                 let (close_tx, close_rx) = flume::unbounded::<u64>();
                 tokio::spawn(async move {
                     while let Ok(connection_id) = close_rx.recv_async().await {
                         if let Some(registrar) = crate::script::api::registrar_arc() {
                             let removed = registrar.unregister_flow(connection_id);
                             if removed > 0 {
-                                tracing::debug!(
+                                tracing::info!(
                                     connection_id,
-                                    removed, "flow-failure deregistration"
+                                    removed,
+                                    "registrar liveness: flow-failure deregistration (stream connection closed)"
                                 );
                             }
                         }
@@ -900,6 +909,9 @@ impl SiphonServer {
                 });
                 Some(close_tx)
             } else {
+                tracing::debug!(
+                    "registrar liveness disabled — Expires-only deregistration"
+                );
                 None
             };
 

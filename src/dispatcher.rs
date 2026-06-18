@@ -1908,7 +1908,14 @@ async fn liveness_dereg_reaped_sas(state: &DispatcherState, reaped: &[(std::net:
             continue;
         }
         let ue_port_c = port_for.get(&ue_ip).copied();
-        liveness_dereg_contact(&context, &aor, &contact, ue_port_c).await;
+        liveness_dereg_contact(
+            &context,
+            &aor,
+            &contact,
+            ue_port_c,
+            "ipsec SA torn down (abandoned-SA sweep)",
+        )
+        .await;
     }
 }
 
@@ -1952,6 +1959,7 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
         liveness.keepalive_interval_secs as u64 * liveness.idle_multiplier.max(1) as u64;
     let probe_timeout = std::time::Duration::from_millis(liveness.probe_timeout_ms);
     let context = LivenessDeregCtx::from_state(state, registrar);
+    let mut suspects = 0usize;
 
     for (aor, contact) in context.registrar.all_contacts() {
         // UDP only — stream transports are covered by flow-failure dereg.
@@ -1991,6 +1999,14 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
 
         // Suspect.  Resolve the IPsec egress pin (source addr/transport) now,
         // then detach the probe so a slow UE can't stall the sweep.
+        suspects += 1;
+        debug!(
+            aor = %aor,
+            ue = %ue_addr,
+            idle_secs = now.saturating_sub(last_active),
+            idle_window,
+            "registrar liveness: binding idle past window — probing with OPTIONS"
+        );
         let (source_local_addr, transport) =
             crate::script::api::ipsec::outbound_for(ue_addr, Transport::Udp).unwrap_or_else(|| {
                 (
@@ -2014,6 +2030,10 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
             )
             .await;
         });
+    }
+
+    if suspects > 0 {
+        debug!(suspects, "registrar liveness: idle sweep flagged suspect UDP+IPsec bindings");
     }
 }
 
@@ -2051,8 +2071,14 @@ async fn liveness_probe_then_dereg(
         }
     }
 
-    debug!(aor = %aor, ue = %destination, "registrar liveness: UE silent + unprobeable — deregistering");
-    liveness_dereg_contact(&context, &aor, &contact, Some(ue_port_c)).await;
+    liveness_dereg_contact(
+        &context,
+        &aor,
+        &contact,
+        Some(ue_port_c),
+        "udp+ipsec idle (no OPTIONS answer)",
+    )
+    .await;
 }
 
 /// The shared dereg funnel for both the idle-probe path and the SA-teardown
@@ -2066,15 +2092,23 @@ async fn liveness_dereg_contact(
     aor: &str,
     contact: &crate::registrar::Contact,
     ue_port_c: Option<u16>,
+    reason: &str,
 ) {
     let contact_uri = contact.uri.to_string();
+    let network_dereg = context.dereg_mode == crate::config::LivenessDeregMode::NetworkDereg
+        && contact.flow_token.is_some();
+    info!(
+        aor = %aor,
+        contact = %contact_uri,
+        reason,
+        network_dereg,
+        "registrar liveness: deregistering binding"
+    );
 
     // 1. P-CSCF network de-REGISTER (before dropping local state, while the
     //    Service-Route is still available).  Only for a proxy-cached binding
     //    (one carrying a flow_token) under network-dereg mode.
-    if context.dereg_mode == crate::config::LivenessDeregMode::NetworkDereg
-        && contact.flow_token.is_some()
-    {
+    if network_dereg {
         send_liveness_network_dereg(context, aor, &contact_uri).await;
     }
 
