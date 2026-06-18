@@ -9695,10 +9695,15 @@ fn schedule_zombie_cancelled_cleanup(call_actors: Arc<crate::b2bua::actor::CallA
 /// the response's Contact (the remote target), and the INVITE's CSeq number
 /// with method ACK. From / To / Call-ID are echoed from the 2xx (its To already
 /// carries the remote tag).
+///
+/// Pure w.r.t. dispatcher state — the caller supplies the local `via_host` /
+/// `via_port` (from `DispatcherState::via_host`/`via_port`) so this is directly
+/// unit-testable.
 fn build_b2bua_ack_for_2xx(
     response: &SipMessage,
     transport: Transport,
-    state: &DispatcherState,
+    via_host: &str,
+    via_port: u16,
 ) -> Option<SipMessage> {
     let request_uri = response.headers.get("Contact")
         .map(|c| crate::b2bua::actor::extract_contact_uri(c))
@@ -9716,8 +9721,8 @@ fn build_b2bua_ack_for_2xx(
         .via(format!(
             "SIP/2.0/{} {}:{};branch={}",
             transport_str,
-            state.via_host(&transport),
-            state.via_port(&transport),
+            via_host,
+            via_port,
             TransactionKey::generate_branch(),
         ))
         .from(from.to_string())
@@ -9753,7 +9758,12 @@ fn handle_zombie_cancelled_2xx(
     let destination = leg.transport.remote_addr;
 
     // ACK the 2xx on every match — a lost ACK leaves the callee retransmitting.
-    if let Some(ack) = build_b2bua_ack_for_2xx(response, transport, state) {
+    if let Some(ack) = build_b2bua_ack_for_2xx(
+        response,
+        transport,
+        &state.via_host(&transport),
+        state.via_port(&transport),
+    ) {
         send_b2bua_to_bleg(ack, transport, destination, state);
     }
 
@@ -12484,6 +12494,70 @@ a=rtpmap:8 PCMA/8000\r\n";
         // Defensive: build_cancel_from_invite must reject responses.
         let response = build_response(&b_leg_invite_sample(), 100, "Trying", None, &[]);
         assert!(build_cancel_from_invite(&response).is_none());
+    }
+
+    // --- 2xx-after-CANCEL glare: ACK builder (RFC 3261 §13.2.2.4) ---
+
+    #[test]
+    fn build_ack_for_2xx_echoes_dialog_and_targets_contact() {
+        // The ACK siphon sends when a 2xx races our CANCEL must be its own
+        // transaction: R-URI = the 2xx Contact, CSeq = the INVITE's number with
+        // method ACK, From/To/Call-ID echoed (To carries the remote tag), and a
+        // fresh Via on our supplied host:port.
+        let response = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-bleg".to_string())
+            .from("<sip:alice@10.0.0.50>;tag=our-tag".to_string())
+            .to("<sip:bob@10.0.0.2>;tag=their-tag".to_string())
+            .call_id("glare-call@10.0.0.50".to_string())
+            .cseq("5 INVITE".to_string())
+            .header("Contact", "<sip:bob@10.0.0.2:5070>".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let ack = build_b2bua_ack_for_2xx(&response, Transport::Udp, "10.0.0.9", 5060)
+            .expect("ACK builds");
+        let wire = String::from_utf8(ack.to_bytes()).unwrap();
+
+        // R-URI is the 2xx Contact (the remote target), method ACK.
+        assert!(
+            wire.starts_with("ACK sip:bob@10.0.0.2:5070 SIP/2.0\r\n"),
+            "request line wrong:\n{wire}"
+        );
+        // Same CSeq number as the INVITE, method ACK (RFC 3261 §13.2.2.4).
+        assert!(wire.contains("CSeq: 5 ACK\r\n"), "CSeq wrong:\n{wire}");
+        // Dialog identifiers echoed from the 2xx, including the remote To-tag.
+        assert!(wire.contains("Call-ID: glare-call@10.0.0.50\r\n"), "Call-ID:\n{wire}");
+        assert!(wire.contains(";tag=their-tag"), "To-tag must survive:\n{wire}");
+        assert!(wire.contains(";tag=our-tag"), "From-tag must survive:\n{wire}");
+        // Fresh Via on the supplied local host:port.
+        assert!(
+            wire.contains("Via: SIP/2.0/UDP 10.0.0.9:5060;branch="),
+            "Via host:port wrong:\n{wire}"
+        );
+    }
+
+    #[test]
+    fn build_ack_for_2xx_falls_back_when_contact_absent() {
+        // No Contact on the 2xx → R-URI degrades to a placeholder rather than
+        // panicking; CSeq number is still preserved from the response.
+        let response = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-x".to_string())
+            .from("<sip:alice@10.0.0.50>;tag=a".to_string())
+            .to("<sip:bob@10.0.0.2>;tag=b".to_string())
+            .call_id("no-contact@10.0.0.50".to_string())
+            .cseq("9 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let ack = build_b2bua_ack_for_2xx(&response, Transport::Udp, "10.0.0.9", 5060)
+            .expect("ACK builds even without Contact");
+        let wire = String::from_utf8(ack.to_bytes()).unwrap();
+        assert!(wire.starts_with("ACK "), "must still be an ACK:\n{wire}");
+        assert!(wire.contains("CSeq: 9 ACK\r\n"), "CSeq preserved:\n{wire}");
     }
 
     // --- Proxy-forwarded CANCEL Via (RFC 3261 §9.1 / §16.10) ---
