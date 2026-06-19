@@ -14,6 +14,7 @@ use pyo3::types::{PyDict, PyModule};
 use crate::dns::SipResolver;
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::headers::cseq::CSeq;
+use crate::sip::headers::route::RouteEntry;
 use crate::sip::message::{Method, StartLine};
 use crate::sip::parser::parse_uri_standalone;
 use crate::sip::uri::SipUri;
@@ -244,7 +245,8 @@ impl PyProxyUtils {
     ///     body: Optional body — ``str`` or ``bytes``.
     ///     next_hop: Optional next-hop URI (e.g. Path from registrar).  The
     ///               R-URI stays in the Request-Line; the message is routed
-    ///               to next_hop.
+    ///               to next_hop.  Outranks a `Route` header for next-hop
+    ///               selection (see "Pre-loaded route set" below).
     ///     wait_for_response: When ``True``, the awaitable resolves to a
     ///               :class:`Reply` once the peer responds (or ``None`` after
     ///               ``timeout_ms``).  When ``False`` (default), the
@@ -259,6 +261,12 @@ impl PyProxyUtils {
     ///     A Python awaitable. ``await`` it to get ``None`` (fire-and-forget
     ///     or timeout) or a :class:`Reply` (when ``wait_for_response=True``
     ///     and the peer responded in time).
+    ///
+    /// Pre-loaded route set: when `next_hop` is omitted but `headers` carries a
+    /// `Route` (a pre-loaded route set), the request is sent to the URI of the
+    /// first `Route` entry (its `;lr` loose-route target) per RFC 3261 §8.1.2 /
+    /// §16.4 — the R-URI stays in the Request-Line and the `Route` rides along.
+    /// Only when neither is present is the R-URI itself resolved (RFC 3263).
     ///
     /// Example (Python script):
     ///
@@ -301,19 +309,22 @@ impl PyProxyUtils {
             pyo3::exceptions::PyValueError::new_err(format!("invalid request URI '{ruri}': {error}"))
         })?;
 
-        // Resolve the transport destination.
-        // When next_hop is provided (e.g. Path from registrar), resolve that
-        // instead of the R-URI. The R-URI stays in the Request-Line but the
-        // message is sent to next_hop (like Route-based forwarding).
-        let resolve_uri = if let Some(hop) = next_hop {
-            parse_uri_standalone(hop).map_err(|error| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "invalid next_hop URI '{hop}': {error}"
-                ))
-            })?
-        } else {
-            uri.clone()
-        };
+        // Resolve the transport destination per RFC 3261 §8.1.2 (a UAC's
+        // next-hop rules):
+        //   1. An explicit `next_hop` override wins (local policy — e.g. a
+        //      Path learned from the registrar). The R-URI stays in the
+        //      Request-Line but the message is sent to next_hop.
+        //   2. Otherwise, if the script pre-loaded a route set (a `Route`
+        //      header), the destination is the URI of the *first* Route entry
+        //      (its `;lr` loose-route target). The R-URI stays in the
+        //      Request-Line and the Route header(s) ride along untouched —
+        //      RFC 3261 §16.4 / §12.2.1.1. This is what lets a script steer a
+        //      UAC-originated request straight to a known next hop (e.g. an
+        //      AS addressing a served IMPU with the serving S-CSCF pre-loaded)
+        //      instead of resolving the R-URI's home domain and taking the
+        //      long way round.
+        //   3. Otherwise, resolve the R-URI (RFC 3263).
+        let resolve_uri = resolve_send_target(&uri, next_hop, headers)?;
 
         let transport_hint = resolve_uri.get_param("transport").map(|s: &str| s.to_string());
         let resolver_clone = Arc::clone(resolver);
@@ -336,9 +347,8 @@ impl PyProxyUtils {
         });
 
         let target = destination.into_iter().next().ok_or_else(|| {
-            let resolve_target = next_hop.unwrap_or(ruri);
             pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "cannot resolve destination for '{resolve_target}'"
+                "cannot resolve destination for '{resolve_uri}'"
             ))
         })?;
 
@@ -432,6 +442,82 @@ impl PyProxyUtils {
             0
         }
     }
+}
+
+/// Decide which URI the outbound request's next hop resolves to, per
+/// RFC 3261 §8.1.2 (a UAC's next-hop selection):
+///
+///   1. An explicit `next_hop` override wins (local policy).
+///   2. Else the URI of the first `Route` header entry, when the script
+///      pre-loaded a route set (loose routing — §16.4 / §12.2.1.1).
+///   3. Else the Request-URI.
+///
+/// In every case the Request-URI stays in the Request-Line; only the
+/// *destination* (the address RFC 3263 resolution runs against) changes.
+fn resolve_send_target(
+    ruri: &SipUri,
+    next_hop: Option<&str>,
+    headers: Option<&Bound<'_, PyDict>>,
+) -> PyResult<SipUri> {
+    if let Some(hop) = next_hop {
+        return parse_uri_standalone(hop).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid next_hop URI '{hop}': {error}"
+            ))
+        });
+    }
+    if let Some(route_uri) = route_next_hop(headers) {
+        return Ok(route_uri);
+    }
+    Ok(ruri.clone())
+}
+
+/// Extract the next-hop URI from a script-supplied `Route` header.
+///
+/// Scans the outgoing `headers` dict for a `Route` (case-insensitive) and
+/// returns the URI of its first entry — the loose-route target the request
+/// should be sent to (RFC 3261 §8.1.2).  Returns `None` when no `Route`
+/// header is present (or its value can't be parsed), so the caller falls
+/// back to resolving the Request-URI.  Non-string keys/values are skipped
+/// here; `build_send_request_message` surfaces the canonical type error.
+fn route_next_hop(headers: Option<&Bound<'_, PyDict>>) -> Option<SipUri> {
+    let header_dict = headers?;
+    for (key, value) in header_dict.iter() {
+        let Ok(name) = key.extract::<String>() else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("Route") {
+            continue;
+        }
+        let Ok(raw) = value.extract::<String>() else {
+            continue;
+        };
+        return parse_first_route_uri(&raw);
+    }
+    None
+}
+
+/// Parse the URI of the first entry of a `Route` header value.
+///
+/// Handles a comma-separated route set (`<sip:a;lr>, <sip:b;lr>` → the `a`
+/// URI) via the angle-bracket-aware [`RouteEntry`] parser, with a lenient
+/// fallback for a bare addr-spec that omits the angle brackets.
+fn parse_first_route_uri(raw: &str) -> Option<SipUri> {
+    if let Ok(mut entries) = RouteEntry::parse_multi(raw) {
+        if !entries.is_empty() {
+            return Some(entries.remove(0).uri);
+        }
+    }
+    // Lenient fallback: a bare addr-spec (`sip:host;lr`) without angle
+    // brackets — strip an opening `<` up to `>` if present, then take the
+    // first comma-separated chunk.
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix('<')
+        .and_then(|rest| rest.split('>').next())
+        .unwrap_or(trimmed);
+    let first = inner.split(',').next().unwrap_or(inner).trim();
+    parse_uri_standalone(first).ok()
 }
 
 /// Build the SIP message originated by `proxy.send_request()`.
@@ -1357,5 +1443,213 @@ mod tests {
             pending_before,
             "scenario 4: matched response must remove the pending entry"
         );
+
+        // ---------------------------------------------------------------
+        // Scenario 5 — a pre-loaded `Route` header drives the next hop
+        // (RFC 3261 §8.1.2 / §16.4).  The R-URI resolves to host-B
+        // (127.0.0.9), but the route set names host-A (127.0.0.5), so the
+        // message MUST be sent to host-A with the R-URI unchanged and the
+        // Route header riding along.  This is the reg-event-SUBSCRIBE bug:
+        // pre-loading the serving S-CSCF as a loose route should bypass the
+        // I-CSCF the R-URI's home domain would otherwise resolve to.
+        // ---------------------------------------------------------------
+        Python::attach(|py| {
+            let bound = utils_py.bind(py);
+
+            let headers = PyDict::new(py);
+            headers
+                .set_item("Route", "<sip:127.0.0.5:5055;lr>")
+                .unwrap();
+            headers.set_item("Event", "reg").unwrap();
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("headers", headers).unwrap();
+
+            // R-URI is host-B; Route is host-A.
+            let args = PyTuple::new(py, ["SUBSCRIBE", "sip:127.0.0.9:5099"]).unwrap();
+            let coroutine = bound
+                .call_method("send_request", args, Some(&kwargs))
+                .expect("scenario 5: route-driven dispatch");
+            let _ = coroutine.call_method0("close");
+        });
+
+        let outbound = udp_rx
+            .try_recv()
+            .expect("scenario 5: no UDP egress for route-driven request");
+        assert_eq!(
+            outbound.destination,
+            "127.0.0.5:5055".parse().unwrap(),
+            "scenario 5: a pre-loaded Route must drive the next hop (host-A), \
+             not the R-URI (host-B)"
+        );
+        let wire = String::from_utf8(outbound.data.to_vec()).unwrap();
+        assert!(
+            wire.starts_with("SUBSCRIBE sip:127.0.0.9:5099 SIP/2.0\r\n"),
+            "scenario 5: R-URI must stay in the Request-Line unchanged:\n{wire}"
+        );
+        assert!(
+            wire.contains("Route: <sip:127.0.0.5:5055;lr>"),
+            "scenario 5: the Route header must ride along untouched:\n{wire}"
+        );
+
+        // ---------------------------------------------------------------
+        // Scenario 6 — an explicit `next_hop` outranks a `Route` header
+        // (local policy wins, RFC 3261 §8.1.2 step 1).  R-URI = host-B,
+        // Route = host-A, next_hop = host-C (127.0.0.7) → host-C wins.
+        // ---------------------------------------------------------------
+        Python::attach(|py| {
+            let bound = utils_py.bind(py);
+
+            let headers = PyDict::new(py);
+            headers
+                .set_item("Route", "<sip:127.0.0.5:5055;lr>")
+                .unwrap();
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("headers", headers).unwrap();
+            kwargs.set_item("next_hop", "sip:127.0.0.7:5077").unwrap();
+
+            let args = PyTuple::new(py, ["SUBSCRIBE", "sip:127.0.0.9:5099"]).unwrap();
+            let coroutine = bound
+                .call_method("send_request", args, Some(&kwargs))
+                .expect("scenario 6: next_hop-override dispatch");
+            let _ = coroutine.call_method0("close");
+        });
+
+        let outbound = udp_rx
+            .try_recv()
+            .expect("scenario 6: no UDP egress for next_hop-override request");
+        assert_eq!(
+            outbound.destination,
+            "127.0.0.7:5077".parse().unwrap(),
+            "scenario 6: an explicit next_hop must outrank a Route header"
+        );
+    }
+
+    #[test]
+    fn parse_first_route_uri_single_loose_route() {
+        let uri = parse_first_route_uri("<sip:scscf-0.ims.example.org:6060;lr>")
+            .expect("loose route must parse");
+        assert_eq!(uri.host, "scscf-0.ims.example.org");
+        assert_eq!(uri.port, Some(6060));
+        assert!(uri.params.iter().any(|(n, _)| n == "lr"));
+    }
+
+    #[test]
+    fn parse_first_route_uri_picks_first_of_route_set() {
+        // A comma-separated route set must yield the FIRST hop only.
+        let uri = parse_first_route_uri("<sip:host-a.example.org;lr>, <sip:host-b.example.org;lr>")
+            .expect("multi route must parse");
+        assert_eq!(uri.host, "host-a.example.org");
+    }
+
+    #[test]
+    fn parse_first_route_uri_with_transport_param() {
+        let uri = parse_first_route_uri("<sip:proxy.example.org:5060;transport=tcp;lr>")
+            .expect("route with transport must parse");
+        assert_eq!(uri.get_param("transport"), Some("tcp"));
+        assert_eq!(uri.port, Some(5060));
+    }
+
+    #[test]
+    fn parse_first_route_uri_bare_addr_spec_fallback() {
+        // A bare addr-spec without angle brackets is tolerated.
+        let uri = parse_first_route_uri("sip:proxy.example.org:5060").expect("bare uri must parse");
+        assert_eq!(uri.host, "proxy.example.org");
+        assert_eq!(uri.port, Some(5060));
+    }
+
+    #[test]
+    fn parse_first_route_uri_rejects_garbage() {
+        assert!(parse_first_route_uri("not a uri at all").is_none());
+    }
+
+    #[test]
+    fn route_next_hop_reads_route_header() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("To", "<sip:bob@example.org>").unwrap();
+            headers.set_item("Route", "<sip:scscf-0.example.org:6060;lr>").unwrap();
+
+            let uri = route_next_hop(Some(&headers)).expect("Route must produce a next hop");
+            assert_eq!(uri.host, "scscf-0.example.org");
+            assert_eq!(uri.port, Some(6060));
+        });
+    }
+
+    #[test]
+    fn route_next_hop_is_case_insensitive() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("rOuTe", "<sip:scscf-0.example.org:6060;lr>").unwrap();
+
+            let uri = route_next_hop(Some(&headers)).expect("Route is case-insensitive");
+            assert_eq!(uri.host, "scscf-0.example.org");
+        });
+    }
+
+    #[test]
+    fn route_next_hop_none_without_route_header() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("To", "<sip:bob@example.org>").unwrap();
+            headers.set_item("Event", "reg").unwrap();
+
+            assert!(route_next_hop(Some(&headers)).is_none());
+        });
+    }
+
+    #[test]
+    fn route_next_hop_none_for_empty_headers() {
+        assert!(route_next_hop(None).is_none());
+    }
+
+    #[test]
+    fn resolve_send_target_prefers_explicit_next_hop() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let ruri = SipUri::new("host-b.example.org".to_string());
+            let headers = PyDict::new(py);
+            headers.set_item("Route", "<sip:host-a.example.org;lr>").unwrap();
+
+            // next_hop (host-c) outranks both the Route (host-a) and R-URI (host-b).
+            let target = resolve_send_target(&ruri, Some("sip:host-c.example.org"), Some(&headers))
+                .expect("explicit next_hop must parse");
+            assert_eq!(target.host, "host-c.example.org");
+        });
+    }
+
+    #[test]
+    fn resolve_send_target_uses_route_over_ruri() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let ruri = SipUri::new("host-b.example.org".to_string());
+            let headers = PyDict::new(py);
+            headers.set_item("Route", "<sip:host-a.example.org;lr>").unwrap();
+
+            let target = resolve_send_target(&ruri, None, Some(&headers))
+                .expect("route must produce a target");
+            assert_eq!(
+                target.host, "host-a.example.org",
+                "a Route set must outrank the R-URI for next-hop selection"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_send_target_falls_back_to_ruri() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let ruri = SipUri::new("host-b.example.org".to_string());
+            let headers = PyDict::new(py);
+            headers.set_item("Event", "reg").unwrap();
+
+            let target = resolve_send_target(&ruri, None, Some(&headers))
+                .expect("R-URI fallback must parse");
+            assert_eq!(target.host, "host-b.example.org");
+        });
     }
 }

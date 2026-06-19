@@ -181,9 +181,16 @@ class MockProxy:
         Args:
             method: SIP method name (e.g. "NOTIFY", "OPTIONS", "MESSAGE").
             ruri: Request-URI string (e.g. "sip:alice@10.0.0.1:5060").
-            headers: Optional dict of header name → value to add.
+            headers: Optional dict of header name → value to add.  When a
+                ``Route`` header is supplied without ``next_hop``, the request
+                is sent to the first ``Route`` entry's URI (its ``;lr``
+                loose-route target) per RFC 3261 §8.1.2 — the R-URI stays in
+                the Request-Line.  Use this to steer a request straight to a
+                known next hop (e.g. a served IMPU's serving S-CSCF) instead of
+                resolving the R-URI's home domain.
             body: Optional body — ``str`` or ``bytes``.
-            next_hop: Optional next-hop URI override.
+            next_hop: Optional next-hop URI override.  Outranks a ``Route``
+                header for next-hop selection.
             wait_for_response: When ``True``, return the configured mock reply.
             timeout_ms: Response timeout (not meaningfully enforced in the mock).
         """
