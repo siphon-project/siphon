@@ -3971,6 +3971,12 @@ fn handle_response(
                         return;
                     }
                 };
+                // Free-threaded CPython (3.14t) requires an attached thread to
+                // touch a `Py<…>` refcount; clone the relay callbacks through a
+                // `Python` token rather than the bare `Clone` impl, which would
+                // panic on this (unattached) executor worker. See
+                // `ProxySession::clone_relay_callbacks`.
+                let (relay_on_reply, relay_on_failure) = session.clone_relay_callbacks();
                 (
                     session.source_addr,
                     session.inbound_local_addr,
@@ -3980,8 +3986,8 @@ fn handle_response(
                     session.fork_aggregator.clone(),
                     session.branch_index_map.get(client_key).copied(),
                     session.original_request.clone(),
-                    session.on_reply_callback.clone(),
-                    session.on_failure_callback.clone(),
+                    relay_on_reply,
+                    relay_on_failure,
                     session.client_branches.get(client_key).cloned(),
                 )
             };

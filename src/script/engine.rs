@@ -854,7 +854,13 @@ async fn timer_loop(
         tokio::time::sleep(wait).await;
 
         let timer_name = name.clone();
-        let callback = callable.clone();
+        // Attach before cloning the Py callback — `timer_loop` runs as a
+        // spawned Tokio task whose worker is detached from the interpreter
+        // (pyo3 `ATTACH_COUNT == 0`), and on free-threaded Python cloning a
+        // `Py<>` while detached panics ("Cannot clone pointer into Python heap
+        // without the thread being attached"). Mirrors the clone at the timer
+        // registration site (`restart_timers`).
+        let callback = Python::attach(|python| callable.clone_ref(python));
         let result = crate::script::py_executor::try_run(move || {
             Python::attach(|python| {
                 let bound = callback.bind(python);
@@ -994,6 +1000,48 @@ mod tests {
     fn empty_script_yields_no_handlers() {
         let state = compile_temp_script("# empty script\npass\n").unwrap();
         assert!(state.handlers.is_empty());
+    }
+
+    /// Regression: `timer_loop` re-clones the timer's Python callable on every
+    /// fire to hand it to the executor. It runs as a spawned Tokio task whose
+    /// worker is detached from the interpreter (pyo3 `ATTACH_COUNT == 0`), so a
+    /// bare `Py::clone` there panics ("Cannot clone pointer into Python heap
+    /// without the thread being attached") on free-threaded CPython — the same
+    /// family of bug as the dispatcher relay callbacks. The clone must go
+    /// through `Python::attach` / `clone_ref` (mirrors `restart_timers`).
+    #[test]
+    fn timer_loop_fires_without_detached_clone_panic() {
+        Python::initialize();
+
+        // The periodic timer loop calls the handler with no arguments.
+        let callable: Py<PyAny> = Python::attach(|python| {
+            python
+                .eval(c"lambda: None", None, None)
+                .expect("compile timer lambda")
+                .unbind()
+        });
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // interval = 1s, so exactly one fire lands inside the 1200ms window.
+        // With a bare clone the worker panics at the first fire (~1s) and the
+        // panic unwinds `block_on`, failing the test. With the fix the loop
+        // keeps running and the timeout elapses.
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1200),
+                timer_loop(callable, false, 1, 0, "regression-timer".to_string()),
+            )
+            .await
+        });
+
+        assert!(
+            outcome.is_err(),
+            "timer_loop returned early — it should loop forever after firing"
+        );
     }
 
     #[test]

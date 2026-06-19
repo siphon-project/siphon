@@ -123,6 +123,31 @@ impl ProxySession {
     pub fn get_client_branch(&self, key: &TransactionKey) -> Option<&ClientBranch> {
         self.client_branches.get(key)
     }
+
+    /// Clone the per-relay `on_reply` / `on_failure` Python callbacks for use
+    /// on the response path.
+    ///
+    /// Free-threaded CPython (3.14t / PEP 703, pyo3 0.28) requires the calling
+    /// thread to be *attached* to the interpreter before a `Py<…>` refcount may
+    /// be touched: `Py::clone` panics with "Cannot clone pointer into Python
+    /// heap without the thread being attached" whenever it runs on a
+    /// dispatcher/executor worker that is not currently inside a
+    /// `Python::attach` scope. The dispatcher lifts these callbacks out of the
+    /// session read-guard on exactly such a worker, so the bare `Clone` impl is
+    /// unsound there. Clone through a `Python` token instead — matching the
+    /// request path (`script::handle::call_handler`, which uses `clone_ref`).
+    pub fn clone_relay_callbacks(&self) -> (Option<Py<PyAny>>, Option<Py<PyAny>>) {
+        Python::attach(|python| {
+            (
+                self.on_reply_callback
+                    .as_ref()
+                    .map(|callback| callback.clone_ref(python)),
+                self.on_failure_callback
+                    .as_ref()
+                    .map(|callback| callback.clone_ref(python)),
+            )
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +633,67 @@ mod tests {
         session.add_client_key(client_key("2"));
         session.add_client_key(client_key("3"));
         assert_eq!(session.client_keys.len(), 3);
+    }
+
+    /// Regression: the dispatcher response path clones a session's per-relay
+    /// `on_reply` / `on_failure` callbacks on a Python-executor worker that is
+    /// NOT inside a `Python::attach` scope. On free-threaded CPython (3.14t,
+    /// pyo3 0.28) a bare `Py::clone` from such a thread panics with "Cannot
+    /// clone pointer into Python heap without the thread being attached" — and
+    /// the panic check is thread-attachment based, so it reproduces on any
+    /// build from a freshly spawned (never-attached) OS thread.
+    /// `clone_relay_callbacks` must attach first; if it regresses to a bare
+    /// clone, the worker thread panics and `join()` returns `Err` here.
+    #[test]
+    fn clone_relay_callbacks_from_unattached_worker_thread() {
+        pyo3::Python::initialize();
+
+        // Real Python callables, built while attached on this (main) thread.
+        let (on_reply, on_failure): (Py<PyAny>, Py<PyAny>) = Python::attach(|python| {
+            let reply = python
+                .eval(c"lambda request, reply: None", None, None)
+                .expect("compile on_reply lambda")
+                .unbind();
+            let failure = python
+                .eval(c"lambda request, code, reason: None", None, None)
+                .expect("compile on_failure lambda")
+                .unbind();
+            (reply, failure)
+        });
+        let original_reply_ptr = on_reply.as_ptr() as usize;
+
+        let mut session = make_session();
+        session.on_reply_callback = Some(on_reply);
+        session.on_failure_callback = Some(on_failure);
+        let session = Arc::new(session);
+
+        // A freshly spawned OS thread has pyo3 ATTACH_COUNT == 0 — the exact
+        // precondition the dispatcher worker hits when a relayed response
+        // arrives.
+        let worker = {
+            let session = Arc::clone(&session);
+            std::thread::spawn(move || {
+                let (reply_callback, failure_callback) = session.clone_relay_callbacks();
+                let cloned_reply_ptr = reply_callback.as_ref().map(|cb| cb.as_ptr() as usize);
+                (
+                    reply_callback.is_some(),
+                    failure_callback.is_some(),
+                    cloned_reply_ptr,
+                )
+            })
+        };
+        let (has_reply, has_failure, cloned_reply_ptr) = worker
+            .join()
+            .expect("clone_relay_callbacks panicked on an unattached worker thread");
+
+        assert!(has_reply, "on_reply callback lost in cross-thread clone");
+        assert!(has_failure, "on_failure callback lost in cross-thread clone");
+        // `clone_ref` must alias the same Python object, not substitute a new one.
+        assert_eq!(
+            cloned_reply_ptr,
+            Some(original_reply_ptr),
+            "clone must reference the same callable object"
+        );
     }
 
     // -- ProxySessionStore tests --
