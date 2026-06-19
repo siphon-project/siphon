@@ -5233,6 +5233,59 @@ fn resolve_in_dialog_flow_uri(
     (destination, ipsec_pin_transport(destination, transport), connection_id)
 }
 
+/// Choose the wire destination for a B2BUA retry INVITE that supersedes a failed
+/// outbound leg in place — the 401/407 credentialed re-INVITE and the RFC 4028
+/// 422 higher-Session-Expires re-INVITE both take this path (RFC 5923 connection
+/// reuse).
+///
+/// The CSeq-1 INVITE, its non-2xx final response, and any server nonce all
+/// traversed one specific trunk member. The retry is a *fresh* pre-dialog
+/// transaction (new Via branch, new CSeq, no To-tag yet), so the in-dialog
+/// connection-reuse path doesn't apply to it. Re-resolving the trunk hostname
+/// here would re-run the RFC 3263 §4.2 A/AAAA shuffle and can pick a *different*
+/// member than the one that issued the challenge — on a strict trunk a 401 retry
+/// draws another 401 (auth loop), and even on a lenient trunk it splits one
+/// INVITE transaction across two members (fragile CANCEL/BYE/session-timer
+/// correlation, per-member state divergence).
+///
+/// So when the failed leg has a recorded destination, reuse it verbatim
+/// (address + transport + connection_id): for TCP/TLS [`send_to_target`] then
+/// reuses the pooled connection to that member (keyed by address); for UDP it
+/// pins the datagram to the same member. Only when the leg has no recorded
+/// destination (defensive — in the live path `b_leg_dest` is derived from the
+/// same matched leg as the target URI) do we resolve `target_uri` afresh and
+/// open/pool a new connection.
+///
+/// Returns `(destination, transport, connection_id, relay_target)`, or `None`
+/// when there is no leg destination and `target_uri` does not resolve.
+fn select_b2bua_retry_destination(
+    b_leg_dest: Option<(SocketAddr, Transport)>,
+    b_leg_connection_id: ConnectionId,
+    target_uri: &str,
+    resolver: &SipResolver,
+) -> Option<(SocketAddr, Transport, ConnectionId, RelayTarget)> {
+    match b_leg_dest {
+        Some((member_addr, member_transport)) => Some((
+            member_addr,
+            member_transport,
+            b_leg_connection_id,
+            RelayTarget {
+                address: member_addr,
+                transport: Some(member_transport),
+            },
+        )),
+        None => resolve_target(target_uri, resolver).map(|relay_target| {
+            let transport = relay_target.transport.unwrap_or(Transport::Udp);
+            (
+                relay_target.address,
+                transport,
+                ConnectionId::default(),
+                relay_target,
+            )
+        }),
+    }
+}
+
 /// Flatten Record-Route header lines into one URI per entry.
 ///
 /// SIP allows multiple URIs per Record-Route header line separated by commas
@@ -8198,7 +8251,7 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, call_state, outbound_credentials, li_record, b_leg_handle_tx, b_leg_stored_invite, b_leg_local_cseq, a_leg_supports_100rel) = match state.call_actors.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_connection_id, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, call_state, outbound_credentials, li_record, b_leg_handle_tx, b_leg_stored_invite, b_leg_local_cseq, a_leg_supports_100rel) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
@@ -8207,6 +8260,10 @@ fn handle_b2bua_response(
             let local_contact = matching_b.and_then(|b| b.dialog.local_contact.clone());
             let dialog = matching_b.map(|b| (b.dialog.call_id.clone(), b.dialog.local_tag.clone()));
             let dest = matching_b.map(|b| (b.transport.remote_addr, b.transport.transport));
+            // The connection_id the original B-leg INVITE was sent on — reused
+            // by the 401/407 retry path so the credentialed re-INVITE stays on
+            // the same trunk member that issued the nonce (RFC 5923).
+            let connection_id = matching_b.map(|b| b.transport.connection_id).unwrap_or_default();
             let stored_vias = matching_b.map(|b| b.stored_vias.clone()).unwrap_or_default();
             let stored_cseq = matching_b.and_then(|b| b.stored_cseq.clone());
             let handle_tx = matching_b_idx
@@ -8215,7 +8272,7 @@ fn handle_b2bua_response(
                 .map(|h| h.tx.clone());
             let stored_invite = matching_b.and_then(|b| b.b_leg_invite.clone());
             let local_cseq = matching_b.map(|b| b.dialog.local_cseq).unwrap_or(2);
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, stored_cseq, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx, stored_invite, local_cseq, call.a_leg_supports_100rel)
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, connection_id, matching_b_idx, stored_vias, stored_cseq, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx, stored_invite, local_cseq, call.a_leg_supports_100rel)
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -9515,11 +9572,22 @@ fn handle_b2bua_response(
                                 "B2BUA: 422 received, retrying with Session-Expires={min_se}"
                             );
 
-                            // Resolve target
-                            if let Some(relay_target) = resolve_target(target_uri, &state.dns_resolver) {
-                                let destination = relay_target.address;
-                                let b_leg_transport = b_leg_dest.map(|(_, t)| t).unwrap_or(Transport::Udp);
-                                let transport = relay_target.transport.unwrap_or(b_leg_transport);
+                            // RFC 5923 connection reuse: keep the higher-
+                            // Session-Expires retry on the SAME trunk member the
+                            // 422'd INVITE traversed, instead of re-resolving the
+                            // trunk hostname and round-robining onto a sibling
+                            // member (see select_b2bua_retry_destination).
+                            {
+                                let (destination, transport, reuse_connection_id, relay_target) =
+                                    match select_b2bua_retry_destination(
+                                        b_leg_dest,
+                                        b_leg_connection_id,
+                                        target_uri,
+                                        &state.dns_resolver,
+                                    ) {
+                                        Some(resolved) => resolved,
+                                        None => return,
+                                    };
 
                                 // Build retry INVITE from stored A-leg INVITE
                                 let Ok(original) = invite_arc.lock() else {
@@ -9580,7 +9648,7 @@ fn handle_b2bua_response(
                                     new_branch,
                                     LegTransport {
                                         remote_addr: destination,
-                                        connection_id: ConnectionId::default(),
+                                        connection_id: reuse_connection_id,
                                         transport,
                                     },
                                 );
@@ -9609,7 +9677,7 @@ fn handle_b2bua_response(
                                 }
 
                                 let data = Bytes::from(retry.to_bytes());
-                                send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
+                                send_to_target(data, &relay_target, transport, reuse_connection_id, state);
                             }
                             return; // don't forward 422 to A-leg or fire on_failure
                         }
@@ -9772,11 +9840,25 @@ fn handle_b2bua_response(
                                 None,
                             );
 
-                            // Resolve target
-                            if let Some(relay_target) = resolve_target(target_uri, &state.dns_resolver) {
-                                let destination = relay_target.address;
-                                let b_leg_transport = b_leg_dest.map(|(_, t)| t).unwrap_or(Transport::Udp);
-                                let transport = relay_target.transport.unwrap_or(b_leg_transport);
+                            // RFC 5923 connection reuse: keep the authenticated
+                            // retry on the SAME trunk member the CSeq-1 INVITE
+                            // (and its 401 + nonce) traversed, instead of
+                            // re-resolving the trunk hostname and round-robining
+                            // onto a sibling member that never issued the nonce.
+                            // See select_b2bua_retry_destination for the full
+                            // rationale; it falls back to a fresh DNS resolution
+                            // only when the leg has no recorded destination.
+                            {
+                                let (destination, transport, reuse_connection_id, relay_target) =
+                                    match select_b2bua_retry_destination(
+                                        b_leg_dest,
+                                        b_leg_connection_id,
+                                        target_uri,
+                                        &state.dns_resolver,
+                                    ) {
+                                        Some(resolved) => resolved,
+                                        None => return,
+                                    };
 
                                 // Build retry from the stored, hygiene-processed B-leg INVITE.
                                 // Call-ID, From-tag, From-host, To, RURI, Contact, User-Agent,
@@ -9819,7 +9901,7 @@ fn handle_b2bua_response(
                                     new_branch,
                                     LegTransport {
                                         remote_addr: destination,
-                                        connection_id: ConnectionId::default(),
+                                        connection_id: reuse_connection_id,
                                         transport,
                                     },
                                 );
@@ -9865,7 +9947,7 @@ fn handle_b2bua_response(
                                 }
 
                                 let data = Bytes::from(retry.to_bytes());
-                                send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
+                                send_to_target(data, &relay_target, transport, reuse_connection_id, state);
                             }
                             return; // don't forward 401/407 to A-leg or fire on_failure
                         }
@@ -12807,6 +12889,81 @@ a=rtpmap:8 PCMA/8000\r\n";
             ConnectionId::default(),
             "fresh resolution must not reuse the established connection_id",
         );
+    }
+
+    // --- B2BUA 401/407/422 retry connection reuse (RFC 5923) ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b2bua_retry_reuses_established_member_not_resolved_sibling() {
+        // The 401'd CSeq-1 INVITE (and the nonce) went to trunk member A.  The
+        // dial target resolves to a *different* member B (the RFC 3263 A/AAAA
+        // shuffle on a multi-member trunk behind one DNS name).  The retry MUST
+        // stay on member A — the member that issued the nonce — so a strict
+        // trunk doesn't 401 again and the INVITE isn't split across members.
+        let resolver = test_resolver();
+        let member_a = "198.51.100.10:5061".parse::<SocketAddr>().unwrap();
+        let member_b_uri = "sip:trunk@198.51.100.20:5061;transport=tls";
+        let leg_connection_id = ConnectionId(99);
+
+        let (destination, transport, connection_id, relay_target) =
+            select_b2bua_retry_destination(
+                Some((member_a, Transport::Tls)),
+                leg_connection_id,
+                member_b_uri,
+                &resolver,
+            )
+            .expect("established leg destination is always selectable");
+
+        assert_eq!(
+            destination, member_a,
+            "retry must reuse the nonce-issuing member, not re-resolve onto a sibling",
+        );
+        assert_eq!(transport, Transport::Tls);
+        assert_eq!(
+            relay_target.address, member_a,
+            "send target must point at the established member so the TLS pool reuses its connection",
+        );
+        assert_eq!(relay_target.transport, Some(Transport::Tls));
+        // RFC 5923: the retry rides the connection the original INVITE was sent on.
+        assert_eq!(connection_id, leg_connection_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b2bua_retry_resolves_fresh_when_leg_has_no_destination() {
+        // Defensive fallback: with no recorded leg destination, resolve the
+        // target afresh and open/pool a new connection (default connection_id).
+        let resolver = test_resolver();
+        let (destination, transport, connection_id, relay_target) =
+            select_b2bua_retry_destination(
+                None,
+                ConnectionId(99),
+                "sip:bob@192.0.2.50:5061;transport=tls",
+                &resolver,
+            )
+            .expect("a resolvable literal-IP target yields a destination");
+
+        assert_eq!(destination, "192.0.2.50:5061".parse::<SocketAddr>().unwrap());
+        assert_eq!(transport, Transport::Tls);
+        assert_eq!(relay_target.address, destination);
+        assert_eq!(
+            connection_id,
+            ConnectionId::default(),
+            "fresh resolution must not claim a reused connection_id",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b2bua_retry_none_when_no_dest_and_unresolvable_target() {
+        // No leg destination and an unresolvable target → None, so the caller
+        // drops the retry rather than sending to a bogus address.
+        let resolver = test_resolver();
+        let result = select_b2bua_retry_destination(
+            None,
+            ConnectionId::default(),
+            "sip:bob@this-domain-should-not-exist-xyzzy.invalid",
+            &resolver,
+        );
+        assert!(result.is_none());
     }
 
     // --- CANCEL tests ---
