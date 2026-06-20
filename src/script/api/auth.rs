@@ -245,16 +245,14 @@ impl PyAuth {
                                     resync_data.extend_from_slice(&nonce_bytes[..16]);
                                     resync_data.extend_from_slice(&auts_bytes);
 
-                                    let maa_resync = tokio::task::block_in_place(|| {
-                                        tokio::runtime::Handle::current().block_on(
-                                            client.send_mar(
-                                                &public_identity,
-                                                1,
-                                                "Digest-AKAv1-MD5",
-                                                Some(&resync_data),
-                                            ),
-                                        )
-                                    }).map_err(|error| {
+                                    let maa_resync = crate::script::detach_block_on(
+                                        client.send_mar(
+                                            &public_identity,
+                                            1,
+                                            "Digest-AKAv1-MD5",
+                                            Some(&resync_data),
+                                        ),
+                                    ).map_err(|error| {
                                         pyo3::exceptions::PyRuntimeError::new_err(
                                             format!("MAR resync failed: {error}")
                                         )
@@ -321,11 +319,9 @@ impl PyAuth {
         }
 
         // ── First REGISTER (no Authorization) or re-challenge — send MAR ──
-        let maa = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                client.send_mar(&public_identity, 1, "SIP Digest", None),
-            )
-        }).map_err(|e| {
+        let maa = crate::script::detach_block_on(
+            client.send_mar(&public_identity, 1, "SIP Digest", None),
+        ).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("MAR failed: {e}"))
         })?;
 
@@ -884,28 +880,29 @@ impl PyAuth {
         let url = http_config.url.replace("{username}", username);
         debug!(url = %url, username = %username, "HTTP auth lookup");
 
-        // Block on the async HTTP request (we're called from sync Python context).
-        let response = match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.get(&url).send())
-        }) {
-            Ok(resp) => resp,
-            Err(error) => {
-                warn!(error = %error, url = %url, "HTTP auth request failed");
-                return None;
+        // Release the interpreter for the whole blocking HTTP exchange — see
+        // `crate::script::detach_block_on` for why this is mandatory on
+        // free-threaded CPython (blocking while attached stalls the GC
+        // stop-the-world and wedges the engine).
+        let outcome: Result<Option<String>, reqwest::Error> =
+            crate::script::detach_block_on(async {
+                let response = client.get(&url).send().await?;
+                if !response.status().is_success() {
+                    // user not found / backend rejected — not an error
+                    return Ok(None);
+                }
+                let body = response.text().await?;
+                Ok(Some(body.trim().to_string()))
+            });
+
+        match outcome {
+            Ok(Some(body)) => Some(body),
+            Ok(None) => {
+                debug!(username = %username, "HTTP auth: user not found (non-success status)");
+                None
             }
-        };
-
-        if !response.status().is_success() {
-            debug!(status = %response.status(), username = %username, "HTTP auth: user not found");
-            return None;
-        }
-
-        match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(response.text())
-        }) {
-            Ok(body) => Some(body.trim().to_string()),
             Err(error) => {
-                warn!(error = %error, "HTTP auth: failed to read response body");
+                warn!(error = %error, url = %url, "HTTP auth request/read failed");
                 None
             }
         }

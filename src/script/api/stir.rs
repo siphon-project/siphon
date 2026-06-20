@@ -231,10 +231,21 @@ impl PyStir {
             (values, orig, dest)
         };
 
-        let verification = self
-            .service
-            .verify(&values, orig.as_deref(), dest.as_deref(), current_unix_time())
-            .map_err(stir_error_to_py)?;
+        // `service.verify` blocks on the x5u SHAKEN-cert HTTP fetch internally.
+        // Release the interpreter for it: blocking while attached stalls the
+        // free-threaded GC stop-the-world and wedges the engine (see
+        // `crate::script::blocking`). `verify` is pure Rust (no Python refs).
+        let verification = pyo3::Python::attach(|python| {
+            python.detach(|| {
+                self.service.verify(
+                    &values,
+                    orig.as_deref(),
+                    dest.as_deref(),
+                    current_unix_time(),
+                )
+            })
+        })
+        .map_err(stir_error_to_py)?;
         Ok(StirResult::from_verification(verification))
     }
 

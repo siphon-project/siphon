@@ -337,14 +337,12 @@ impl PyProxyUtils {
         // we hand a coroutine back to Python — scripts that don't `await`
         // still get the message out.  The only awaitable work is the
         // optional response wait.
-        let destination = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(resolver_clone.resolve(
-                &host,
-                port,
-                &scheme,
-                transport_hint.as_deref(),
-            ))
-        });
+        let destination = crate::script::detach_block_on(resolver_clone.resolve(
+            &host,
+            port,
+            &scheme,
+            transport_hint.as_deref(),
+        ));
 
         let target = destination.into_iter().next().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(

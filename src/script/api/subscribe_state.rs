@@ -178,9 +178,7 @@ impl PySubscribeState {
     fn get(&self, id: &str) -> PyResult<Option<PySubscribeHandle>> {
         let store = Arc::clone(&self.store);
         let id_owned = id.to_string();
-        let found = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(store.get(&id_owned))
-        });
+        let found = crate::script::detach_block_on(store.get(&id_owned));
         Ok(found.map(|dialog| PySubscribeHandle {
             store: Arc::clone(&self.store),
             id: dialog.id,
@@ -272,14 +270,12 @@ impl PySubscribeState {
         let port = resolve_uri.port;
         let scheme = resolve_uri.scheme.clone();
 
-        let destination = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(resolver_clone.resolve(
-                &host,
-                port,
-                &scheme,
-                transport_hint.as_deref(),
-            ))
-        });
+        let destination = crate::script::detach_block_on(resolver_clone.resolve(
+            &host,
+            port,
+            &scheme,
+            transport_hint.as_deref(),
+        ));
         let target = destination.into_iter().next().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "cannot resolve destination for '{resolve_target}'"
@@ -350,10 +346,8 @@ impl PySubscribeState {
         );
 
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                tokio::time::timeout(timeout, receiver).await
-            })
+        let result = crate::script::detach_block_on(async {
+            tokio::time::timeout(timeout, receiver).await
         });
 
         let response = match result {
@@ -680,9 +674,7 @@ impl PySubscribeHandle {
     fn load_sync(&self) -> PyResult<SubscribeDialog> {
         let store = Arc::clone(&self.store);
         let id = self.id.clone();
-        let found = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(store.get(&id))
-        });
+        let found = crate::script::detach_block_on(store.get(&id));
         found.ok_or_else(|| {
             pyo3::exceptions::PyLookupError::new_err(format!(
                 "subscribe_state dialog '{}' not found",
@@ -749,14 +741,12 @@ fn send_notify(
     let port = resolve_uri.port;
     let scheme = resolve_uri.scheme.clone();
 
-    let destination = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(resolver_clone.resolve(
-            &host,
-            port,
-            &scheme,
-            transport_hint.as_deref(),
-        ))
-    });
+    let destination = crate::script::detach_block_on(resolver_clone.resolve(
+        &host,
+        port,
+        &scheme,
+        transport_hint.as_deref(),
+    ));
 
     let target = destination.into_iter().next().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -859,10 +849,8 @@ fn send_in_dialog_subscribe_with_timeout(
     })?;
     let receiver = uac_sender.send_request_with_response(message, target_addr, transport);
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    let result = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            tokio::time::timeout(timeout, receiver).await
-        })
+    let result = crate::script::detach_block_on(async {
+        tokio::time::timeout(timeout, receiver).await
     });
     match result {
         Ok(Ok(crate::uac::UacResult::Response(message))) => {
@@ -919,14 +907,12 @@ fn build_in_dialog_subscribe(
     let port = resolve_uri.port;
     let scheme = resolve_uri.scheme.clone();
 
-    let destination = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(resolver_clone.resolve(
-            &host,
-            port,
-            &scheme,
-            transport_hint.as_deref(),
-        ))
-    });
+    let destination = crate::script::detach_block_on(resolver_clone.resolve(
+        &host,
+        port,
+        &scheme,
+        transport_hint.as_deref(),
+    ));
     let target = destination.into_iter().next().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
             "cannot resolve destination for '{resolve_target}'"

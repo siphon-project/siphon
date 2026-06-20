@@ -70,6 +70,35 @@ Design accordingly:
   slow blocking backends; lower it on memory-constrained NFs (peak memory ≈
   `sync_pool_max × ~2 MB`).
 
+### Blocking calls must release the interpreter (free-threaded GC safety)
+
+On free-threaded CPython (3.14t) the cyclic GC performs a **stop-the-world**:
+it pauses every thread that is *attached* to the interpreter at a safe point. A
+thread that performs a blocking call (an HTTP/Diameter auth fetch, a DNS lookup,
+…) **while still attached** can never reach that safe point, so for the duration
+of that block every other handler that allocates cyclic garbage — which Python
+does constantly — stalls behind the GC. This is verified: a thread blocking
+while attached hangs a concurrent `gc.collect()` for the whole block; detached,
+it returns immediately. Under blocking-heavy load (auth/Diameter storms) the
+result is periodic **engine-wide latency spikes**, each lasting as long as the
+blocking call — and it bites even at low concurrency (one blocked-while-attached
+handler plus one GC trigger).
+
+The worst case has been seen on `cpus ≈ 1` nodes (a single-worker runtime,
+where `available_parallelism()` reports 1), where the engine wedged outright
+rather than just stalling. The exact escalation from a transient stall to a
+permanent wedge on such nodes is not reproduced here, so treat it as an observed
+correlation; the deadlock-aware watchdog (below) is the recovery backstop for
+it. Either way the fix is the same.
+
+The fix, and the rule for any blocking Rust-side work, is to **release the
+interpreter for the blocking window** — in pyo3 terms,
+`Python::attach(|py| py.detach(|| block_in_place(block_on(future))))`. siphon's
+built-in blocking APIs (e.g. the HTTP digest-auth backend) do this internally;
+the deadlock-aware watchdog above is the backstop for any path that doesn't. The
+integration regression `run-tests.sh --http-auth` drives a REGISTER storm
+through the blocking HA1-fetch path and fails if the engine wedges.
+
 ## Backpressure & liveness guarantees
 
 Beyond elasticity, the pool is defended on two more fronts so a misbehaving
@@ -79,16 +108,18 @@ handler degrades gracefully instead of taking the node down silently:
    full, new jobs are dropped (the SIP client retransmits) rather than growing
    memory without bound. Counted by `siphon_pyexec_jobs_shed_total`.
 2. **Liveness watchdog / fail-fast.** A dedicated thread (immune to any lock a
-   wedged handler holds) aborts the process when the pool is **at its thread cap
-   with every worker busy and zero completions** for
-   `script.handler_stall_abort_secs` (default 30 s; `0` disables). Keying on
-   "at the cap" is what makes it correct for an elastic pool — a busy
-   below-cap pool just grows; only an at-cap, fully-blocked, no-progress pool is
-   unrecoverable (e.g. every worker hung on a deadlocked backend). Aborting is
-   deliberate: a hung-but-alive SIP engine never recovers on its own, so a
-   `restart: always` / systemd policy never fires — the abort turns an
-   indefinite outage into a seconds-long restart and leaves a core for
-   post-mortem.
+   wedged handler holds) aborts the process when there is **work pending (a
+   handler in-flight *or* jobs queued) yet zero completions** for
+   `script.handler_stall_abort_secs` (default 30 s; `0` disables). The trigger
+   is **independent of pool fill**, so it catches a *low-concurrency deadlock*
+   (a handful of handlers stuck on a lock/await while the pool sits far below
+   its cap) as well as full saturation — an earlier "at the thread cap + fully
+   busy" condition could never see the former, since the pool never grew to the
+   cap. A healthy pool advances completions every tick; a genuinely idle pool
+   has no pending work — neither trips. Aborting is deliberate: a hung-but-alive
+   SIP engine never recovers on its own, so a `restart: always` / systemd policy
+   never fires — the abort turns an indefinite outage into a seconds-long
+   restart and leaves a core for post-mortem.
 
 ## Metrics (`/metrics`)
 

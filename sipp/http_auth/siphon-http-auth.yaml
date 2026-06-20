@@ -1,0 +1,45 @@
+# siphon-http-auth.yaml — config for the HTTP-auth deadlock integration test.
+#
+# Drives the production deadlock path: REGISTER → digest challenge → blocking
+# HA1 fetch from an HTTP backend. The HA1 cache is DISABLED so every auth'd
+# REGISTER actually hits the (slow) backend, maximising the number of handlers
+# parked in the blocking fetch at once — which is what triggers the
+# free-threaded-CPython GC stop-the-world deadlock on an unfixed build.
+#
+# Used by: sipp/docker-compose.yaml  (profile: http-auth)
+# Script:  scripts/proxy_default.py  (REGISTER → auth.require_digest → registrar.save)
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "example.com"          # proxy_default.py challenges with realm "example.com"
+    - "172.20.0.60"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/proxy_default.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+
+auth:
+  realm: "example.com"
+  backend: http
+  http:
+    url: "http://172.20.0.61:8080/sip/auth/{username}"
+    timeout_ms: 5000
+    connect_timeout_ms: 2000
+    ha1: true
+    cache_ttl_secs: 0        # disabled on purpose: every REGISTER blocks on the backend
+
+log:
+  level: warn
+  format: pretty

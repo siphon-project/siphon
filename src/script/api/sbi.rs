@@ -83,9 +83,7 @@ impl PySbi {
         };
 
         let client = Arc::clone(&self.client);
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.create_app_session(&context))
-        });
+        let result = crate::script::detach_block_on(client.create_app_session(&context));
 
         match result {
             Ok(response) => {
@@ -107,9 +105,7 @@ impl PySbi {
     fn delete_session(&self, session_id: &str) -> PyResult<bool> {
         let client = Arc::clone(&self.client);
         let sid = session_id.to_string();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.delete_app_session(&sid))
-        });
+        let result = crate::script::detach_block_on(client.delete_app_session(&sid));
 
         match result {
             Ok(()) => Ok(true),
@@ -154,9 +150,7 @@ impl PySbi {
 
         let client = Arc::clone(&self.client);
         let sid = session_id.to_string();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.update_app_session(&sid, &context))
-        });
+        let result = crate::script::detach_block_on(client.update_app_session(&sid, &context));
 
         match result {
             Ok(response) => {

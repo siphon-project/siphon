@@ -30,6 +30,7 @@ RUN_REINVITE=false
 RUN_B2BUA=false
 RUN_GATEWAY=false
 RUN_AUTO100=false
+RUN_HTTP_AUTH=false
 SKIP_RUST=false
 
 for arg in "$@"; do
@@ -42,9 +43,10 @@ for arg in "$@"; do
     --b2bua)      RUN_B2BUA=true ;;
     --gateway)    RUN_GATEWAY=true ;;
     --auto100)    RUN_AUTO100=true ;;
+    --http-auth)  RUN_HTTP_AUTH=true ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--skip-rust]"
+      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--skip-rust]"
       exit 0
       ;;
     *)
@@ -205,6 +207,25 @@ fi
 if [[ "$RUN_IPSEC" == true ]]; then
   echo "=== SIPp IPsec VoLTE registration test ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile ipsec run --rm sipp-ipsec
+fi
+
+# ── Step 12: HTTP-auth deadlock regression (optional) ────────────────────────
+# Drives sustained REGISTER load through the blocking HTTP HA1-fetch path. On an
+# unfixed build the handler stays attached to the free-threaded interpreter
+# while blocking, stalling the GC stop-the-world, and the engine deadlocks — the
+# load then fails to complete (non-zero exit). With the `py.detach()` fix every
+# registration succeeds. The --exit-code-from makes the load container's result
+# the gate; a deadlock is a hard FAIL, not a tolerated dead-call (255).
+if [[ "$RUN_HTTP_AUTH" == true ]]; then
+  echo "=== Building siphon-http-auth image ==="
+  docker compose -f "$COMPOSE_FILE" --profile http-auth build siphon-http-auth
+
+  echo "=== HTTP-auth deadlock regression (REGISTER storm → blocking HA1 fetch) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile http-auth \
+    up --abort-on-container-exit --exit-code-from sipp-http-auth-load \
+    mock-http-auth siphon-http-auth sipp-http-auth-load
+  docker compose -f "$COMPOSE_FILE" --profile http-auth rm -sf \
+    mock-http-auth siphon-http-auth sipp-http-auth-load 2>/dev/null || true
 fi
 
 echo ""

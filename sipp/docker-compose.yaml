@@ -1949,6 +1949,110 @@ services:
     profiles:
       - ims
 
+  # ── HTTP-auth deadlock regression (profile: http-auth) ─────────────────────
+  #
+  # Reproduces the production deadlock: REGISTER digest auth → blocking HA1
+  # fetch from an HTTP backend. On an unfixed build a handler stays attached to
+  # the free-threaded interpreter while blocking in that fetch, stalling the GC
+  # stop-the-world; under a stream of REGISTERs the engine wedges and the load
+  # below fails to complete. With the fix (`py.detach()` around the blocking
+  # call) every registration succeeds.
+  #
+  #   docker compose -f sipp/docker-compose.yaml --profile http-auth \
+  #     up --abort-on-container-exit --exit-code-from sipp-http-auth-load \
+  #     sipp-http-auth-load
+
+  # Slow HTTP HA1 backend — the delay widens the blocking window.
+  mock-http-auth:
+    image: python:3.12-slim
+    container_name: mock-http-auth
+    volumes:
+      - ./http_auth:/app:ro
+    working_dir: /app
+    command: ["python3", "mock_auth.py"]
+    environment:
+      AUTH_REALM: "example.com"
+      AUTH_PASSWORD: "secret"
+      AUTH_DELAY_MS: "400"
+      AUTH_PORT: "8080"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.61
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/sip/auth/hc', timeout=2).read()\""]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+    profiles:
+      - http-auth
+
+  # SIPhon with auth.backend: http (HA1 cache disabled — every REGISTER blocks).
+  # Pinned to 0.5 CPU to match the production node: available_parallelism()
+  # reports 1, so the tokio runtime has a single worker — the condition under
+  # which a handler blocking-while-attached (unfixed) permanently wedges (the
+  # one worker can't drive the blocked fetch to completion to release the GC
+  # stop-the-world). On a many-core host the stall is only transient, so the
+  # bug does NOT reproduce without this limit.
+  siphon-http-auth:
+    build:
+      context: ..
+    container_name: siphon-http-auth-test
+    cpus: 0.5
+    depends_on:
+      mock-http-auth:
+        condition: service_healthy
+    volumes:
+      - ./http_auth/siphon-http-auth.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.60
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - http-auth
+
+  # Sustained REGISTER load (digest handshake → blocking HA1 fetch per call).
+  # A wedged siphon cannot complete these, so a non-zero exit == deadlock.
+  sipp-http-auth-load:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-http-auth:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.62
+    entrypoint:
+      - sipp
+      - "172.20.0.60:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -au
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "150"
+      - -r
+      - "25"
+      - -l
+      - "60"
+      - -timeout
+      - "120"
+      - -trace_err
+    profiles:
+      - http-auth
+
 # ── Network ────────────────────────────────────────────────────────────────
 networks:
   sipnet:

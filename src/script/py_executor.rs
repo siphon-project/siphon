@@ -444,8 +444,8 @@ impl Drop for PyExecutor {
 
 /// Tuning for [`run_watchdog`].
 struct WatchdogParams {
-    /// Thread cap — the pool can still grow below this, so it is only truly
-    /// wedged once `total` has reached `max_threads` and stops completing work.
+    /// Configured thread ceiling — used only for the diagnostic abort log, not
+    /// for the trigger condition.
     max_threads: usize,
     /// Stall threshold; `None` = sample metrics only, never abort.
     stall_abort: Option<Duration>,
@@ -456,12 +456,20 @@ struct WatchdogParams {
 /// Sample the pool every `check_interval`: publish live thread count / queue-depth
 /// / in-flight / completed to Prometheus, and — when `stall_abort` is set — fire
 /// `on_stall` (in production: abort the process) once the pool has shown **zero
-/// forward progress while at the thread cap with every worker busy** for `stall_abort`.
+/// forward progress while any work is pending** for `stall_abort`.
 ///
-/// Keying on "at the cap" (not just "busy") is what makes this correct for an
-/// elastic pool: a busy-but-below-cap pool is not wedged, it just needs to grow.
-/// Only when every one of `max_threads` workers is blocked and nothing completes
-/// is the pool unrecoverable (e.g. all workers hung on a deadlocked backend).
+/// The trigger is intentionally **independent of pool fill**: it fires whenever
+/// there is work to do (a handler in-flight *or* jobs queued) and not one job
+/// has completed for the whole window. This catches a **low-concurrency
+/// deadlock** — a few workers stuck on a lock/await that never returns while the
+/// pool sits far below its cap — which an earlier "at the thread cap + fully
+/// busy" condition could never detect (the pool never grows to the cap, so the
+/// precondition was unreachable, and the engine wedged silently). A healthy pool
+/// advances `completed` every tick so it never accumulates; a genuinely idle
+/// pool has no in-flight/queued work so it never trips. The only false positive
+/// is a *single* handler that legitimately runs longer than the window —
+/// pathological for a SIP handler, and the default 30 s (6× the 5 s HTTP-auth
+/// timeout) is sized so transient blocking never reaches it.
 ///
 /// Runs on a dedicated OS thread that never takes a lock or touches Python, so
 /// a handler that wedges every worker (or holds a lock forever) cannot stall
@@ -505,14 +513,14 @@ fn run_watchdog(
             continue;
         };
 
-        // Wedged ⟺ the pool is at its thread cap, every worker is busy, AND not
-        // one job has completed since the last sample. A pool below the cap can
-        // still grow, so it is never "wedged"; a pool churning fast jobs advances
-        // `completed` each tick, so it never accumulates. Only a fully-grown pool
-        // where every worker is blocked indefinitely trips this.
-        let at_cap = params.max_threads > 0 && total >= params.max_threads;
-        let saturated = at_cap && inflight >= total;
-        if saturated && completed == last_completed {
+        // Wedged ⟺ there is work to do (a handler in-flight OR jobs queued) yet
+        // not one has completed since the last sample. Independent of pool fill,
+        // so it catches a low-concurrency deadlock (workers stuck on a
+        // lock/await that never returns) as well as full saturation. A healthy
+        // pool advances `completed` every tick; an idle pool has no pending work
+        // — neither trips.
+        let has_work = inflight > 0 || queue_depth > 0;
+        if has_work && completed == last_completed {
             stalled_for += params.check_interval;
             if stalled_for >= threshold {
                 error!(
@@ -521,10 +529,11 @@ fn run_watchdog(
                     queue_depth,
                     max_threads = params.max_threads,
                     stalled_secs = stalled_for.as_secs(),
-                    "Python executor pool wedged: at the thread cap with every \
-                     worker busy and zero completions for the stall window — \
-                     aborting so a supervisor restarts the process (a hung-but- \
-                     alive SIP engine never recovers on its own)"
+                    "Python executor pool wedged: work pending (in-flight/queued) \
+                     with zero completions for the stall window — aborting so a \
+                     supervisor restarts the process (a hung-but-alive SIP engine \
+                     never recovers on its own). Fires regardless of pool fill, so \
+                     it catches a low-concurrency deadlock, not just saturation."
                 );
                 on_stall();
                 // Reach here only in tests (production aborted above). Reset so
@@ -1016,13 +1025,12 @@ mod tests {
         drop(pool);
     }
 
-    /// Watchdog positive: a pool that is at its thread cap with every worker
-    /// busy and zero completions for the stall window fires the abort action.
+    /// Watchdog positive: a pool with an in-flight handler and zero completions
+    /// for the stall window fires the abort action.
     #[test]
     fn watchdog_fires_when_pool_wedged() {
         let metrics = Arc::new(PoolMetrics::default());
-        // Simulate a fully-grown 1-thread pool whose only worker is wedged:
-        // at the cap (total == max), busy, never completes.
+        // One worker, busy, never completes.
         metrics.total.store(1, Ordering::Relaxed);
         metrics.inflight.store(1, Ordering::Relaxed);
 
@@ -1117,18 +1125,69 @@ mod tests {
         let _ = progress.join();
     }
 
-    /// Watchdog must NOT fire while the pool can still grow: every current
-    /// worker busy with zero completions is fine if `total < max_threads`,
-    /// because the next submit will add a worker. Only an at-cap wedge is fatal.
+    /// **Regression guard for the low-concurrency deadlock** — the watchdog must
+    /// fire even when the pool is far below its thread cap. A handler stuck on a
+    /// lock/await that never returns wedges the engine at low concurrency; the
+    /// pool never grows to max, so an "at the cap" trigger could never catch it
+    /// (the bug in the prior watchdog). Here one worker is busy with zero
+    /// completions while max_threads=8 — it MUST still abort.
     #[test]
-    fn watchdog_does_not_fire_below_cap() {
+    fn watchdog_fires_below_cap_on_low_concurrency_deadlock() {
         let metrics = Arc::new(PoolMetrics::default());
-        // One thread, busy, no completions — but the cap is 4, so the pool is
-        // not wedged, it just hasn't grown yet.
+        // One of a possible 8 workers is wedged; the pool is nowhere near cap.
         metrics.total.store(1, Ordering::Relaxed);
         metrics.inflight.store(1, Ordering::Relaxed);
 
         let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_action = Arc::clone(&fired);
+        let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            fired_for_action.store(true, Ordering::Relaxed);
+        });
+
+        let params = WatchdogParams {
+            max_threads: 8,
+            stall_abort: Some(Duration::from_millis(150)),
+            check_interval: Duration::from_millis(50),
+        };
+        let metrics_for_thread = Arc::clone(&metrics);
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            run_watchdog(
+                metrics_for_thread,
+                receiver,
+                params,
+                shutdown_for_thread,
+                on_stall,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            fired.load(Ordering::Relaxed),
+            "watchdog must fire on an in-flight handler that never completes, \
+             even far below the thread cap (low-concurrency deadlock)"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    /// Watchdog must fire on a stranded *queued* job too (work pending with zero
+    /// completions), not only on an in-flight one.
+    #[test]
+    fn watchdog_fires_on_stranded_queued_work() {
+        let metrics = Arc::new(PoolMetrics::default());
+        // No worker is running it, but a job sits in the queue unconsumed.
+        metrics.total.store(2, Ordering::Relaxed);
+        metrics.inflight.store(0, Ordering::Relaxed);
+
+        let (keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        keep_alive_sender
+            .try_send(Box::new(|| {}) as Job)
+            .expect("queue a job that is never consumed");
+
         let shutdown = Arc::new(AtomicBool::new(false));
         let fired = Arc::new(AtomicBool::new(false));
         let fired_for_action = Arc::clone(&fired);
@@ -1155,12 +1214,137 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(600));
         assert!(
-            !fired.load(Ordering::Relaxed),
-            "watchdog must not fire while the pool is below its thread cap (can still grow)"
+            fired.load(Ordering::Relaxed),
+            "watchdog must fire on a queued job that is never picked up"
         );
 
         shutdown.store(true, Ordering::Relaxed);
         let _ = handle.join();
+        drop(keep_alive_sender);
+    }
+
+    /// Watchdog must NOT fire when the pool is genuinely idle (no in-flight and
+    /// no queued work) — zero completions then is normal, not a deadlock.
+    #[test]
+    fn watchdog_does_not_fire_when_idle() {
+        let metrics = Arc::new(PoolMetrics::default());
+        metrics.total.store(8, Ordering::Relaxed); // workers exist...
+        metrics.inflight.store(0, Ordering::Relaxed); // ...but none are busy
+
+        let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8); // empty queue
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_action = Arc::clone(&fired);
+        let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            fired_for_action.store(true, Ordering::Relaxed);
+        });
+
+        let params = WatchdogParams {
+            max_threads: 8,
+            stall_abort: Some(Duration::from_millis(150)),
+            check_interval: Duration::from_millis(50),
+        };
+        let metrics_for_thread = Arc::clone(&metrics);
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            run_watchdog(
+                metrics_for_thread,
+                receiver,
+                params,
+                shutdown_for_thread,
+                on_stall,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            !fired.load(Ordering::Relaxed),
+            "watchdog must not fire on an idle pool (no in-flight or queued work)"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    /// **Regression guard for the free-threaded GC stop-the-world deadlock.**
+    ///
+    /// On free-threaded CPython (3.14t) the cyclic GC pauses every *attached*
+    /// thread at a safe point. A handler that performs a blocking call (the HTTP
+    /// auth fetch) WHILE attached can never reach that safe point, so a
+    /// concurrent `gc.collect()` — triggered constantly by Python allocation —
+    /// hangs, and every other thread blocks behind it: the engine-wide deadlock.
+    /// The fix is to `py.detach()` around blocking calls. This test proves that
+    /// a thread blocking *while detached* does NOT stall a concurrent
+    /// `gc.collect()`. (With the buggy attached-blocking pattern this same test
+    /// hangs until the blocker is released — verified during investigation.)
+    #[test]
+    fn detached_blocking_does_not_stall_gc() {
+        pyo3::Python::initialize();
+        let unblock = Arc::new(AtomicBool::new(false));
+        let in_block = Arc::new(AtomicBool::new(false));
+
+        // Thread A: a handler that blocks the way the fixed code does — DETACHED.
+        let unblock_a = Arc::clone(&unblock);
+        let in_block_a = Arc::clone(&in_block);
+        let blocker = std::thread::spawn(move || {
+            pyo3::Python::attach(|python| {
+                python.detach(|| {
+                    in_block_a.store(true, Ordering::Relaxed);
+                    while !unblock_a.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+            });
+        });
+        while !in_block.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Thread B: a stop-the-world gc.collect() must complete while A is still
+        // parked in its blocking section.
+        let gc_done = Arc::new(AtomicBool::new(false));
+        let gc_done_b = Arc::clone(&gc_done);
+        let collector = std::thread::spawn(move || {
+            pyo3::Python::attach(|python| {
+                // Allocate cyclic garbage so collect() actually does STW work.
+                let _ = python.run(
+                    std::ffi::CString::new(
+                        "import gc\nfor _ in range(1000):\n    a=[]; a.append(a)\ngc.collect()",
+                    )
+                    .unwrap()
+                    .as_c_str(),
+                    None,
+                    None,
+                );
+            });
+            gc_done_b.store(true, Ordering::Relaxed);
+        });
+
+        let mut gc_completed = false;
+        for _ in 0..200 {
+            if gc_done.load(Ordering::Relaxed) {
+                gc_completed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Release the blocker regardless, so the test can never hang the suite.
+        let still_blocking = in_block.load(Ordering::Relaxed) && !gc_done.load(Ordering::Relaxed);
+        unblock.store(true, Ordering::Relaxed);
+        let _ = blocker.join();
+        let _ = collector.join();
+
+        assert!(
+            gc_completed,
+            "gc.collect() did not complete while a handler was in its blocking \
+             section — a detached blocking call must not stall the free-threaded \
+             stop-the-world GC (engine-wide deadlock)"
+        );
+        // Sanity: GC finished before we released the blocker, proving it didn't
+        // simply wait the blocker out.
+        let _ = still_blocking;
     }
 
     /// **Regression guard for commit 1c541e3** — the fixed (non-elastic) pool
