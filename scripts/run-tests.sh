@@ -226,6 +226,13 @@ if [[ "$RUN_HTTP_AUTH" == true ]]; then
     mock-http-auth siphon-http-auth sipp-http-auth-load
   docker compose -f "$COMPOSE_FILE" --profile http-auth rm -sf \
     mock-http-auth siphon-http-auth sipp-http-auth-load 2>/dev/null || true
+
+  echo "=== on_change blocking-notify regression (REGISTER storm → blocking notify per save) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile http-auth \
+    up --abort-on-container-exit --exit-code-from sipp-onchange-load \
+    mock-http-auth siphon-onchange sipp-onchange-load
+  docker compose -f "$COMPOSE_FILE" --profile http-auth rm -sf \
+    mock-http-auth siphon-onchange sipp-onchange-load 2>/dev/null || true
 fi
 
 echo ""

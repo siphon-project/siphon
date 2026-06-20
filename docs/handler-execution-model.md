@@ -95,9 +95,19 @@ The fix, and the rule for any blocking Rust-side work, is to **release the
 interpreter for the blocking window** — in pyo3 terms,
 `Python::attach(|py| py.detach(|| block_in_place(block_on(future))))`. siphon's
 built-in blocking APIs (e.g. the HTTP digest-auth backend) do this internally;
-the deadlock-aware watchdog above is the backstop for any path that doesn't. The
-integration regression `run-tests.sh --http-auth` drives a REGISTER storm
-through the blocking HA1-fetch path and fails if the engine wedges.
+the deadlock-aware watchdog above is the backstop for any path that doesn't.
+
+This GC hazard is specific to **Rust-side** blocking calls, which hold the attach
+for their whole duration. A blocking call made **from Python** in a handler — a
+synchronous `httpx`/`urllib`/`requests` request in `@registrar.on_change`, say —
+does *not* stall the GC: CPython releases the interpreter around the blocking
+socket syscall, so the handler is detached for the wait. It still pins a pool
+worker for the duration, though, so prefer `asyncio.create_task(...)` for slow
+side-effects (throughput, not safety). Both paths are exercised by
+`run-tests.sh --http-auth`: one scenario drives a REGISTER storm through the
+blocking HA1-fetch (Rust) path, another through a blocking `on_change` notify
+(Python) path, each on a single-worker (`cpus: 0.5`) siphon; the engine must
+complete the registrations.
 
 ## Backpressure & liveness guarantees
 
