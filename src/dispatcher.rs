@@ -2416,6 +2416,34 @@ fn handle_request(
     method: String,
     state: &Arc<DispatcherState>,
 ) {
+    // --- Request security filter (scanner_block + rate_limit) ---
+    // Runs before any transaction/dialog/script processing. trusted_cidrs are
+    // exempt (handled inside the filter). A blocked request is dropped silently
+    // (no response) so we never fingerprint the server to scanners — the same
+    // silent-drop policy the Python blocking API uses. Opt-in: a cheap OnceLock
+    // read that no-ops until security.rate_limit / security.scanner_block is set.
+    if let Some(filter) = crate::security::security_filter() {
+        let source = inbound.remote_addr.ip();
+        let user_agent = message.headers.get("User-Agent").map(String::as_str);
+        match filter.evaluate(source, user_agent) {
+            crate::security::SecurityVerdict::Allow => {}
+            crate::security::SecurityVerdict::Scanner => {
+                debug!(source = %source, %method, "security: dropping request (scanner User-Agent)");
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.scanner_blocked_total.inc();
+                }
+                return;
+            }
+            crate::security::SecurityVerdict::RateLimited => {
+                debug!(source = %source, %method, "security: dropping request (rate limit exceeded)");
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.rate_limited_total.inc();
+                }
+                return;
+            }
+        }
+    }
+
     // --- Extract the UAC's Via branch and sent-by ---
     let uac_via = message
         .headers

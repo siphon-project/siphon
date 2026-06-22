@@ -33,6 +33,7 @@ RUN_AUTO100=false
 RUN_HTTP_AUTH=false
 RUN_WEDGE=false
 RUN_BANSCAN=false
+RUN_SECURITY=false
 SKIP_RUST=false
 
 for arg in "$@"; do
@@ -48,9 +49,10 @@ for arg in "$@"; do
     --http-auth)  RUN_HTTP_AUTH=true ;;
     --wedge)      RUN_WEDGE=true ;;
     --banscan)    RUN_BANSCAN=true ;;
+    --security)   RUN_SECURITY=true ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--skip-rust]"
+      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--skip-rust]"
       exit 0
       ;;
     *)
@@ -257,6 +259,15 @@ fi
 if [[ "$RUN_BANSCAN" == true ]]; then
   echo "=== failed_auth_ban auto-ban regression (scanner banned at accept) ==="
   run_sipp bash scripts/banscan_test.sh
+fi
+
+# ── rate_limit + scanner_block regression (optional) ─────────────────────────
+# A scanner User-Agent must be silently dropped, and a source that exceeds
+# security.rate_limit.max_requests must be rate-limited. Hard exit 1 if either
+# blocked request still gets answered.
+if [[ "$RUN_SECURITY" == true ]]; then
+  echo "=== rate_limit + scanner_block regression (request filter) ==="
+  run_sipp bash scripts/security_test.sh
 fi
 
 echo ""

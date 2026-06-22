@@ -1,0 +1,26 @@
+# Config for the rate_limit + scanner_block functional regression
+# (scripts/security_test.sh).
+#
+# Low max_requests so a short burst trips the limiter quickly. No trusted_cidrs,
+# so the loopback test client IS subject to both filters (a trusted client would
+# be exempt — that path is covered by the Rust unit/integration tests).
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local: ["127.0.0.1", "0.0.0.0"]
+script:
+  path: "/etc/siphon/test_scripts/security_handler.py"
+security:
+  rate_limit:
+    window_secs: 60
+    max_requests: 5
+    ban_duration_secs: 60
+  scanner_block:
+    user_agents:
+      - "sipvicious"
+      - "friendly-scanner"
+      - "sipcli"
+log:
+  level: warn
+  format: pretty

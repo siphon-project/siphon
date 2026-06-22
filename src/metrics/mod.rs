@@ -166,6 +166,13 @@ pub struct SiphonMetrics {
     /// Total failures recorded toward the auto-ban: auth challenges that were not
     /// followed by a success, plus non-ACK INVITE server-transaction timeouts.
     pub auth_failures_total: IntCounter,
+    /// Total inbound requests dropped because the source's User-Agent matched a
+    /// `security.scanner_block` signature (sipvicious, friendly-scanner, …).
+    pub scanner_blocked_total: IntCounter,
+    /// Total inbound requests dropped because the source exceeded
+    /// `security.rate_limit.max_requests` within the window (PIKE-style flood
+    /// protection). trusted_cidrs are never counted.
+    pub rate_limited_total: IntCounter,
 
     // --- Diameter ---
     pub diameter_peers_connected: IntGauge,
@@ -332,6 +339,16 @@ impl SiphonMetrics {
             "Total failures recorded toward the auto-ban (auth challenges without a subsequent success + non-ACK INVITE server-transaction timeouts)",
         )?;
 
+        let scanner_blocked_total = IntCounter::new(
+            "siphon_scanner_blocked_total",
+            "Total inbound requests dropped because the source User-Agent matched a security.scanner_block signature",
+        )?;
+
+        let rate_limited_total = IntCounter::new(
+            "siphon_rate_limited_total",
+            "Total inbound requests dropped because the source exceeded security.rate_limit.max_requests within the window",
+        )?;
+
         let diameter_peers_connected = IntGauge::new(
             "siphon_diameter_peers_connected",
             "Number of currently connected Diameter peers",
@@ -413,6 +430,8 @@ impl SiphonMetrics {
         registry.register(Box::new(auth_ha1_cache_hits_total.clone()))?;
         registry.register(Box::new(banned_ips.clone()))?;
         registry.register(Box::new(auth_failures_total.clone()))?;
+        registry.register(Box::new(scanner_blocked_total.clone()))?;
+        registry.register(Box::new(rate_limited_total.clone()))?;
         registry.register(Box::new(diameter_peers_connected.clone()))?;
         registry.register(Box::new(diameter_requests_total.clone()))?;
         registry.register(Box::new(diameter_request_errors_total.clone()))?;
@@ -454,6 +473,8 @@ impl SiphonMetrics {
             auth_ha1_cache_hits_total,
             banned_ips,
             auth_failures_total,
+            scanner_blocked_total,
+            rate_limited_total,
             diameter_peers_connected,
             diameter_requests_total,
             diameter_request_errors_total,

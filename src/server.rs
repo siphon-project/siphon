@@ -823,6 +823,34 @@ impl SiphonServer {
                     }
                 });
             }
+
+            // --- Request security filter (rate_limit + scanner_block) ---
+            // Opt-in: only installed when `security.rate_limit` and/or
+            // `security.scanner_block` is set. Once installed, the dispatcher
+            // consults it on every inbound request (before transaction/dialog
+            // processing) via crate::security::security_filter(). trusted_cidrs
+            // are exempt from both checks.
+            if let Some(filter) = crate::security::SecurityFilter::from_config(sec) {
+                crate::security::set_security_filter(Arc::clone(&filter));
+                info!(
+                    rate_limit = sec.rate_limit.is_some(),
+                    scanner_user_agents = sec
+                        .scanner_block
+                        .as_ref()
+                        .map(|block| block.user_agents.len())
+                        .unwrap_or(0),
+                    trusted_cidrs = sec.trusted_cidrs.len(),
+                    "request security filter enabled (rate_limit / scanner_block)"
+                );
+                // Periodic prune to bound the rate-limiter maps under scanner churn.
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                    loop {
+                        ticker.tick().await;
+                        filter.prune();
+                    }
+                });
+            }
         }
 
         // --- Transport channels ---
