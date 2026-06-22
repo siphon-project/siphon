@@ -34,6 +34,7 @@ RUN_HTTP_AUTH=false
 RUN_WEDGE=false
 RUN_BANSCAN=false
 RUN_SECURITY=false
+RUN_WEBRTC=false
 SKIP_RUST=false
 
 for arg in "$@"; do
@@ -50,9 +51,10 @@ for arg in "$@"; do
     --wedge)      RUN_WEDGE=true ;;
     --banscan)    RUN_BANSCAN=true ;;
     --security)   RUN_SECURITY=true ;;
+    --webrtc)     RUN_WEBRTC=true ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--skip-rust]"
+      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--webrtc] [--skip-rust]"
       exit 0
       ;;
     *)
@@ -268,6 +270,31 @@ fi
 if [[ "$RUN_SECURITY" == true ]]; then
   echo "=== rate_limit + scanner_block regression (request filter) ==="
   run_sipp bash scripts/security_test.sh
+fi
+
+# ── WebRTC (SIP-over-WebSocket) two-UA call test (optional) ───────────────────
+# Two real sip.js WS user agents register and call each other through siphon.
+# Proves RFC 7118 / RFC 5626 §5.3 flow-based MT routing: the INVITE reaches a
+# WS-registered UE over its captured inbound connection (the Contact host is an
+# unresolvable .invalid). Tests MT and MO toward/from both WebRTC legs. The
+# webrtc-client container exits non-zero if any callee never receives the INVITE.
+if [[ "$RUN_WEBRTC" == true ]]; then
+  echo "=== Building siphon-webrtc images (proxy + b2bua) ==="
+  docker compose -f "$COMPOSE_FILE" --profile webrtc build siphon-webrtc siphon-webrtc-b2bua
+
+  echo "=== WebRTC (WS) two-UA call test — PROXY mode (MT + MO toward/from WebRTC legs) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile webrtc \
+    up --abort-on-container-exit --exit-code-from webrtc-client \
+    siphon-webrtc webrtc-client
+  docker compose -f "$COMPOSE_FILE" --profile webrtc rm -sf \
+    siphon-webrtc webrtc-client 2>/dev/null || true
+
+  echo "=== WebRTC (WS) two-UA call test — B2BUA mode (MT + MO toward/from WebRTC legs) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile webrtc \
+    up --abort-on-container-exit --exit-code-from webrtc-b2bua-client \
+    siphon-webrtc-b2bua webrtc-b2bua-client
+  docker compose -f "$COMPOSE_FILE" --profile webrtc rm -sf \
+    siphon-webrtc-b2bua webrtc-b2bua-client 2>/dev/null || true
 fi
 
 echo ""

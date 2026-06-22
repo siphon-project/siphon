@@ -34,7 +34,33 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream_connections: StreamConnections,
     close_tx: Option<flume::Sender<u64>>,
 ) {
-    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    // RFC 7118 §4: a SIP-over-WebSocket server MUST confirm the "sip"
+    // subprotocol the UA offers in `Sec-WebSocket-Protocol`.  Without it,
+    // browser / JS WebSocket clients (sip.js, JsSIP) abort the connection
+    // immediately after the handshake (close 1006).  `accept_async` ignores
+    // subprotocols entirely, so negotiate it here.
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(
+        stream,
+        |request: &Request, mut response: Response| {
+            let offers_sip = request
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(',').any(|proto| proto.trim().eq_ignore_ascii_case("sip")))
+                .unwrap_or(false);
+            if offers_sip {
+                response
+                    .headers_mut()
+                    .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("sip"));
+            }
+            Ok(response)
+        },
+    )
+    .await
+    {
         Ok(stream) => stream,
         Err(error) => {
             warn!("WebSocket upgrade failed from {}: {}", remote_addr, error);
@@ -450,6 +476,42 @@ mod tests {
             registry.reuse(message.remote_addr, Transport::WebSocket),
             None,
             "registry entry must clear on connection close"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_echoes_sip_subprotocol() {
+        // RFC 7118 §4: a UA that offers the "sip" subprotocol must get it back
+        // in the handshake response, or browser/JS WebSocket clients (sip.js,
+        // JsSIP) abort the connection right after the upgrade (close 1006).
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+        let addr = free_port();
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
+
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut request = format!("ws://127.0.0.1:{}", addr.port())
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("sip"));
+        let (_ws_stream, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("WS connect offering the sip subprotocol failed");
+        assert_eq!(
+            response
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some("sip"),
+            "server must echo the sip subprotocol (RFC 7118 §4)"
         );
     }
 

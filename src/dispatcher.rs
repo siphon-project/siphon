@@ -3146,10 +3146,26 @@ fn relay_request(
             let target = match resolve_target(&target_uri_string, &state.dns_resolver) {
                 Some(t) => t,
                 None => {
-                    warn!(target = %target_uri_string, "cannot resolve relay target");
-                    let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref(), &[]);
-                    send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
-                    return;
+                    // The next hop didn't resolve.  For an in-dialog request to
+                    // a WebSocket UE this is expected — its Contact is an
+                    // unresolvable `<uuid>.invalid` host (RFC 7118), so fall
+                    // back to the connection the dialog was established on
+                    // (RFC 5923 / RFC 5626 §5.3).  `send_to_target` then reuses
+                    // the live WS/WSS/TLS connection.  Mirrors the 2xx-ACK path
+                    // (`handle_ack_via_session`), which already does this — that
+                    // is why the ACK reaches the UE but the BYE used to 502.
+                    match in_dialog_reuse_destination(message, state) {
+                        Some((dest, transport)) => RelayTarget {
+                            address: dest,
+                            transport: Some(transport),
+                        },
+                        None => {
+                            warn!(target = %target_uri_string, "cannot resolve relay target");
+                            let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref(), &[]);
+                            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                            return;
+                        }
+                    }
                 }
             };
             (target_uri_string, target.address, target.transport.unwrap_or(inbound.transport), None)
@@ -5340,6 +5356,31 @@ fn resolve_in_dialog_destination(
         ConnectionId::default(),
     );
     (destination, transport)
+}
+
+/// For an in-dialog request whose next hop did not resolve — e.g. a WebSocket
+/// UE registered a `<uuid>.invalid` Contact (RFC 7118), so the R-URI can't be
+/// DNS-resolved — recover the destination from the connection the dialog was
+/// established on (RFC 5923 / RFC 5626 §5.3 connection reuse).
+///
+/// Returns the established far-end `(destination, transport)`.  The destination
+/// is the peer's source address, which the stream-connection registry is keyed
+/// on, so [`send_to_target`]'s per-transport reuse (TCP/TLS/WS/WSS arms) then
+/// routes the request over the live connection — the only way back to a WS/WSS
+/// UE.  Looked up by the dialog key `(Call-ID, From-tag)`; finds the session for
+/// any in-dialog request originated by the dialog's creator (the common case:
+/// a UAC sending BYE/re-INVITE/UPDATE for its own call).
+fn in_dialog_reuse_destination(
+    message: &SipMessage,
+    state: &DispatcherState,
+) -> Option<(SocketAddr, Transport)> {
+    let call_id = message.headers.get("Call-ID")?;
+    let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag)?;
+    let session_arc = state.session_store.get_by_dialog_key(call_id, &from_tag)?;
+    let session = session_arc.read().ok()?;
+    let client_key = session.client_keys.first()?;
+    let branch = session.get_client_branch(client_key)?;
+    Some((branch.destination, branch.transport))
 }
 
 /// Pin the outbound transport to a matching IPsec SA's protocol
@@ -8725,6 +8766,14 @@ fn handle_registrant_ipsec_challenge(
                 return;
             }
         };
+        // Re-REGISTER rekey: tear down any prior SA pair on the same UE
+        // protected client port before installing the new one. The UE keeps
+        // fixed protected ports, so old and new cannot overlap (their XFRM
+        // policy selectors would collide) — delete-before-install avoids the
+        // collision and the leak; no-op on the first registration. (Full
+        // TS 33.203 §6.3 old/new overlap would need fresh ports per
+        // registration, i.e. runtime listener binding.)
+        let _ = ipsec_manager.delete_sa_pair(&ue_addr, ue_port_c).await;
         if let Err(error) = ipsec_manager.create_ue_sa_pair(sa).await {
             warn!(aor = %aor_task, %error, "IPsec UE: SA install failed, protected REGISTER not sent");
             registrant_task.handle_failure(&aor_task, 0);

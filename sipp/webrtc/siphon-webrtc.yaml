@@ -1,0 +1,40 @@
+# siphon-webrtc.yaml — config for the WebRTC (SIP-over-WebSocket) call test.
+#
+# Two sip.js WebSocket user agents register and call each other through siphon.
+# Exercises RFC 7118 / RFC 5626 §5.3 flow-based MT routing: the INVITE toward a
+# WS-registered UE is delivered back over its captured inbound WebSocket
+# connection — the sip.js Contact URI is an unresolvable `<uuid>.invalid` host,
+# so connection reuse is the ONLY path back.  Pre-fix this INVITE never arrived.
+#
+# Plain WS, not WSS: WSS = WS + TLS, and the TLS layer is already covered by the
+# TLS transport + `wss_roundtrip` tests — this isolates the WebSocket SIP
+# routing path without Node cert-trust setup.
+#
+# Used by: sipp/docker-compose.yaml (profile: webrtc)
+# Script:  sipp/webrtc/webrtc_proxy.py (mounted at /etc/siphon/test_scripts)
+
+listen:
+  udp:
+    - "0.0.0.0:5060"     # for the docker healthcheck OPTIONS probe
+  ws:
+    - "0.0.0.0:8080"     # SIP over WebSocket (RFC 7118)
+
+domain:
+  local:
+    - "siphon.test"
+    - "example.com"
+    - "172.20.0.80"
+    - "127.0.0.1"
+
+script:
+  path: "/etc/siphon/test_scripts/webrtc_proxy.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+log:
+  level: info
+  format: pretty

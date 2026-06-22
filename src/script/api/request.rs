@@ -329,6 +329,13 @@ impl PyRequest {
         std::mem::take(&mut self.reply_headers)
     }
 
+    /// Queue a multi-value reply header (append semantics) from Rust-side
+    /// callers — e.g. the registrar enumerating REGISTER 200 OK `Contact`
+    /// bindings (RFC 3261 §10.3 step 8).
+    pub fn push_reply_header_add(&mut self, name: &str, value: String) {
+        self.reply_headers.push((ReplyHeaderOp::Add, name.to_string(), value));
+    }
+
     /// Take the response body set by `set_reply_body()` (consumed by the dispatcher).
     pub fn take_reply_body(&mut self) -> Option<(Vec<u8>, String)> {
         self.reply_body.take()

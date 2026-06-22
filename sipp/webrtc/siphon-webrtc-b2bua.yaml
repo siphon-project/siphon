@@ -1,0 +1,35 @@
+# siphon-webrtc-b2bua.yaml — B2BUA variant of the WebRTC call test.
+#
+# Same two-sip.js-UA WebSocket call, but siphon runs as a B2BUA: the INVITE is
+# bridged onto a fresh B-leg INVITE sent over the callee's captured inbound
+# WebSocket flow (b2bua_send_b_leg_invite flow path; RFC 7118 §5 / RFC 5626
+# §5.3).  Validates the B2BUA dial/fork flow path, not just the proxy relay path.
+#
+# Used by: sipp/docker-compose.yaml (profile: webrtc, service siphon-webrtc-b2bua)
+# Script:  sipp/webrtc/webrtc_b2bua.py (mounted at /etc/siphon/test_scripts)
+
+listen:
+  udp:
+    - "0.0.0.0:5060"     # for the docker healthcheck OPTIONS probe
+  ws:
+    - "0.0.0.0:8080"     # SIP over WebSocket (RFC 7118)
+
+domain:
+  local:
+    - "siphon.test"
+    - "example.com"
+    - "172.20.0.82"
+    - "127.0.0.1"
+
+script:
+  path: "/etc/siphon/test_scripts/webrtc_b2bua.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+log:
+  level: info
+  format: pretty

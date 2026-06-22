@@ -633,8 +633,21 @@ impl PyRegistrar {
             self.inner.set_associated_uris(&aor, aliases);
         }
 
-        // Send 200 OK — the dispatcher's build_response() will include
-        // the Expires header we just set.
+        // RFC 3261 §10.3 step 8: the 200 OK MUST enumerate all current bindings
+        // as Contact headers, each with an `expires` parameter.  Strict UAs
+        // (sip.js / JsSIP / browser WebRTC clients) drop a REGISTER 200 OK that
+        // carries no Contact and the registration fails — the top-level Expires
+        // header set above is not sufficient for them.
+        for binding in self.inner.lookup(&aor) {
+            let mut value = format!("<{}>;expires={}", binding.uri, binding.remaining_seconds());
+            if (binding.q - 1.0).abs() > f32::EPSILON {
+                value.push_str(&format!(";q={}", binding.q));
+            }
+            request.push_reply_header_add("Contact", value);
+        }
+
+        // Send 200 OK — build_response() includes the Expires header set above
+        // and the Contact bindings queued here.
         request.set_reply(200, "OK".to_string());
 
         Ok(true)
@@ -1387,6 +1400,29 @@ mod tests {
         assert_eq!(flow.connection_id, 4242);
         // No token was passed, so flow_token stays absent.
         assert_eq!(contacts[0].flow_token(), None);
+    }
+
+    #[test]
+    fn save_enumerates_contact_in_register_ok() {
+        // RFC 3261 §10.3 step 8: the REGISTER 200 OK must enumerate the bound
+        // Contact(s) with an `expires` param.  Strict UAs (sip.js) drop a 200
+        // with no Contact, so the registration silently fails without this.
+        let registrar = make_registrar();
+        let (mut request, py_reg) = make_register_request(
+            "<sip:alice@example.com>",
+            "<sip:alice@10.0.0.1:5060>",
+            &registrar,
+        );
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+
+        let reply_headers = request.take_reply_headers();
+        let contact = reply_headers
+            .iter()
+            .find(|(_, name, _)| name == "Contact")
+            .map(|(_, _, value)| value)
+            .expect("REGISTER 200 OK must carry a Contact binding (RFC 3261 §10.3 step 8)");
+        assert!(contact.contains("alice@10.0.0.1"), "contact value: {contact}");
+        assert!(contact.contains("expires="), "contact must carry an expires param: {contact}");
     }
 
     #[test]
