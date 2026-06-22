@@ -2157,6 +2157,80 @@ fn init_registrant(
         if is_hostname {
             entry.address_str = Some(address_str.clone());
         }
+
+        // IMS AKAv1-MD5 (3GPP TS 33.203): attach the USIM secrets so the 401
+        // runs through Milenage instead of password digest.
+        let entry = if entry_config
+            .auth
+            .as_deref()
+            .map(|mode| mode.eq_ignore_ascii_case("aka"))
+            .unwrap_or(false)
+        {
+            let aka_config = match &entry_config.aka {
+                Some(aka) => aka,
+                None => {
+                    error!(aor = %entry_config.aor, "auth: aka requires an `aka:` block, skipping entry");
+                    continue;
+                }
+            };
+            let credentials = match crate::registrant::aka::AkaCredentials::from_hex(
+                &aka_config.k,
+                aka_config.op.as_deref(),
+                aka_config.opc.as_deref(),
+                &aka_config.amf,
+            ) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    error!(aor = %entry_config.aor, %error, "invalid AKA credentials, skipping entry");
+                    continue;
+                }
+            };
+            let initial_sqn = match crate::ipsec::milenage::hex_to_bytes(&aka_config.sqn) {
+                Some(bytes) if bytes.len() == 6 => {
+                    let mut sqn = [0u8; 6];
+                    sqn.copy_from_slice(&bytes);
+                    sqn
+                }
+                _ => {
+                    error!(aor = %entry_config.aor, "sqn must be 12 hex chars, skipping entry");
+                    continue;
+                }
+            };
+            entry.with_aka(credentials, initial_sqn)
+        } else {
+            entry
+        };
+
+        // IPsec sec-agree (UE side) — only meaningful alongside auth: aka.
+        let entry = if let Some(ipsec_config) = &entry_config.ipsec {
+            if entry.auth_mode != crate::registrant::AuthMode::Aka {
+                error!(aor = %entry_config.aor, "registrant ipsec requires auth: aka, skipping entry");
+                continue;
+            }
+            let aalg = match crate::ipsec::IntegrityAlgorithm::from_sec_agree_name(&ipsec_config.alg) {
+                Some(alg) => alg,
+                None => {
+                    error!(aor = %entry_config.aor, alg = %ipsec_config.alg, "unknown ipsec alg, skipping entry");
+                    continue;
+                }
+            };
+            let ealg = match crate::ipsec::EncryptionAlgorithm::from_sec_agree_name(&ipsec_config.ealg) {
+                Some(ealg) => ealg,
+                None => {
+                    error!(aor = %entry_config.aor, ealg = %ipsec_config.ealg, "unknown ipsec ealg, skipping entry");
+                    continue;
+                }
+            };
+            entry.with_ipsec(crate::registrant::UeIpsec::new(
+                ipsec_config.ue_port_c,
+                ipsec_config.ue_port_s,
+                aalg,
+                ealg,
+            ))
+        } else {
+            entry
+        };
+
         manager.add(entry);
     }
 

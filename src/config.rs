@@ -1820,15 +1820,19 @@ pub struct RegistrantYamlConfig {
 /// A single static registrant entry.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RegistrantEntryConfig {
-    /// Address-of-Record (e.g. "sip:alice@carrier.com").
+    /// Address-of-Record (e.g. "sip:alice@carrier.com"). For IMS AKA this is
+    /// the IMPU.
     pub aor: String,
-    /// Registrar URI (e.g. "sip:registrar.carrier.com:5060").
+    /// Registrar URI (e.g. "sip:registrar.carrier.com:5060"). For IMS this is
+    /// the P-CSCF.
     pub registrar: String,
-    /// Authentication username.
+    /// Authentication username. For IMS AKA this is the IMPI.
     pub user: String,
-    /// Authentication password.
+    /// Authentication password (digest only; unused for AKA).
+    #[serde(default)]
     pub password: String,
-    /// Optional realm hint — derived from 401 challenge if omitted.
+    /// Optional realm hint — derived from 401 challenge if omitted (the home
+    /// domain for IMS).
     pub realm: Option<String>,
     /// Registration interval override in seconds.
     pub interval: Option<u32>,
@@ -1837,6 +1841,62 @@ pub struct RegistrantEntryConfig {
     /// Transport: "udp" (default), "tcp", "tls".
     #[serde(default = "default_registrant_transport")]
     pub transport: String,
+    /// Authentication mode: "digest" (default) or "aka" for IMS AKAv1-MD5
+    /// (RFC 3310 / 3GPP TS 33.203).
+    pub auth: Option<String>,
+    /// IMS AKA credentials — required when `auth: aka`.
+    pub aka: Option<RegistrantAkaConfig>,
+    /// IPsec sec-agree (UE side) — only valid with `auth: aka`.
+    pub ipsec: Option<RegistrantIpsecConfig>,
+}
+
+/// IMS AKA credentials for a registrant entry (3GPP TS 33.203).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantAkaConfig {
+    /// Subscriber key K as 32 hex chars.
+    pub k: String,
+    /// Operator variant OP as 32 hex chars (supply `op` OR `opc`).
+    pub op: Option<String>,
+    /// Pre-computed OPc as 32 hex chars (supply `op` OR `opc`).
+    pub opc: Option<String>,
+    /// Authentication Management Field as 4 hex chars.
+    #[serde(default = "default_aka_amf")]
+    pub amf: String,
+    /// Initial stored sequence number SQN_MS as 12 hex chars.
+    #[serde(default = "default_aka_sqn")]
+    pub sqn: String,
+}
+
+/// IPsec sec-agree parameters for a registrant entry (UE side, TS 33.203).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantIpsecConfig {
+    /// UE protected client port (must also be a `listen.udp` entry).
+    pub ue_port_c: u16,
+    /// UE protected server port (must also be a `listen.udp` entry).
+    pub ue_port_s: u16,
+    /// Offered integrity algorithm: "hmac-sha-1-96" (default), "hmac-md5-96",
+    /// or "hmac-sha-256-128".
+    #[serde(default = "default_ipsec_alg")]
+    pub alg: String,
+    /// Offered encryption algorithm: "null" (default) or "aes-cbc".
+    #[serde(default = "default_ipsec_ealg")]
+    pub ealg: String,
+}
+
+fn default_aka_amf() -> String {
+    "8000".to_string()
+}
+
+fn default_aka_sqn() -> String {
+    "000000000000".to_string()
+}
+
+fn default_ipsec_alg() -> String {
+    "hmac-sha-1-96".to_string()
+}
+
+fn default_ipsec_ealg() -> String {
+    "null".to_string()
 }
 
 fn default_registrant_interval() -> u32 {
@@ -2704,6 +2764,62 @@ registrant:
         assert_eq!(bob.interval, None);
         assert_eq!(bob.contact, None);
         assert_eq!(bob.transport, "udp"); // default
+
+        // Digest entries carry no AKA / IPsec blocks.
+        assert!(alice.auth.is_none());
+        assert!(alice.aka.is_none());
+        assert!(alice.ipsec.is_none());
+    }
+
+    #[test]
+    fn parses_registrant_aka_ipsec_config() {
+        // 3GPP test range (MCC 001 / MNC 01) + TS 35.208 Test Set 1 secrets.
+        let yaml = r#"
+listen:
+  udp:
+    - "10.0.0.20:5060"
+    - "10.0.0.20:6100"
+    - "10.0.0.20:6101"
+domain:
+  local:
+    - "10.0.0.20"
+script:
+  path: "examples/ims_ue_b2bua.py"
+ipsec:
+  backend: netlink
+registrant:
+  entries:
+    - aor: "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org"
+      registrar: "sip:pcscf.ims.mnc01.mcc001.3gppnetwork.org:5060"
+      user: "001010000000001@ims.mnc01.mcc001.3gppnetwork.org"
+      auth: "aka"
+      aka:
+        k: "465b5ce8b199b49faa5f0a2ee238a6bc"
+        opc: "cd63cb71954a9f4e48a5994e37a02baf"
+        amf: "b9b9"
+      ipsec:
+        ue_port_c: 6100
+        ue_port_s: 6101
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let registrant = config.registrant.unwrap();
+        let ue = &registrant.entries[0];
+        assert_eq!(ue.auth.as_deref(), Some("aka"));
+        // password omitted (unused for AKA) defaults to empty.
+        assert_eq!(ue.password, "");
+
+        let aka = ue.aka.as_ref().expect("aka block");
+        assert_eq!(aka.k, "465b5ce8b199b49faa5f0a2ee238a6bc");
+        assert_eq!(aka.opc.as_deref(), Some("cd63cb71954a9f4e48a5994e37a02baf"));
+        assert_eq!(aka.op, None);
+        assert_eq!(aka.amf, "b9b9");
+        assert_eq!(aka.sqn, "000000000000"); // default
+
+        let ipsec = ue.ipsec.as_ref().expect("ipsec block");
+        assert_eq!(ipsec.ue_port_c, 6100);
+        assert_eq!(ipsec.ue_port_s, 6101);
+        assert_eq!(ipsec.alg, "hmac-sha-1-96"); // default
+        assert_eq!(ipsec.ealg, "null"); // default
     }
 
     #[test]
