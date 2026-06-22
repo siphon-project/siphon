@@ -11,6 +11,8 @@
 //! - Applies exponential backoff on failure.
 //! - Sends de-registration (Expires: 0) on shutdown.
 
+pub mod aka;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
@@ -94,6 +96,27 @@ pub struct RegistrantCredentials {
     pub realm: Option<String>,
 }
 
+/// How an entry authenticates to its upstream registrar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMode {
+    /// RFC 2617 / RFC 7616 password digest (carriers, SBCs). The default.
+    #[default]
+    Digest,
+    /// IMS AKAv1-MD5 (RFC 3310 / 3GPP TS 33.203) — register *into* an IMS core
+    /// as a UE. The digest "password" is the Milenage RES; CK/IK seed the
+    /// IPsec SAs (wired in Phase 2).
+    Aka,
+}
+
+impl fmt::Display for AuthMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Digest => write!(formatter, "digest"),
+            Self::Aka => write!(formatter, "aka"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry
 // ---------------------------------------------------------------------------
@@ -136,6 +159,26 @@ pub struct RegistrantEntry {
     pub failure_count: u32,
     /// When the last REGISTER was sent (for transaction timeout detection).
     pub last_sent_at: Option<Instant>,
+
+    // --- IMS AKA (Phase 1) ---
+    /// Authentication mode. `Digest` (default) keeps the carrier-trunk path
+    /// unchanged; `Aka` routes the 401 through Milenage (see [`aka`]).
+    pub auth_mode: AuthMode,
+    /// IMS AKA credentials (K/OPc/AMF). `Some` only when `auth_mode == Aka`.
+    pub aka: Option<aka::AkaCredentials>,
+    /// UE's stored sequence number `SQN_MS`. Advances on each accepted
+    /// challenge; a challenge whose SQN is not strictly greater triggers an
+    /// AUTS re-synchronisation (3GPP TS 33.102 §6.3.3).
+    pub sqn_ms: [u8; 6],
+
+    // --- Captured from the 200 OK (IMS) ---
+    /// Service-Route set (RFC 3608) — the path to the S-CSCF for originating
+    /// requests. Consumed by the B2BUA when routing MO calls (Phase 3).
+    pub service_route: Vec<String>,
+    /// P-Associated-URI list (the implicit registration set).
+    pub associated_uris: Vec<String>,
+    /// Path header set (RFC 3327) returned by the registrar.
+    pub path: Vec<String>,
 }
 
 impl RegistrantEntry {
@@ -166,7 +209,25 @@ impl RegistrantEntry {
             call_id: format!("reg-{}", uuid::Uuid::new_v4()),
             failure_count: 0,
             last_sent_at: None,
+            auth_mode: AuthMode::Digest,
+            aka: None,
+            sqn_ms: [0u8; 6],
+            service_route: Vec::new(),
+            associated_uris: Vec::new(),
+            path: Vec::new(),
         }
+    }
+
+    /// Switch this entry to IMS AKAv1-MD5 authentication (3GPP TS 33.203).
+    ///
+    /// `initial_sqn` seeds `SQN_MS`; pass all-zeros for a fresh soft-UE (the
+    /// first in-range challenge then sets the real baseline). The digest
+    /// `username` carried in `RegistrantCredentials` should be the IMPI.
+    pub fn with_aka(mut self, credentials: aka::AkaCredentials, initial_sqn: [u8; 6]) -> Self {
+        self.auth_mode = AuthMode::Aka;
+        self.aka = Some(credentials);
+        self.sqn_ms = initial_sqn;
+        self
     }
 
     /// Returns seconds until expiry, or 0 if expired/not registered.
@@ -355,6 +416,27 @@ impl RegistrantManager {
             builder = builder.header("User-Agent", user_agent.clone());
         }
 
+        // IMS AKA: the initial (unprotected) REGISTER carries an Authorization
+        // header with an empty response so the S-CSCF learns the IMPI and
+        // fetches an authentication vector — the 401 challenge then comes back
+        // through build_register_aka (RFC 3310 / TS 24.229 §5.1.1.2).
+        if entry.auth_mode == AuthMode::Aka {
+            let realm = entry
+                .credentials
+                .realm
+                .clone()
+                .unwrap_or_else(|| home_domain_from_aor(&entry.aor));
+            let registrar_host = entry
+                .registrar_uri
+                .strip_prefix("sip:")
+                .unwrap_or(&entry.registrar_uri);
+            let digest_uri = format!("sip:{registrar_host}");
+            builder = builder.header(
+                "Authorization",
+                initial_aka_authorization(&entry.credentials.username, &realm, &digest_uri),
+            );
+        }
+
         let message = builder.build();
 
         let destination = entry.destination;
@@ -468,6 +550,163 @@ impl RegistrantManager {
                 None
             }
         }
+    }
+
+    /// Build an authenticated REGISTER in response to an IMS AKAv1-MD5 challenge.
+    ///
+    /// Runs Milenage over the challenge's RAND/AUTN (carried base64 in the
+    /// nonce). On success, the Authorization response is computed from RES and
+    /// `SQN_MS` advances; on a sequence-number mismatch the REGISTER instead
+    /// carries an `auts=` re-synchronisation token (3GPP TS 33.102 §6.3.3); on
+    /// a MAC failure (untrusted network) it returns `None` so the caller fails
+    /// the registration.
+    ///
+    /// This is the Phase-1 (no-IPsec) shape — it does not yet emit
+    /// `Security-Verify` or install SAs (Phase 2), and CK/IK are discarded.
+    pub fn build_register_aka(
+        &self,
+        aor: &str,
+        local_addr: SocketAddr,
+        listen_addrs: &HashMap<Transport, SocketAddr>,
+        challenge: &DigestChallenge,
+        expires: u32,
+    ) -> Option<(SipMessage, String, SocketAddr, Transport)> {
+        let mut entry = self.entries.get_mut(aor)?;
+
+        let credentials = entry.aka.clone()?;
+        let (rand, autn) = match aka::decode_aka_nonce(&challenge.nonce) {
+            Some(parts) => parts,
+            None => {
+                warn!(aor = %entry.aor, "AKA challenge nonce is not valid base64(RAND||AUTN)");
+                return None;
+            }
+        };
+
+        let (res, auts): (Vec<u8>, Option<String>) =
+            match aka::aka_challenge(&credentials, &rand, &autn, &entry.sqn_ms) {
+                aka::AkaOutcome::Success { res, sqn, .. } => {
+                    entry.sqn_ms = sqn;
+                    (res, None)
+                }
+                aka::AkaOutcome::SyncFailure { auts } => {
+                    warn!(aor = %entry.aor, "AKA SQN out of range — sending AUTS re-synchronisation");
+                    // RFC 3310 §3.4: the resync REGISTER carries the auts token;
+                    // the response is computed over an empty RES and the server
+                    // re-bases SQN and re-challenges.
+                    (Vec::new(), Some(aka::encode_auts(&auts)))
+                }
+                aka::AkaOutcome::MacFailure => {
+                    warn!(aor = %entry.aor, "AKA AUTN MAC failed — untrusted network challenge, aborting");
+                    return None;
+                }
+            };
+
+        let effective_addr = listen_addrs
+            .get(&entry.transport)
+            .copied()
+            .unwrap_or(local_addr);
+        let cseq = entry.next_cseq();
+        let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
+
+        let request_uri_str = entry
+            .registrar_uri
+            .strip_prefix("sip:")
+            .unwrap_or(&entry.registrar_uri)
+            .to_string();
+        let request_uri = SipUri::new(request_uri_str.clone());
+
+        let contact = entry
+            .contact_uri
+            .clone()
+            .unwrap_or_else(|| default_contact_uri(&entry.credentials.username, effective_addr, entry.transport));
+        let via = format!(
+            "SIP/2.0/{} {};branch={}",
+            entry.transport, effective_addr, branch
+        );
+
+        let nc = entry.nonce_counter.next_for(&challenge.nonce);
+        let cnonce = format!("{:08x}", rand_u32());
+        let digest_uri = format!("sip:{request_uri_str}");
+
+        let auth_header_value = auth::format_aka_authorization_header(
+            challenge,
+            &entry.credentials.username,
+            &res,
+            &digest_uri,
+            Some(nc),
+            Some(&cnonce),
+            auts.as_deref(),
+        );
+
+        entry.state = RegistrantState::Challenging;
+        entry.last_sent_at = Some(Instant::now());
+
+        let mut builder = SipMessageBuilder::new()
+            .request(Method::Register, request_uri)
+            .via(via)
+            .to(format!("<{}>", entry.aor))
+            .from(format!("<{}>;tag=reg-{}", entry.aor, cseq))
+            .call_id(entry.call_id.clone())
+            .cseq(format!("{cseq} REGISTER"))
+            .header("Contact", format!("<{}>", contact))
+            .header("Expires", expires.to_string())
+            .header("Authorization", auth_header_value)
+            .max_forwards(70)
+            .content_length(0);
+
+        if let Some(ref user_agent) = self.user_agent_header {
+            builder = builder.header("User-Agent", user_agent.clone());
+        }
+
+        let message = builder.build();
+        let destination = entry.destination;
+        let transport = entry.transport;
+
+        match message {
+            Ok(message) => Some((message, branch, destination, transport)),
+            Err(error) => {
+                warn!(aor = %entry.aor, %error, "failed to build AKA REGISTER");
+                None
+            }
+        }
+    }
+
+    /// The authentication mode of an entry (used by the dispatcher to pick the
+    /// digest vs. AKA challenge path).
+    pub fn auth_mode(&self, aor: &str) -> Option<AuthMode> {
+        self.entries.get(aor).map(|entry| entry.auth_mode)
+    }
+
+    /// Store the routing headers captured from a 200 OK (IMS). Replaces any
+    /// previously captured set. Called from the dispatcher's 200 handler.
+    pub fn store_registration_routes(
+        &self,
+        aor: &str,
+        service_route: Vec<String>,
+        associated_uris: Vec<String>,
+        path: Vec<String>,
+    ) {
+        if let Some(mut entry) = self.entries.get_mut(aor) {
+            entry.service_route = service_route;
+            entry.associated_uris = associated_uris;
+            entry.path = path;
+        }
+    }
+
+    /// Captured Service-Route set for an AoR (RFC 3608) — empty if none.
+    pub fn service_route(&self, aor: &str) -> Vec<String> {
+        self.entries
+            .get(aor)
+            .map(|entry| entry.service_route.clone())
+            .unwrap_or_default()
+    }
+
+    /// Captured P-Associated-URI list for an AoR — empty if none.
+    pub fn associated_uris(&self, aor: &str) -> Vec<String> {
+        self.entries
+            .get(aor)
+            .map(|entry| entry.associated_uris.clone())
+            .unwrap_or_default()
     }
 
     /// Handle a successful 200 OK response.
@@ -774,6 +1013,28 @@ fn default_contact_uri(username: &str, address: SocketAddr, transport: Transport
         Transport::Sctp => ";transport=sctp",
     };
     format!("sip:{}@{}{}", username, address, transport_param)
+}
+
+/// Build the empty-response Authorization header the UE puts on its initial
+/// (unprotected) IMS REGISTER (RFC 3310 / TS 24.229). Carries the IMPI as
+/// `username` so the network can fetch an authentication vector; `nonce` and
+/// `response` are empty because no challenge has been received yet.
+fn initial_aka_authorization(impi: &str, realm: &str, digest_uri: &str) -> String {
+    format!(
+        "Digest username=\"{impi}\", realm=\"{realm}\", uri=\"{digest_uri}\", nonce=\"\", response=\"\", algorithm=AKAv1-MD5"
+    )
+}
+
+/// Extract the home-network domain (host) from an AoR/IMPU like
+/// `sip:user@home.domain` or `sip:home.domain`, stripping any port/parameters.
+/// Used as the digest realm on the initial IMS REGISTER when none is configured.
+fn home_domain_from_aor(aor: &str) -> String {
+    let without_scheme = aor
+        .strip_prefix("sip:")
+        .or_else(|| aor.strip_prefix("sips:"))
+        .unwrap_or(aor);
+    let host = without_scheme.rsplit('@').next().unwrap_or(without_scheme);
+    host.split([':', ';']).next().unwrap_or(host).to_string()
 }
 
 /// Simple PRNG for cnonce generation — not cryptographic, just unique enough.
@@ -1445,5 +1706,222 @@ mod tests {
             Some(Instant::now() - Duration::from_secs(60));
 
         assert!(manager.entries_timed_out().is_empty());
+    }
+
+    // -- IMS AKA registration (Phase 1) --
+
+    // 3GPP test IMSI range (MCC 001 / MNC 01) — never a real subscriber.
+    const AKA_AOR: &str = "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org";
+    const AKA_REALM: &str = "ims.mnc01.mcc001.3gppnetwork.org";
+
+    fn make_aka_entry(aor: &str) -> RegistrantEntry {
+        // TS 35.208 Test Set 1 secrets.
+        let credentials = aka::AkaCredentials::from_hex(
+            "465b5ce8b199b49faa5f0a2ee238a6bc",
+            None,
+            Some("cd63cb71954a9f4e48a5994e37a02baf"),
+            "b9b9",
+        )
+        .unwrap();
+        RegistrantEntry::new(
+            aor.to_string(),
+            format!("sip:pcscf.{AKA_REALM}:5060"),
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            RegistrantCredentials {
+                username: "001010000000001@ims.mnc01.mcc001.3gppnetwork.org".to_string(),
+                password: String::new(), // unused for AKA
+                realm: Some(AKA_REALM.to_string()),
+            },
+            600000,
+            None,
+        )
+        .with_aka(credentials, [0u8; 6])
+    }
+
+    /// Build a well-formed AKAv1-MD5 challenge for a given network SQN, using
+    /// the same Test Set 1 secrets as `make_aka_entry` so Milenage verifies.
+    fn build_aka_challenge(sqn_hex: &str) -> DigestChallenge {
+        use crate::ipsec::milenage::{generate_vector_with_rand, hex_to_bytes};
+        use base64::Engine as _;
+
+        let to_array = |hex: &str, out: &mut [u8]| {
+            out.copy_from_slice(&hex_to_bytes(hex).unwrap());
+        };
+        let mut key = [0u8; 16];
+        to_array("465b5ce8b199b49faa5f0a2ee238a6bc", &mut key);
+        let mut op = [0u8; 16];
+        to_array("cdc202d5123e20f62b6d676ac72cb318", &mut op);
+        let mut sqn = [0u8; 6];
+        to_array(sqn_hex, &mut sqn);
+        let mut rand = [0u8; 16];
+        to_array("23553cbe9637a89d218ae64dae47bf35", &mut rand);
+        let amf = [0xb9u8, 0xb9u8];
+
+        let vector = generate_vector_with_rand(&key, &op, &sqn, &amf, &rand);
+        let mut joined = Vec::new();
+        joined.extend_from_slice(&vector.rand);
+        joined.extend_from_slice(&vector.autn);
+        let nonce = base64::engine::general_purpose::STANDARD.encode(&joined);
+
+        DigestChallenge {
+            realm: AKA_REALM.to_string(),
+            nonce,
+            opaque: None,
+            qop: Some("auth".to_string()),
+            algorithm: auth::DigestAlgorithm::AkaV1Md5,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn build_register_initial_aka_carries_empty_auth() {
+        let manager = make_manager();
+        manager.add(make_aka_entry(AKA_AOR));
+
+        let (message, _, _, _) = manager
+            .build_register(AKA_AOR, "127.0.0.1:5060".parse().unwrap(), &HashMap::new(), 600000)
+            .unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(raw.contains("Authorization: Digest"), "{raw}");
+        assert!(raw.contains("algorithm=AKAv1-MD5"));
+        assert!(raw.contains("nonce=\"\""));
+        assert!(raw.contains("response=\"\""));
+        assert!(raw.contains(
+            "username=\"001010000000001@ims.mnc01.mcc001.3gppnetwork.org\""
+        ));
+        assert!(raw.contains(&format!("realm=\"{AKA_REALM}\"")));
+    }
+
+    #[test]
+    fn build_register_aka_success_advances_sqn() {
+        let manager = make_manager();
+        manager.add(make_aka_entry(AKA_AOR));
+
+        let challenge = build_aka_challenge("ff9bb4d0b607");
+        let result = manager.build_register_aka(
+            AKA_AOR,
+            "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
+            &challenge,
+            600000,
+        );
+        assert!(result.is_some());
+
+        let (message, branch, _, _) = result.unwrap();
+        assert!(branch.starts_with("z9hG4bK-reg-"));
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(raw.contains("Authorization: Digest"));
+        assert!(raw.contains("algorithm=AKAv1-MD5"));
+        assert!(!raw.contains("auts="), "fresh challenge must not resync: {raw}");
+
+        let entry = manager.entries.get(AKA_AOR).unwrap();
+        assert_eq!(entry.sqn_ms, [0xff, 0x9b, 0xb4, 0xd0, 0xb6, 0x07]);
+        assert_eq!(entry.state, RegistrantState::Challenging);
+    }
+
+    #[test]
+    fn build_register_aka_resync_includes_auts() {
+        let manager = make_manager();
+        let mut entry = make_aka_entry(AKA_AOR);
+        entry.sqn_ms = [0, 0, 0, 0, 0, 0x10]; // ahead of the challenge SQN (0x05)
+        manager.add(entry);
+
+        let challenge = build_aka_challenge("000000000005");
+        let (message, _, _, _) = manager
+            .build_register_aka(
+                AKA_AOR,
+                "127.0.0.1:5060".parse().unwrap(),
+                &HashMap::new(),
+                &challenge,
+                600000,
+            )
+            .unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(raw.contains("auts="), "SQN mismatch must emit AUTS: {raw}");
+    }
+
+    #[test]
+    fn build_register_aka_mac_failure_returns_none() {
+        use base64::Engine as _;
+        let manager = make_manager();
+        manager.add(make_aka_entry(AKA_AOR));
+
+        let good = build_aka_challenge("ff9bb4d0b607");
+        // Corrupt the AUTN MAC (bytes 24..32 of RAND‖AUTN) so authentication fails.
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(good.nonce.as_bytes())
+            .unwrap();
+        bytes[24] ^= 0xff;
+        let corrupted = DigestChallenge {
+            nonce: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            ..good
+        };
+
+        assert!(manager
+            .build_register_aka(
+                AKA_AOR,
+                "127.0.0.1:5060".parse().unwrap(),
+                &HashMap::new(),
+                &corrupted,
+                600000,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn auth_mode_reports_digest_and_aka() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+        manager.add(make_aka_entry(AKA_AOR));
+        assert_eq!(manager.auth_mode("sip:alice@carrier.com"), Some(AuthMode::Digest));
+        assert_eq!(manager.auth_mode(AKA_AOR), Some(AuthMode::Aka));
+        assert_eq!(manager.auth_mode("sip:nobody@x.com"), None);
+    }
+
+    #[test]
+    fn store_and_get_registration_routes() {
+        let manager = make_manager();
+        manager.add(make_aka_entry(AKA_AOR));
+
+        manager.store_registration_routes(
+            AKA_AOR,
+            vec![format!("<sip:scscf.{AKA_REALM}:6060;lr>")],
+            vec![
+                AKA_AOR.to_string(),
+                "tel:+15551234567".to_string(),
+            ],
+            vec![format!("<sip:pcscf.{AKA_REALM}:5060;lr>")],
+        );
+
+        assert_eq!(manager.service_route(AKA_AOR).len(), 1);
+        assert_eq!(manager.associated_uris(AKA_AOR).len(), 2);
+        assert!(manager.service_route("sip:nobody@x.com").is_empty());
+    }
+
+    #[test]
+    fn home_domain_extraction() {
+        assert_eq!(home_domain_from_aor(AKA_AOR), AKA_REALM);
+        assert_eq!(home_domain_from_aor("sip:ims.example.com:5060"), "ims.example.com");
+        assert_eq!(
+            home_domain_from_aor("sip:user@host.com;transport=tcp"),
+            "host.com"
+        );
+    }
+
+    #[test]
+    fn aka_mode_does_not_disturb_digest_entries() {
+        // A digest entry's initial REGISTER must NOT gain an AKA Authorization.
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+        let (message, _, _, _) = manager
+            .build_register("sip:alice@carrier.com", "127.0.0.1:5060".parse().unwrap(), &HashMap::new(), 3600)
+            .unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(!raw.contains("Authorization"), "digest initial REGISTER has no auth: {raw}");
     }
 }

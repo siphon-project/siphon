@@ -28,7 +28,6 @@ const C3: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 const C4: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4];
 
 /// c5 constant — 0x00...08 (used by f5* for re-synchronisation).
-#[allow(dead_code)]
 const C5: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8];
 
 /// Rotation constants (in bits). All are multiples of 8.
@@ -37,7 +36,6 @@ const R2: usize = 0;
 const R3: usize = 32;
 const R4: usize = 64;
 /// r5 rotation for f5* (re-synchronisation).
-#[allow(dead_code)]
 const R5: usize = 96;
 
 // ---------------------------------------------------------------------------
@@ -112,19 +110,20 @@ pub fn compute_opc(key: &[u8; 16], op: &[u8; 16]) -> [u8; 16] {
     xor_blocks(&encrypted, op)
 }
 
-/// Compute MAC-A using Milenage f1 (network authentication).
+/// Compute the full OUT1 block shared by f1 (MAC-A) and f1* (MAC-S).
 ///
-/// MAC-A is included in the AUTN parameter to allow the UE to
-/// authenticate the network.
+/// `OUT1 = AES_K(TEMP XOR rotate(OPc XOR IN1, r1) XOR c1) XOR OPc`, where
+/// `TEMP = AES_K(RAND XOR OPc)` and `IN1 = SQN || AMF || SQN || AMF`.
 ///
-/// Returns an 8-byte MAC-A value.
-pub fn f1(
+/// MAC-A is `OUT1[0..8]` (network authentication) and MAC-S is `OUT1[8..16]`
+/// (re-synchronisation), so both fall out of a single computation.
+fn f1_out1(
     key: &[u8; 16],
     opc: &[u8; 16],
     rand: &[u8; 16],
     sqn: &[u8; 6],
     amf: &[u8; 2],
-) -> [u8; 8] {
+) -> [u8; 16] {
     // TEMP = AES_K(RAND XOR OPc)
     let temp_input = xor_blocks(rand, opc);
     let temp = aes_encrypt(key, &temp_input);
@@ -142,12 +141,54 @@ pub fn f1(
     let inner = xor_blocks(&temp, &rotated);
     let inner = xor_blocks(&inner, &C1);
     let encrypted = aes_encrypt(key, &inner);
-    let out1 = xor_blocks(&encrypted, opc);
+    xor_blocks(&encrypted, opc)
+}
 
-    // MAC-A = OUT1[0..7]
+/// Compute MAC-A using Milenage f1 (network authentication).
+///
+/// MAC-A is included in the AUTN parameter to allow the UE to
+/// authenticate the network.
+///
+/// Returns an 8-byte MAC-A value.
+pub fn f1(
+    key: &[u8; 16],
+    opc: &[u8; 16],
+    rand: &[u8; 16],
+    sqn: &[u8; 6],
+    amf: &[u8; 2],
+) -> [u8; 8] {
+    // MAC-A = OUT1[0..8]
+    let out1 = f1_out1(key, opc, rand, sqn, amf);
     let mut mac_a = [0u8; 8];
     mac_a.copy_from_slice(&out1[0..8]);
     mac_a
+}
+
+/// Compute MAC-S using Milenage f1* (re-synchronisation message authentication).
+///
+/// MAC-S is the integrity check the UE places in the AUTS token when it
+/// detects an out-of-range SQN and forces the HSS to re-synchronise
+/// (3GPP TS 33.102 §6.3.3). It is `OUT1[8..16]` from the same computation
+/// that yields MAC-A.
+///
+/// Note: per TS 33.102, the AMF in a re-synchronisation MAC-S assumes a
+/// dummy value of all zeros (it is not carried in AUTS); [`compute_auts`]
+/// applies that for callers — `f1star` itself takes whatever AMF it is given
+/// so it can also be validated against the published 3GPP test vectors.
+///
+/// Returns an 8-byte MAC-S value.
+pub fn f1star(
+    key: &[u8; 16],
+    opc: &[u8; 16],
+    rand: &[u8; 16],
+    sqn: &[u8; 6],
+    amf: &[u8; 2],
+) -> [u8; 8] {
+    // MAC-S = OUT1[8..16]
+    let out1 = f1_out1(key, opc, rand, sqn, amf);
+    let mut mac_s = [0u8; 8];
+    mac_s.copy_from_slice(&out1[8..16]);
+    mac_s
 }
 
 /// Compute f2 (RES), f3 (CK), f4 (IK), and f5 (AK) in one pass.
@@ -193,6 +234,61 @@ pub fn f2345(
     let ik = xor_blocks(&encrypted4, opc);
 
     (res, ck, ik, ak)
+}
+
+/// Compute f5* (AK*) — the anonymity key used to conceal SQN_MS inside the
+/// AUTS re-synchronisation token (3GPP TS 35.206 §4.5, TS 33.102 §6.3.3).
+///
+/// `OUT5 = AES_K(rotate(TEMP XOR OPc, r5) XOR c5) XOR OPc`, where
+/// `TEMP = AES_K(RAND XOR OPc)`; AK* = `OUT5[0..6]`.
+///
+/// AK* is a *separate* anonymity key from the f5 AK returned by [`f2345`];
+/// using f5 here instead of f5* would leak the relationship between the
+/// normal and re-synch tokens, so this is its own derivation.
+pub fn f5star(key: &[u8; 16], opc: &[u8; 16], rand: &[u8; 16]) -> [u8; 6] {
+    // TEMP = AES_K(RAND XOR OPc)
+    let temp_input = xor_blocks(rand, opc);
+    let temp = aes_encrypt(key, &temp_input);
+
+    // OUT5 = AES_K(rot(TEMP XOR OPc, r5) XOR c5) XOR OPc
+    let temp_xor_opc = xor_blocks(&temp, opc);
+    let rotated5 = rotate_left(&temp_xor_opc, R5);
+    let inner5 = xor_blocks(&rotated5, &C5);
+    let encrypted5 = aes_encrypt(key, &inner5);
+    let out5 = xor_blocks(&encrypted5, opc);
+
+    let mut ak_star = [0u8; 6];
+    ak_star.copy_from_slice(&out5[0..6]);
+    ak_star
+}
+
+/// Build the AUTS re-synchronisation token (3GPP TS 33.102 §6.3.3).
+///
+/// `AUTS = (SQN_MS XOR AK*) || MAC-S` (6 + 8 = 14 bytes), where SQN_MS is the
+/// UE's stored sequence number, AK* comes from [`f5star`], and MAC-S comes
+/// from [`f1star`] computed over SQN_MS with a **dummy all-zero AMF** (the AMF
+/// is not carried in AUTS, so both sides agree on zeros for the MAC-S input).
+///
+/// The UE emits this in the `auts` Authorization parameter when it detects an
+/// out-of-range SQN in a network challenge, forcing the HSS to re-base its
+/// sequence counter.
+pub fn compute_auts(
+    key: &[u8; 16],
+    opc: &[u8; 16],
+    rand: &[u8; 16],
+    sqn_ms: &[u8; 6],
+) -> [u8; 14] {
+    const RESYNC_AMF: [u8; 2] = [0, 0];
+
+    let ak_star = f5star(key, opc, rand);
+    let mac_s = f1star(key, opc, rand, sqn_ms, &RESYNC_AMF);
+
+    let mut auts = [0u8; 14];
+    for index in 0..6 {
+        auts[index] = sqn_ms[index] ^ ak_star[index];
+    }
+    auts[6..14].copy_from_slice(&mac_s);
+    auts
 }
 
 /// Generate an AKA authentication vector with a random RAND.
@@ -505,6 +601,100 @@ mod tests {
 
         let (res, _, _, _) = f2345(&key, &opc, &rand);
         assert_eq!(res.len(), 8, "RES must be 8 bytes");
+    }
+
+    // -- f1* (MAC-S) / f5* (AK*) re-synchronisation tests --
+
+    #[test]
+    fn f1star_mac_s_test_set_1() {
+        let key = test_set_1_key();
+        let opc: [u8; 16] = hex_array("cd63cb71954a9f4e48a5994e37a02baf");
+        let rand = test_set_1_rand();
+        let sqn = test_set_1_sqn();
+        let amf = test_set_1_amf();
+
+        // 3GPP TS 35.208 Test Set 1: f1* = 01cfaf9ec4e871e9
+        let mac_s = f1star(&key, &opc, &rand, &sqn, &amf);
+        let expected: [u8; 8] = hex_array("01cfaf9ec4e871e9");
+        assert_eq!(mac_s, expected);
+    }
+
+    #[test]
+    fn f1_and_f1star_come_from_same_block() {
+        // MAC-A is OUT1[0..8], MAC-S is OUT1[8..16] — disjoint halves of one
+        // computation, so they must never be equal for these inputs.
+        let key = test_set_1_key();
+        let opc: [u8; 16] = hex_array("cd63cb71954a9f4e48a5994e37a02baf");
+        let rand = test_set_1_rand();
+        let sqn = test_set_1_sqn();
+        let amf = test_set_1_amf();
+
+        let mac_a = f1(&key, &opc, &rand, &sqn, &amf);
+        let mac_s = f1star(&key, &opc, &rand, &sqn, &amf);
+        assert_ne!(mac_a, mac_s);
+    }
+
+    #[test]
+    fn f5star_ak_star_test_set_1() {
+        let key = test_set_1_key();
+        let opc: [u8; 16] = hex_array("cd63cb71954a9f4e48a5994e37a02baf");
+        let rand = test_set_1_rand();
+
+        // 3GPP TS 35.208 Test Set 1: f5* = 451e8beca43b
+        let ak_star = f5star(&key, &opc, &rand);
+        let expected: [u8; 6] = hex_array("451e8beca43b");
+        assert_eq!(ak_star, expected);
+    }
+
+    #[test]
+    fn f5star_differs_from_f5() {
+        // AK* (f5*) must be a different anonymity key from AK (f5).
+        let key = test_set_1_key();
+        let opc: [u8; 16] = hex_array("cd63cb71954a9f4e48a5994e37a02baf");
+        let rand = test_set_1_rand();
+
+        let (_, _, _, ak) = f2345(&key, &opc, &rand);
+        let ak_star = f5star(&key, &opc, &rand);
+        assert_ne!(ak, ak_star);
+    }
+
+    #[test]
+    fn compute_auts_structure() {
+        // AUTS = (SQN_MS XOR AK*) || MAC-S, with MAC-S over a dummy zero AMF.
+        let key = test_set_1_key();
+        let opc: [u8; 16] = hex_array("cd63cb71954a9f4e48a5994e37a02baf");
+        let rand = test_set_1_rand();
+        let sqn_ms = test_set_1_sqn();
+
+        let auts = compute_auts(&key, &opc, &rand, &sqn_ms);
+        assert_eq!(auts.len(), 14);
+
+        // First 6 bytes: SQN_MS XOR AK*.
+        let ak_star = f5star(&key, &opc, &rand);
+        for index in 0..6 {
+            assert_eq!(auts[index], sqn_ms[index] ^ ak_star[index]);
+        }
+
+        // Last 8 bytes: MAC-S computed with the dummy all-zero AMF.
+        let expected_mac_s = f1star(&key, &opc, &rand, &sqn_ms, &[0, 0]);
+        assert_eq!(&auts[6..14], &expected_mac_s);
+    }
+
+    #[test]
+    fn compute_auts_recoverable_sqn() {
+        // The HSS recovers SQN_MS by XORing the first 6 AUTS bytes with AK*.
+        let key = test_set_1_key();
+        let opc: [u8; 16] = hex_array("cd63cb71954a9f4e48a5994e37a02baf");
+        let rand = test_set_1_rand();
+        let sqn_ms: [u8; 6] = hex_array("000000000021");
+
+        let auts = compute_auts(&key, &opc, &rand, &sqn_ms);
+        let ak_star = f5star(&key, &opc, &rand);
+        let mut recovered = [0u8; 6];
+        for index in 0..6 {
+            recovered[index] = auts[index] ^ ak_star[index];
+        }
+        assert_eq!(recovered, sqn_ms);
     }
 
     // -- generate_vector_with_rand tests --

@@ -42,16 +42,26 @@ impl PyRegistration {
     /// Add a new outbound registration.
     ///
     /// Args:
-    ///     aor: Address-of-Record (e.g. "sip:alice@carrier.com").
-    ///     registrar: Registrar URI (e.g. "sip:registrar.carrier.com:5060").
-    ///     user: Authentication username.
-    ///     password: Authentication password.
+    ///     aor: Address-of-Record (e.g. "sip:alice@carrier.com"). For IMS AKA
+    ///         this is the IMPU (e.g. "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org").
+    ///     registrar: Registrar URI (e.g. "sip:registrar.carrier.com:5060"). For
+    ///         IMS this is the P-CSCF.
+    ///     user: Authentication username. For IMS AKA this is the IMPI.
+    ///     password: Authentication password (digest only; unused for AKA).
     ///     interval: Registration interval in seconds (default: manager default).
-    ///     realm: Optional realm hint (derived from 401 if omitted).
+    ///     realm: Optional realm hint (derived from 401 if omitted; the home
+    ///         domain for IMS).
     ///     contact: Optional Contact URI (auto-generated if omitted).
     ///     transport: Transport protocol: "udp" (default), "tcp", "tls".
+    ///     auth: "digest" (default) or "aka" for IMS AKAv1-MD5 (RFC 3310 / TS 33.203).
+    ///     k: Subscriber key K as 32 hex chars (required when auth="aka").
+    ///     op: Operator variant OP as 32 hex chars (supply op OR opc for AKA).
+    ///     opc: Pre-computed OPc as 32 hex chars (supply op OR opc for AKA).
+    ///     amf: Authentication Management Field as 4 hex chars (default "8000").
+    ///     sqn: Initial stored sequence number SQN_MS as 12 hex chars
+    ///         (default all-zeros — correct for a fresh soft-UE).
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (aor, registrar, *, user, password, interval=None, realm=None, contact=None, transport=None))]
+    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None))]
     fn add(
         &self,
         aor: &str,
@@ -62,6 +72,12 @@ impl PyRegistration {
         realm: Option<String>,
         contact: Option<String>,
         transport: Option<&str>,
+        auth: Option<&str>,
+        k: Option<&str>,
+        op: Option<&str>,
+        opc: Option<&str>,
+        amf: Option<&str>,
+        sqn: Option<&str>,
     ) -> PyResult<()> {
         let transport_type = match transport {
             Some("tcp") => Transport::Tcp,
@@ -116,6 +132,25 @@ impl PyRegistration {
             contact,
         );
 
+        // IMS AKAv1-MD5: attach the USIM secrets so the 401 challenge runs
+        // through Milenage instead of password digest (RFC 3310 / TS 33.203).
+        let entry = if auth.is_some_and(|mode| mode.eq_ignore_ascii_case("aka")) {
+            let k = k.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("auth='aka' requires the subscriber key `k`")
+            })?;
+            let credentials =
+                crate::registrant::aka::AkaCredentials::from_hex(k, op, opc, amf.unwrap_or("8000"))
+                    .map_err(|error| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "invalid AKA credentials: {error}"
+                        ))
+                    })?;
+            let initial_sqn = parse_sqn(sqn.unwrap_or("000000000000"))?;
+            entry.with_aka(credentials, initial_sqn)
+        } else {
+            entry
+        };
+
         self.inner.add(entry);
         Ok(())
     }
@@ -159,6 +194,20 @@ impl PyRegistration {
     }
 }
 
+/// Parse an initial SQN_MS from a 12-hex-char string into 6 bytes.
+fn parse_sqn(hex: &str) -> PyResult<[u8; 6]> {
+    let bytes = crate::ipsec::milenage::hex_to_bytes(hex)
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("sqn must be hex"))?;
+    if bytes.len() != 6 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "sqn must be 6 bytes (12 hex chars)",
+        ));
+    }
+    let mut out = [0u8; 6];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +248,116 @@ mod tests {
         let manager = make_manager();
         let py_reg = PyRegistration::new(manager, "127.0.0.1:5060".parse().unwrap());
         assert!(!py_reg.refresh("sip:nobody@example.com"));
+    }
+
+    // 3GPP test IMSI range (MCC 001 / MNC 01) + TS 35.208 Test Set 1 secrets.
+    const AKA_AOR: &str = "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org";
+    const AKA_K: &str = "465b5ce8b199b49faa5f0a2ee238a6bc";
+    const AKA_OPC: &str = "cd63cb71954a9f4e48a5994e37a02baf";
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_aka(
+        py_reg: &PyRegistration,
+        k: Option<&str>,
+        op: Option<&str>,
+        opc: Option<&str>,
+    ) -> PyResult<()> {
+        // Use an IP:port registrar so the test never hits DNS.
+        py_reg.add(
+            AKA_AOR,
+            "sip:10.0.0.1:5060",
+            "001010000000001@ims.mnc01.mcc001.3gppnetwork.org",
+            "",
+            None,
+            None,
+            None,
+            None,
+            Some("aka"),
+            k,
+            op,
+            opc,
+            Some("b9b9"),
+            None,
+        )
+    }
+
+    #[test]
+    fn py_registration_add_aka_sets_aka_mode() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+
+        add_aka(&py_reg, Some(AKA_K), None, Some(AKA_OPC)).unwrap();
+
+        assert_eq!(py_reg.count(), 1);
+        assert_eq!(
+            manager.auth_mode(AKA_AOR),
+            Some(crate::registrant::AuthMode::Aka)
+        );
+    }
+
+    #[test]
+    fn py_registration_add_aka_with_op_computes_opc() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+
+        add_aka(&py_reg, Some(AKA_K), Some("cdc202d5123e20f62b6d676ac72cb318"), None).unwrap();
+        assert_eq!(
+            manager.auth_mode(AKA_AOR),
+            Some(crate::registrant::AuthMode::Aka)
+        );
+    }
+
+    #[test]
+    fn py_registration_add_aka_requires_k() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(manager, "127.0.0.1:5060".parse().unwrap());
+        assert!(add_aka(&py_reg, None, None, Some(AKA_OPC)).is_err());
+    }
+
+    #[test]
+    fn py_registration_add_aka_rejects_bad_key() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(manager, "127.0.0.1:5060".parse().unwrap());
+        // K too short → AkaConfigError surfaces as ValueError.
+        assert!(add_aka(&py_reg, Some("465b5ce8"), None, Some(AKA_OPC)).is_err());
+    }
+
+    #[test]
+    fn py_registration_add_digest_stays_digest() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+        py_reg
+            .add(
+                "sip:alice@carrier.com",
+                "sip:10.0.0.1:5060",
+                "alice",
+                "secret",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.auth_mode("sip:alice@carrier.com"),
+            Some(crate::registrant::AuthMode::Digest)
+        );
+    }
+
+    #[test]
+    fn parse_sqn_validates_length() {
+        assert_eq!(parse_sqn("000000000000").unwrap(), [0u8; 6]);
+        assert_eq!(
+            parse_sqn("ff9bb4d0b607").unwrap(),
+            [0xff, 0x9b, 0xb4, 0xd0, 0xb6, 0x07]
+        );
+        assert!(parse_sqn("00").is_err());
+        assert!(parse_sqn("zz").is_err());
     }
 }

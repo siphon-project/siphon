@@ -89,6 +89,7 @@ class MockProxy:
         - ``@proxy.on_request`` / ``@proxy.on_request("INVITE")``
         - ``@proxy.on_reply``
         - ``@proxy.on_failure``
+        - ``@proxy.on_cancel``
         - ``@proxy.on_register_reply``
 
     Example::
@@ -154,6 +155,32 @@ class MockProxy:
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("proxy.on_failure", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_cancel(fn: Callable) -> Callable:
+        """Register a handler for a CANCELled INVITE (RFC 3261 §9).
+
+        Handler signature: ``(request) -> None``
+
+        Fires once, with the original INVITE, when a relayed INVITE is
+        CANCELled before any final response — the one teardown that neither
+        ``on_reply`` nor ``on_failure`` delivers (the proxy answers the CANCEL
+        with 487 at the transaction layer and the session is gone). Use it to
+        release per-call resources that no BYE will ever clear: Diameter
+        Rx / N5 QoS sessions, rtpengine media anchors, charging maps.
+
+        Fire-and-forget — it does not gate or alter the 487 sent to the UAC.
+
+        Example::
+
+            @proxy.on_cancel
+            async def handle_cancel(request):
+                await _release_qos(request.call_id)
+                await rtpengine.delete(request)
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("proxy.on_cancel", None, fn, is_async)
         return fn
 
     @staticmethod
@@ -230,6 +257,20 @@ class MockProxy:
         self._sent_requests: list[dict] = []
         self._send_request_responses: dict[tuple[str, str], Any] = {}
         self.subscribe_state = MockSubscribeState()
+
+    def __getattr__(self, name: str) -> Any:
+        # The real `proxy` exposes its utility helpers flat
+        # (``proxy.sanity_check``, ``proxy.rate_limit``, ``proxy.enum_lookup``,
+        # ``proxy.memory_used_pct``); the mock keeps them on ``_utils``, so
+        # delegate any otherwise-unknown attribute there. ``__getattr__`` only
+        # fires when normal lookup misses, so real attributes are unaffected.
+        if name != "_utils":
+            utils = self.__dict__.get("_utils")
+            if utils is not None and hasattr(utils, name):
+                return getattr(utils, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +568,7 @@ class MockB2bua:
         - ``@b2bua.on_failure`` — all B-legs failed
         - ``@b2bua.on_bye`` — call ended
         - ``@b2bua.on_refer`` — call transfer (RFC 3515)
+        - ``@b2bua.on_cancel`` — unanswered call cancelled (RFC 3261 §9)
     """
 
     @staticmethod
@@ -600,6 +642,30 @@ class MockB2bua:
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_refer", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_cancel(fn: Callable) -> Callable:
+        """Register handler for a CANCELled call (RFC 3261 §9).
+
+        Handler signature: ``(call) -> None``
+
+        Fires once, with the Call object, when an unanswered call
+        (Calling/Ringing) is CANCELled — the teardown that ``on_failure``
+        (B-leg error) and ``on_bye`` (answered call) never cover. A 2xx that
+        wins the CANCEL/answer glare is ACK+BYE'd by the framework and never
+        delivers ``on_answer``, so this hook only ever sees a genuinely
+        abandoned call. Use it to release per-call resources that no BYE will
+        clear: rtpengine media anchors, QoS sessions.
+
+        Example::
+
+            @b2bua.on_cancel
+            async def handle_cancel(call):
+                await rtpengine.delete(call)
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_cancel", None, fn, is_async)
         return fn
 
 
@@ -2486,21 +2552,45 @@ class MockRegistration:
     def __init__(self) -> None:
         self._entries: dict[str, dict] = {}
 
-    def add(self, aor: str, registrar: str, *, user: str, password: str,
+    def add(self, aor: str, registrar: str, *, user: str, password: str = "",
             interval: Optional[int] = None, realm: Optional[str] = None,
-            contact: Optional[str] = None, transport: Optional[str] = None) -> None:
+            contact: Optional[str] = None, transport: Optional[str] = None,
+            auth: Optional[str] = None, k: Optional[str] = None,
+            op: Optional[str] = None, opc: Optional[str] = None,
+            amf: Optional[str] = None, sqn: Optional[str] = None) -> None:
         """Add a new outbound registration.
 
         Args:
-            aor: Address-of-Record (e.g. "sip:alice@carrier.com").
+            aor: Address-of-Record (e.g. "sip:alice@carrier.com"). For IMS AKA
+                this is the IMPU (e.g.
+                "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org").
             registrar: Registrar URI (e.g. "sip:registrar.carrier.com:5060").
-            user: Authentication username.
-            password: Authentication password.
+                For IMS this is the P-CSCF.
+            user: Authentication username. For IMS AKA this is the IMPI.
+            password: Authentication password (digest only; unused for AKA).
             interval: Registration interval in seconds.
-            realm: Optional realm hint.
+            realm: Optional realm hint (the home domain for IMS).
             contact: Optional Contact URI.
             transport: Transport protocol: "udp" (default), "tcp", "tls".
+            auth: "digest" (default) or "aka" for IMS AKAv1-MD5
+                (RFC 3310 / 3GPP TS 33.203).
+            k: Subscriber key K as 32 hex chars (required when auth="aka").
+            op: Operator variant OP as 32 hex chars (supply op OR opc for AKA).
+            opc: Pre-computed OPc as 32 hex chars (supply op OR opc for AKA).
+            amf: Authentication Management Field as 4 hex chars (default "8000").
+            sqn: Initial stored sequence number SQN_MS as 12 hex chars
+                (default all-zeros — correct for a fresh soft-UE).
+
+        Raises:
+            ValueError: when auth="aka" but `k` or an operator key (`op`/`opc`)
+                is missing, mirroring the Rust binding.
         """
+        is_aka = auth is not None and auth.lower() == "aka"
+        if is_aka:
+            if not k:
+                raise ValueError("auth='aka' requires the subscriber key `k`")
+            if not op and not opc:
+                raise ValueError("auth='aka' requires either `op` or `opc`")
         self._entries[aor] = {
             "aor": aor,
             "registrar": registrar,
@@ -2510,9 +2600,18 @@ class MockRegistration:
             "realm": realm,
             "contact": contact,
             "transport": transport or "udp",
+            "auth": "aka" if is_aka else "digest",
+            "k": k,
+            "op": op,
+            "opc": opc,
+            "amf": amf or "8000",
+            "sqn": sqn or "000000000000",
             "state": "registered",
             "expires_in": interval or 3600,
             "failure_count": 0,
+            # Captured from the 200 OK on a real run (IMS); empty in the mock.
+            "service_route": [],
+            "associated_uris": [],
         }
         self._fire_on_change(aor, "registered")
 

@@ -4585,6 +4585,71 @@ fn run_reply_handlers(
     (extracted, forwarded)
 }
 
+/// Fire `@proxy.on_cancel` handlers for a relayed INVITE that was CANCELled
+/// before any final response (RFC 3261 §9).
+///
+/// Fire-and-forget cleanup: the 487 to the UAC has already been sent at the
+/// transaction layer and is not gated by the script — there is no
+/// `relay()`/`reply()` decision. This is the only teardown signal a script
+/// gets for a cancelled-before-answer call (neither `on_reply` nor
+/// `on_failure` ever fires — the session is torn down with the CANCEL), so it
+/// exists to release per-call resources that no BYE will ever clear (Diameter
+/// Rx/N5 QoS, rtpengine media).
+///
+/// Mirrors `run_reply_handlers`' PyRequest construction — including the
+/// inbound-flow replay — so the handler sees the same listener context the
+/// `on_request` handler did (`registrar.lookup_by_token`, `request.flow`).
+fn run_proxy_cancel_handlers(
+    original_request: SipMessage,
+    transport: crate::transport::Transport,
+    source_addr: SocketAddr,
+    inbound_local_addr: SocketAddr,
+    inbound_connection_id: ConnectionId,
+    state: &DispatcherState,
+) {
+    let engine_state = state.engine.state();
+    let handlers = engine_state.handlers_for(&HandlerKind::ProxyCancel);
+    if handlers.is_empty() {
+        return;
+    }
+
+    let request_arc = Arc::new(std::sync::Mutex::new(original_request));
+    let mut py_request_obj = PyRequest::new(
+        request_arc,
+        transport.to_string(),
+        source_addr.ip().to_string(),
+        source_addr.port(),
+    );
+    py_request_obj.set_local_port(inbound_local_addr.port());
+    py_request_obj.set_inbound_flow(inbound_local_addr, inbound_connection_id.0);
+
+    Python::attach(|python| {
+        let py_request = match Py::new(python, py_request_obj) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyRequest for on_cancel handler: {error}");
+                return;
+            }
+        };
+
+        for handler in &handlers {
+            let callable = handler.callable.bind(python);
+            match callable.call1((py_request.bind(python),)) {
+                Ok(ret) => {
+                    if handler.is_async {
+                        if let Err(error) = run_coroutine(python, &ret) {
+                            error!("async Python on_cancel handler error: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    error!("Python on_cancel handler error: {error}");
+                }
+            }
+        }
+    });
+}
+
 /// Rewrite the Contact URI in a response with the observed source address.
 ///
 /// This is the automatic equivalent of OpenSIPS's `fix_nated_contact()` in
@@ -7070,9 +7135,36 @@ fn handle_cancel_via_session(
         state,
     );
 
-    // Clean up session
+    // Fire @proxy.on_cancel before the session is evicted so scripts can
+    // release per-call resources (Diameter Rx/N5 QoS, rtpengine media) that
+    // no BYE will ever clear — the only teardown signal for a
+    // CANCELled-before-answer INVITE (RFC 3261 §9). Guard the clone: the
+    // common no-handler path stays allocation-free.
     let server_key = invite_server_key.clone();
-    drop(session);
+    let has_cancel_handlers = !state
+        .engine
+        .state()
+        .handlers_for(&HandlerKind::ProxyCancel)
+        .is_empty();
+    if has_cancel_handlers {
+        let cancel_request = session.original_request.clone();
+        let cancel_transport = session.transport;
+        let cancel_source_addr = session.source_addr;
+        let cancel_inbound_local_addr = session.inbound_local_addr;
+        let cancel_connection_id = session.connection_id;
+        drop(session);
+        run_proxy_cancel_handlers(
+            cancel_request,
+            cancel_transport,
+            cancel_source_addr,
+            cancel_inbound_local_addr,
+            cancel_connection_id,
+            state,
+        );
+    } else {
+        drop(session);
+    }
+
     state.session_store.remove_by_server_key(&server_key);
 }
 
@@ -7262,8 +7354,12 @@ fn handle_b2bua_cancel(
         let _ = handle.tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
     }
 
-    // Send 487 Request Terminated to A-leg for the original INVITE
+    // Send 487 Request Terminated to A-leg for the original INVITE.
+    // Capture the stored A-leg INVITE + source before dropping the call ref so
+    // @b2bua.on_cancel can run after the lock is released (no DashMap reentry).
     let a_leg = call.a_leg.clone();
+    let cancel_a_leg_invite = call.a_leg_invite.clone();
+    let cancel_a_leg_source_ip = call.a_leg.transport.remote_addr.ip().to_string();
     drop(call);
 
     // Emit the prepared CANCELs after dropping the call lock so the
@@ -7281,6 +7377,14 @@ fn handle_b2bua_cancel(
         state,
     );
 
+    // Fire @b2bua.on_cancel before tearing the call out of the registry so a
+    // script can release per-call resources (rtpengine media, QoS) that no BYE
+    // will ever clear — the only teardown signal for a cancelled-before-answer
+    // B2BUA call (RFC 3261 §9). A 2xx that races this CANCEL is independently
+    // ACK+BYE'd by handle_zombie_cancelled_2xx and never delivered on_answer,
+    // so this only ever fires for a genuinely abandoned call.
+    run_b2bua_cancel_handlers(&call_id, cancel_a_leg_invite, cancel_a_leg_source_ip, state);
+
     state.call_actors.set_state(&call_id, CallState::Terminated);
     // remove_call_after_cancel sends Shutdown to remaining actors, cleans the
     // registry, and preserves still-pending B-legs as zombie-cancelled entries
@@ -7292,6 +7396,63 @@ fn handle_b2bua_cancel(
         schedule_zombie_cancelled_cleanup(state.call_actors.clone());
     }
     state.call_event_receivers.remove(&call_id);
+}
+
+/// Fire `@b2bua.on_cancel` handlers for an unanswered call (Calling/Ringing)
+/// that was CANCELled.
+///
+/// Fire-and-forget cleanup — the 487 to the A-leg has already been sent and
+/// the call is being torn down regardless. This is the B2BUA teardown signal
+/// that `on_failure` (B-leg error) and `on_bye` (answered call) never cover,
+/// so a script can release per-call resources that no BYE will clear
+/// (rtpengine media, QoS). Mirrors the `on_bye` PyCall construction.
+fn run_b2bua_cancel_handlers(
+    call_id: &str,
+    a_leg_invite: Option<Arc<std::sync::Mutex<SipMessage>>>,
+    a_leg_source_ip: String,
+    state: &DispatcherState,
+) {
+    let engine_state = state.engine.state();
+    let handlers = engine_state.handlers_for(&HandlerKind::B2buaCancel);
+    if handlers.is_empty() {
+        return;
+    }
+
+    let invite_arc = match &a_leg_invite {
+        Some(arc) => Arc::clone(arc),
+        None => {
+            warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_cancel");
+            return;
+        }
+    };
+
+    let py_call = PyCall::new(call_id.to_string(), invite_arc, a_leg_source_ip);
+
+    Python::attach(|python| {
+        let call_obj = match Py::new(python, py_call) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyCall for on_cancel: {error}");
+                return;
+            }
+        };
+
+        for handler in &handlers {
+            let callable = handler.callable.bind(python);
+            match callable.call1((call_obj.bind(python),)) {
+                Ok(ret) => {
+                    if handler.is_async {
+                        if let Err(error) = run_coroutine(python, &ret) {
+                            error!("async B2BUA on_cancel handler error: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    error!("B2BUA on_cancel handler error: {error}");
+                }
+            }
+        }
+    });
 }
 
 /// Arm the answer-timeout for a B2BUA call from a `call.fork`/`call.dial`
@@ -8345,6 +8506,9 @@ fn handle_registrant_response(
         }
     };
 
+    let is_aka =
+        registrant.auth_mode(&aor) == Some(crate::registrant::AuthMode::Aka);
+
     match status_code {
         200 => {
             // Parse granted expires: top-level Expires header first,
@@ -8357,6 +8521,20 @@ fn handle_registrant_response(
                         .and_then(|contact| parse_contact_expires(contact))
                 })
                 .unwrap_or(registrant.default_interval);
+
+            // IMS: capture the Service-Route / P-Associated-URI / Path the
+            // S-CSCF granted, for MO call routing and implicit-set resolution
+            // (Phase 3). Only for AKA entries so the carrier-trunk path is
+            // byte-identical.
+            if is_aka {
+                registrant.store_registration_routes(
+                    &aor,
+                    collect_route_set(message, "Service-Route"),
+                    collect_route_set(message, "P-Associated-URI"),
+                    collect_route_set(message, "Path"),
+                );
+            }
+
             registrant.handle_success(&aor, expires);
         }
         401 | 407 => {
@@ -8377,17 +8555,29 @@ fn handle_registrant_response(
             };
 
             if let Some(challenge) = crate::auth::parse_challenge(&challenge_raw) {
-                let is_proxy_auth = status_code == 407;
-                if let Some((retry_message, _retry_branch, destination, transport)) =
+                // IMS AKA entries run Milenage over the RAND/AUTN in the nonce;
+                // carrier-trunk entries use password digest. The IMS challenge
+                // always arrives as a 401 (WWW-Authenticate).
+                let built = if is_aka {
+                    registrant.build_register_aka(
+                        &aor,
+                        state.local_addr,
+                        &state.listen_addrs,
+                        &challenge,
+                        registrant.default_interval,
+                    )
+                } else {
                     registrant.build_register_with_auth(
                         &aor,
                         state.local_addr,
                         &state.listen_addrs,
                         &challenge,
-                        is_proxy_auth,
+                        status_code == 407,
                         registrant.default_interval,
                     )
-                {
+                };
+
+                if let Some((retry_message, _retry_branch, destination, transport)) = built {
                     let data = bytes::Bytes::from(retry_message.to_bytes());
                     send_outbound(data, transport, destination, crate::transport::ConnectionId::default(), state);
                 } else {
@@ -8402,6 +8592,40 @@ fn handle_registrant_response(
             registrant.handle_failure(&aor, status_code);
         }
     }
+}
+
+/// Expand a route-set header (Service-Route, P-Associated-URI, Path) into its
+/// individual values: each header line plus any comma-folded values within it,
+/// splitting only on top-level commas (not inside `<...>` or quotes).
+fn collect_route_set(message: &SipMessage, header_name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(lines) = message.headers.get_all(header_name) {
+        for line in lines {
+            let mut start = 0;
+            let mut depth = 0i32;
+            let mut in_quotes = false;
+            for (index, byte) in line.bytes().enumerate() {
+                match byte {
+                    b'"' => in_quotes = !in_quotes,
+                    b'<' if !in_quotes => depth += 1,
+                    b'>' if !in_quotes => depth -= 1,
+                    b',' if !in_quotes && depth == 0 => {
+                        let part = line[start..index].trim();
+                        if !part.is_empty() {
+                            values.push(part.to_string());
+                        }
+                        start = index + 1;
+                    }
+                    _ => {}
+                }
+            }
+            let tail = line[start..].trim();
+            if !tail.is_empty() {
+                values.push(tail.to_string());
+            }
+        }
+    }
+    values
 }
 
 /// Maximum credentialed outbound INVITEs the B2BUA will send on the 401/407
@@ -12001,6 +12225,43 @@ mod tests {
     use crate::sip::message::Method;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    #[test]
+    fn collect_route_set_splits_lines_and_top_level_commas() {
+        let mut message = SipMessageBuilder::new()
+            .request(Method::Register, SipUri::new("example.com".to_string()))
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-reg-x".to_string())
+            .to("<sip:alice@example.com>".to_string())
+            .from("<sip:alice@example.com>;tag=t".to_string())
+            .call_id("c".to_string())
+            .cseq("1 REGISTER".to_string())
+            .content_length(0)
+            .build()
+            .expect("builds");
+
+        // One plain header line and one comma-folded line → three route values,
+        // with the comma inside <...> of a uri-param left untouched.
+        message.headers.set_all(
+            "Service-Route",
+            vec![
+                "<sip:scscf1.example.com;lr>".to_string(),
+                "<sip:scscf2.example.com;lr>, <sip:scscf3.example.com;lr>".to_string(),
+            ],
+        );
+
+        let routes = collect_route_set(&message, "Service-Route");
+        assert_eq!(
+            routes,
+            vec![
+                "<sip:scscf1.example.com;lr>".to_string(),
+                "<sip:scscf2.example.com;lr>".to_string(),
+                "<sip:scscf3.example.com;lr>".to_string(),
+            ]
+        );
+
+        // Missing header → empty.
+        assert!(collect_route_set(&message, "P-Associated-URI").is_empty());
+    }
 
     #[test]
     fn build_dereg_register_has_expires_zero_routes_and_aor() {
