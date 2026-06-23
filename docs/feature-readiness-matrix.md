@@ -37,7 +37,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | TLS | **Production** | `listen.tls` | Subscriber-facing, TLS 1.3 validated; RFC 3261 §18.3 stream framing; outbound distributor wedge-hardened with non-blocking `try_send` (see TCP) |
 | TLS 1.3 | **Production** | `tls.method: TLSv1_3` | |
 | TLS 1.2 | Implemented | `tls.method: TLSv1_2` | |
-| mTLS (client cert verification) | Implemented | `tls.verify_client: true` | |
+| mTLS (client cert verification) | Implemented | `tls.verify_client: true`, `tls.client_ca` | Client certificate required and verified against the `tls.client_ca` PEM bundle; applies to `listen.tls` **and** `listen.wss` (shared TLS block). Fails closed at startup if `verify_client` is set without `client_ca` (previously `verify_client` was silently ignored on the SIP listener — read only by the X1 LI interface). TLS handshake bounded by a 10 s timeout (half-open-handshake / slowloris defense). |
 | UDP | **Production** | `listen.udp` | |
 | WebSocket (WS) | Implemented | `listen.ws` | RFC 7118, browser/WebRTC clients; outbound distributor wedge-hardened with non-blocking `try_send` (see TCP). MT routing (INVITE → WS-registered UE) works via RFC 5626 §5.3 connection reuse: every binding captures its inbound flow (no `flow_token=` needed), `registrar.lookup()` returns it as `contact.flow`, and `request.fork(contacts)` / `request.relay(flow=)` / `call.fork(contacts)` / `call.dial(flow=)` route over the captured connection on both proxy and B2BUA. Connections register in a unified cross-transport `StreamConnections` registry (also backs `Flow.is_alive`); `send_to_target` has a WS/WSS arm that reuses the connection and drops (no caller-echo) on miss. |
 | Secure WebSocket (WSS) | Implemented | `listen.wss` | Outbound distributor wedge-hardened with non-blocking `try_send` (see TCP). MT routing via connection reuse — same flow-based path as WS (see the WS row). |
@@ -56,6 +56,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Python custom backend | Implemented | `registrar.backend: python` | |
 | Expires control (default/min/max) | **Production** | `registrar.{default,min,max}_expires` | |
 | Max contacts per AoR | **Production** | `registrar.max_contacts` | |
+| Bind AoR to authenticated user | Implemented | `registrar.enforce_auth_aor_match` | Rejects (403) a REGISTER whose AoR (To-URI user) ≠ the authenticated digest user — anti account-takeover / forced-deregister. Checked **before** the force-clear so a spoofed AoR can't first wipe the victim's bindings. Default off (IMS deployments authorize via the implicit registration set, where the public identity ≠ private auth identity). |
 | Redis TTL slack | **Production** | `registrar.redis.ttl_slack_secs` | Race condition buffer |
 | GRUU (RFC 5627) | Implemented | | |
 | Service-Route (RFC 3608) | **Production** | | Via `registrar.set_service_routes()` / `service_route()` |
@@ -83,7 +84,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | AKA / AKAv1-MD5 (HSS-backed) | **Production** | `auth.require_ims_digest()` | 3GPP TS 33.203 via Cx MAR/MAA |
 | AKA / AKAv1-MD5 (local Milenage) | Implemented | `auth.aka_credentials` | 3GPP TS 35.206 — local key derivation without HSS |
 | SHA-256 digest (RFC 7616) | Implemented | | |
-| Anti-spoofing (from=auth check) | **Production** | Script logic | `auth_user == from_uri.user` |
+| Anti-spoofing (from=auth check) | **Production** | Script logic | `auth_user == from_uri.user` (caller-ID/From); the registrar-side AoR/To equivalent is `registrar.enforce_auth_aor_match` |
+| Digest nonce replay protection (RFC 7616 §3.3) | Implemented | `auth.nonce_secret`, `auth.nonce_ttl_secs` | Nonces are timestamp-bound (`{unix_secs:016x}.{tag}`) and rejected once older than the TTL (default 3600 s), bounding captured-`Authorization` replay from "forever" to the window. Cross-instance safe with **no shared state** (correct behind round-robin DNS where a re-REGISTER may land on a different node). Optional shared `nonce_secret` adds HMAC-SHA256 integrity so a node rejects nonces the cluster never issued — must be identical on every instance behind the domain. Applies to the static + HTTP backends; the IMS/AKA paths use single-use HSS vectors. |
 
 ## STIR/SHAKEN (Caller-ID Attestation)
 
