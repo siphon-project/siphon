@@ -6161,6 +6161,7 @@ pub fn inject_python_singletons(config: &Config) {
         max_expires: config.registrar.max_expires,
         min_expires: config.registrar.min_expires.unwrap_or(60),
         max_contacts: config.registrar.max_contacts.unwrap_or(10) as usize,
+        enforce_auth_aor_match: config.registrar.enforce_auth_aor_match,
     };
     let registrar = Arc::new(Registrar::new(registrar_config));
     let py_registrar = PyRegistrar::new(registrar);

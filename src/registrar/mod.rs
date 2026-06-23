@@ -210,6 +210,14 @@ pub struct RegistrarConfig {
     pub min_expires: u32,
     /// Maximum number of contacts per AoR.
     pub max_contacts: usize,
+    /// When true, `registrar.save()` requires the AoR (To-URI user) to match
+    /// the authenticated digest user, rejecting a REGISTER that tries to bind a
+    /// contact under another subscriber's AoR (account takeover / forced
+    /// deregister). Default false for backward compatibility and IMS
+    /// deployments where the public identity (AoR) legitimately differs from
+    /// the private auth identity — those keep this off and authorize via the
+    /// implicit registration set instead.
+    pub enforce_auth_aor_match: bool,
 }
 
 impl Default for RegistrarConfig {
@@ -219,6 +227,7 @@ impl Default for RegistrarConfig {
             max_expires: 7200,
             min_expires: 60,
             max_contacts: 10,
+            enforce_auth_aor_match: false,
         }
     }
 }

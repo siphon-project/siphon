@@ -474,6 +474,31 @@ impl PyRegistrar {
         // AoR from To header, normalized to strip transport params etc.
         let aor = normalize_aor(&extract_aor(&message)?);
 
+        // F4: bind the registration to the authenticated identity. Without this,
+        // a subscriber authenticated as user A can REGISTER a Contact under user
+        // B's AoR (To header) — silently hijacking B's incoming calls, or
+        // deregistering B (Contact:* / Expires:0). Checked BEFORE the force-clear
+        // below so a spoofed AoR cannot first wipe the victim's bindings.
+        // Opt-in (default off) so IMS deployments (public identity != private
+        // auth identity, authorized via the implicit set) are unaffected.
+        if self.inner.config.enforce_auth_aor_match {
+            if let Some(auth_user) = request.get_auth_user() {
+                let aor_user = crate::sip::parser::parse_uri_standalone(&aor)
+                    .ok()
+                    .and_then(|uri| uri.user);
+                if aor_user.as_deref() != Some(auth_user) {
+                    tracing::warn!(
+                        auth_user = %auth_user,
+                        aor = %aor.escape_debug(),
+                        "rejecting REGISTER: AoR does not match authenticated user"
+                    );
+                    drop(message);
+                    request.set_reply(403, "Forbidden".to_string());
+                    return Ok(false);
+                }
+            }
+        }
+
         if force {
             self.inner.clear_bindings(&aor);
         }
@@ -1288,6 +1313,7 @@ mod tests {
             max_expires: 7200,
             min_expires: 60,
             max_contacts: 10,
+            ..Default::default()
         }))
     }
 
@@ -1812,6 +1838,7 @@ mod tests {
             max_expires: 600,
             min_expires: 60,
             max_contacts: 10,
+            ..Default::default()
         }));
 
         let uri = SipUri::new("example.com".to_string());
@@ -2076,6 +2103,7 @@ mod tests {
             max_expires: 600,
             min_expires: 60,
             max_contacts: 10,
+            ..Default::default()
         }));
         let py_reg = PyRegistrar::new(Arc::clone(&registrar));
 
@@ -2110,6 +2138,49 @@ mod tests {
             "expires {exp} should be ~3632, local max_expires cap of 600 \
              must not apply on save_proxy"
         );
+    }
+
+    #[test]
+    fn save_enforces_auth_aor_match_when_configured() {
+        let registrar = Arc::new(Registrar::new(RegistrarConfig {
+            enforce_auth_aor_match: true,
+            ..Default::default()
+        }));
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        let build_register = |to_user: &str| {
+            let uri = SipUri::new("example.com".to_string());
+            let message = SipMessageBuilder::new()
+                .request(Method::Register, uri)
+                .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK".to_string())
+                .to(format!("<sip:{to_user}@example.com>"))
+                .from(format!("<sip:{to_user}@example.com>;tag=t"))
+                .call_id("c@h".to_string())
+                .cseq("1 REGISTER".to_string())
+                .header("Contact", "<sip:x@10.0.0.2:5060>".to_string())
+                .content_length(0)
+                .build()
+                .unwrap();
+            PyRequest::new(
+                Arc::new(Mutex::new(message)),
+                "udp".to_string(),
+                "10.0.0.2".to_string(),
+                5060,
+            )
+        };
+
+        // Authenticated as "attacker" but REGISTER binds victim's AoR → rejected,
+        // and the victim's keyspace is left empty (no binding, no force-clear).
+        let mut spoof = build_register("victim");
+        spoof.set_auth_user("attacker".to_string());
+        assert!(matches!(py_reg.save(&mut spoof, true, vec![], None), Ok(false)));
+        assert!(py_reg.lookup_str("sip:victim@example.com").is_empty());
+
+        // Authenticated as "victim" binding own AoR → allowed.
+        let mut legit = build_register("victim");
+        legit.set_auth_user("victim".to_string());
+        assert!(matches!(py_reg.save(&mut legit, true, vec![], None), Ok(true)));
+        assert!(!py_reg.lookup_str("sip:victim@example.com").is_empty());
     }
 
     // -----------------------------------------------------------------------

@@ -491,6 +491,13 @@ pub struct RegistrarConfig {
     pub min_expires: Option<u32>,
     /// Maximum contacts per AoR (None = unlimited). Use 1 for single-device deployments.
     pub max_contacts: Option<u32>,
+    /// Require the REGISTER's AoR (To-URI user) to match the authenticated
+    /// digest user, rejecting attempts to bind a contact under another
+    /// subscriber's AoR. Default false (backward-compatible; IMS deployments
+    /// where the public identity differs from the private auth identity must
+    /// leave this off and authorize via the implicit registration set).
+    #[serde(default)]
+    pub enforce_auth_aor_match: bool,
     pub redis: Option<RedisBackendConfig>,
     pub postgres: Option<PostgresBackendConfig>,
     /// Registration liveness — network-initiated deregistration when a UE
@@ -508,6 +515,7 @@ impl Default for RegistrarConfig {
             max_expires: 7200,
             min_expires: None,
             max_contacts: None,
+            enforce_auth_aor_match: false,
             redis: None,
             postgres: None,
             liveness: RegistrarLivenessConfig::default(),

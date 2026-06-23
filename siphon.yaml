@@ -132,6 +132,12 @@ registrar:
   max_expires: 7200        # reject/clamp registrations above this
   # min_expires: 60        # reject with 423 Interval Too Brief if below this
   # max_contacts: 1        # evict existing contacts if above limit (omit = unlimited)
+  # enforce_auth_aor_match: true
+  #   Require the REGISTER's AoR (To-URI user) to equal the authenticated digest
+  #   user, so a subscriber authenticated as A cannot bind a Contact under B's
+  #   AoR (call hijack) or deregister B. Default false. Leave OFF for IMS
+  #   deployments where the public identity (AoR) differs from the private auth
+  #   identity — those authorize via the implicit registration set instead.
 
   # Redis persistence (backend: redis)
   # Survives restarts; required when RTPEngine or dialog state also uses Redis.

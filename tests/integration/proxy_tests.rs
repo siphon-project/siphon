@@ -281,6 +281,7 @@ registrar:
         max_expires: config.registrar.max_expires,
         min_expires: config.registrar.min_expires.unwrap_or(60),
         max_contacts: config.registrar.max_contacts.unwrap_or(10) as usize,
+        ..Default::default()
     };
     let registrar = Registrar::new(registrar_config);
 
