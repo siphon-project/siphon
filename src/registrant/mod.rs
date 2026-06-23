@@ -124,6 +124,23 @@ impl fmt::Display for AuthMode {
     }
 }
 
+/// IMS Contact-header feature tags (3GPP TS 24.229 §5.1.1.2 / GSMA IR.92,
+/// NG.114). These let the S-CSCF match iFCs and register the UE's MMTel /
+/// voice / video / SMS services, and carry the instance ID for GRUU/outbound
+/// (RFC 5626). Emitted after the `<sip:…>` of the Contact when present.
+#[derive(Debug, Clone, Default)]
+pub struct ImsContactParams {
+    /// IMEI for `+sip.instance="<urn:gsma:imei:…>"` (RFC 5626 instance ID).
+    /// `None` → no instance tag.
+    pub instance_id: Option<String>,
+    /// Emit the MMTel ICSI tag (`+g.3gpp.icsi-ref` mmtel).
+    pub mmtel: bool,
+    /// Emit `;video`.
+    pub video: bool,
+    /// Emit `+g.3gpp.smsip` (SMS-over-IP).
+    pub smsip: bool,
+}
+
 /// UE-side IPsec sec-agree parameters for an AKA registration (3GPP TS 33.203).
 ///
 /// `ue_port_c`/`ue_port_s` are the UE's protected client/server ports — they
@@ -140,8 +157,12 @@ pub struct UeIpsec {
     pub ue_port_c: u16,
     /// UE protected server port (also a `listen.udp` listener).
     pub ue_port_s: u16,
-    /// Offered integrity algorithm.
+    /// Chosen integrity algorithm for the SA (the preferred one until the
+    /// P-CSCF picks one in Security-Server, see [`record_server_answer`]).
     pub aalg: IntegrityAlgorithm,
+    /// Integrity algorithms offered in Security-Client (one `ipsec-3gpp`
+    /// mechanism each), preference order — handsets offer SHA-1 + MD5.
+    pub offered_aalgs: Vec<IntegrityAlgorithm>,
     /// Offered encryption algorithm (`Null` for integrity-only).
     pub ealg: EncryptionAlgorithm,
     /// UE client SPI for the current handshake (0 before the first offer).
@@ -166,6 +187,19 @@ pub struct UeIpsec {
     pub security_server: Option<String>,
 }
 
+/// The integrity algorithms a UE offers in Security-Client: the preferred one
+/// first, then the interoperable defaults (HMAC-SHA-1-96, HMAC-MD5-96), deduped.
+/// Real handsets offer both SHA-1 and MD5, letting the P-CSCF pick.
+fn offered_integrity_algs(preferred: IntegrityAlgorithm) -> Vec<IntegrityAlgorithm> {
+    let mut algs = vec![preferred];
+    for alg in [IntegrityAlgorithm::HmacSha1, IntegrityAlgorithm::HmacMd5] {
+        if !algs.contains(&alg) {
+            algs.push(alg);
+        }
+    }
+    algs
+}
+
 impl UeIpsec {
     /// Build from configured ports + transform; runtime fields start empty.
     pub fn new(
@@ -178,6 +212,7 @@ impl UeIpsec {
             ue_port_c,
             ue_port_s,
             aalg,
+            offered_aalgs: offered_integrity_algs(aalg),
             ealg,
             spi_uc: 0,
             spi_us: 0,
@@ -191,10 +226,11 @@ impl UeIpsec {
         }
     }
 
-    /// The Security-Client offer for the current SPIs/ports/transform.
+    /// The Security-Client offer for the current SPIs/ports — one mechanism per
+    /// offered integrity algorithm.
     pub fn offer(&self) -> UeSecurityOffer {
         UeSecurityOffer::new(
-            self.aalg,
+            self.offered_aalgs.clone(),
             self.ealg,
             self.spi_uc,
             self.spi_us,
@@ -337,6 +373,10 @@ pub struct RegistrantEntry {
     /// REGISTER then carries Security-Client and the protected re-REGISTER
     /// carries Security-Verify. `None` = AKA without IPsec (test cores).
     pub ue_ipsec: Option<UeIpsec>,
+
+    /// IMS Contact feature tags (instance ID + MMTel/video/SMS). `Some` →
+    /// appended to the Contact so the S-CSCF registers the implied services.
+    pub ims_contact: Option<ImsContactParams>,
 }
 
 impl RegistrantEntry {
@@ -374,6 +414,7 @@ impl RegistrantEntry {
             associated_uris: Vec::new(),
             path: Vec::new(),
             ue_ipsec: None,
+            ims_contact: None,
         }
     }
 
@@ -393,6 +434,13 @@ impl RegistrantEntry {
     /// Only meaningful together with [`with_aka`](Self::with_aka).
     pub fn with_ipsec(mut self, ipsec: UeIpsec) -> Self {
         self.ue_ipsec = Some(ipsec);
+        self
+    }
+
+    /// Attach IMS Contact feature tags (instance ID + MMTel/video/SMS) so the
+    /// S-CSCF registers the implied services (TS 24.229 / GSMA IR.92).
+    pub fn with_ims_contact(mut self, ims: ImsContactParams) -> Self {
+        self.ims_contact = Some(ims);
         self
     }
 
@@ -455,9 +503,12 @@ impl RegistrantManager {
         }
     }
 
-    /// Base for UE IPsec SPI allocation — `0x20000000`, far above any P-CSCF
-    /// SPI partition, so a single host can run both roles without collisions.
-    const UE_SPI_BASE: u32 = 0x2000_0000;
+    /// Base for UE IPsec SPI allocation. Above the default P-CSCF SPI partition
+    /// (10000..18192) so a single host could run both roles without colliding,
+    /// and well clear of the RFC 4303 §2.1 reserved 1..255 range. Kept in a
+    /// normal, handset-like magnitude (not 0x20000000) — the value advertised
+    /// in Security-Client IS the value installed in the kernel inbound SA.
+    const UE_SPI_BASE: u32 = 50_000;
 
     /// Allocate a fresh `(spi_uc, spi_us)` pair for a UE sec-agree offer.
     pub fn allocate_ue_spi_pair(&self) -> (u32, u32) {
@@ -568,7 +619,7 @@ impl RegistrantManager {
             .unwrap_or_else(|| default_contact_uri(&entry.credentials.username, effective_addr, entry.transport));
 
         let via = format!(
-            "SIP/2.0/{} {};branch={}",
+            "SIP/2.0/{} {};branch={};rport",
             entry.transport, effective_addr, branch
         );
 
@@ -582,7 +633,7 @@ impl RegistrantManager {
             ))
             .call_id(entry.call_id.clone())
             .cseq(format!("{cseq} REGISTER"))
-            .header("Contact", format!("<{}>", contact))
+            .header("Contact", build_contact_header(&contact, entry.ims_contact.as_ref()))
             .header("Expires", expires.to_string())
             .max_forwards(70)
             .content_length(0);
@@ -628,7 +679,8 @@ impl RegistrantManager {
                     .header("Security-Client", security_client)
                     .header("Require", "sec-agree".to_string())
                     .header("Proxy-Require", "sec-agree".to_string())
-                    .header("Supported", "path".to_string());
+                    .header("Supported", "path, sec-agree".to_string())
+                    .header("Allow", IMS_ALLOW_METHODS.to_string());
             }
         }
 
@@ -682,7 +734,7 @@ impl RegistrantManager {
             .unwrap_or_else(|| default_contact_uri(&entry.credentials.username, effective_addr, entry.transport));
 
         let via = format!(
-            "SIP/2.0/{} {};branch={}",
+            "SIP/2.0/{} {};branch={};rport",
             entry.transport, effective_addr, branch
         );
 
@@ -723,7 +775,7 @@ impl RegistrantManager {
             ))
             .call_id(entry.call_id.clone())
             .cseq(format!("{cseq} REGISTER"))
-            .header("Contact", format!("<{}>", contact))
+            .header("Contact", build_contact_header(&contact, entry.ims_contact.as_ref()))
             .header("Expires", expires.to_string())
             .header(auth_header_name, auth_header_value)
             .max_forwards(70)
@@ -822,7 +874,7 @@ impl RegistrantManager {
             .clone()
             .unwrap_or_else(|| default_contact_uri(&entry.credentials.username, effective_addr, entry.transport));
         let via = format!(
-            "SIP/2.0/{} {};branch={}",
+            "SIP/2.0/{} {};branch={};rport",
             entry.transport, effective_addr, branch
         );
 
@@ -850,7 +902,7 @@ impl RegistrantManager {
             .from(format!("<{}>;tag=reg-{}", entry.aor, cseq))
             .call_id(entry.call_id.clone())
             .cseq(format!("{cseq} REGISTER"))
-            .header("Contact", format!("<{}>", contact))
+            .header("Contact", build_contact_header(&contact, entry.ims_contact.as_ref()))
             .header("Expires", expires.to_string())
             .header("Authorization", auth_header_value)
             .max_forwards(70)
@@ -870,7 +922,9 @@ impl RegistrantManager {
                 builder = builder
                     .header("Security-Client", build_security_client(&ipsec.offer()))
                     .header("Require", "sec-agree".to_string())
-                    .header("Proxy-Require", "sec-agree".to_string());
+                    .header("Proxy-Require", "sec-agree".to_string())
+                    .header("Supported", "path, sec-agree".to_string())
+                    .header("Allow", IMS_ALLOW_METHODS.to_string());
             }
         }
 
@@ -1250,12 +1304,27 @@ pub async fn registration_loop(
                             hep.capture_outbound(via_addr, destination, transport, &data);
                         }
 
+                        // UDP only: egress from the same local address advertised
+                        // in the Via (build_register uses the same listen_addrs
+                        // lookup), so the source port matches the Via and the
+                        // response / conntrack return path is consistent. With
+                        // multiple UDP listeners + IPsec, a `None` source picks a
+                        // non-deterministic udp_default — the initial REGISTER
+                        // could egress from a protected port (e.g. 6100) while the
+                        // Via said 5060, breaking the 401 return path. For TCP/TLS
+                        // the outbound connection is separate from the listener,
+                        // so leave the source unpinned.
+                        let source_local_addr = if transport == Transport::Udp {
+                            Some(listen_addrs.get(&transport).copied().unwrap_or(local_addr))
+                        } else {
+                            None
+                        };
                         let outbound_message = OutboundMessage {
                             connection_id: ConnectionId::default(),
                             transport,
                             destination,
                             data,
-                            source_local_addr: None,
+                            source_local_addr,
                         };
                         debug!(aor = %aor, branch = %branch, "sending REGISTER");
                         if let Err(error) = outbound.send(outbound_message) {
@@ -1278,12 +1347,17 @@ pub async fn registration_loop(
                             hep.capture_outbound(via_addr, destination, transport, &data);
                         }
 
+                        let source_local_addr = if transport == Transport::Udp {
+                            Some(listen_addrs.get(&transport).copied().unwrap_or(local_addr))
+                        } else {
+                            None
+                        };
                         let outbound_message = OutboundMessage {
                             connection_id: ConnectionId::default(),
                             transport,
                             destination,
                             data,
-                            source_local_addr: None,
+                            source_local_addr,
                         };
                         let _ = outbound.send(outbound_message);
                     }
@@ -1292,6 +1366,35 @@ pub async fn registration_loop(
             }
         }
     }
+}
+
+/// Methods the soft-UE advertises in `Allow` on IMS REGISTERs (RFC 3261 §20.5)
+/// — what a real VoLTE handset offers, so the S-CSCF/AS see the supported set.
+const IMS_ALLOW_METHODS: &str =
+    "INVITE, ACK, OPTIONS, CANCEL, BYE, UPDATE, INFO, REFER, NOTIFY, MESSAGE, PRACK";
+
+/// Build the Contact header value: `<contact_uri>` plus any IMS feature tags
+/// (3GPP TS 24.229 §5.1.1.2 / GSMA IR.92). The instance ID, `q=1.0`, MMTel
+/// ICSI, `video` and SMS-over-IP tags are emitted in handset order so the
+/// S-CSCF registers the implied services. Without `ims`, just `<contact_uri>`.
+fn build_contact_header(contact_uri: &str, ims: Option<&ImsContactParams>) -> String {
+    let mut header = format!("<{}>", contact_uri);
+    if let Some(ims) = ims {
+        if let Some(ref imei) = ims.instance_id {
+            header.push_str(&format!(";+sip.instance=\"<urn:gsma:imei:{imei}>\""));
+        }
+        header.push_str(";q=1.0");
+        if ims.mmtel {
+            header.push_str(";+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"");
+        }
+        if ims.video {
+            header.push_str(";video");
+        }
+        if ims.smsip {
+            header.push_str(";+g.3gpp.smsip");
+        }
+    }
+    header
 }
 
 /// Build a default Contact URI from the entry's username, effective address, and transport.
@@ -2231,6 +2334,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_contact_header_emits_ims_feature_tags() {
+        // No IMS params → plain Contact.
+        assert_eq!(
+            build_contact_header("sip:bob@10.0.0.2:5060", None),
+            "<sip:bob@10.0.0.2:5060>"
+        );
+
+        // Full handset-shaped tag set, in order.
+        let ims = ImsContactParams {
+            instance_id: Some("35436012-861541-0".to_string()),
+            mmtel: true,
+            video: true,
+            smsip: true,
+        };
+        let header = build_contact_header("sip:208909990000002@100.65.0.4:5060", Some(&ims));
+        assert!(header.starts_with("<sip:208909990000002@100.65.0.4:5060>"));
+        assert!(header.contains(";+sip.instance=\"<urn:gsma:imei:35436012-861541-0>\""));
+        assert!(header.contains(";q=1.0"));
+        assert!(header
+            .contains(";+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""));
+        assert!(header.contains(";video"));
+        assert!(header.contains(";+g.3gpp.smsip"));
+
+        // No mmtel → no ICSI; q=1.0 still emitted when IMS params present.
+        let minimal = ImsContactParams::default();
+        assert_eq!(
+            build_contact_header("sip:x@y:5060", Some(&minimal)),
+            "<sip:x@y:5060>;q=1.0"
+        );
+    }
+
     /// Regression: an IPv4:port registrar must produce a clean Request-URI
     /// (no IPv6 brackets), and an IMPI username (user@domain) must produce a
     /// single-`@` Contact. Both broke the live REGISTER (P-CSCF 502 + DNS fail).
@@ -2276,6 +2411,11 @@ mod tests {
         );
         assert!(!raw.contains("sip:[172.16.0.101"), "{raw}");
 
+        // Via carries rport (RFC 3581) so the P-CSCF can respond to the actual
+        // source port (NAT / symmetric-response robustness).
+        assert!(raw.contains(";branch="), "{raw}");
+        assert!(raw.contains(";rport"), "Via must carry rport: {raw}");
+
         // Contact: single @, userpart only (domain stripped).
         assert!(
             raw.contains("Contact: <sip:001019999999999@100.65.0.3:5060>"),
@@ -2301,8 +2441,9 @@ mod tests {
         assert_eq!(a1, a0 + 1);
         assert_eq!(b1, b0 + 1);
         assert_eq!(b0, a0 + 2);
-        // Seeded high so it can't collide with a P-CSCF SPI partition.
-        assert!(a0 >= 0x2000_0000);
+        // Above the default P-CSCF partition and well clear of the RFC 4303
+        // reserved 1..255 range, but a normal magnitude (not 0x20000000).
+        assert!(a0 >= 50_000);
     }
 
     #[test]
@@ -2316,21 +2457,52 @@ mod tests {
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
 
-        assert!(raw.contains("Security-Client: ipsec-3gpp"), "{raw}");
+        // Handset-shaped Security-Client: mandatory prot=esp;mod=trans, and one
+        // mechanism per offered algorithm (SHA-1 + MD5).
+        assert!(raw.contains("Security-Client: ipsec-3gpp;prot=esp;mod=trans;"), "{raw}");
         assert!(raw.contains("alg=hmac-sha-1-96"));
+        assert!(raw.contains("alg=hmac-md5-96"));
         assert!(raw.contains("ealg=null"));
-        assert!(raw.contains("port-c=6100"));
-        assert!(raw.contains("port-s=6101"));
+        assert!(raw.contains("port-c=6100;port-s=6101"));
         assert!(raw.contains("Require: sec-agree"));
         assert!(raw.contains("Proxy-Require: sec-agree"));
+        assert!(raw.contains("Supported: path, sec-agree"));
+        assert!(raw.contains("Allow: INVITE, ACK, OPTIONS"));
 
-        // SPIs were allocated and stored on the entry, and appear in the header.
+        // SPIs were allocated (sane magnitude) and appear in the header.
         let entry = manager.entries.get(AKA_AOR).unwrap();
         let ipsec = entry.ue_ipsec.as_ref().unwrap();
-        assert!(ipsec.spi_uc >= 0x2000_0000);
+        assert!(ipsec.spi_uc >= 50_000);
         assert_eq!(ipsec.spi_us, ipsec.spi_uc + 1);
         assert!(raw.contains(&format!("spi-c={}", ipsec.spi_uc)));
         assert!(raw.contains(&format!("spi-s={}", ipsec.spi_us)));
+    }
+
+    /// The user's SPI concern: the spi-c advertised in Security-Client MUST be
+    /// the exact value installed as the UE inbound SA (`spi_uc`) — a mismatch
+    /// silently breaks decryption of the protected REGISTER.
+    #[test]
+    fn advertised_security_client_spi_matches_installed_sa() {
+        let manager = make_manager();
+        manager.add(make_aka_ipsec_entry(AKA_AOR));
+        let local = "127.0.0.1:5060".parse().unwrap();
+
+        // Initial REGISTER allocates the SPIs.
+        manager.build_register(AKA_AOR, local, &HashMap::new(), 600000).unwrap();
+        // Record server answer + run the challenge so the SA descriptor exists.
+        let server = crate::ipsec::parse_security_client(SECURITY_SERVER).unwrap();
+        manager.store_security_server(AKA_AOR, &server, SECURITY_SERVER);
+        let challenge = build_aka_challenge("ff9bb4d0b607");
+        manager
+            .build_register_aka(AKA_AOR, local, &HashMap::new(), &challenge, 600000, Some(SECURITY_SERVER))
+            .unwrap();
+
+        let advertised = manager.entries.get(AKA_AOR).unwrap().ue_ipsec.as_ref().unwrap().spi_uc;
+        let sa = manager
+            .ue_sa_pair(AKA_AOR, "127.0.0.1".parse().unwrap(), "10.0.0.1".parse().unwrap(), Some(600000), SaProtocol::Any)
+            .expect("SA descriptor");
+        assert_eq!(advertised, sa.spi_uc, "advertised spi-c must equal installed UE inbound SA SPI");
+        assert!(sa.spi_uc >= 256, "RFC 4303 §2.1: SPI must be >= 256");
     }
 
     #[test]

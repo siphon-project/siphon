@@ -2565,7 +2565,8 @@ class MockRegistration:
             amf: Optional[str] = None, sqn: Optional[str] = None,
             ipsec: bool = False, ue_port_c: Optional[int] = None,
             ue_port_s: Optional[int] = None, ipsec_alg: Optional[str] = None,
-            ipsec_ealg: Optional[str] = None) -> None:
+            ipsec_ealg: Optional[str] = None, imei: Optional[str] = None,
+            ims_features: Optional[list[str]] = None) -> None:
         """Add a new outbound registration.
 
         Args:
@@ -2634,6 +2635,8 @@ class MockRegistration:
             "ue_port_s": ue_port_s,
             "ipsec_alg": ipsec_alg or "hmac-sha-1-96",
             "ipsec_ealg": ipsec_ealg or "null",
+            "imei": imei,
+            "ims_features": list(ims_features) if ims_features else [],
             "state": "registered",
             "expires_in": interval or 3600,
             "failure_count": 0,

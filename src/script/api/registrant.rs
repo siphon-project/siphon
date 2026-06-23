@@ -68,8 +68,12 @@ impl PyRegistration {
     ///     ipsec_alg: Offered integrity algorithm — "hmac-sha-1-96" (default),
     ///         "hmac-md5-96", or "hmac-sha-256-128".
     ///     ipsec_ealg: Offered encryption algorithm — "null" (default) or "aes-cbc".
+    ///     imei: IMEI for the Contact +sip.instance (urn:gsma:imei). None → no
+    ///         instance tag.
+    ///     ims_features: Contact feature tags to advertise so the S-CSCF
+    ///         registers the implied services — any of "mmtel", "video", "smsip".
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=false, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None))]
+    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=false, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None))]
     fn add(
         &self,
         aor: &str,
@@ -91,6 +95,8 @@ impl PyRegistration {
         ue_port_s: Option<u16>,
         ipsec_alg: Option<&str>,
         ipsec_ealg: Option<&str>,
+        imei: Option<String>,
+        ims_features: Option<Vec<String>>,
     ) -> PyResult<()> {
         let transport_type = match transport {
             Some("tcp") => Transport::Tcp,
@@ -188,6 +194,21 @@ impl PyRegistration {
                 pyo3::exceptions::PyValueError::new_err(format!("unknown ipsec_ealg '{ealg_token}'"))
             })?;
             entry.with_ipsec(UeIpsec::new(port_c, port_s, aalg, ealg))
+        } else {
+            entry
+        };
+
+        // IMS Contact feature tags (instance ID + MMTel/video/SMS) so the
+        // S-CSCF registers the implied services (TS 24.229 / GSMA IR.92).
+        let entry = if imei.is_some() || ims_features.is_some() {
+            let features = ims_features.unwrap_or_default();
+            let has = |tag: &str| features.iter().any(|f| f.eq_ignore_ascii_case(tag));
+            entry.with_ims_contact(crate::registrant::ImsContactParams {
+                instance_id: imei,
+                mmtel: has("mmtel"),
+                video: has("video"),
+                smsip: has("smsip"),
+            })
         } else {
             entry
         };
@@ -362,6 +383,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
     }
 
@@ -390,6 +413,8 @@ mod tests {
             true,
             ue_port_c,
             ue_port_s,
+            None,
+            None,
             None,
             None,
         )
@@ -457,6 +482,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                None,
                 None,
                 None,
                 None,

@@ -1885,6 +1885,19 @@ pub struct RegistrantEntryConfig {
     pub aka: Option<RegistrantAkaConfig>,
     /// IPsec sec-agree (UE side) — only valid with `auth: aka`.
     pub ipsec: Option<RegistrantIpsecConfig>,
+    /// IMS Contact feature tags (instance ID + MMTel/video/SMS) so the S-CSCF
+    /// registers the implied services.
+    pub ims: Option<RegistrantImsConfig>,
+}
+
+/// IMS Contact feature tags for a registrant entry (TS 24.229 / GSMA IR.92).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantImsConfig {
+    /// IMEI for `+sip.instance="<urn:gsma:imei:…>"` (RFC 5626 instance ID).
+    pub imei: Option<String>,
+    /// Feature tags to advertise: any of "mmtel", "video", "smsip".
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 /// IMS AKA credentials for a registrant entry (3GPP TS 33.203).
@@ -2875,6 +2888,9 @@ registrant:
         let ipsec = ue.ipsec.as_ref().expect("ipsec block");
         assert_eq!(ipsec.ue_port_c, 6100);
         assert_eq!(ipsec.ue_port_s, 6101);
+        let ims = ue.ims.as_ref().expect("ims block");
+        assert!(ims.imei.is_some());
+        assert!(ims.features.iter().any(|f| f == "mmtel"));
     }
 
     #[test]

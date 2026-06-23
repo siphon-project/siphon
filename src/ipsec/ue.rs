@@ -24,10 +24,11 @@ use crate::ipsec::{EncryptionAlgorithm, IntegrityAlgorithm, SecurityClient};
 /// answers with its own SPIs/ports in the Security-Server header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UeSecurityOffer {
-    /// Security mechanism — always `"ipsec-3gpp"` for IMS.
-    pub mechanism: String,
-    /// Offered integrity algorithm.
-    pub aalg: IntegrityAlgorithm,
+    /// Offered integrity algorithms, in preference order. The UE emits one
+    /// `ipsec-3gpp` mechanism per algorithm (all sharing the SPIs/ports); the
+    /// P-CSCF picks one in its Security-Server answer (handsets offer both
+    /// `hmac-sha-1-96` and `hmac-md5-96`).
+    pub aalgs: Vec<IntegrityAlgorithm>,
     /// Offered encryption algorithm (`Null` for integrity-only).
     pub ealg: EncryptionAlgorithm,
     /// UE client SPI (becomes `spi_uc` in the SA pair).
@@ -41,9 +42,9 @@ pub struct UeSecurityOffer {
 }
 
 impl UeSecurityOffer {
-    /// Build an `ipsec-3gpp` offer for the given transform + endpoints.
+    /// Build an `ipsec-3gpp` offer for the given algorithms + endpoints.
     pub fn new(
-        aalg: IntegrityAlgorithm,
+        aalgs: Vec<IntegrityAlgorithm>,
         ealg: EncryptionAlgorithm,
         spi_c: u32,
         spi_s: u32,
@@ -51,8 +52,7 @@ impl UeSecurityOffer {
         port_s: u16,
     ) -> Self {
         Self {
-            mechanism: "ipsec-3gpp".to_string(),
-            aalg,
+            aalgs,
             ealg,
             spi_c,
             spi_s,
@@ -63,21 +63,32 @@ impl UeSecurityOffer {
 }
 
 /// Build the `Security-Client` header value the UE puts on its REGISTER
-/// (3GPP TS 33.203 §7.2 / RFC 3329).
+/// (3GPP TS 33.203 §7.2 / RFC 3329 §2.2).
 ///
-/// `ealg` is always emitted (including `ealg=null`) — IMS P-CSCFs key the
-/// answer on the offered algorithm pair, and an absent `ealg` is ambiguous.
+/// Emits one `ipsec-3gpp` mechanism per offered integrity algorithm, all
+/// sharing the same SPIs/ports, comma-separated — exactly the shape a real
+/// IMS handset sends. Each mechanism carries the mandatory `prot=esp` and
+/// `mod=trans` (ESP transport-mode SA) and uses the handset parameter order:
+/// `prot;mod;spi-c;spi-s;port-c;port-s;alg;ealg`. `ealg` is always emitted
+/// (incl. `ealg=null`) — an absent `ealg` is ambiguous to the P-CSCF.
 pub fn build_security_client(offer: &UeSecurityOffer) -> String {
-    format!(
-        "{}; alg={}; ealg={}; spi-c={}; spi-s={}; port-c={}; port-s={}",
-        offer.mechanism,
-        offer.aalg.sec_agree_name(),
-        offer.ealg.sec_agree_name(),
-        offer.spi_c,
-        offer.spi_s,
-        offer.port_c,
-        offer.port_s,
-    )
+    let ealg = offer.ealg.sec_agree_name();
+    offer
+        .aalgs
+        .iter()
+        .map(|aalg| {
+            format!(
+                "ipsec-3gpp;prot=esp;mod=trans;spi-c={};spi-s={};port-c={};port-s={};alg={};ealg={}",
+                offer.spi_c,
+                offer.spi_s,
+                offer.port_c,
+                offer.port_s,
+                aalg.sec_agree_name(),
+                ealg,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Parse a `Security-Server` header value sent by the P-CSCF.
@@ -105,26 +116,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_security_client_emits_all_params() {
+    fn build_security_client_single_mechanism_handset_shape() {
         let offer = UeSecurityOffer::new(
-            IntegrityAlgorithm::HmacSha1,
+            vec![IntegrityAlgorithm::HmacSha1],
             EncryptionAlgorithm::Null,
             0x1111,
             0x2222,
             6100,
             6101,
         );
-        let header = build_security_client(&offer);
+        // prot=esp;mod=trans, handset parameter order, no spaces within a
+        // mechanism (matches Samsung IMS 6.0 / TS 33.203 §7.2).
         assert_eq!(
-            header,
-            "ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; spi-c=4369; spi-s=8738; port-c=6100; port-s=6101"
+            build_security_client(&offer),
+            "ipsec-3gpp;prot=esp;mod=trans;spi-c=4369;spi-s=8738;port-c=6100;port-s=6101;alg=hmac-sha-1-96;ealg=null"
         );
+    }
+
+    #[test]
+    fn build_security_client_multi_mechanism_one_per_alg() {
+        // Offering both algorithms emits two ipsec-3gpp mechanisms sharing the
+        // SPIs/ports, comma-separated, preference order preserved.
+        let offer = UeSecurityOffer::new(
+            vec![IntegrityAlgorithm::HmacSha1, IntegrityAlgorithm::HmacMd5],
+            EncryptionAlgorithm::Null,
+            68054,
+            68055,
+            6100,
+            6101,
+        );
+        let header = build_security_client(&offer);
+        let mechs: Vec<&str> = header.split(", ").collect();
+        assert_eq!(mechs.len(), 2);
+        assert!(mechs[0].contains("alg=hmac-sha-1-96"));
+        assert!(mechs[1].contains("alg=hmac-md5-96"));
+        // Shared SPIs/ports + mandatory prot/mod on both.
+        for mech in &mechs {
+            assert!(mech.starts_with("ipsec-3gpp;prot=esp;mod=trans;"));
+            assert!(mech.contains("spi-c=68054"));
+            assert!(mech.contains("spi-s=68055"));
+            assert!(mech.contains("port-c=6100;port-s=6101"));
+            assert!(mech.contains("ealg=null"));
+        }
     }
 
     #[test]
     fn build_security_client_emits_aes_cbc() {
         let offer = UeSecurityOffer::new(
-            IntegrityAlgorithm::HmacMd5,
+            vec![IntegrityAlgorithm::HmacMd5],
             EncryptionAlgorithm::AesCbc128,
             11111,
             22222,
@@ -138,12 +177,13 @@ mod tests {
         assert!(header.contains("port-s=5062"));
     }
 
-    /// The Security-Client we build must round-trip through the shared parser
-    /// (the P-CSCF reads it with exactly that code).
+    /// A single offered mechanism must round-trip through the shared parser
+    /// (the P-CSCF reads each mechanism with exactly that code) — including the
+    /// new prot/mod params, which the parser ignores.
     #[test]
     fn build_security_client_round_trips_through_parser() {
         let offer = UeSecurityOffer::new(
-            IntegrityAlgorithm::HmacSha1,
+            vec![IntegrityAlgorithm::HmacSha1],
             EncryptionAlgorithm::Null,
             33333,
             44444,

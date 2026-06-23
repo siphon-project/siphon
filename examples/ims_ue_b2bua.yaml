@@ -61,6 +61,11 @@ registrant:
       ipsec:
         ue_port_c: 6100        # must match the listen.udp ports above
         ue_port_s: 6101        # alg: hmac-sha-1-96 / ealg: null (defaults)
+      ims:
+        # IMS Contact feature tags (TS 24.229 / GSMA IR.92) — let the S-CSCF
+        # register the implied services. imei feeds +sip.instance (instance ID).
+        imei: "${UE_IMEI:-35436012-861541-0}"
+        features: [mmtel, video, smsip]
 
 log:
   level: info

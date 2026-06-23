@@ -2233,6 +2233,19 @@ fn init_registrant(
             entry
         };
 
+        // IMS Contact feature tags (instance ID + MMTel/video/SMS).
+        let entry = if let Some(ims_config) = &entry_config.ims {
+            let has = |tag: &str| ims_config.features.iter().any(|f| f.eq_ignore_ascii_case(tag));
+            entry.with_ims_contact(crate::registrant::ImsContactParams {
+                instance_id: ims_config.imei.clone(),
+                mmtel: has("mmtel"),
+                video: has("video"),
+                smsip: has("smsip"),
+            })
+        } else {
+            entry
+        };
+
         manager.add(entry);
     }
 
