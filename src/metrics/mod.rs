@@ -166,6 +166,19 @@ pub struct SiphonMetrics {
     /// Total failures recorded toward the auto-ban: auth challenges that were not
     /// followed by a success, plus non-ACK INVITE server-transaction timeouts.
     pub auth_failures_total: IntCounter,
+    /// Total TLS/WSS/WS handshakes that failed or timed out before completing,
+    /// each recorded toward the auto-ban. These are TCP-validated source IPs
+    /// (no spoofing), so a sustained rise is an unambiguous scanning campaign.
+    pub handshake_failures_total: IntCounter,
+    /// Total digest attempts carrying present-but-invalid credentials (wrong
+    /// password) or a forged/stale/replayed nonce, each recorded toward the
+    /// auto-ban as a high-confidence signal. Distinct from `auth_failures_total`
+    /// (which counts credential-less challenge first-legs).
+    pub credential_failures_total: IntCounter,
+    /// Total non-SIP / unparseable messages received on a stream transport
+    /// (TCP/TLS) and dropped, each recorded toward the auto-ban. Excludes
+    /// incomplete-but-plausible frames, empty connections, and CRLF keepalives.
+    pub malformed_messages_total: IntCounter,
     /// Total inbound requests dropped because the source's User-Agent matched a
     /// `security.scanner_block` signature (sipvicious, friendly-scanner, …).
     pub scanner_blocked_total: IntCounter,
@@ -339,6 +352,21 @@ impl SiphonMetrics {
             "Total failures recorded toward the auto-ban (auth challenges without a subsequent success + non-ACK INVITE server-transaction timeouts)",
         )?;
 
+        let handshake_failures_total = IntCounter::new(
+            "siphon_handshake_failures_total",
+            "Total TLS/WSS/WS handshakes that failed or timed out before completing, each recorded toward the auto-ban (TCP-validated source IPs)",
+        )?;
+
+        let credential_failures_total = IntCounter::new(
+            "siphon_credential_failures_total",
+            "Total digest attempts with present-but-invalid credentials or a forged/stale/replayed nonce, each recorded toward the auto-ban as a high-confidence signal",
+        )?;
+
+        let malformed_messages_total = IntCounter::new(
+            "siphon_malformed_messages_total",
+            "Total non-SIP / unparseable messages received on a stream transport (TCP/TLS) and dropped, each recorded toward the auto-ban",
+        )?;
+
         let scanner_blocked_total = IntCounter::new(
             "siphon_scanner_blocked_total",
             "Total inbound requests dropped because the source User-Agent matched a security.scanner_block signature",
@@ -430,6 +458,9 @@ impl SiphonMetrics {
         registry.register(Box::new(auth_ha1_cache_hits_total.clone()))?;
         registry.register(Box::new(banned_ips.clone()))?;
         registry.register(Box::new(auth_failures_total.clone()))?;
+        registry.register(Box::new(handshake_failures_total.clone()))?;
+        registry.register(Box::new(credential_failures_total.clone()))?;
+        registry.register(Box::new(malformed_messages_total.clone()))?;
         registry.register(Box::new(scanner_blocked_total.clone()))?;
         registry.register(Box::new(rate_limited_total.clone()))?;
         registry.register(Box::new(diameter_peers_connected.clone()))?;
@@ -473,6 +504,9 @@ impl SiphonMetrics {
             auth_ha1_cache_hits_total,
             banned_ips,
             auth_failures_total,
+            handshake_failures_total,
+            credential_failures_total,
+            malformed_messages_total,
             scanner_blocked_total,
             rate_limited_total,
             diameter_peers_connected,

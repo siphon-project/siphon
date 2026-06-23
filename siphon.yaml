@@ -327,14 +327,31 @@ auth:
 #     - "10.0.0.0/8"            # own infra: AS, BGCF, trunks, monitoring
 #
 #   failed_auth_ban:            # auto-ban scanners at accept (TCP/TLS/UDP/WS/SCTP)
-#     threshold: 10             # failures within window_secs before a ban
+#     threshold: 10             # weighted failures within window_secs before a ban
 #     window_secs: 600          # sliding window for counting failures (default 600)
 #     ban_duration_secs: 3600   # how long the ban lasts (then auto-expires)
-#     # A "failure" = an auth challenge (401/407) not followed by a successful
-#     # auth, OR a non-ACK INVITE server-transaction timeout (the toll-fraud
-#     # scanner pattern). A successful auth resets the source's counter, so a
-#     # legit client that challenges-then-succeeds never accumulates.
-#     # trusted_cidrs are exempt. Banned IPs are dropped before any SIP parsing.
+#     strong_signal_weight: 3   # weight of a high-confidence abuse signal toward
+#                               # threshold (default 3); a plain probe counts as 1
+#     # Failures counted toward the ban, by weight:
+#     #   weight 1 (low-confidence — may fire for a benign peer):
+#     #     - an auth challenge (401/407) not followed by a successful auth
+#     #     - a non-ACK INVITE server-transaction timeout (toll-fraud pattern)
+#     #     - a failed/timed-out TLS / WSS / WS handshake
+#     #   weight = strong_signal_weight (high-confidence abuse — bans faster):
+#     #     - present-but-invalid digest credentials (wrong password), or a
+#     #       forged / stale / replayed nonce  [over UDP this stays weight 1,
+#     #       since a UDP source is spoofable and would amplify a reflected ban]
+#     #     - non-SIP / unparseable bytes on a TCP/TLS stream (HTTP probe, TLS
+#     #       record on the plaintext port, random bytes)
+#     #     - a request whose User-Agent matched scanner_block, over a
+#     #       connection-oriented transport (UDP scanner UAs are dropped, not banned)
+#     # A successful auth resets the source's counter, so a legit client that
+#     # challenges-then-succeeds (or retries a stale nonce) never accumulates.
+#     # trusted_cidrs are exempt — put load balancers / health-check probes
+#     # (e.g. AWS NLB) there; L4 (connect-only) checks send no data and are
+#     # never mistaken for garbage, but an L7/HTTP health check against a SIP
+#     # port would be, so its source belongs in trusted_cidrs.
+#     # Banned IPs are dropped at accept/recv, before any SIP parsing.
 #
 #   apiban:                     # APIBAN community blocklist (apiban.org)
 #     api_key: "your-api-key"   # get a free key at apiban.org

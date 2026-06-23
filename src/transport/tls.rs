@@ -390,10 +390,12 @@ pub async fn listen(
                             Ok(Ok(stream)) => stream,
                             Ok(Err(error)) => {
                                 warn!("TLS handshake failed from {}: {}", remote_addr, error);
+                                crate::security::record_handshake_failure(remote_addr.ip(), "TLS");
                                 return;
                             }
                             Err(_) => {
                                 warn!("TLS handshake timed out from {}", remote_addr);
+                                crate::security::record_handshake_failure(remote_addr.ip(), "TLS");
                                 return;
                             }
                         };
@@ -441,7 +443,15 @@ pub async fn listen(
                                             }
                                             let message_len = match crate::transport::tcp::extract_sip_message_length(&accumulator) {
                                                 Some(len) if len <= accumulator.len() => len,
-                                                _ => break, // incomplete message, need more data
+                                                Some(_) => break, // header block complete, body still arriving — wait
+                                                None => match crate::transport::tcp::classify_incomplete_stream(&accumulator) {
+                                                    crate::transport::tcp::StreamVerdict::MaybeSip => break, // SIP still arriving — need more data
+                                                    crate::transport::tcp::StreamVerdict::Garbage => {
+                                                        warn!("non-SIP bytes from {} on TLS {:?}; dropping connection", remote_addr, connection_id);
+                                                        crate::security::record_malformed_message(remote_addr.ip(), "TLS");
+                                                        return; // close the connection
+                                                    }
+                                                },
                                             };
                                             let data = accumulator.split_to(message_len).freeze();
                                             let message = InboundMessage {

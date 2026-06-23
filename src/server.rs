@@ -801,12 +801,14 @@ impl SiphonServer {
                     fab.window_secs,
                     fab.ban_duration_secs,
                     &sec.trusted_cidrs,
+                    fab.strong_signal_weight,
                 ));
                 crate::security::set_auto_ban(Arc::clone(&store));
                 info!(
                     threshold = fab.threshold,
                     window_secs = fab.window_secs,
                     ban_duration_secs = fab.ban_duration_secs,
+                    strong_signal_weight = fab.strong_signal_weight,
                     trusted_cidrs = sec.trusted_cidrs.len(),
                     "failed_auth_ban scanner protection enabled"
                 );

@@ -190,7 +190,15 @@ pub async fn listen(
                                             }
                                             let message_len = match extract_sip_message_length(&accumulator) {
                                                 Some(len) if len <= accumulator.len() => len,
-                                                _ => break, // incomplete message, need more data
+                                                Some(_) => break, // header block complete, body still arriving — wait
+                                                None => match classify_incomplete_stream(&accumulator) {
+                                                    StreamVerdict::MaybeSip => break, // SIP still arriving — need more data
+                                                    StreamVerdict::Garbage => {
+                                                        warn!("non-SIP bytes from {} on TCP {:?}; dropping connection", remote_addr, connection_id);
+                                                        crate::security::record_malformed_message(remote_addr.ip(), "TCP");
+                                                        return; // close the connection
+                                                    }
+                                                },
                                             };
                                             let data = accumulator.split_to(message_len).freeze();
                                             let message = InboundMessage {
@@ -273,6 +281,69 @@ pub(crate) fn extract_sip_message_length(buffer: &[u8]) -> Option<usize> {
     let content_length = extract_content_length(header_block).unwrap_or(0);
 
     Some(headers_len + content_length)
+}
+
+/// Maximum bytes of an incomplete (no `\r\n\r\n` yet) stream message before it
+/// is treated as abusive. A legitimate SIP header block is far smaller; an
+/// unbounded stream with no end-of-headers is either a slow-loris or a non-SIP
+/// flood, and is dropped (and auto-banned) rather than accumulated unbounded.
+const MAX_INCOMPLETE_HEADER_BYTES: usize = 64 * 1024;
+
+/// Verdict for a stream buffer that does not yet contain a complete SIP message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamVerdict {
+    /// Bytes are (or could still become) a SIP message — keep reading.
+    MaybeSip,
+    /// Bytes are definitely not SIP (a complete non-SIP first line, a binary
+    /// probe, or an over-long header block). Drop the connection.
+    Garbage,
+}
+
+/// Classify a stream buffer that [`extract_sip_message_length`] reported as
+/// incomplete (no `\r\n\r\n` yet): is it a SIP message still arriving, or a
+/// scanner's non-SIP probe (an HTTP request, a TLS record on the plaintext
+/// port, random bytes)?
+///
+/// The caller must have already drained leading CRLF keepalives (RFC 5626
+/// §4.4.1) and confirmed the buffer is non-empty, so an empty connection (an
+/// AWS NLB / load-balancer L4 health check that connects and closes without
+/// data) and CRLF pings never reach here and are never mistaken for garbage.
+///
+/// RFC 3261 permits extension methods, so unknown method tokens are NOT
+/// rejected: a request-line is accepted while its first line ends with
+/// ` SIP/2.0`, and a status-line while it starts with `SIP/2.0 `. Only a
+/// *complete* first line that is neither, a C0 control byte that cannot appear
+/// in a start-line (catches binary probes immediately), or an over-long header
+/// block is declared garbage.
+pub(crate) fn classify_incomplete_stream(buffer: &[u8]) -> StreamVerdict {
+    // Over-long header block with no end-of-headers — slow-loris / flood.
+    if buffer.len() > MAX_INCOMPLETE_HEADER_BYTES {
+        return StreamVerdict::Garbage;
+    }
+    // A C0 control byte (other than CR/LF/HT) never appears in a SIP start-line
+    // or header — catches binary probes (e.g. a TLS ClientHello: 0x16 0x03 …)
+    // before a CRLF is even seen. Scan only the head; garbage shows at the start.
+    let head = &buffer[..buffer.len().min(512)];
+    if head
+        .iter()
+        .any(|&byte| byte < 0x20 && byte != b'\r' && byte != b'\n' && byte != b'\t')
+    {
+        return StreamVerdict::Garbage;
+    }
+    // Wait for the first line to complete before judging its request/status shape.
+    match buffer.windows(2).position(|window| window == b"\r\n") {
+        Some(line_end) => {
+            let line = &buffer[..line_end];
+            if line.starts_with(b"SIP/2.0 ") || line.ends_with(b" SIP/2.0") {
+                StreamVerdict::MaybeSip
+            } else {
+                StreamVerdict::Garbage
+            }
+        }
+        // First line still arriving and free of control bytes — keep reading
+        // (bounded by the size cap above and the connection idle timeout).
+        None => StreamVerdict::MaybeSip,
+    }
 }
 
 /// Extract Content-Length value from raw header bytes.
@@ -383,6 +454,64 @@ mod tests {
     fn extract_length_incomplete_headers() {
         let partial = b"INVITE sip:bob@example.com SIP/2.0\r\nContent-Length: 5\r\n";
         assert_eq!(extract_sip_message_length(partial), None);
+    }
+
+    #[test]
+    fn classify_accepts_partial_sip_request() {
+        // A request-line whose message is still arriving (no \r\n\r\n yet).
+        let partial = b"INVITE sip:bob@example.com SIP/2.0\r\nVia: SIP/2.0/TCP h";
+        assert_eq!(classify_incomplete_stream(partial), StreamVerdict::MaybeSip);
+    }
+
+    #[test]
+    fn classify_accepts_partial_status_line() {
+        let partial = b"SIP/2.0 200 OK\r\nVia: SIP/2.0/TCP host";
+        assert_eq!(classify_incomplete_stream(partial), StreamVerdict::MaybeSip);
+    }
+
+    #[test]
+    fn classify_accepts_method_prefix_before_crlf() {
+        // First line not yet terminated — too short to judge, keep reading.
+        assert_eq!(classify_incomplete_stream(b"INV"), StreamVerdict::MaybeSip);
+        assert_eq!(
+            classify_incomplete_stream(b"REGISTER sip:exa"),
+            StreamVerdict::MaybeSip
+        );
+    }
+
+    #[test]
+    fn classify_accepts_rfc3261_extension_method() {
+        // RFC 3261 permits extension methods — an unknown token is NOT garbage
+        // as long as the request-line ends with " SIP/2.0".
+        let unknown = b"FROBNICATE sip:bob@example.com SIP/2.0\r\nVia: x";
+        assert_eq!(classify_incomplete_stream(unknown), StreamVerdict::MaybeSip);
+    }
+
+    #[test]
+    fn classify_rejects_http_probe() {
+        let http = b"GET / HTTP/1.1\r\nHost: example.com\r\n";
+        assert_eq!(classify_incomplete_stream(http), StreamVerdict::Garbage);
+    }
+
+    #[test]
+    fn classify_rejects_binary_probe() {
+        // A TLS ClientHello on the plaintext port: record type 0x16, version 0x0301.
+        let tls_hello = b"\x16\x03\x01\x00\xa5\x01\x00\x00\xa1\x03\x03";
+        assert_eq!(
+            classify_incomplete_stream(tls_hello),
+            StreamVerdict::Garbage
+        );
+    }
+
+    #[test]
+    fn classify_rejects_oversized_header_block() {
+        // No end-of-headers within the cap — slow-loris / flood.
+        let mut flood = Vec::from(&b"INVITE sip:x SIP/2.0\r\n"[..]);
+        flood.resize(MAX_INCOMPLETE_HEADER_BYTES + 1, b'A');
+        assert_eq!(
+            classify_incomplete_stream(&flood),
+            StreamVerdict::Garbage
+        );
     }
 
     #[test]

@@ -1032,10 +1032,22 @@ pub struct FailedAuthBanConfig {
     pub window_secs: u32,
     /// How long a ban lasts (seconds) before the source IP is allowed again.
     pub ban_duration_secs: u32,
+    /// Weight applied to a single high-confidence abuse signal — present-but-
+    /// invalid credentials (wrong password), a forged/stale/replayed digest
+    /// nonce, non-SIP garbage on a stream transport, or a scanner User-Agent —
+    /// toward `threshold`. A weight > 1 bans these unambiguous signals faster
+    /// than a bare scanning probe (which counts as 1) while sharing the same
+    /// per-IP window. Clamped to ≥ 1. Default: 3.
+    #[serde(default = "default_strong_signal_weight")]
+    pub strong_signal_weight: u32,
 }
 
 fn default_failed_auth_window_secs() -> u32 {
     600
+}
+
+fn default_strong_signal_weight() -> u32 {
+    3
 }
 
 // ---------------------------------------------------------------------------

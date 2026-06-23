@@ -2432,6 +2432,19 @@ fn handle_request(
                 if let Some(metrics) = crate::metrics::try_metrics() {
                     metrics.scanner_blocked_total.inc();
                 }
+                // Escalate to an IP ban so the scanner's *other* probes (across
+                // methods and transports) are dropped at the ACL too — but only
+                // over a connection-oriented transport, where the TCP/TLS/WS/SCTP
+                // handshake validates the source address. A scanner User-Agent in
+                // a lone UDP datagram has a spoofable source, so banning on it
+                // would let an attacker get a victim's IP banned (reflected ban).
+                if inbound.transport != crate::transport::Transport::Udp {
+                    if let Some(ban) = crate::security::auto_ban() {
+                        if ban.record_strong_failure(source) {
+                            warn!(source = %source, "auto-ban: source banned (scanner User-Agent)");
+                        }
+                    }
+                }
                 return;
             }
             crate::security::SecurityVerdict::RateLimited => {

@@ -62,6 +62,59 @@ pub fn security_filter() -> Option<&'static Arc<SecurityFilter>> {
     SECURITY_FILTER.get()
 }
 
+/// Record one failed/timed-out transport handshake (TLS / WSS TLS / WS upgrade)
+/// from `source` as an auto-ban signal, and bump the handshake-failure metric.
+///
+/// Called from the TLS/WSS/WS accept paths when a handshake never completes.
+/// Because all three run over TCP, `source` is validated by the TCP three-way
+/// handshake (no UDP-style spoofing), making a failed handshake one of the
+/// highest-confidence ban signals available — a legitimate SIP client never
+/// fails the handshake this way (it sends sig-algs, a usable cipher suite, a
+/// well-formed `Sec-WebSocket-Protocol`). The metric is always counted (so
+/// scanner volume is visible even before bans are turned on); the ban itself is
+/// a no-op until `security.failed_auth_ban` is configured, and `trusted_cidrs`
+/// are exempt inside the store. `transport` only labels the ban-transition log.
+pub fn record_handshake_failure(source: IpAddr, transport: &str) {
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics.handshake_failures_total.inc();
+    }
+    if let Some(ban) = auto_ban() {
+        if ban.record_failure(source) {
+            tracing::warn!(
+                source = %source,
+                transport,
+                "auto-ban: source banned (repeated handshake failures)"
+            );
+        }
+    }
+}
+
+/// Record one non-SIP / unparseable message from `source` on a stream transport
+/// (`transport` = "TCP" / "TLS") as a high-confidence auto-ban signal, and bump
+/// the malformed-message metric.
+///
+/// Called from the TCP/TLS read loop only when the accumulated bytes are a
+/// *definite* non-SIP attempt — never for an incomplete-but-plausible SIP frame
+/// still arriving, never for an empty connection (an AWS NLB / load-balancer TCP
+/// health check opens and closes without data), and never for a CRLF keepalive
+/// (RFC 5626 §4.4.1), all of which are drained/filtered before this is reached.
+/// Because the bytes arrived over a completed TCP handshake the source IP is
+/// validated (no UDP-style spoofing), so this is weighted as a strong signal.
+pub fn record_malformed_message(source: IpAddr, transport: &str) {
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics.malformed_messages_total.inc();
+    }
+    if let Some(ban) = auto_ban() {
+        if ban.record_strong_failure(source) {
+            tracing::warn!(
+                source = %source,
+                transport,
+                "auto-ban: source banned (non-SIP bytes on stream)"
+            );
+        }
+    }
+}
+
 /// Fixed-window failure counter for one source IP.
 #[derive(Debug, Clone, Copy)]
 struct FailureWindow {
@@ -81,6 +134,13 @@ pub struct AutoBanStore {
     threshold: u32,
     window: Duration,
     ban_duration: Duration,
+    /// Failure weight applied by [`Self::record_strong_failure`] — how many
+    /// counts a single high-confidence abuse signal (present-but-invalid
+    /// credentials, forged/stale/replayed nonce, non-SIP garbage on a stream,
+    /// scanner User-Agent) contributes toward `threshold`. A weight > 1 bans
+    /// these unambiguous signals faster than a bare scanning probe (weight 1)
+    /// while reusing the single per-IP window. Always ≥ 1.
+    strong_weight: u32,
 }
 
 impl AutoBanStore {
@@ -91,6 +151,7 @@ impl AutoBanStore {
         window_secs: u32,
         ban_duration_secs: u32,
         trusted_cidrs: &[String],
+        strong_weight: u32,
     ) -> Self {
         let trusted = trusted_cidrs
             .iter()
@@ -104,6 +165,7 @@ impl AutoBanStore {
             threshold: threshold.max(1),
             window: Duration::from_secs(u64::from(window_secs.max(1))),
             ban_duration: Duration::from_secs(u64::from(ban_duration_secs.max(1))),
+            strong_weight: strong_weight.max(1),
         }
     }
 
@@ -111,13 +173,28 @@ impl AutoBanStore {
         self.trusted.iter().any(|net| net.contains(&source))
     }
 
-    /// Record one failure for `source`. Returns `true` if this call newly banned
-    /// the IP (so the caller can log/metric the transition once).
+    /// Record one low-confidence failure for `source` (weight 1) — a signal that
+    /// could occasionally fire for a benign peer: an auth challenge without
+    /// credentials (the legitimate first leg of challenge-response), a non-ACK
+    /// INVITE server-transaction timeout, a failed transport handshake. Returns
+    /// `true` if this call newly banned the IP (so the caller can log/metric the
+    /// transition once).
     pub fn record_failure(&self, source: IpAddr) -> bool {
-        self.record_failure_at(source, Instant::now())
+        self.record_failure_weighted_at(source, 1, Instant::now())
     }
 
-    fn record_failure_at(&self, source: IpAddr, now: Instant) -> bool {
+    /// Record one high-confidence abuse signal for `source`, weighted by
+    /// `strong_weight` so it bans faster than a bare probe: present-but-invalid
+    /// credentials (wrong password), a forged/stale/replayed digest nonce,
+    /// non-SIP garbage on a stream transport, or a scanner User-Agent. A
+    /// legitimate client never produces these (a stale-nonce retry is reset by
+    /// the subsequent [`Self::record_success`]). Returns `true` if this call
+    /// newly banned the IP.
+    pub fn record_strong_failure(&self, source: IpAddr) -> bool {
+        self.record_failure_weighted_at(source, self.strong_weight, Instant::now())
+    }
+
+    fn record_failure_weighted_at(&self, source: IpAddr, weight: u32, now: Instant) -> bool {
         if self.is_trusted(source) {
             return false;
         }
@@ -136,7 +213,7 @@ impl AutoBanStore {
                 entry.count = 0;
                 entry.window_start = now;
             }
-            entry.count += 1;
+            entry.count = entry.count.saturating_add(weight);
             entry.count >= self.threshold
             // `entry` (shard write guard) dropped here, before we touch `bans`
             // or `failures` again — never hold a DashMap guard across another
@@ -148,6 +225,12 @@ impl AutoBanStore {
             self.bans.insert(source, now + self.ban_duration);
         }
         newly_banned
+    }
+
+    /// Test-only weight-1 shim preserving the pre-weighting call shape.
+    #[cfg(test)]
+    fn record_failure_at(&self, source: IpAddr, now: Instant) -> bool {
+        self.record_failure_weighted_at(source, 1, now)
     }
 
     /// A successful authentication from `source` clears its failure count.
@@ -405,7 +488,7 @@ mod tests {
 
     #[test]
     fn bans_after_threshold_failures() {
-        let store = AutoBanStore::new(3, 600, 3600, &[]);
+        let store = AutoBanStore::new(3, 600, 3600, &[], 1);
         let source = ip("203.0.113.7");
         assert!(!store.record_failure(source)); // 1
         assert!(!store.record_failure(source)); // 2
@@ -417,7 +500,7 @@ mod tests {
 
     #[test]
     fn success_resets_the_counter() {
-        let store = AutoBanStore::new(3, 600, 3600, &[]);
+        let store = AutoBanStore::new(3, 600, 3600, &[], 1);
         let source = ip("203.0.113.8");
         store.record_failure(source);
         store.record_failure(source);
@@ -430,7 +513,7 @@ mod tests {
 
     #[test]
     fn trusted_cidr_never_banned() {
-        let store = AutoBanStore::new(2, 600, 3600, &["10.0.0.0/8".to_string()]);
+        let store = AutoBanStore::new(2, 600, 3600, &["10.0.0.0/8".to_string()], 1);
         let source = ip("10.1.2.3");
         for _ in 0..10 {
             assert!(!store.record_failure(source));
@@ -441,7 +524,7 @@ mod tests {
 
     #[test]
     fn window_rolls_so_slow_failures_do_not_ban() {
-        let store = AutoBanStore::new(3, 600, 3600, &[]);
+        let store = AutoBanStore::new(3, 600, 3600, &[], 1);
         let source = ip("203.0.113.9");
         let t0 = Instant::now();
         assert!(!store.record_failure_at(source, t0));
@@ -453,7 +536,7 @@ mod tests {
 
     #[test]
     fn ban_expires_after_ttl() {
-        let store = AutoBanStore::new(1, 600, 60, &[]);
+        let store = AutoBanStore::new(1, 600, 60, &[], 1);
         let source = ip("203.0.113.10");
         let t0 = Instant::now();
         assert!(store.record_failure_at(source, t0)); // threshold 1 -> immediate ban
@@ -463,7 +546,7 @@ mod tests {
 
     #[test]
     fn prune_drops_expired_entries() {
-        let store = AutoBanStore::new(1, 600, 60, &[]);
+        let store = AutoBanStore::new(1, 600, 60, &[], 1);
         let source = ip("203.0.113.11");
         let t0 = Instant::now();
         store.record_failure_at(source, t0);
@@ -474,11 +557,77 @@ mod tests {
 
     #[test]
     fn already_banned_failure_is_noop() {
-        let store = AutoBanStore::new(1, 600, 3600, &[]);
+        let store = AutoBanStore::new(1, 600, 3600, &[], 1);
         let source = ip("203.0.113.12");
         assert!(store.record_failure(source)); // ban
         assert!(!store.record_failure(source)); // already banned -> not "newly banned"
         assert!(store.is_banned(source));
+    }
+
+    #[test]
+    fn strong_failures_ban_faster_than_plain_probes() {
+        // threshold 6, strong weight 3: two high-confidence signals (3+3=6) ban,
+        // while a plain probe (weight 1) needs the full six hits.
+        let store = AutoBanStore::new(6, 600, 3600, &[], 3);
+
+        let abuser = ip("203.0.113.30");
+        assert!(!store.record_strong_failure(abuser)); // 3 < 6
+        assert!(store.record_strong_failure(abuser)); // 6 -> ban
+        assert!(store.is_banned(abuser));
+
+        let prober = ip("203.0.113.31");
+        for _ in 0..5 {
+            assert!(!store.record_failure(prober)); // 1..=5 < 6
+        }
+        assert!(store.record_failure(prober)); // 6 -> ban
+        assert!(store.is_banned(prober));
+    }
+
+    #[test]
+    fn strong_weight_is_clamped_to_at_least_one() {
+        // A misconfigured weight of 0 must not make strong signals free.
+        let store = AutoBanStore::new(2, 600, 3600, &[], 0);
+        let source = ip("203.0.113.32");
+        assert!(!store.record_strong_failure(source)); // 1
+        assert!(store.record_strong_failure(source)); // 2 -> ban
+    }
+
+    // --- record_handshake_failure (TLS/WSS/WS auto-ban signal) -------------
+    //
+    // This test owns the process-global AUTO_BAN OnceLock: no other test (and no
+    // code outside server.rs startup) installs a store, so the install here is
+    // deterministic within the lib test binary. It uses TEST-NET-2 addresses
+    // (RFC 5737, 198.51.100.0/24) that no other test touches, so the lingering
+    // global store cannot perturb the ACL/auth tests that share the binary.
+    #[test]
+    fn handshake_failures_feed_the_auto_ban_store_and_acl() {
+        // Before any store is installed, the helper must be a cheap no-op and
+        // never panic — the whole feature is off until failed_auth_ban is set.
+        let never = ip("198.51.100.78");
+        crate::security::record_handshake_failure(never, "TLS");
+
+        // Install a low-threshold store (3 failures / 600 s window / 1 h ban).
+        let store = Arc::new(AutoBanStore::new(3, 600, 3600, &[], 1));
+        set_auto_ban(Arc::clone(&store));
+
+        // Handshake failures accumulate per-IP across transports and ban at the
+        // threshold — exactly like the auth / INVITE-timeout signals.
+        let scanner = ip("198.51.100.77");
+        crate::security::record_handshake_failure(scanner, "TLS");
+        crate::security::record_handshake_failure(scanner, "TLS");
+        assert!(!store.is_banned(scanner)); // 2 < threshold
+        crate::security::record_handshake_failure(scanner, "WSS"); // 3rd -> ban
+        assert!(store.is_banned(scanner));
+
+        // The pre-install no-op IP never accrued a count.
+        assert!(!store.is_banned(never));
+
+        // End-to-end: the banned scanner is now dropped at transport accept by
+        // the ACL (which consults the same global store), while an IP that never
+        // failed a handshake still passes.
+        let acl = crate::transport::acl::TransportAcl::new(vec![], vec![]);
+        assert!(!acl.is_allowed(scanner));
+        assert!(acl.is_allowed(never));
     }
 
     // --- SecurityFilter (rate_limit + scanner_block) -----------------------

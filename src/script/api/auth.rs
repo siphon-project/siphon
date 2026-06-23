@@ -623,6 +623,12 @@ impl PyAuth {
             }
         };
 
+        // Distinguish a credential-less first leg (the legitimate opening of
+        // challenge-response, or a toll-fraud probe — weight 1) from a present-
+        // but-invalid attempt (wrong password, or a forged/stale/replayed nonce
+        // — a high-confidence abuse signal) handled in the failure arm below.
+        let credentials_present = auth_header.is_some();
+
         match auth_header {
             Some(value) if self.validate_credentials(&value, realm, &method) => {
                 // Extract username from the Authorization header
@@ -652,20 +658,43 @@ impl PyAuth {
                 Ok(true)
             }
             _ => {
-                // No / invalid credentials — a challenge is being issued. Count it
-                // toward the auto-ban: a scanner that never authenticates (the
-                // toll-fraud pattern: REGISTER/INVITE without creds, repeatedly)
-                // accumulates failures, while a legit client is reset by the
-                // record_success above. trusted_cidrs are exempt inside the store.
+                // A challenge is being issued. Count it toward the auto-ban:
+                //  * credentials absent → the toll-fraud pattern (REGISTER/INVITE
+                //    without creds, repeatedly) accrues weight 1; a legit client
+                //    is reset by the record_success above.
+                //  * credentials present but invalid → wrong password, or a
+                //    forged/stale/replayed nonce: a high-confidence abuse signal,
+                //    weighted heavier so brute-force bans faster. The heavier
+                //    weight only applies over a connection-oriented transport
+                //    whose handshake validates the source — a bad-nonce attempt
+                //    needs no round-trip, so over UDP its source is spoofable and
+                //    a heavier weight would amplify a reflected ban. Over UDP it
+                //    falls back to weight 1 (today's behaviour, unchanged).
+                // trusted_cidrs are exempt inside the store.
+                let source_validated = request.transport_name() != "udp";
+                let strong = credentials_present && source_validated;
                 if let Some(ban) = crate::security::auto_ban() {
                     if let Ok(source) = request.source_ip_str().parse::<std::net::IpAddr>() {
-                        if ban.record_failure(source) {
-                            tracing::warn!(source = %source, "auto-ban: source banned (repeated auth challenges)");
+                        let newly_banned = if strong {
+                            ban.record_strong_failure(source)
+                        } else {
+                            ban.record_failure(source)
+                        };
+                        if newly_banned {
+                            tracing::warn!(
+                                source = %source,
+                                credentials_present,
+                                "auto-ban: source banned (repeated auth failures)"
+                            );
                         }
                     }
                 }
                 if let Some(metrics) = crate::metrics::try_metrics() {
-                    metrics.auth_failures_total.inc();
+                    if credentials_present {
+                        metrics.credential_failures_total.inc();
+                    } else {
+                        metrics.auth_failures_total.inc();
+                    }
                 }
 
                 // Send challenge

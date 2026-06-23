@@ -64,6 +64,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         Ok(stream) => stream,
         Err(error) => {
             warn!("WebSocket upgrade failed from {}: {}", remote_addr, error);
+            crate::security::record_handshake_failure(
+                remote_addr.ip(),
+                &transport_variant.to_string(),
+            );
             return;
         }
     };
@@ -332,6 +336,7 @@ pub async fn listen_secure(
                             Ok(stream) => stream,
                             Err(error) => {
                                 warn!("WSS TLS handshake failed from {}: {}", remote_addr, error);
+                                crate::security::record_handshake_failure(remote_addr.ip(), "WSS");
                                 return;
                             }
                         };
