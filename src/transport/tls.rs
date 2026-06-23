@@ -28,6 +28,12 @@ use crate::transport::pool::ConnectionPool;
 /// atomically by the file watcher when the cert or key on disk changes.
 pub type SharedTlsAcceptor = Arc<ArcSwap<TlsAcceptor>>;
 
+/// Maximum time allowed for a TLS handshake to complete. tokio imposes no
+/// default, so without this a peer that connects and then stalls mid-handshake
+/// (slowloris) would pin a task + socket until the OS killed it. Generous
+/// enough for slow mobile clients, short enough to bound half-open handshakes.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Build a `TlsAcceptor` from the certificate and key paths in config.
 pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
     use rustls_pemfile::{certs, private_key};
@@ -372,11 +378,22 @@ pub async fn listen(
                     configure_tcp_socket(&tcp_stream, tos);
 
                     tokio::spawn(async move {
-                        // Perform TLS handshake — timeout is inherited from tokio runtime.
-                        let tls_stream = match acceptor.accept(tcp_stream).await {
-                            Ok(stream) => stream,
-                            Err(error) => {
+                        // Perform TLS handshake under a bounded timeout so a peer
+                        // that connects and stalls mid-handshake (slowloris) cannot
+                        // pin a task + socket indefinitely.
+                        let tls_stream = match tokio::time::timeout(
+                            TLS_HANDSHAKE_TIMEOUT,
+                            acceptor.accept(tcp_stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => stream,
+                            Ok(Err(error)) => {
                                 warn!("TLS handshake failed from {}: {}", remote_addr, error);
+                                return;
+                            }
+                            Err(_) => {
+                                warn!("TLS handshake timed out from {}", remote_addr);
                                 return;
                             }
                         };
