@@ -27,8 +27,12 @@ impl RouteEntry {
         let lt_pos = input
             .find('<')
             .ok_or_else(|| format!("Route entry missing '<': {input}"))?;
-        let gt_pos = input
+        // Search for the closing '>' AFTER the '<'. Searching from offset 0 would
+        // accept a '>' that precedes the '<', giving a reversed range that panics
+        // the slice below (same bug class as the live-confirmed NameAddr DoS).
+        let gt_pos = input[lt_pos + 1..]
             .find('>')
+            .map(|offset| lt_pos + 1 + offset)
             .ok_or_else(|| format!("Route entry missing '>': {input}"))?;
 
         let uri_str = &input[lt_pos + 1..gt_pos];
@@ -205,5 +209,17 @@ mod tests {
         assert_eq!(entry.params.len(), 1);
         assert_eq!(entry.params[0].0, "custom");
         assert_eq!(entry.params[0].1.as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn reversed_angle_brackets_do_not_panic() {
+        // Regression: a '>' before '<' must NOT panic the `&input[lt_pos+1..gt_pos]`
+        // slice. Same bug class as the live-confirmed NameAddr panic, reachable
+        // via in-dialog Route/Record-Route (loose_route()). Post-fix the parser is
+        // lenient (stray leading '>' swallowed) — the point is it does NOT panic.
+        assert!(RouteEntry::parse("><sip:proxy@x.com>").is_ok());
+        assert!(RouteEntry::parse_multi("><sip:proxy@x.com>").is_ok());
+        // Lone '>' with no '<' → graceful Err, never a panic.
+        assert!(RouteEntry::parse(">").is_err());
     }
 }
