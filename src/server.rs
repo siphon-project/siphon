@@ -745,6 +745,48 @@ impl SiphonServer {
             });
         }
 
+        // --- Registrant manager + registration namespace ---
+        //
+        // Create the manager and install the `registration` Python namespace
+        // BEFORE `ScriptEngine::new()` — same reason as subscribe_state above.
+        // A script's `from siphon import registration` binds whatever
+        // `siphon.registration` is at import time; if the Rust namespace is
+        // installed later (when the background loop is wired, which needs
+        // `outbound_senders`), the script keeps the no-op `_RegistrationNamespace`
+        // stub and `registration.flow()` / `service_route()` raise
+        // NotImplementedError at call time. The config entries + refresh loop
+        // are wired later in `init_registrant` using this same manager.
+        let registrant_manager: Option<Arc<crate::registrant::RegistrantManager>> =
+            config.registrant.as_ref().map(|registrant_config| {
+                let registrant_user_agent = config
+                    .server
+                    .as_ref()
+                    .and_then(|server| server.user_agent_header.clone())
+                    .or_else(|| Some(format!("{product_name}/{product_version}")));
+                let manager = Arc::new(crate::registrant::RegistrantManager::new(
+                    registrant_config.default_interval,
+                    std::time::Duration::from_secs(registrant_config.retry_interval),
+                    std::time::Duration::from_secs(registrant_config.max_retry_interval),
+                    registrant_user_agent,
+                ));
+                pyo3::Python::attach(|python| {
+                    // PyRegistration ignores local_addr (flow() takes ue_ip
+                    // explicitly); pass a placeholder.
+                    let py_registration = crate::script::api::registrant::PyRegistration::new(
+                        Arc::clone(&manager),
+                        std::net::SocketAddr::from(([0u8, 0, 0, 0], 0)),
+                    );
+                    if let Err(error) =
+                        crate::script::api::set_registration_singleton(python, py_registration)
+                    {
+                        error!("failed to store registration singleton: {error}");
+                    } else {
+                        info!("registration namespace registered for injection");
+                    }
+                });
+                manager
+            });
+
         // --- Script engine ---
         let engine = if let Some(bytecode) = self.embedded_bytecode {
             Arc::new(ScriptEngine::new_from_bytecode(bytecode).unwrap_or_else(|error| {
@@ -1348,7 +1390,11 @@ impl SiphonServer {
         // and the channel must stay open for the lifetime of the process.
 
         // --- Outbound registration ---
-        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, stream_connections.clone(), product_name, product_version);
+        // `registrant_manager` was created (and its Python namespace installed)
+        // before ScriptEngine::new; here we wire its config entries + loop.
+        if let Some(ref manager) = registrant_manager {
+            init_registrant(manager, &config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, stream_connections.clone());
+        }
 
         // --- LI tasks ---
         spawn_li_tasks(li_state, &config);
@@ -2086,7 +2132,12 @@ fn init_rf_charging(
     Some(service)
 }
 
+/// Wire the config entries + background refresh loop onto the registrant
+/// `manager` that was created (and whose Python namespace was installed) early
+/// in `serve()` — before `ScriptEngine::new()` — so the script's
+/// `registration` namespace is the real Rust one, not the stub.
 fn init_registrant(
+    manager: &Arc<crate::registrant::RegistrantManager>,
     config: &Config,
     outbound_senders: &Arc<transport::OutboundRouter>,
     local_addr: std::net::SocketAddr,
@@ -2094,23 +2145,13 @@ fn init_registrant(
     advertised_addrs: &std::collections::HashMap<transport::Transport, String>,
     hep_sender: &Option<Arc<HepSender>>,
     stream_connections: transport::StreamConnections,
-    product_name: &str,
-    product_version: &str,
-) -> Option<Arc<crate::registrant::RegistrantManager>> {
-    use crate::registrant::{RegistrantCredentials, RegistrantEntry, RegistrantManager};
+) {
+    use crate::registrant::{RegistrantCredentials, RegistrantEntry};
 
-    let registrant_config = config.registrant.as_ref()?;
-
-    let registrant_user_agent = config.server.as_ref()
-        .and_then(|server| server.user_agent_header.clone())
-        .or_else(|| Some(format!("{product_name}/{product_version}")));
-
-    let manager = Arc::new(RegistrantManager::new(
-        registrant_config.default_interval,
-        std::time::Duration::from_secs(registrant_config.retry_interval),
-        std::time::Duration::from_secs(registrant_config.max_retry_interval),
-        registrant_user_agent,
-    ));
+    let registrant_config = match config.registrant.as_ref() {
+        Some(config) => config,
+        None => return,
+    };
 
     for entry_config in &registrant_config.entries {
         let registrar_host = entry_config.registrar
@@ -2256,7 +2297,7 @@ fn init_registrant(
 
     // Spawn background registration loop
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let loop_manager = Arc::clone(&manager);
+    let loop_manager = Arc::clone(manager);
     let loop_outbound = Arc::clone(outbound_senders);
     let loop_listen_addrs = listen_addrs.clone();
     let loop_advertised_addrs = advertised_addrs.clone();
@@ -2282,21 +2323,8 @@ fn init_registrant(
     // starving the sleep branch and preventing REGISTERs from being sent.
     std::mem::forget(shutdown_tx);
 
-    // Inject registration Python API
-    let py_manager = Arc::clone(&manager);
-    pyo3::Python::attach(|python| {
-        let py_registration = crate::script::api::registrant::PyRegistration::new(
-            py_manager,
-            local_addr,
-        );
-        if let Err(error) = crate::script::api::set_registration_singleton(python, py_registration) {
-            error!("failed to store registration singleton: {error}");
-        } else {
-            info!("registration namespace registered for injection");
-        }
-    });
-
-    Some(manager)
+    // The `registration` Python namespace was already installed early in
+    // `serve()` (before ScriptEngine::new) using this same manager.
 }
 
 fn spawn_li_tasks(
