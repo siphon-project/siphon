@@ -128,6 +128,20 @@ pub struct AppSessionContextResp {
     pub authorized: bool,
 }
 
+/// Result of a successful app-session create — the parsed body plus the
+/// absolute resource URI from the `201 Created` `Location` header.
+///
+/// `location` is the replica-independent address of the created session; the
+/// script persists it and hands it back on teardown so `update`/`delete` reach
+/// the same PCF even from a different siphon replica (TS 29.514 §4.2.2.2).
+#[derive(Debug, Clone)]
+pub struct CreatedAppSession {
+    /// The parsed `AppSessionContext` response body.
+    pub response: AppSessionContextResp,
+    /// Absolute app-session resource URI (`Location` header), if present.
+    pub location: Option<String>,
+}
+
 /// SBI error type.
 #[derive(Debug)]
 pub enum SbiError {
@@ -169,14 +183,23 @@ impl NpcfClient {
     }
 
     /// Create a new app session (POST /npcf-policyauthorization/v1/app-sessions).
+    ///
+    /// `target` overrides the base URL for this one call — used to address the
+    /// N5 transaction at a BSF-discovered PCF (`pcfFqdn`) instead of the
+    /// configured SCP/fallback. `None` posts to `self.base_url` (today's
+    /// VoLTE-via-SCP path, byte-for-byte unchanged).
+    ///
+    /// Returns the parsed body plus the `Location` header (the absolute
+    /// resource URI) so the caller can address the same session on teardown.
     pub async fn create_app_session(
         &self,
+        target: Option<&str>,
         context: &AppSessionContext,
-    ) -> Result<AppSessionContextResp, SbiError> {
-        let url = format!(
-            "{}/npcf-policyauthorization/v1/app-sessions",
-            self.base_url
-        );
+    ) -> Result<CreatedAppSession, SbiError> {
+        let base = target
+            .map(|target| target.trim_end_matches('/'))
+            .unwrap_or(&self.base_url);
+        let url = format!("{base}/npcf-policyauthorization/v1/app-sessions");
         let response = self
             .client
             .post(&url)
@@ -189,18 +212,32 @@ impl NpcfClient {
             return Err(SbiError::HttpError(response.status().as_u16()));
         }
 
-        response
+        // Capture the Location header before consuming the body. Resolve a
+        // relative Location against the base we posted to.
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(|location| resolve_location(base, location));
+
+        let body = response
             .json::<AppSessionContextResp>()
             .await
-            .map_err(|error| SbiError::Deserialization(error.to_string()))
+            .map_err(|error| SbiError::Deserialization(error.to_string()))?;
+
+        Ok(CreatedAppSession {
+            response: body,
+            location,
+        })
     }
 
-    /// Delete an app session (DELETE /npcf-policyauthorization/v1/app-sessions/{id}).
-    pub async fn delete_app_session(&self, session_id: &str) -> Result<(), SbiError> {
-        let url = format!(
-            "{}/npcf-policyauthorization/v1/app-sessions/{}",
-            self.base_url, session_id
-        );
+    /// Delete an app session.
+    ///
+    /// `session_ref` is either a bare app-session id (resolved against
+    /// `self.base_url`, the legacy behaviour) or an absolute resource URI
+    /// (`http(s)://…`, used verbatim — the replica-independent teardown path).
+    pub async fn delete_app_session(&self, session_ref: &str) -> Result<(), SbiError> {
+        let url = self.resolve_session_url(session_ref);
         let response = self
             .client
             .delete(&url)
@@ -214,18 +251,17 @@ impl NpcfClient {
         Ok(())
     }
 
-    /// Update an app session (PATCH /npcf-policyauthorization/v1/app-sessions/{id}).
+    /// Update an app session (PATCH the resource).
     ///
     /// Used for media renegotiation (re-INVITE/UPDATE) to modify QoS.
+    /// `session_ref` follows the same id-or-absolute-URI rule as
+    /// [`delete_app_session`].
     pub async fn update_app_session(
         &self,
-        session_id: &str,
+        session_ref: &str,
         context: &AppSessionContext,
     ) -> Result<AppSessionContextResp, SbiError> {
-        let url = format!(
-            "{}/npcf-policyauthorization/v1/app-sessions/{}",
-            self.base_url, session_id
-        );
+        let url = self.resolve_session_url(session_ref);
         let response = self
             .client
             .patch(&url)
@@ -244,9 +280,43 @@ impl NpcfClient {
             .map_err(|error| SbiError::Deserialization(error.to_string()))
     }
 
+    /// Resolve a session reference to a concrete resource URL.
+    ///
+    /// Absolute references (`http://`/`https://`) are used verbatim; a bare id
+    /// is appended to `self.base_url`'s app-sessions collection.
+    fn resolve_session_url(&self, session_ref: &str) -> String {
+        if is_absolute_http_url(session_ref) {
+            session_ref.to_string()
+        } else {
+            format!(
+                "{}/npcf-policyauthorization/v1/app-sessions/{}",
+                self.base_url, session_ref
+            )
+        }
+    }
+
     /// Get the base URL this client is configured to use.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+}
+
+/// Whether a string is an absolute `http`/`https` URL.
+fn is_absolute_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+/// Resolve a (possibly relative) `Location` header against the base URL the
+/// request was sent to. Absolute Locations are returned verbatim.
+fn resolve_location(base: &str, location: &str) -> String {
+    if is_absolute_http_url(location) {
+        location.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            location.trim_start_matches('/')
+        )
     }
 }
 
@@ -425,5 +495,132 @@ mod tests {
         assert!(context.supi.is_none());
         assert!(context.ue_ipv4.is_none());
         assert!(context.media_components.is_empty());
+    }
+
+    #[test]
+    fn is_absolute_http_url_detects_scheme() {
+        assert!(is_absolute_http_url("http://pcf/x"));
+        assert!(is_absolute_http_url("https://pcf/x"));
+        assert!(!is_absolute_http_url("sess-abc-123"));
+        assert!(!is_absolute_http_url("/npcf-policyauthorization/v1/app-sessions/1"));
+    }
+
+    #[test]
+    fn resolve_session_url_bare_id_against_base() {
+        let client = NpcfClient::new("http://scp.local:8080", reqwest::Client::new());
+        assert_eq!(
+            client.resolve_session_url("sess-1"),
+            "http://scp.local:8080/npcf-policyauthorization/v1/app-sessions/sess-1"
+        );
+    }
+
+    #[test]
+    fn resolve_session_url_absolute_uri_verbatim() {
+        let client = NpcfClient::new("http://scp.local:8080", reqwest::Client::new());
+        let absolute = "http://pcf01.5gc:8080/npcf-policyauthorization/v1/app-sessions/abc";
+        assert_eq!(client.resolve_session_url(absolute), absolute);
+    }
+
+    #[test]
+    fn resolve_location_relative_and_absolute() {
+        assert_eq!(
+            resolve_location(
+                "http://pcf01:8080",
+                "/npcf-policyauthorization/v1/app-sessions/x"
+            ),
+            "http://pcf01:8080/npcf-policyauthorization/v1/app-sessions/x"
+        );
+        assert_eq!(
+            resolve_location("http://pcf01:8080", "http://other/abs/x"),
+            "http://other/abs/x"
+        );
+    }
+
+    /// Spawn an axum router on `127.0.0.1:0` and return its base URL.
+    async fn spawn_mock(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn create_router() -> axum::Router {
+        use axum::routing::post;
+        axum::Router::new().route(
+            "/npcf-policyauthorization/v1/app-sessions",
+            post(|| async {
+                (
+                    axum::http::StatusCode::CREATED,
+                    [(
+                        "location",
+                        "/npcf-policyauthorization/v1/app-sessions/sess-xyz",
+                    )],
+                    r#"{"appSessionId": "sess-xyz", "authorized": true}"#,
+                )
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn create_posts_to_target_not_base_url() {
+        let base = spawn_mock(create_router()).await;
+        // Base URL is unroutable; only the per-call target is reachable. If
+        // the call ignored `target` it would fail with a transport error.
+        let client = NpcfClient::new("http://127.0.0.1:9", reqwest::Client::new());
+        let context = AppSessionContext {
+            af_app_id: Some("IMS Services".to_string()),
+            media_components: vec![],
+            sip_call_id: None,
+            supi: None,
+            ue_ipv4: None,
+            ue_ipv6: None,
+            dnn: None,
+            ev_subsc: None,
+            notif_uri: None,
+            supp_feat: None,
+        };
+        let created = client
+            .create_app_session(Some(&base), &context)
+            .await
+            .expect("create against target must succeed");
+        assert_eq!(created.response.app_session_id, "sess-xyz");
+        // Location resolved against the target base.
+        assert_eq!(
+            created.location.as_deref(),
+            Some(
+                format!("{base}/npcf-policyauthorization/v1/app-sessions/sess-xyz").as_str()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn create_none_target_posts_to_base_url() {
+        let base = spawn_mock(create_router()).await;
+        let client = NpcfClient::new(&base, reqwest::Client::new());
+        let context = AppSessionContext {
+            af_app_id: None,
+            media_components: vec![],
+            sip_call_id: None,
+            supi: None,
+            ue_ipv4: None,
+            ue_ipv6: None,
+            dnn: None,
+            ev_subsc: None,
+            notif_uri: None,
+            supp_feat: None,
+        };
+        let created = client
+            .create_app_session(None, &context)
+            .await
+            .expect("create against base must succeed");
+        assert!(created.response.authorized);
+        assert_eq!(
+            created.location.as_deref(),
+            Some(
+                format!("{base}/npcf-policyauthorization/v1/app-sessions/sess-xyz").as_str()
+            )
+        );
     }
 }

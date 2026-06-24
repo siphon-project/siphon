@@ -2470,6 +2470,16 @@ pub struct SbiYamlConfig {
     pub npcf_url: Option<String>,
     /// Nchf base URL (if not using NRF discovery).
     pub nchf_url: Option<String>,
+    /// Nbsf_Management (BSF) base URL for `sbi.discover_pcf_binding()`.
+    /// May equal the SCP/Npcf URL. When unset, `discover_pcf_binding` raises
+    /// a clear "BSF not configured" error rather than silently defaulting.
+    pub bsf_url: Option<String>,
+    /// Per-discovery timeout for BSF lookups in milliseconds. Falls back to
+    /// `timeout_secs` when unset.
+    pub bsf_timeout_ms: Option<u64>,
+    /// URL scheme ("http" | "https", default "http") used when deriving a PCF
+    /// base URL from a `pcfFqdn` returned by the BSF.
+    pub pcf_scheme: Option<String>,
     /// Listen address for incoming PCF event notifications (e.g. "0.0.0.0:8080").
     pub notif_listen: Option<String>,
 }

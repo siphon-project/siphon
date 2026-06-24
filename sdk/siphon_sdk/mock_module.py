@@ -4357,10 +4357,20 @@ class MockMetrics:
 _metrics = MockMetrics()
 
 
+class BsfError(RuntimeError):
+    """Raised by ``sbi.discover_pcf_binding()`` when the BSF is unhealthy
+    (5xx / timeout / transport / malformed body).
+
+    A 404 (no binding for the UE IP) is **not** a ``BsfError`` — it returns
+    ``None`` (the 4G UE case). Mirrors the Rust ``sbi.BsfError`` exception.
+    """
+
+
 class MockSbi:
     """Mock SBI namespace for testing scripts that use ``from siphon import sbi``.
 
-    Provides mock N5/Npcf policy authorization methods.
+    Provides mock N5/Npcf policy authorization methods plus Nbsf_Management
+    discovery (``discover_pcf_binding``).
 
     Example::
 
@@ -4372,10 +4382,24 @@ class MockSbi:
         assert result["authorized"] is True
     """
 
+    #: The ``sbi.BsfError`` exception type, so scripts can ``except sbi.BsfError``.
+    BsfError = BsfError
+
     def __init__(self) -> None:
         self._sessions: dict[str, dict] = {}
         self._next_session_id: int = 1
         self._authorized: bool = True
+        #: discover_pcf_binding result: a binding dict (5G) or None (404 / 4G).
+        self._binding: Optional[dict] = None
+        #: when True, discover_pcf_binding raises BsfError (BSF unhealthy).
+        self._bsf_error: bool = False
+
+    @staticmethod
+    def _session_id(session_ref: str) -> str:
+        """Resolve a bare id or an absolute ``app_session_uri`` to the id."""
+        if session_ref.startswith(("http://", "https://")):
+            return session_ref.rstrip("/").rsplit("/", 1)[-1]
+        return session_ref
 
     def create_session(self, af_app_id: str = "IMS Services",
                        sip_call_id: Optional[str] = None,
@@ -4384,7 +4408,8 @@ class MockSbi:
                        ue_ipv6: Optional[str] = None,
                        dnn: Optional[str] = None,
                        notif_uri: Optional[str] = None,
-                       media_components: Optional[list] = None) -> Optional[dict]:
+                       media_components: Optional[list] = None,
+                       pcf_uri: Optional[str] = None) -> Optional[dict]:
         """Create an N5 app session for QoS policy authorization.
 
         Args:
@@ -4397,44 +4422,87 @@ class MockSbi:
             notif_uri: Notification URI for PCF events.
             media_components: list of media-component dicts (same shape as
                 ``diameter.rx_aar``'s ``media_components``).
+            pcf_uri: per-call N5 target — address this session at the given PCF
+                base URL (e.g. a BSF-discovered ``pcf_uri``) instead of the
+                configured ``npcf_url``. ``None`` ⇒ configured PCF.
 
         Returns:
-            Dict with ``app_session_id`` and ``authorized``, or ``None``.
+            Dict with ``app_session_id``, ``authorized`` and ``app_session_uri``
+            (the absolute resource URI — persist it and hand it back to
+            ``update_session`` / ``delete_session`` for replica-independent
+            teardown), or ``None``.
         """
         session_id = f"mock-n5-{self._next_session_id}"
         self._next_session_id += 1
         self._sessions[session_id] = {
             "sip_call_id": sip_call_id,
             "ue_ipv4": ue_ipv4,
+            "pcf_uri": pcf_uri,
         }
-        return {"app_session_id": session_id, "authorized": self._authorized}
+        base = (pcf_uri or "http://mock-pcf").rstrip("/")
+        app_session_uri = (
+            f"{base}/npcf-policyauthorization/v1/app-sessions/{session_id}"
+        )
+        return {
+            "app_session_id": session_id,
+            "authorized": self._authorized,
+            "app_session_uri": app_session_uri,
+        }
 
     def delete_session(self, session_id: str) -> bool:
         """Delete an N5 app session.
 
         Args:
-            session_id: The app session ID from ``create_session()``.
+            session_id: The app session id from ``create_session()`` **or** the
+                absolute ``app_session_uri`` (replica-independent teardown).
 
         Returns:
             ``True`` on success, ``False`` if session not found.
         """
-        return self._sessions.pop(session_id, None) is not None
+        return self._sessions.pop(self._session_id(session_id), None) is not None
 
     def update_session(self, session_id: str,
                        media_components: Optional[list] = None) -> Optional[dict]:
         """Update an N5 app session (media renegotiation).
 
         Args:
-            session_id: The app session ID to update.
+            session_id: The app session id to update, or the absolute
+                ``app_session_uri`` from ``create_session``.
             media_components: list of media-component dicts (same shape as
                 ``create_session``).
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or ``None``.
         """
-        if session_id not in self._sessions:
+        resolved = self._session_id(session_id)
+        if resolved not in self._sessions:
             return None
-        return {"app_session_id": session_id, "authorized": self._authorized}
+        return {"app_session_id": resolved, "authorized": self._authorized}
+
+    def discover_pcf_binding(self, ue_ipv4: Optional[str] = None,
+                             ue_ipv6: Optional[str] = None) -> Optional[dict]:
+        """Nbsf_Management discovery — look up the PCF binding for a UE IP.
+
+        Returns a binding dict (5G; configure via ``set_binding``), ``None``
+        when the BSF has no binding (404 / 4G), or raises ``sbi.BsfError`` when
+        configured unhealthy via ``set_bsf_error``.
+
+        Exactly one of ``ue_ipv4`` / ``ue_ipv6`` must be supplied.
+
+        Args:
+            ue_ipv4: UE IPv4 address (the IPsec SA peer).
+            ue_ipv6: UE IPv6 address/prefix.
+
+        Returns:
+            The binding dict (incl. a ready-to-use ``pcf_uri``) or ``None``.
+        """
+        if (ue_ipv4 is None) == (ue_ipv6 is None):
+            raise ValueError(
+                "discover_pcf_binding: supply exactly one of ue_ipv4 / ue_ipv6"
+            )
+        if self._bsf_error:
+            raise BsfError("mock BSF unhealthy")
+        return self._binding
 
     @staticmethod
     def on_event(fn: Any) -> Any:
@@ -4459,11 +4527,29 @@ class MockSbi:
         """
         self._authorized = authorized
 
+    def set_binding(self, binding: Optional[dict]) -> None:
+        """Configure what ``discover_pcf_binding`` returns (test helper).
+
+        Args:
+            binding: a binding dict (5G case) or ``None`` (404 / 4G case).
+        """
+        self._binding = binding
+
+    def set_bsf_error(self, raise_error: bool) -> None:
+        """Configure ``discover_pcf_binding`` to raise ``BsfError`` (test helper).
+
+        Args:
+            raise_error: when True, ``discover_pcf_binding`` raises ``BsfError``.
+        """
+        self._bsf_error = raise_error
+
     def clear(self) -> None:
         """Reset all mock sessions (test helper)."""
         self._sessions.clear()
         self._next_session_id = 1
         self._authorized = True
+        self._binding = None
+        self._bsf_error = False
 
 
 class MockIsc:

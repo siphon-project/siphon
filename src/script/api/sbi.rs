@@ -4,25 +4,125 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyType};
 use tracing::warn;
 
+use crate::sbi::nbsf::{BindingQuery, BsfClient, PcfBinding, Scheme};
 use crate::sbi::npcf::{AppSessionContext, MediaComponent, MediaSubComponent, NpcfClient};
+
+pyo3::create_exception!(
+    siphon,
+    BsfError,
+    pyo3::exceptions::PyRuntimeError,
+    "Raised by sbi.discover_pcf_binding() when the BSF is unhealthy \
+     (5xx / timeout / transport / malformed body). A 404 (no binding) is \
+     NOT a BsfError — it returns None."
+);
 
 /// Python-visible SBI namespace.
 #[pyclass(name = "SbiNamespace", skip_from_py_object)]
 pub struct PySbi {
     client: Arc<NpcfClient>,
+    bsf: Option<Arc<BsfClient>>,
+    pcf_scheme: Scheme,
 }
 
 impl PySbi {
-    pub fn new(client: Arc<NpcfClient>) -> Self {
-        Self { client }
+    pub fn new(
+        client: Arc<NpcfClient>,
+        bsf: Option<Arc<BsfClient>>,
+        pcf_scheme: Scheme,
+    ) -> Self {
+        Self {
+            client,
+            bsf,
+            pcf_scheme,
+        }
     }
 }
 
 #[pymethods]
 impl PySbi {
+    /// The `sbi.BsfError` exception type (subclass of `RuntimeError`), raised
+    /// by `discover_pcf_binding` when the BSF is unhealthy. Exposed as a class
+    /// attribute so scripts can `except sbi.BsfError:`.
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn BsfError(python: Python<'_>) -> Bound<'_, PyType> {
+        python.get_type::<BsfError>()
+    }
+
+    /// Nbsf_Management discovery — look up the PCF binding for a UE IP.
+    ///
+    /// The discriminator a P-CSCF uses to pick its policy interface per
+    /// session (TS 29.521 §5.2.2.2.2):
+    ///
+    /// Returns:
+    ///   * a dict (the PcfBinding, incl. a ready-to-use ``pcf_uri``) when the
+    ///     BSF has a binding → caller treats as 5G;
+    ///   * ``None`` when the BSF returns 404 (no binding) → caller treats as 4G;
+    ///   * raises ``sbi.BsfError`` on 5xx / timeout / transport / malformed body.
+    ///
+    /// Raises ``RuntimeError`` (NOT ``BsfError``) when ``sbi.bsf_url`` is unset,
+    /// so a misconfiguration is loud rather than a silent always-4G.
+    ///
+    /// Exactly one of ``ue_ipv4`` / ``ue_ipv6`` must be supplied. ``ue_ipv6``
+    /// is treated as a prefix; a bare address gets ``/64`` appended.
+    #[pyo3(signature = (ue_ipv4=None, ue_ipv6=None))]
+    fn discover_pcf_binding<'py>(
+        &self,
+        python: Python<'py>,
+        ue_ipv4: Option<&str>,
+        ue_ipv6: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let query = match (ue_ipv4, ue_ipv6) {
+            (Some(ipv4), None) => BindingQuery::Ipv4(ipv4.to_string()),
+            (None, Some(ipv6)) => {
+                // Treat a bare address as a /64 prefix (TS 29.521 wire form).
+                let prefix = if ipv6.contains('/') {
+                    ipv6.to_string()
+                } else {
+                    format!("{ipv6}/64")
+                };
+                BindingQuery::Ipv6Prefix(prefix)
+            }
+            (Some(_), Some(_)) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "discover_pcf_binding: supply exactly one of ue_ipv4 / ue_ipv6, not both",
+                ));
+            }
+            (None, None) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "discover_pcf_binding: one of ue_ipv4 / ue_ipv6 is required",
+                ));
+            }
+        };
+
+        let bsf = match &self.bsf {
+            Some(bsf) => Arc::clone(bsf),
+            None => {
+                // Deliberately a plain RuntimeError, not BsfError: a script's
+                // `except sbi.BsfError` retry loop must NOT swallow a misconfig
+                // into a silent default-access fallback.
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "discover_pcf_binding: BSF not configured (set sbi.bsf_url)",
+                ));
+            }
+        };
+
+        let result = crate::script::detach_block_on(async move { bsf.discover_binding(&query).await });
+
+        match result {
+            Ok(Some(binding)) => {
+                Ok(Some(binding_to_pydict(python, &binding, self.pcf_scheme)?))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(BsfError::new_err(format!(
+                "sbi.discover_pcf_binding failed: {error}"
+            ))),
+        }
+    }
+
     /// Create an N5 app session for QoS policy authorization.
     ///
     /// Args:
@@ -39,9 +139,14 @@ impl PySbi {
     ///         ``codec_data``, and a ``flows`` list whose entries carry
     ///         ``number``, ``descriptions`` (IPFilterRules), and optional
     ///         ``status`` / ``usage``.
+    ///     pcf_uri: per-call N5 target — address this session at the given PCF
+    ///         base URL (e.g. a BSF-discovered ``pcf_uri``) instead of the
+    ///         configured ``npcf_url``.  ``None`` ⇒ ``npcf_url`` (unchanged).
     ///
-    /// Returns a dict with ``app_session_id`` and ``authorized``, or ``None``
-    /// on failure.
+    /// Returns a dict with ``app_session_id``, ``authorized``, and
+    /// ``app_session_uri`` (the absolute resource URI — persist it and pass it
+    /// back to ``update_session`` / ``delete_session`` so teardown reaches the
+    /// same PCF from any replica), or ``None`` on failure.
     #[pyo3(signature = (
         af_app_id="IMS Services",
         sip_call_id=None,
@@ -51,6 +156,7 @@ impl PySbi {
         dnn=None,
         notif_uri=None,
         media_components=None,
+        pcf_uri=None,
     ))]
     fn create_session<'py>(
         &self,
@@ -63,6 +169,7 @@ impl PySbi {
         dnn: Option<&str>,
         notif_uri: Option<&str>,
         media_components: Option<&Bound<'py, PyAny>>,
+        pcf_uri: Option<&str>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let components = match media_components {
             Some(obj) => parse_sbi_media_components(obj)?,
@@ -83,13 +190,17 @@ impl PySbi {
         };
 
         let client = Arc::clone(&self.client);
-        let result = crate::script::detach_block_on(client.create_app_session(&context));
+        let target = pcf_uri.map(String::from);
+        let result = crate::script::detach_block_on(async move {
+            client.create_app_session(target.as_deref(), &context).await
+        });
 
         match result {
-            Ok(response) => {
+            Ok(created) => {
                 let dict = PyDict::new(python);
-                dict.set_item("app_session_id", &response.app_session_id)?;
-                dict.set_item("authorized", response.authorized)?;
+                dict.set_item("app_session_id", &created.response.app_session_id)?;
+                dict.set_item("authorized", created.response.authorized)?;
+                dict.set_item("app_session_uri", created.location)?;
                 Ok(Some(dict))
             }
             Err(error) => {
@@ -101,7 +212,10 @@ impl PySbi {
 
     /// Delete an N5 app session.
     ///
-    /// Returns True on success, False on failure.
+    /// ``session_id`` is either the bare app-session id (resolved against
+    /// ``npcf_url``) or the absolute ``app_session_uri`` returned by
+    /// :func:`create_session` (sent verbatim — reaches the originating PCF from
+    /// any replica). Returns True on success, False on failure.
     fn delete_session(&self, session_id: &str) -> PyResult<bool> {
         let client = Arc::clone(&self.client);
         let sid = session_id.to_string();
@@ -119,7 +233,9 @@ impl PySbi {
     /// Update an N5 app session — media renegotiation (re-INVITE / UPDATE).
     ///
     /// Same kwarg shape as :func:`create_session` minus the addressing
-    /// fields the PCF already holds from the original create.
+    /// fields the PCF already holds from the original create. ``session_id``
+    /// accepts a bare id or the absolute ``app_session_uri`` from
+    /// :func:`create_session` (same id-or-URI rule as :func:`delete_session`).
     #[pyo3(signature = (
         session_id,
         media_components=None,
@@ -165,6 +281,86 @@ impl PySbi {
             }
         }
     }
+}
+
+/// Convert a discovered [`PcfBinding`] into a Python dict with snake_case keys
+/// (matching repo Python conventions), plus a ready-to-use ``pcf_uri`` derived
+/// via [`PcfBinding::pcf_base_url`] so the script never has to know the
+/// fqdn-vs-endpoint preference rules.
+fn binding_to_pydict<'py>(
+    python: Python<'py>,
+    binding: &PcfBinding,
+    scheme: Scheme,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(python);
+
+    if let Some(ref supi) = binding.supi {
+        dict.set_item("supi", supi)?;
+    }
+    if let Some(ref gpsi) = binding.gpsi {
+        dict.set_item("gpsi", gpsi)?;
+    }
+    if let Some(ref ipv4_addr) = binding.ipv4_addr {
+        dict.set_item("ipv4_addr", ipv4_addr)?;
+    }
+    if let Some(ref ipv6_prefix) = binding.ipv6_prefix {
+        dict.set_item("ipv6_prefix", ipv6_prefix)?;
+    }
+    if let Some(ref dnn) = binding.dnn {
+        dict.set_item("dnn", dnn)?;
+    }
+    if let Some(ref pcf_fqdn) = binding.pcf_fqdn {
+        dict.set_item("pcf_fqdn", pcf_fqdn)?;
+    }
+    if let Some(ref endpoints) = binding.pcf_ip_end_points {
+        let list = PyList::empty(python);
+        for endpoint in endpoints {
+            let endpoint_dict = PyDict::new(python);
+            if let Some(ref ipv4) = endpoint.ipv4_address {
+                endpoint_dict.set_item("ipv4_address", ipv4)?;
+            }
+            if let Some(ref ipv6) = endpoint.ipv6_address {
+                endpoint_dict.set_item("ipv6_address", ipv6)?;
+            }
+            if let Some(ref transport) = endpoint.transport {
+                endpoint_dict.set_item("transport", transport)?;
+            }
+            if let Some(port) = endpoint.port {
+                endpoint_dict.set_item("port", port)?;
+            }
+            list.append(endpoint_dict)?;
+        }
+        dict.set_item("pcf_ip_end_points", list)?;
+    }
+    if let Some(ref pcf_diam_host) = binding.pcf_diam_host {
+        dict.set_item("pcf_diam_host", pcf_diam_host)?;
+    }
+    if let Some(ref pcf_diam_realm) = binding.pcf_diam_realm {
+        dict.set_item("pcf_diam_realm", pcf_diam_realm)?;
+    }
+    if let Some(ref snssai) = binding.snssai {
+        let snssai_dict = PyDict::new(python);
+        snssai_dict.set_item("sst", snssai.sst)?;
+        if let Some(ref sd) = snssai.sd {
+            snssai_dict.set_item("sd", sd)?;
+        }
+        dict.set_item("snssai", snssai_dict)?;
+    }
+    if let Some(ref pcf_id) = binding.pcf_id {
+        dict.set_item("pcf_id", pcf_id)?;
+    }
+    if let Some(ref bind_level) = binding.bind_level {
+        dict.set_item("bind_level", bind_level)?;
+    }
+    if let Some(ref supp_feat) = binding.supp_feat {
+        dict.set_item("supp_feat", supp_feat)?;
+    }
+
+    // The convenience field the script feeds straight into
+    // create_session(pcf_uri=...). None when the binding is degenerate.
+    dict.set_item("pcf_uri", binding.pcf_base_url(scheme))?;
+
+    Ok(dict)
 }
 
 /// Normalize a media-type alias into the upper-cased string the 5G SBI
@@ -455,6 +651,57 @@ mod tests {
             list.append(component).unwrap();
             let error = parse_sbi_media_components(list.as_any()).unwrap_err();
             assert!(error.to_string().contains("hologram"));
+        });
+    }
+
+    #[test]
+    fn binding_to_pydict_snake_case_keys_plus_pcf_uri() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let binding: PcfBinding = serde_json::from_str(
+                r#"{
+                    "supi": "imsi-001010000000001",
+                    "ipv4Addr": "10.45.0.7",
+                    "dnn": "ims",
+                    "snssai": {"sst": 1, "sd": "000001"},
+                    "pcfFqdn": "pcf01.5gc.example.org",
+                    "pcfIpEndPoints": [{"ipv4Address": "10.10.0.20", "transport": "TCP", "port": 8080}]
+                }"#,
+            )
+            .unwrap();
+
+            let dict = binding_to_pydict(python, &binding, Scheme::Http).unwrap();
+
+            let supi: String = dict.get_item("supi").unwrap().unwrap().extract().unwrap();
+            assert_eq!(supi, "imsi-001010000000001");
+            let dnn: String = dict.get_item("dnn").unwrap().unwrap().extract().unwrap();
+            assert_eq!(dnn, "ims");
+
+            // pcf_uri derived from pcfFqdn — the field the script hands straight
+            // to create_session(pcf_uri=...).
+            let pcf_uri: String = dict.get_item("pcf_uri").unwrap().unwrap().extract().unwrap();
+            assert_eq!(pcf_uri, "http://pcf01.5gc.example.org");
+
+            // Nested snssai dict.
+            let snssai = dict.get_item("snssai").unwrap().unwrap();
+            let sst: u8 = snssai.get_item("sst").unwrap().extract().unwrap();
+            assert_eq!(sst, 1);
+
+            // Endpoints list.
+            let endpoints = dict.get_item("pcf_ip_end_points").unwrap().unwrap();
+            assert_eq!(endpoints.len().unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn binding_to_pydict_pcf_uri_none_when_degenerate() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let binding: PcfBinding = serde_json::from_str(r#"{"supi": "imsi-1"}"#).unwrap();
+            let dict = binding_to_pydict(python, &binding, Scheme::Http).unwrap();
+            // pcf_uri key is present but None for a binding with no PCF address.
+            let pcf_uri = dict.get_item("pcf_uri").unwrap().unwrap();
+            assert!(pcf_uri.is_none());
         });
     }
 }

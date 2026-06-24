@@ -1422,13 +1422,45 @@ impl SiphonServer {
                 let npcf_client = std::sync::Arc::new(
                     crate::sbi::npcf::NpcfClient::new(npcf_url, http_client)
                 );
+
+                // Optional Nbsf_Management (BSF) discovery client. Its own
+                // reqwest client carries the BSF-specific timeout
+                // (bsf_timeout_ms, falling back to timeout_secs).
+                let bsf_client = sbi_config.bsf_url.as_ref().map(|bsf_url| {
+                    let bsf_timeout = std::time::Duration::from_millis(
+                        sbi_config
+                            .bsf_timeout_ms
+                            .unwrap_or(sbi_config.timeout_secs.saturating_mul(1000)),
+                    );
+                    let bsf_http = reqwest::Client::builder()
+                        .timeout(bsf_timeout)
+                        .build()
+                        .unwrap_or_default();
+                    std::sync::Arc::new(crate::sbi::nbsf::BsfClient::new(bsf_url, bsf_http))
+                });
+                let pcf_scheme = crate::sbi::nbsf::Scheme::from_config_str(
+                    sbi_config.pcf_scheme.as_deref().unwrap_or("http"),
+                );
+
                 pyo3::Python::attach(|python| {
-                    let py_sbi = crate::script::api::sbi::PySbi::new(npcf_client);
+                    let py_sbi = crate::script::api::sbi::PySbi::new(
+                        npcf_client,
+                        bsf_client,
+                        pcf_scheme,
+                    );
                     if let Err(error) = crate::script::api::set_sbi_singleton(python, py_sbi) {
                         error!("failed to store SBI singleton: {error}");
                     }
                 });
                 info!(npcf_url = %npcf_url, "Npcf client initialized and exposed to Python");
+                if let Some(ref bsf_url) = sbi_config.bsf_url {
+                    info!(bsf_url = %bsf_url, "BSF (Nbsf_Management) discovery client initialized");
+                }
+            } else if sbi_config.bsf_url.is_some() {
+                tracing::warn!(
+                    "sbi.bsf_url is set but sbi.npcf_url is not — the sbi namespace \
+                     (and discover_pcf_binding) is only exposed when npcf_url is configured"
+                );
             }
 
             // Start SBI notification listener for PCF events (N5 callback)

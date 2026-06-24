@@ -301,7 +301,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | IMS P-CSCF role | **Production** | Example `examples/ims_pcscf.{py,yaml}` | |
 | IMS I-CSCF role | **Production** | Example `examples/ims_icscf.{py,yaml}` | |
 | IMS S-CSCF role | **Production** | Example `examples/ims_scscf.{py,yaml}` | |
-| 5G SBI — Npcf (policy) | **Production** | `sbi` | N5 app-session for VoNR QoS; NRF discovery, OAuth2. `sbi.create_session(media_components=[…])` shapes the request into TS 29.514 §5.6.2.4 `medSubComps` with `flowDescriptions` + `flowUsage` so PCF gating works on real UPFs, not just lab boxes; same dict shape as `diameter.rx_aar`. |
+| 5G SBI — Npcf (policy) | **Production** | `sbi` | N5 app-session for VoNR QoS; NRF discovery, OAuth2. `sbi.create_session(media_components=[…])` shapes the request into TS 29.514 §5.6.2.4 `medSubComps` with `flowDescriptions` + `flowUsage` so PCF gating works on real UPFs, not just lab boxes; same dict shape as `diameter.rx_aar`. Per-call `pcf_uri=` addresses a session at a discovered PCF instead of the static `npcf_url`; create returns `app_session_uri` and update/delete accept it for replica-independent teardown. |
+| 5G SBI — Nbsf (PCF discovery) | Implemented | `sbi.discover_pcf_binding`, `sbi.bsf_url` | Nbsf_Management `pcfBindings` lookup keyed on the UE IP (TS 29.521) — the reliable 5G-vs-4G discriminator a P-CSCF uses to pick N5 vs Rx per session. `200`→binding dict (incl. ready-to-use `pcf_uri`), `404`→`None` (4G), `5xx`/timeout→`sbi.BsfError`. Message-level + SDK tested (axum mock); not yet validated against a live open5gs BSF. |
 | 5G SBI — Nchf (charging) | Implemented | `sbi` | |
 
 ## Lawful Intercept / Recording

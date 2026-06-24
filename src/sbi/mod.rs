@@ -9,6 +9,7 @@
 
 pub mod npcf;
 pub mod nchf;
+pub mod nbsf;
 
 /// Configuration for SBI client connections.
 #[derive(Debug, Clone)]
