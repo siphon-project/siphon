@@ -2867,8 +2867,21 @@ mod tests {
 
             let entries = registry_mod.call_method0("entries").unwrap();
             let entries: Vec<RegistryEntry> = entries.extract().unwrap();
-            assert_eq!(entries.len(), 3);
-            for entry in &entries {
+            // `_siphon_registry` is a process-global list shared with the
+            // parallel test runner, so count only this test's own S6c
+            // on_command registrations rather than the global total (which
+            // races with concurrent registrations from other tests).
+            let s6c: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.0.starts_with("diameter.on_command:S6c:"))
+                .collect();
+            assert_eq!(
+                s6c.len(),
+                3,
+                "expected 3 S6c on_command registrations, got {}",
+                s6c.len()
+            );
+            for entry in &s6c {
                 assert_eq!(entry.0, "diameter.on_command:S6c:Alert-Service-Centre");
             }
 

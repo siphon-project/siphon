@@ -686,15 +686,53 @@ diameter = _DiameterNamespace()
 # SBI namespace (5G Service Based Interfaces — N5/Npcf policy authorization)
 # ---------------------------------------------------------------------------
 
-class _SbiNamespace:
-    """Stub SBI namespace with decorator support.
+class BsfError(RuntimeError):
+    """Raised by ``sbi.discover_pcf_binding()`` when the BSF is unhealthy
+    (5xx / timeout / transport / malformed body).
 
-    When ``sbi:`` is configured, the Rust SbiNamespace replaces this.
-    The ``@on_event`` decorator still needs to be available for registration
-    even before the Rust instance is injected (decorators run at import time).
+    A 404 (no binding for the UE IP) is **not** a ``BsfError`` — it returns
+    ``None`` (the 4G UE case).  This Python class is only a pre-injection
+    fallback so ``except sbi.BsfError`` resolves before the Rust singleton is
+    wired; once ``sbi._inner`` is injected, ``sbi.BsfError`` forwards to the
+    Rust exception type (which is what ``discover_pcf_binding`` actually
+    raises).
     """
 
-    def create_session(self, **kwargs):
+
+class _SbiNamespace:
+    """SBI namespace façade.
+
+    Data methods (``create_session``, ``discover_pcf_binding``, …) forward to
+    the Rust-backed singleton, injected at startup as ``self._inner`` — the
+    same pattern ``_ProxyNamespace`` uses for ``_utils``.  Forwarding (rather
+    than replacing the module attribute) means a script that did
+    ``from siphon import sbi`` before the singleton was wired still reaches the
+    Rust impl, and the Python ``@on_event`` decorator (which the Rust namespace
+    does not implement) keeps working.
+
+    ``__getattr__`` delegates any other attribute (notably ``BsfError``) to the
+    injected singleton so ``except sbi.BsfError`` catches the actual Rust
+    exception type once wired.
+    """
+
+    def __init__(self):
+        # Replaced at startup by the Rust SbiNamespace (set_sbi_singleton /
+        # install_siphon_module).  None until then.
+        self._inner = None
+
+    def __getattr__(self, name):
+        inner = object.__getattribute__(self, "__dict__").get("_inner")
+        if inner is not None:
+            return getattr(inner, name)
+        if name == "BsfError":
+            # Pre-injection fallback so `except sbi.BsfError` resolves.
+            return BsfError
+        raise AttributeError(
+            f"sbi.{name} not available — sbi: not configured "
+            "(needs npcf_url and/or bsf_url)"
+        )
+
+    def create_session(self, *args, **kwargs):
         """Create an N5 app session for QoS policy authorization.
 
         Requires ``sbi:`` configuration with ``npcf_url``.
@@ -710,41 +748,74 @@ class _SbiNamespace:
             media_components: list of media-component dicts.  See the
                 project docs for the full shape (mirrors
                 ``diameter.rx_aar``).
+            pcf_uri: per-call N5 target — the discovered PCF.  In ``indirect``
+                communication mode it becomes the ``3gpp-Sbi-Target-apiRoot``
+                routed via the SCP; in ``direct`` mode it is the POST base.
 
         Returns:
-            Dict with ``app_session_id`` and ``authorized``, or None.
+            Dict with ``app_session_id``, ``authorized`` and
+            ``app_session_uri``, or None.
         """
-        raise NotImplementedError(
-            "sbi.create_session() requires sbi: with npcf_url in config"
-        )
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise NotImplementedError(
+                "sbi.create_session() requires sbi: with npcf_url in config"
+            )
+        return inner.create_session(*args, **kwargs)
 
-    def delete_session(self, session_id):
+    def delete_session(self, *args, **kwargs):
         """Delete an N5 app session.
 
         Args:
-            session_id: The app session ID from create_session().
+            session_id: The app session id from create_session(), or the
+                absolute ``app_session_uri`` for replica-independent teardown.
 
         Returns:
             True on success, False on failure.
         """
-        raise NotImplementedError(
-            "sbi.delete_session() requires sbi: with npcf_url in config"
-        )
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise NotImplementedError(
+                "sbi.delete_session() requires sbi: with npcf_url in config"
+            )
+        return inner.delete_session(*args, **kwargs)
 
-    def update_session(self, session_id, **kwargs):
+    def update_session(self, *args, **kwargs):
         """Update an N5 app session (media renegotiation).
 
         Args:
-            session_id: The app session ID to update.
+            session_id: The app session id to update, or the absolute
+                ``app_session_uri``.
             media_components: list of media-component dicts (same shape as
                 ``create_session``).
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or None.
         """
-        raise NotImplementedError(
-            "sbi.update_session() requires sbi: with npcf_url in config"
-        )
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise NotImplementedError(
+                "sbi.update_session() requires sbi: with npcf_url in config"
+            )
+        return inner.update_session(*args, **kwargs)
+
+    def discover_pcf_binding(self, *args, **kwargs):
+        """Nbsf_Management discovery — look up the PCF binding for a UE IP.
+
+        Returns a binding dict (BSF 200, 5G; incl. a ready-to-use ``pcf_uri``),
+        ``None`` (BSF 404, 4G), or raises ``sbi.BsfError`` (BSF unhealthy).
+        Requires ``sbi:`` configuration with ``bsf_url``.
+
+        Args:
+            ue_ipv4: UE IPv4 address (the IPsec SA peer).
+            ue_ipv6: UE IPv6 address/prefix.  Exactly one of ue_ipv4 / ue_ipv6.
+        """
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise NotImplementedError(
+                "sbi.discover_pcf_binding() requires sbi: with bsf_url in config"
+            )
+        return inner.discover_pcf_binding(*args, **kwargs)
 
     @staticmethod
     def on_event(fn):

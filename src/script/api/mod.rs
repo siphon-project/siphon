@@ -288,6 +288,25 @@ pub fn set_sbi_singleton(
     let sbi_py: Py<PyAny> = Py::new(python, py_sbi)
         .map_err(|error| SiphonError::Script(format!("Py::new(sbi): {error}")))?
         .into_any();
+
+    // Live-patch an already-installed siphon module. The SBI singleton is wired
+    // after `ScriptEngine::new`, so on a cold start the script already did
+    // `from siphon import sbi` and holds the `_SbiNamespace` stub — the same
+    // object as `sys.modules["siphon"].sbi`. Setting its `_inner` makes it
+    // forward to the Rust impl on the next request, without waiting for a
+    // hot-reload. Future re-installs pick the singleton up via SBI_SINGLETON.
+    if let Ok(modules) = python.import("sys").and_then(|sys| sys.getattr("modules")) {
+        if let Ok(siphon_module) = modules.get_item("siphon") {
+            if !siphon_module.is_none() {
+                if let Ok(sbi_ns) = siphon_module.getattr("sbi") {
+                    if let Err(error) = sbi_ns.setattr("_inner", sbi_py.bind(python)) {
+                        tracing::warn!(%error, "failed to live-patch siphon.sbi._inner");
+                    }
+                }
+            }
+        }
+    }
+
     let _ = SBI_SINGLETON.set(sbi_py);
     Ok(())
 }
@@ -682,11 +701,18 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
             .map_err(|error| SiphonError::Script(format!("setattr isc: {error}")))?;
     }
 
-    // Inject optional SBI singleton.
+    // Inject optional SBI singleton onto the existing `_SbiNamespace` stub as
+    // `_inner` (rather than replacing the module attribute), so the Python
+    // `@sbi.on_event` decorator survives (the Rust namespace has no on_event)
+    // and a script that already imported the stub still forwards to the Rust
+    // impl via the stub's __getattr__.
     if let Some(sbi_py) = SBI_SINGLETON.get() {
-        module
-            .setattr("sbi", sbi_py.bind(python))
-            .map_err(|error| SiphonError::Script(format!("setattr sbi: {error}")))?;
+        let sbi_ns = module
+            .getattr("sbi")
+            .map_err(|error| SiphonError::Script(format!("getattr sbi: {error}")))?;
+        sbi_ns
+            .setattr("_inner", sbi_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr sbi._inner: {error}")))?;
     }
 
     // Inject optional IPsec singleton (P-CSCF role).

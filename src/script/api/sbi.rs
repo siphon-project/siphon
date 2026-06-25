@@ -704,4 +704,75 @@ mod tests {
             assert!(pcf_uri.is_none());
         });
     }
+
+    /// Façade-drift regression (the live blocker): the embedded `_SbiNamespace`
+    /// stub in siphon_package.py must expose every method/attr the Rust `PySbi`
+    /// does — pre-injection (`hasattr`) — and, once a singleton is injected as
+    /// `_inner`, forward to it (so `sbi.discover_pcf_binding` / `sbi.BsfError`
+    /// can never AttributeError again). Evaluated from source against an
+    /// isolated globals dict, independent of the global SBI_SINGLETON OnceLock.
+    #[test]
+    fn sbi_facade_exposes_full_surface_and_forwards() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            // The package source does `import _siphon_registry` at top level.
+            crate::script::api::ensure_registry(python).expect("ensure_registry");
+
+            let source = include_str!("siphon_package.py");
+            let module_globals = PyDict::new(python);
+            python
+                .run(
+                    &std::ffi::CString::new(source).expect("CString"),
+                    Some(&module_globals),
+                    Some(&module_globals),
+                )
+                .expect("evaluate siphon_package.py");
+
+            let script = r#"
+# 1. Pre-injection surface parity with the Rust PySbi.
+expected = ('create_session', 'delete_session', 'update_session',
+            'discover_pcf_binding', 'on_event', 'BsfError')
+for name in expected:
+    assert hasattr(sbi, name), f"sbi facade missing {name!r}"
+assert issubclass(sbi.BsfError, RuntimeError), "sbi.BsfError must be a RuntimeError"
+
+# 2. Pre-injection, data methods raise the helpful NotImplementedError.
+try:
+    sbi.discover_pcf_binding(ue_ipv4="10.0.0.1")
+except NotImplementedError as e:
+    assert "bsf_url" in str(e), str(e)
+else:
+    raise AssertionError("discover_pcf_binding did not raise pre-injection")
+
+# 3. Inject a fake _inner and assert every call forwards to it, and that
+#    BsfError now forwards to the inner's exception type (so a script that
+#    holds the stub catches the type the Rust impl actually raises).
+class _FakeInner:
+    class BsfError(RuntimeError):
+        pass
+    def discover_pcf_binding(self, **kw):
+        return {"pcf_uri": "http://pcf01", "_seen": kw}
+    def create_session(self, **kw):
+        return {"app_session_id": "s1", "ok": True}
+    def delete_session(self, ref):
+        return ref
+    def update_session(self, ref, **kw):
+        return ref
+
+fake = _FakeInner()
+sbi._inner = fake
+assert sbi.discover_pcf_binding(ue_ipv4="10.0.0.1")["pcf_uri"] == "http://pcf01"
+assert sbi.create_session(supi="imsi-1")["app_session_id"] == "s1"
+assert sbi.delete_session("http://pcf01/x") == "http://pcf01/x"
+assert sbi.BsfError is _FakeInner.BsfError, "BsfError must forward to the inner type"
+"#;
+            python
+                .run(
+                    &std::ffi::CString::new(script).expect("CString"),
+                    Some(&module_globals),
+                    Some(&module_globals),
+                )
+                .expect("sbi facade surface + forwarding assertions");
+        });
+    }
 }
