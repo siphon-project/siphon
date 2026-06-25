@@ -21,6 +21,24 @@ use super::request::PyRequest;
 /// window to land before the proxy's cached binding evaporates.
 const PROXY_BINDING_GRACE_SECS: u32 = 32;
 
+/// Re-pin the IPsec SA pair bound to a REGISTER's UE flow to the granted
+/// binding lifetime (`granted_expires + PROXY_BINDING_GRACE_SECS`), so an
+/// IPsec-protected registration's SA tracks its binding across no-AKA
+/// refreshes (3GPP TS 33.203 §7.4).  Shared by [`save`](PyRegistrar::save)
+/// and [`save_proxy`](PyRegistrar::save_proxy).
+///
+/// No-op when the request did not arrive on a protected port or no SA
+/// matches (`protected_ue_flow` returns `None`) — i.e. every non-IMS,
+/// non-IPsec deployment.  The underlying `ipsec::repin_sa_for_ue` is itself
+/// fire-and-forget and guards against a missing IPsec manager / Tokio
+/// runtime, so this is safe to call unconditionally on the REGISTER path.
+fn repin_protected_sa(request: &PyRequest, granted_expires: u32) {
+    if let Some((ue_addr, ue_port_c)) = request.protected_ue_flow() {
+        let hard_lifetime = u64::from(granted_expires) + u64::from(PROXY_BINDING_GRACE_SECS);
+        super::ipsec::repin_sa_for_ue(&ue_addr, ue_port_c, hard_lifetime);
+    }
+}
+
 /// Python-visible contact object returned from `registrar.lookup()`.
 /// Opaque view of an inbound flow captured at REGISTER time.  Carries the
 /// transport, the UE's source address, the listener local address, and the
@@ -655,6 +673,14 @@ impl PyRegistrar {
         message.headers.set("Expires", granted_expires.to_string());
         drop(message);
 
+        // Extend the bound IPsec SA pair on a protected refresh (TS 33.203
+        // §7.4) — same rationale as save_proxy.  Skipped for a de-REGISTER
+        // (granted_expires == 0): that tears the binding (and its SA) down via
+        // the dedicated paths, not a lifetime bump.  No-op for non-IPsec saves.
+        if granted_expires > 0 {
+            repin_protected_sa(request, granted_expires);
+        }
+
         // Declare the implicit registration set (3GPP TS 23.228) — each
         // alias URI becomes resolvable to this AoR for subsequent
         // `registrar.lookup(alias)` calls.  Empty list is intentionally
@@ -756,6 +782,17 @@ impl PyRegistrar {
             self.inner.remove_all(&aor);
             return Ok(true);
         }
+
+        // 3GPP TS 33.203 §7.4: an IPsec-protected REGISTER refresh must extend
+        // the bound SA pair's hard lifetime in step with the binding it is
+        // refreshing.  IR.92 refreshes carry no AKA challenge (no 401 → no
+        // PendingSA → `activate` never runs), so this registrar hook is the
+        // only path that moves the SA forward — without it an actively-
+        // refreshing UE's SA ages out of the kernel under it and gets reaped +
+        // network-de-REGISTERed.  Match the per-contact binding grace applied
+        // below (granted + PROXY_BINDING_GRACE_SECS).  No-op when the request
+        // didn't arrive protected / no SA matches.
+        repin_protected_sa(request, granted_expires);
 
         let source_addr = request.source_socket_addr();
         let source_transport = Some(request.transport_name().to_string());

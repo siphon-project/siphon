@@ -296,8 +296,9 @@ impl UeIpsec {
             integrity_key: crate::ipsec::bytes_to_hex(&integrity_key),
             hard_lifetime_secs,
             protocol,
-            // Recomputed authoritatively inside create_ue_sa_pair.
+            // Recomputed authoritatively inside create_ue_sa_pair (→ create_sa_pair).
             expires_at: Instant::now(),
+            created_at: Instant::now(),
             role: SaRole::Ue,
         })
     }

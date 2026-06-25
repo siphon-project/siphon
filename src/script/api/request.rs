@@ -304,6 +304,35 @@ impl PyRequest {
             .map(|ip| std::net::SocketAddr::new(ip, self.source_port))
     }
 
+    /// Resolve the active IPsec SA pair that decrypted this request, if any.
+    ///
+    /// Rust-only shared core behind the `matched_sa` Python getter and the
+    /// registrar refresh re-pin (`protected_ue_flow`).  Returns `None` when
+    /// the request did not arrive on a configured P-CSCF protected port or no
+    /// active SA matches its source `(addr, port)`.
+    fn resolve_protected_sa(&self) -> Option<crate::ipsec::SecurityAssociationPair> {
+        let port = self.local_port?;
+        if !super::ipsec::is_protected_local_port(port) {
+            return None;
+        }
+        let ue_addr: std::net::IpAddr = self.source_ip.parse().ok()?;
+        super::ipsec::find_sa_for_ue(&ue_addr, self.source_port)
+    }
+
+    /// `(ue_addr, ue_port_c)` of the IPsec SA bound to this request's flow
+    /// when it arrived protected, else `None`.
+    ///
+    /// `ue_port_c` is the SA's canonical `contact_key` port (the UE's
+    /// protected client port), resolved even when the refresh arrived from
+    /// the UE's server port.  Consumed by `registrar.save_proxy` / `save` to
+    /// re-pin the SA hard-lifetime on a REGISTER refresh so an actively-
+    /// refreshing UE's SA tracks its binding (3GPP TS 33.203 §7.4) instead of
+    /// ageing out under it.
+    pub(crate) fn protected_ue_flow(&self) -> Option<(std::net::IpAddr, u16)> {
+        let sa = self.resolve_protected_sa()?;
+        Some((sa.ue_addr, sa.ue_port_c))
+    }
+
     /// Get Via transport override (set by `force_send_via`).
     pub fn via_transport_override(&self) -> Option<&str> {
         self.via_transport_override.as_deref()
@@ -772,13 +801,9 @@ impl PyRequest {
     /// matches (including when `ipsec` is not configured).
     #[getter]
     fn matched_sa(&self) -> Option<super::ipsec::PySAHandle> {
-        let port = self.local_port?;
-        if !super::ipsec::is_protected_local_port(port) {
-            return None;
-        }
-        let ue_addr: std::net::IpAddr = self.source_ip.parse().ok()?;
-        let sa = super::ipsec::find_sa_for_ue(&ue_addr, self.source_port)?;
-        Some(super::ipsec::PySAHandle::from_sa(&sa))
+        self.resolve_protected_sa()
+            .as_ref()
+            .map(super::ipsec::PySAHandle::from_sa)
     }
 
     // -----------------------------------------------------------------------
@@ -1520,6 +1545,17 @@ mod tests {
     fn method_returns_invite() {
         let request = make_request();
         assert_eq!(request.method().unwrap(), "INVITE");
+    }
+
+    #[test]
+    fn protected_ue_flow_none_when_not_ipsec_protected() {
+        // A request that never arrived on a configured P-CSCF protected port
+        // (here `local_port` is unset) exposes no IPsec flow, so the registrar
+        // refresh re-pin (`repin_protected_sa`) no-ops.  This keeps every
+        // non-IMS, non-IPsec REGISTER path unaffected by the SA-lifetime hook.
+        let request = make_request();
+        assert_eq!(request.protected_ue_flow(), None);
+        assert!(request.matched_sa().is_none());
     }
 
     #[test]

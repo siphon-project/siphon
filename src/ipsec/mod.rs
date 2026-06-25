@@ -491,6 +491,17 @@ pub struct SecurityAssociationPair {
     /// pair with a fresh `expires_at`, so only truly-abandoned UEs are
     /// reaped.
     pub expires_at: Instant,
+    /// Wall-clock instant the SA pair was installed in the kernel — the
+    /// local mirror of the kernel's `xfrm_state.curlft.add_time`.  Stamped
+    /// once in [`create_sa_pair`] and **never** moved by a re-pin, because
+    /// `XFRM_MSG_UPDSA` preserves `add_time`: the kernel always computes the
+    /// hard-expiry as `add_time + hard_add_expires_seconds`.  This anchor
+    /// lets [`update_sa_pair_lifetime`] translate a "lifetime from now" into
+    /// the "lifetime from install" the kernel actually wants — without it, a
+    /// re-pin on a long-lived registration would move the in-memory
+    /// `expires_at` forward but leave the kernel SA dying on its original
+    /// timer.
+    pub created_at: Instant,
     /// Whether siphon is the network (P-CSCF) or the UE for this pair.
     /// Determines the four policy directions in `create_sa_pair` /
     /// `delete_sa_pair`; the SA states are identical either way.
@@ -749,6 +760,12 @@ impl IpsecManager {
         // pre-set, so the in-memory entry always agrees with the kernel
         // hard-lifetime that the four states/policies were installed with.
         sa.expires_at = compute_sa_expires_at(sa.hard_lifetime_secs);
+        // Anchor the install instant here too — this is the moment the four
+        // XFRM states get their kernel `add_time`.  A later re-pin measures
+        // elapsed-since-install from this anchor (see
+        // `update_sa_pair_lifetime`), so it must be stamped at the same point
+        // as the kernel install, ignoring any placeholder the caller pre-set.
+        sa.created_at = Instant::now();
 
         // Idempotent install: clear any colliding kernel entry first
         // (best-effort — `ENOENT` is fine). The four SA *states* rarely collide
@@ -1042,20 +1059,30 @@ impl IpsecManager {
     /// Re-pin the kernel hard-lifetime on all four SAs of an existing
     /// pair, without rekeying or disturbing selectors / SPIs.
     ///
-    /// Used by ``ipsec.PendingSA.activate(hard_lifetime_secs=…)`` to
-    /// tighten the SA expiry from whatever was installed at allocation
-    /// time (usually the UE's `Expires:` ask, commonly 600000 s for
-    /// VoLTE handsets) to the value the registrar of record actually
-    /// granted (3GPP TS 33.203 §7.4 ties IPsec SA lifetime to SIP
-    /// registration lifetime).
+    /// `hard_lifetime_secs` is the desired lifetime measured **from now**
+    /// (the registrar's granted Expires + grace).  Two callers:
+    /// * ``ipsec.PendingSA.activate(hard_lifetime_secs=…)`` on the
+    ///   200-after-401 — tightens from the allocation-time placeholder
+    ///   (usually the UE's `Expires:` ask, commonly 600000 s for VoLTE
+    ///   handsets) down to the granted value.
+    /// * `registrar.save_proxy` / `save` on every REGISTER refresh —
+    ///   extends an actively-refreshing UE's SA so it never ages out under
+    ///   it (3GPP TS 33.203 §7.4 ties IPsec SA lifetime to SIP registration
+    ///   lifetime; IR.92 refreshes carry no AKA, so this is the only path
+    ///   that moves the SA forward on a refresh).
     ///
     /// The kernel keys `XFRM_MSG_UPDSA` by `(daddr, spi, proto=ESP)` and
-    /// preserves `xfrm_state.curlft.add_time`, so the resulting deadline
-    /// is `add_time + hard_lifetime_secs` — i.e. the SA expires
-    /// `hard_lifetime_secs` after its **original** install, not from
-    /// "now".  For a typical IMS REGISTER → 401 → REGISTER → 200 OK
-    /// round-trip the install / repin gap is sub-second, so this is
-    /// indistinguishable from "expires after the granted Expires".
+    /// preserves `xfrm_state.curlft.add_time`, computing the hard-expiry as
+    /// `add_time + value`.  To land the deadline at `now + hard_lifetime_secs`
+    /// we therefore pass the kernel `hard_lifetime_secs + elapsed-since-install`
+    /// (the elapsed term comes from [`SecurityAssociationPair::created_at`]).
+    /// On the activate round-trip elapsed is sub-second (a no-op delta); on a
+    /// refresh hours later it is precisely what pushes the kernel deadline
+    /// forward instead of leaving it pinned to the original install.
+    ///
+    /// The in-memory `expires_at` and stored `hard_lifetime_secs` are refreshed
+    /// to the from-now value; `created_at` is left untouched (UPDSA preserves
+    /// `add_time`, so the anchor stays valid across any number of re-pins).
     ///
     /// Returns `Ok(())` even when the UE has no active SA pair (no-op).
     /// Errors from any of the four UPDSA messages are surfaced verbatim.
@@ -1075,13 +1102,29 @@ impl IpsecManager {
         };
         let proto = sa.protocol;
 
+        // `hard_lifetime_secs` is the desired lifetime measured **from now**
+        // (e.g. the registrar's granted Expires + grace).  The kernel,
+        // however, computes the hard-expiry as `add_time + value` and
+        // preserves `add_time` across `XFRM_MSG_UPDSA`.  So to land the
+        // kernel deadline at `now + requested` we must pass
+        // `requested + elapsed_since_install`.  On the initial 200-after-401
+        // re-pin (`PendingSA.activate`) elapsed is sub-second, so this is a
+        // no-op delta; on a no-AKA REGISTER refresh hours later it is what
+        // actually pushes the kernel SA's deadline forward instead of
+        // leaving it pinned to the original install.  `None` (permanent SA)
+        // carries through untouched.
+        let kernel_lifetime_secs = hard_lifetime_secs.map(|requested| {
+            let elapsed = Instant::now().saturating_duration_since(sa.created_at).as_secs();
+            requested.saturating_add(elapsed)
+        });
+
         // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps
         self.update_sa_only(
             &sa.ue_addr, sa.ue_port_c,
             &sa.pcscf_addr, sa.pcscf_port_s,
             sa.spi_ps,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, hard_lifetime_secs,
+            proto, kernel_lifetime_secs,
         ).await?;
         // SA2: PCSCF:port_ps → UE:port_uc, SPI=spi_uc
         self.update_sa_only(
@@ -1089,7 +1132,7 @@ impl IpsecManager {
             &sa.ue_addr, sa.ue_port_c,
             sa.spi_uc,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, hard_lifetime_secs,
+            proto, kernel_lifetime_secs,
         ).await?;
         // SA3: PCSCF:port_pc → UE:port_us, SPI=spi_us
         self.update_sa_only(
@@ -1097,7 +1140,7 @@ impl IpsecManager {
             &sa.ue_addr, sa.ue_port_s,
             sa.spi_us,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, hard_lifetime_secs,
+            proto, kernel_lifetime_secs,
         ).await?;
         // SA4: UE:port_us → PCSCF:port_pc, SPI=spi_pc
         self.update_sa_only(
@@ -1105,28 +1148,28 @@ impl IpsecManager {
             &sa.pcscf_addr, sa.pcscf_port_c,
             sa.spi_pc,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, hard_lifetime_secs,
+            proto, kernel_lifetime_secs,
         ).await?;
 
         info!(
             ue = %sa.ue_addr,
             ue_port_c = sa.ue_port_c,
             hard_lifetime_secs = ?hard_lifetime_secs,
+            kernel_lifetime_secs = ?kernel_lifetime_secs,
             "IPsec: SA pair hard-lifetime re-pinned"
         );
 
-        // Mirror the new value into the cached SecurityAssociationPair so
-        // any subsequent inspection (or downstream re-pin) sees the
-        // tightened limit.  Re-insert under the same key.  Also refresh
-        // the sweep deadline so the in-memory entry reaps in step with the
-        // re-pinned hard lifetime — without this an SA installed with the
-        // UE's 600000 s ask but re-pinned down to the granted Expires
-        // would keep its old far-out `expires_at` and never sweep on time.
-        // The kernel preserves `add_time` across UPDSA so its true expiry
-        // is `original_install + new_lifetime`; the install→repin gap is
-        // sub-second, so computing from `now` here is conservatively close
-        // (slightly later) and the kernel still reaps states/policies on
-        // the exact deadline regardless.
+        // Mirror the new from-now value into the cached SecurityAssociationPair
+        // so any subsequent inspection (or downstream re-pin) sees it, and
+        // refresh the sweep deadline to `now + hard_lifetime_secs + grace`.
+        // The kernel was re-pinned with the elapsed-adjusted value above, so
+        // its true deadline is also `now + hard_lifetime_secs`; the two now
+        // agree (modulo the sub-second sweep grace), unlike before the
+        // elapsed adjustment where a late re-pin would leave the kernel SA
+        // dying early while `expires_at` claimed it was alive.  `created_at`
+        // is deliberately preserved (cloned through unchanged) — UPDSA keeps
+        // the kernel `add_time`, so the install anchor stays valid for the
+        // next re-pin's elapsed computation.
         sa.hard_lifetime_secs = hard_lifetime_secs;
         sa.expires_at = compute_sa_expires_at(hard_lifetime_secs);
         self.associations.insert(key, sa);
@@ -1414,6 +1457,12 @@ impl IpsecManager {
         protocol: SaProtocol,
         hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
+        #[cfg(test)]
+        if let Some(result) =
+            self.mock_update(format!("sa:{destination}:{spi}"), hard_lifetime_secs)
+        {
+            return result;
+        }
         match self.backend {
             #[cfg(target_os = "linux")]
             XfrmBackend::Netlink => {
@@ -1939,6 +1988,9 @@ struct KernelMock {
     /// When true, an add of an already-live key returns `EEXIST` (simulates the
     /// kernel's `NLM_F_EXCL` semantics).
     reject_existing: bool,
+    /// Ordered log of `update_sa` calls as `(key, hard_lifetime_secs)`, so
+    /// tests can assert the elapsed-adjusted kernel lifetime a re-pin sends.
+    updates: Vec<(String, Option<u64>)>,
 }
 
 #[cfg(test)]
@@ -1979,6 +2031,23 @@ impl IpsecManager {
             )));
         }
         state.live.insert(key);
+        Some(Ok(()))
+    }
+
+    /// Mock update-path: records the `(key, hard_lifetime_secs)` so tests can
+    /// assert the elapsed-adjusted kernel lifetime a re-pin sends, then
+    /// succeeds.  Returns `Some(Ok)` when a mock kernel is installed so the
+    /// real backend (`ip xfrm` shell-out / netlink) is bypassed, `None`
+    /// otherwise.
+    fn mock_update(
+        &self,
+        key: String,
+        hard_lifetime_secs: Option<u64>,
+    ) -> Option<Result<(), IpsecError>> {
+        let mock = self.kernel_mock.as_ref()?;
+        let mut state = mock.lock().expect("mock kernel lock poisoned");
+        state.ops.push(format!("update_sa {key}"));
+        state.updates.push((key, hard_lifetime_secs));
         Some(Ok(()))
     }
 
@@ -2240,6 +2309,7 @@ mod tests {
             hard_lifetime_secs: None,
             protocol: SaProtocol::Udp,
             expires_at: Instant::now(),
+            created_at: Instant::now(),
             role: SaRole::PCscf,
         };
         let cloned = sa.clone();
@@ -2294,6 +2364,106 @@ mod tests {
         assert_eq!(manager.active_count(), 0);
     }
 
+    /// `create_sa_pair` must stamp `created_at` at the kernel-install moment,
+    /// overwriting whatever placeholder the caller pre-set — that anchor is
+    /// what every later re-pin measures elapsed-since-install against.
+    #[tokio::test]
+    async fn create_sa_pair_stamps_created_at_at_install() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "198.51.100.7".parse().unwrap();
+        let mut sa = test_sa_pair(ue, 50000, 20000);
+        // A distinctly-wrong placeholder far in the future; create_sa_pair
+        // must replace it with `now`.  (Future offset avoids the monotonic-
+        // clock underflow that a past offset risks on low-uptime CI.)
+        sa.created_at = Instant::now() + Duration::from_secs(10_000);
+        manager
+            .create_sa_pair(sa)
+            .await
+            .expect("create_sa_pair should succeed against the mock kernel");
+        let installed = manager.get_sa(&ue, 50000).expect("SA pair present after create");
+        assert!(
+            installed.created_at <= Instant::now() + Duration::from_secs(60),
+            "created_at must be re-stamped to install time, not the far-future placeholder"
+        );
+    }
+
+    /// Core of the refresh fix: a re-pin must push the **kernel** hard
+    /// lifetime to `requested + elapsed-since-install`, because XFRM UPDSA
+    /// preserves `add_time`.  Also proves the install anchor is preserved
+    /// across repeated re-pins (so the SA keeps moving forward on every
+    /// refresh, not just the first).
+    #[tokio::test]
+    async fn update_sa_pair_lifetime_adds_elapsed_and_keeps_anchor() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "198.51.100.8".parse().unwrap();
+        let mut sa = test_sa_pair(ue, 50000, 21000);
+        sa.hard_lifetime_secs = Some(100);
+        // `created_at` defaults to `now` (set in test_sa_pair).
+        let anchor = sa.created_at;
+        insert_test_pair(&manager, sa);
+
+        // Let real time pass so elapsed floors to exactly 1 s (the sleep
+        // guarantees ≥1.1 s; two fast re-pins keep it < 2 s).
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        manager
+            .update_sa_pair_lifetime(&ue, 50000, Some(100))
+            .await
+            .expect("re-pin should succeed");
+
+        // Four UPDSA messages, each carrying requested(100) + elapsed(1) = 101.
+        let first: Vec<Option<u64>> =
+            manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
+        assert_eq!(first.len(), 4, "one UPDSA per SA of the pair");
+        assert!(
+            first.iter().all(|lft| *lft == Some(101)),
+            "kernel lifetime must be requested + elapsed-since-install, got {first:?}"
+        );
+
+        // In-memory mirror keeps the *from-now* value (not the inflated kernel
+        // value) and moves the sweep deadline forward.
+        let cached = manager.get_sa(&ue, 50000).expect("SA still present");
+        assert_eq!(cached.hard_lifetime_secs, Some(100));
+        assert!(cached.expires_at > Instant::now() + Duration::from_secs(100));
+        assert_eq!(cached.created_at, anchor, "install anchor must not move on re-pin");
+
+        // A second re-pin still measures elapsed from the ORIGINAL install
+        // (≈1 s), not from the first re-pin — if the anchor had been reset to
+        // `now`, this would record 100 instead of 101.
+        manager.mock().updates.clear();
+        manager
+            .update_sa_pair_lifetime(&ue, 50000, Some(100))
+            .await
+            .expect("second re-pin should succeed");
+        let second: Vec<Option<u64>> =
+            manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
+        assert!(
+            second.iter().all(|lft| *lft == Some(101)),
+            "re-pin must stay anchored to original install, got {second:?}"
+        );
+    }
+
+    /// A permanent SA (`hard_lifetime_secs == None`) carries `None` through to
+    /// the kernel unchanged — no elapsed inflation, no spurious deadline.
+    #[tokio::test]
+    async fn update_sa_pair_lifetime_none_passes_through() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "198.51.100.9".parse().unwrap();
+        let mut sa = test_sa_pair(ue, 50000, 22000);
+        sa.hard_lifetime_secs = None;
+        insert_test_pair(&manager, sa);
+
+        manager
+            .update_sa_pair_lifetime(&ue, 50000, None)
+            .await
+            .expect("re-pin with None should succeed");
+
+        let updates: Vec<Option<u64>> =
+            manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
+        assert_eq!(updates.len(), 4);
+        assert!(updates.iter().all(|lft| lft.is_none()), "None must not inflate");
+    }
+
     #[test]
     fn sa_protocol_default_is_any() {
         // Spec-driven default change (3GPP TS 33.203 §7.2): an SA pair
@@ -2328,6 +2498,7 @@ mod tests {
             hard_lifetime_secs: Some(3600),
             protocol: SaProtocol::Any,
             expires_at: compute_sa_expires_at(Some(3600)),
+            created_at: Instant::now(),
             role: SaRole::PCscf,
         }
     }
