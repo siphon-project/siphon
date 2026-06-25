@@ -5,6 +5,7 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:   # manual "Run workflow" — also the only trigger for sipp-ipsec
 
 env:
   CARGO_TERM_COLOR: always
@@ -234,11 +235,18 @@ jobs:
       - name: Run fuzz target (60s)
         run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run sip_parser_fuzz -- -max_total_time=60
 
-  # ── SIPp IPsec VoLTE test ──────────────────────────────────────────────
+  # ── SIPp IPsec VoLTE test (manual-only) ────────────────────────────────
+  # IPsec XFRM SA installation needs CAP_NET_ADMIN, which GitHub-hosted runners
+  # don't grant — this can NEVER pass here. It used to run on every push/PR,
+  # burning ~7 min compiling siphon for a guaranteed (continue-on-error) red.
+  # Now it only runs on a manual `workflow_dispatch`, so point that at a
+  # privileged/self-hosted runner when you actually want it. The ipsec logic is
+  # covered by the unit tests in rust-tests.
   sipp-ipsec:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     needs: rust-tests
-    continue-on-error: true  # IPsec xfrm requires NET_ADMIN — may fail in CI
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
