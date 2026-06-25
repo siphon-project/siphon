@@ -207,20 +207,46 @@ impl std::fmt::Display for BsfError {
 
 impl std::error::Error for BsfError {}
 
+/// SCP delegated-discovery headers for Nbsf, Model D (TS 29.500 §5.2.3.2.4).
+const DISCOVERY_TARGET_NF_TYPE_HEADER: &str = "3gpp-Sbi-Discovery-target-nf-type";
+const DISCOVERY_SERVICE_NAMES_HEADER: &str = "3gpp-Sbi-Discovery-service-names";
+const DISCOVERY_REQUESTER_NF_TYPE_HEADER: &str = "3gpp-Sbi-Discovery-requester-nf-type";
+
 /// Nbsf_Management discovery client.
 pub struct BsfClient {
     base_url: String,
     client: reqwest::Client,
+    communication: crate::sbi::Communication,
+    /// Requester NF type for the `3gpp-Sbi-Discovery-requester-nf-type` header
+    /// in Indirect mode (the P-CSCF acts as an AF).
+    requester_nf_type: String,
 }
 
 impl BsfClient {
-    /// Create a new BSF client pointing at the given base URL, reusing a
-    /// shared pooled `reqwest::Client`.
+    /// Create a new BSF client pointing at the given base URL (the BSF in
+    /// `Direct` mode, the SCP in `Indirect` mode), reusing a shared pooled
+    /// `reqwest::Client`. Defaults to `Direct` communication, requester `AF`.
     pub fn new(base_url: &str, client: reqwest::Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
+            communication: crate::sbi::Communication::Direct,
+            requester_nf_type: "AF".to_string(),
         }
+    }
+
+    /// Set the SBI communication model. `Indirect` routes via the SCP and emits
+    /// the `3gpp-Sbi-Discovery-*` delegated-discovery headers (Model D).
+    pub fn with_communication(mut self, communication: crate::sbi::Communication) -> Self {
+        self.communication = communication;
+        self
+    }
+
+    /// Set the requester NF type advertised in delegated discovery (default
+    /// `"AF"`).
+    pub fn with_requester_nf_type(mut self, requester_nf_type: &str) -> Self {
+        self.requester_nf_type = requester_nf_type.to_string();
+        self
     }
 
     /// The configured base URL.
@@ -231,7 +257,9 @@ impl BsfClient {
     /// Look up the PCF binding for a UE IP (TS 29.521 §5.2.2.2.2).
     ///
     /// `Ok(Some(binding))` on `200`, `Ok(None)` on `404`, `Err(BsfError)` on
-    /// anything else.
+    /// anything else. In `Indirect` mode the request carries the
+    /// `3gpp-Sbi-Discovery-*` headers so the SCP discovers the BSF via the NRF
+    /// (Model D); the 200/404 contract reaching the caller is unchanged.
     pub async fn discover_binding(
         &self,
         key: &BindingQuery,
@@ -242,10 +270,15 @@ impl BsfClient {
             BindingQuery::Ipv6Prefix(prefix) => [("ipv6Prefix", prefix.as_str())],
         };
 
-        let response = self
-            .client
-            .get(&url)
-            .query(&query)
+        let mut request = self.client.get(&url).query(&query);
+        if self.communication.is_indirect() {
+            request = request
+                .header(DISCOVERY_TARGET_NF_TYPE_HEADER, "BSF")
+                .header(DISCOVERY_SERVICE_NAMES_HEADER, "nbsf-management")
+                .header(DISCOVERY_REQUESTER_NF_TYPE_HEADER, &self.requester_nf_type);
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|error| BsfError::Transport(format!("{url}: {error}")))?;
@@ -495,5 +528,92 @@ mod tests {
         assert!(query.starts_with("ipv6Prefix="), "got: {query}");
         // The `/` of the /64 prefix MUST be percent-encoded (TS 29.521 wire).
         assert!(query.contains("%2F64"), "slash must be %2F encoded: {query}");
+    }
+
+    /// A discovery router that records the `3gpp-Sbi-Discovery-*` headers
+    /// (each None when absent) seen on the request, then 404s.
+    fn capturing_discovery_router(
+        captured: Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>>,
+    ) -> axum::Router {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        axum::Router::new().route(
+            "/bsf-management/v1/pcfBindings",
+            get(move |headers: HeaderMap| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let get = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .map(|value| value.to_string())
+                    };
+                    captured.lock().unwrap().push((
+                        get("3gpp-sbi-discovery-target-nf-type"),
+                        get("3gpp-sbi-discovery-service-names"),
+                        get("3gpp-sbi-discovery-requester-nf-type"),
+                    ));
+                    axum::http::StatusCode::NOT_FOUND
+                }
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn indirect_discover_emits_delegated_discovery_headers() {
+        let captured: Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let scp = spawn_mock(capturing_discovery_router(Arc::clone(&captured))).await;
+        let client = BsfClient::new(&scp, reqwest::Client::new())
+            .with_communication(crate::sbi::Communication::Indirect);
+
+        let result = client
+            .discover_binding(&BindingQuery::Ipv4("10.45.0.7".into()))
+            .await
+            .unwrap();
+        assert!(result.is_none(), "404 still maps to Ok(None) in indirect mode");
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let (target_nf, service_names, requester_nf) = &captured[0];
+        assert_eq!(target_nf.as_deref(), Some("BSF"));
+        assert_eq!(service_names.as_deref(), Some("nbsf-management"));
+        assert_eq!(requester_nf.as_deref(), Some("AF"));
+    }
+
+    #[tokio::test]
+    async fn direct_discover_emits_no_discovery_headers() {
+        let captured: Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let bsf = spawn_mock(capturing_discovery_router(Arc::clone(&captured))).await;
+        // Direct by default.
+        let client = BsfClient::new(&bsf, reqwest::Client::new());
+
+        let _ = client
+            .discover_binding(&BindingQuery::Ipv4("10.45.0.7".into()))
+            .await
+            .unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0], (None, None, None), "direct mode emits no discovery headers");
+    }
+
+    #[tokio::test]
+    async fn indirect_requester_nf_type_override() {
+        let captured: Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let scp = spawn_mock(capturing_discovery_router(Arc::clone(&captured))).await;
+        let client = BsfClient::new(&scp, reqwest::Client::new())
+            .with_communication(crate::sbi::Communication::Indirect)
+            .with_requester_nf_type("PCF");
+
+        let _ = client
+            .discover_binding(&BindingQuery::Ipv4("10.45.0.7".into()))
+            .await
+            .unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured[0].2.as_deref(), Some("PCF"));
     }
 }

@@ -1416,12 +1416,21 @@ impl SiphonServer {
 
             // Create NpcfClient and inject as Python singleton
             if let Some(ref npcf_url) = sbi_config.npcf_url {
+                // SBI communication model (TS 29.500 §6.10): direct to the NF
+                // (default) or indirect via the SCP with 3gpp-Sbi-* headers.
+                let communication = crate::sbi::Communication::from_config_str(
+                    sbi_config.communication.as_deref().unwrap_or("direct"),
+                );
+                let requester_nf_type =
+                    sbi_config.requester_nf_type.as_deref().unwrap_or("AF");
+
                 let http_client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(sbi_config.timeout_secs))
                     .build()
                     .unwrap_or_default();
                 let npcf_client = std::sync::Arc::new(
                     crate::sbi::npcf::NpcfClient::new(npcf_url, http_client)
+                        .with_communication(communication),
                 );
 
                 // Optional Nbsf_Management (BSF) discovery client. Its own
@@ -1437,7 +1446,11 @@ impl SiphonServer {
                         .timeout(bsf_timeout)
                         .build()
                         .unwrap_or_default();
-                    std::sync::Arc::new(crate::sbi::nbsf::BsfClient::new(bsf_url, bsf_http))
+                    std::sync::Arc::new(
+                        crate::sbi::nbsf::BsfClient::new(bsf_url, bsf_http)
+                            .with_communication(communication)
+                            .with_requester_nf_type(requester_nf_type),
+                    )
                 });
                 let pcf_scheme = crate::sbi::nbsf::Scheme::from_config_str(
                     sbi_config.pcf_scheme.as_deref().unwrap_or("http"),

@@ -2480,6 +2480,14 @@ pub struct SbiYamlConfig {
     /// URL scheme ("http" | "https", default "http") used when deriving a PCF
     /// base URL from a `pcfFqdn` returned by the BSF.
     pub pcf_scheme: Option<String>,
+    /// SBI communication model: "direct" (default — straight to the NF) or
+    /// "indirect" (via the SCP, with `3gpp-Sbi-*` routing headers; TS 29.500
+    /// §6.10). When "indirect", `npcf_url`/`bsf_url` point at the SCP.
+    pub communication: Option<String>,
+    /// Requester NF type advertised in Nbsf delegated discovery
+    /// (`3gpp-Sbi-Discovery-requester-nf-type`) when communication is indirect.
+    /// Default "AF" (a P-CSCF acts as an AF).
+    pub requester_nf_type: Option<String>,
     /// Listen address for incoming PCF event notifications (e.g. "0.0.0.0:8080").
     pub notif_listen: Option<String>,
 }

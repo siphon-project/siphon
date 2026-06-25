@@ -167,19 +167,33 @@ impl std::fmt::Display for SbiError {
 
 impl std::error::Error for SbiError {}
 
+/// HTTP header carrying the target NF apiRoot for SCP indirect communication,
+/// Model C (TS 29.500 §5.2.3.2.2).
+const TARGET_APIROOT_HEADER: &str = "3gpp-Sbi-Target-apiRoot";
+
 /// Npcf client for policy authorization.
 pub struct NpcfClient {
     base_url: String,
     client: reqwest::Client,
+    communication: crate::sbi::Communication,
 }
 
 impl NpcfClient {
-    /// Create a new Npcf client pointing at the given PCF base URL.
+    /// Create a new Npcf client pointing at the given base URL (the PCF in
+    /// `Direct` mode, the SCP in `Indirect` mode). Defaults to `Direct`.
     pub fn new(base_url: &str, client: reqwest::Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
+            communication: crate::sbi::Communication::Direct,
         }
+    }
+
+    /// Set the SBI communication model. `Indirect` routes via the SCP and emits
+    /// the `3gpp-Sbi-Target-apiRoot` header (Model C).
+    pub fn with_communication(mut self, communication: crate::sbi::Communication) -> Self {
+        self.communication = communication;
+        self
     }
 
     /// Create a new app session (POST /npcf-policyauthorization/v1/app-sessions).
@@ -196,14 +210,31 @@ impl NpcfClient {
         target: Option<&str>,
         context: &AppSessionContext,
     ) -> Result<CreatedAppSession, SbiError> {
-        let base = target
+        // The PCF this session belongs to (the per-call target, else base_url).
+        // Used as the apiRoot in Indirect mode and to resolve a relative
+        // Location in either mode.
+        let target_apiroot = target
             .map(|target| target.trim_end_matches('/'))
             .unwrap_or(&self.base_url);
-        let url = format!("{base}/npcf-policyauthorization/v1/app-sessions");
-        let response = self
-            .client
-            .post(&url)
-            .json(context)
+
+        let (url, send_target_header) = match self.communication {
+            // Direct: POST straight at the target PCF.
+            crate::sbi::Communication::Direct => (
+                format!("{target_apiroot}/npcf-policyauthorization/v1/app-sessions"),
+                false,
+            ),
+            // Indirect (Model C): POST to the SCP, target carried in the header.
+            crate::sbi::Communication::Indirect => (
+                format!("{}/npcf-policyauthorization/v1/app-sessions", self.base_url),
+                true,
+            ),
+        };
+
+        let mut request = self.client.post(&url).json(context);
+        if send_target_header {
+            request = request.header(TARGET_APIROOT_HEADER, target_apiroot);
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| SbiError::Transport(error.to_string()))?;
@@ -213,12 +244,13 @@ impl NpcfClient {
         }
 
         // Capture the Location header before consuming the body. Resolve a
-        // relative Location against the base we posted to.
+        // relative Location against the target PCF apiRoot (the resource lives
+        // on the PCF, not the SCP).
         let location = response
             .headers()
             .get(reqwest::header::LOCATION)
             .and_then(|value| value.to_str().ok())
-            .map(|location| resolve_location(base, location));
+            .map(|location| resolve_location(target_apiroot, location));
 
         let body = response
             .json::<AppSessionContextResp>()
@@ -237,10 +269,12 @@ impl NpcfClient {
     /// `self.base_url`, the legacy behaviour) or an absolute resource URI
     /// (`http(s)://…`, used verbatim — the replica-independent teardown path).
     pub async fn delete_app_session(&self, session_ref: &str) -> Result<(), SbiError> {
-        let url = self.resolve_session_url(session_ref);
-        let response = self
-            .client
-            .delete(&url)
+        let (url, target_apiroot) = self.resolve_session_request(session_ref);
+        let mut request = self.client.delete(&url);
+        if let Some(ref apiroot) = target_apiroot {
+            request = request.header(TARGET_APIROOT_HEADER, apiroot);
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| SbiError::Transport(error.to_string()))?;
@@ -261,11 +295,12 @@ impl NpcfClient {
         session_ref: &str,
         context: &AppSessionContext,
     ) -> Result<AppSessionContextResp, SbiError> {
-        let url = self.resolve_session_url(session_ref);
-        let response = self
-            .client
-            .patch(&url)
-            .json(context)
+        let (url, target_apiroot) = self.resolve_session_request(session_ref);
+        let mut request = self.client.patch(&url).json(context);
+        if let Some(ref apiroot) = target_apiroot {
+            request = request.header(TARGET_APIROOT_HEADER, apiroot);
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| SbiError::Transport(error.to_string()))?;
@@ -280,18 +315,42 @@ impl NpcfClient {
             .map_err(|error| SbiError::Deserialization(error.to_string()))
     }
 
-    /// Resolve a session reference to a concrete resource URL.
+    /// Resolve a session reference to a concrete request URL plus an optional
+    /// `3gpp-Sbi-Target-apiRoot` value.
     ///
-    /// Absolute references (`http://`/`https://`) are used verbatim; a bare id
-    /// is appended to `self.base_url`'s app-sessions collection.
-    fn resolve_session_url(&self, session_ref: &str) -> String {
-        if is_absolute_http_url(session_ref) {
-            session_ref.to_string()
-        } else {
-            format!(
-                "{}/npcf-policyauthorization/v1/app-sessions/{}",
-                self.base_url, session_ref
-            )
+    /// - `Direct`: absolute references are used verbatim; a bare id is appended
+    ///   to `self.base_url`'s app-sessions collection. No target header.
+    /// - `Indirect`: send to the SCP (`self.base_url`). An absolute resource
+    ///   URI is split into apiRoot (→ header) and path (→ appended to the SCP);
+    ///   a bare id targets the SCP collection with no specific PCF.
+    fn resolve_session_request(&self, session_ref: &str) -> (String, Option<String>) {
+        match self.communication {
+            crate::sbi::Communication::Direct => {
+                if is_absolute_http_url(session_ref) {
+                    (session_ref.to_string(), None)
+                } else {
+                    (
+                        format!(
+                            "{}/npcf-policyauthorization/v1/app-sessions/{}",
+                            self.base_url, session_ref
+                        ),
+                        None,
+                    )
+                }
+            }
+            crate::sbi::Communication::Indirect => {
+                if let Some((apiroot, path)) = apiroot_and_path(session_ref) {
+                    (format!("{}{}", self.base_url, path), Some(apiroot))
+                } else {
+                    (
+                        format!(
+                            "{}/npcf-policyauthorization/v1/app-sessions/{}",
+                            self.base_url, session_ref
+                        ),
+                        None,
+                    )
+                }
+            }
         }
     }
 
@@ -304,6 +363,23 @@ impl NpcfClient {
 /// Whether a string is an absolute `http`/`https` URL.
 fn is_absolute_http_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
+}
+
+/// Split an absolute `http(s)` URL into its apiRoot (`{scheme}://{authority}`)
+/// and the remaining path (`/...`, empty if none). Returns `None` for a
+/// non-absolute reference (a bare id).
+fn apiroot_and_path(value: &str) -> Option<(String, String)> {
+    let scheme_end = value.find("://")? + 3;
+    let (scheme_host, rest) = value.split_at(scheme_end);
+    // `rest` is `authority[/path...]`; the apiRoot stops at the first `/`.
+    match rest.find('/') {
+        Some(slash) => {
+            let authority = &rest[..slash];
+            let path = &rest[slash..];
+            Some((format!("{scheme_host}{authority}"), path.to_string()))
+        }
+        None => Some((value.to_string(), String::new())),
+    }
 }
 
 /// Resolve a (possibly relative) `Location` header against the base URL the
@@ -506,19 +582,54 @@ mod tests {
     }
 
     #[test]
-    fn resolve_session_url_bare_id_against_base() {
+    fn resolve_session_request_direct_bare_id_against_base() {
         let client = NpcfClient::new("http://scp.local:8080", reqwest::Client::new());
+        let (url, target) = client.resolve_session_request("sess-1");
         assert_eq!(
-            client.resolve_session_url("sess-1"),
+            url,
             "http://scp.local:8080/npcf-policyauthorization/v1/app-sessions/sess-1"
         );
+        assert!(target.is_none());
     }
 
     #[test]
-    fn resolve_session_url_absolute_uri_verbatim() {
+    fn resolve_session_request_direct_absolute_uri_verbatim() {
         let client = NpcfClient::new("http://scp.local:8080", reqwest::Client::new());
         let absolute = "http://pcf01.5gc:8080/npcf-policyauthorization/v1/app-sessions/abc";
-        assert_eq!(client.resolve_session_url(absolute), absolute);
+        let (url, target) = client.resolve_session_request(absolute);
+        assert_eq!(url, absolute);
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn resolve_session_request_indirect_absolute_splits_apiroot_and_path() {
+        let client = NpcfClient::new("http://scp:8080", reqwest::Client::new())
+            .with_communication(crate::sbi::Communication::Indirect);
+        let absolute = "http://pcf01.5gc:8080/npcf-policyauthorization/v1/app-sessions/abc";
+        let (url, target) = client.resolve_session_request(absolute);
+        // Sent to the SCP at the resource path; PCF carried in the header.
+        assert_eq!(
+            url,
+            "http://scp:8080/npcf-policyauthorization/v1/app-sessions/abc"
+        );
+        assert_eq!(target.as_deref(), Some("http://pcf01.5gc:8080"));
+    }
+
+    #[test]
+    fn apiroot_and_path_splits_correctly() {
+        assert_eq!(
+            apiroot_and_path("http://pcf01:8080/npcf/v1/x"),
+            Some(("http://pcf01:8080".to_string(), "/npcf/v1/x".to_string()))
+        );
+        assert_eq!(
+            apiroot_and_path("https://pcf01/"),
+            Some(("https://pcf01".to_string(), "/".to_string()))
+        );
+        assert_eq!(
+            apiroot_and_path("https://pcf01"),
+            Some(("https://pcf01".to_string(), String::new()))
+        );
+        assert_eq!(apiroot_and_path("sess-bare-id"), None);
     }
 
     #[test]
@@ -621,6 +732,97 @@ mod tests {
             Some(
                 format!("{base}/npcf-policyauthorization/v1/app-sessions/sess-xyz").as_str()
             )
+        );
+    }
+
+    // --- Indirect communication (SCP, Model C: 3gpp-Sbi-Target-apiRoot) ---
+
+    use std::sync::{Arc, Mutex};
+
+    fn empty_context() -> AppSessionContext {
+        AppSessionContext {
+            af_app_id: None,
+            media_components: vec![],
+            sip_call_id: None,
+            supi: None,
+            ue_ipv4: None,
+            ue_ipv6: None,
+            dnn: None,
+            ev_subsc: None,
+            notif_uri: None,
+            supp_feat: None,
+        }
+    }
+
+    /// A create router that records the `3gpp-Sbi-Target-apiRoot` header value
+    /// (None when absent) seen on each request.
+    fn capturing_create_router(captured: Arc<Mutex<Vec<Option<String>>>>) -> axum::Router {
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        axum::Router::new().route(
+            "/npcf-policyauthorization/v1/app-sessions",
+            post(move |headers: HeaderMap| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let target = headers
+                        .get("3gpp-sbi-target-apiroot")
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| value.to_string());
+                    captured.lock().unwrap().push(target);
+                    (
+                        axum::http::StatusCode::CREATED,
+                        [(
+                            "location",
+                            "/npcf-policyauthorization/v1/app-sessions/sess-xyz",
+                        )],
+                        r#"{"appSessionId": "sess-xyz", "authorized": true}"#,
+                    )
+                }
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn create_indirect_posts_to_scp_with_target_apiroot_header() {
+        let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let scp = spawn_mock(capturing_create_router(Arc::clone(&captured))).await;
+        let client = NpcfClient::new(&scp, reqwest::Client::new())
+            .with_communication(crate::sbi::Communication::Indirect);
+
+        let created = client
+            // pcf_uri (the per-call target) becomes the target apiRoot header.
+            .create_app_session(Some("http://pcf01.5gc:8080"), &empty_context())
+            .await
+            .expect("indirect create must succeed");
+
+        assert_eq!(created.response.app_session_id, "sess-xyz");
+        // Location resolves against the PCF apiRoot, not the SCP.
+        assert_eq!(
+            created.location.as_deref(),
+            Some("http://pcf01.5gc:8080/npcf-policyauthorization/v1/app-sessions/sess-xyz")
+        );
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].as_deref(), Some("http://pcf01.5gc:8080"));
+    }
+
+    #[tokio::test]
+    async fn create_direct_sends_no_target_apiroot_header() {
+        let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let pcf = spawn_mock(capturing_create_router(Arc::clone(&captured))).await;
+        // Direct by default.
+        let client = NpcfClient::new(&pcf, reqwest::Client::new());
+
+        client
+            .create_app_session(None, &empty_context())
+            .await
+            .expect("direct create must succeed");
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0].is_none(),
+            "direct mode must not send 3gpp-Sbi-Target-apiRoot"
         );
     }
 }

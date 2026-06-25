@@ -139,9 +139,11 @@ impl PySbi {
     ///         ``codec_data``, and a ``flows`` list whose entries carry
     ///         ``number``, ``descriptions`` (IPFilterRules), and optional
     ///         ``status`` / ``usage``.
-    ///     pcf_uri: per-call N5 target — address this session at the given PCF
-    ///         base URL (e.g. a BSF-discovered ``pcf_uri``) instead of the
-    ///         configured ``npcf_url``.  ``None`` ⇒ ``npcf_url`` (unchanged).
+    ///     pcf_uri: per-call N5 target — the discovered PCF (e.g. a
+    ///         BSF-returned ``pcf_uri``).  In ``direct`` communication mode it
+    ///         is the POST base (instead of ``npcf_url``); in ``indirect`` mode
+    ///         it becomes the ``3gpp-Sbi-Target-apiRoot`` header while the POST
+    ///         goes to the SCP (``npcf_url``).  ``None`` ⇒ ``npcf_url``.
     ///
     /// Returns a dict with ``app_session_id``, ``authorized``, and
     /// ``app_session_uri`` (the absolute resource URI — persist it and pass it

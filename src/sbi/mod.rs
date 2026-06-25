@@ -11,6 +11,40 @@ pub mod npcf;
 pub mod nchf;
 pub mod nbsf;
 
+/// SBI communication model (TS 29.500 §6.10).
+///
+/// - `Direct`: the NF Service Consumer sends requests straight to the target
+///   NF (the configured `*_url` is the NF). No `3gpp-Sbi-*` routing headers.
+/// - `Indirect`: requests traverse the SCP (the configured `*_url` is the SCP).
+///   The consumer indicates the target via routing headers — Model C
+///   (`3gpp-Sbi-Target-apiRoot`) for Npcf where the PCF is known from the BSF
+///   binding, Model D (`3gpp-Sbi-Discovery-*`, delegated discovery) for Nbsf
+///   where only the target NF type is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Communication {
+    /// Direct to the target NF (default — today's behaviour).
+    #[default]
+    Direct,
+    /// Indirect via the SCP, with 3GPP routing headers.
+    Indirect,
+}
+
+impl Communication {
+    /// Parse the `sbi.communication` config value. Anything other than a
+    /// case-insensitive `"indirect"` is treated as `direct`.
+    pub fn from_config_str(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "indirect" => Self::Indirect,
+            _ => Self::Direct,
+        }
+    }
+
+    /// Whether routing headers should be emitted.
+    pub fn is_indirect(self) -> bool {
+        matches!(self, Self::Indirect)
+    }
+}
+
 /// Configuration for SBI client connections.
 #[derive(Debug, Clone)]
 pub struct SbiConfig {
@@ -64,6 +98,18 @@ impl SbiManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn communication_from_config_str() {
+        assert_eq!(Communication::from_config_str("indirect"), Communication::Indirect);
+        assert_eq!(Communication::from_config_str("INDIRECT"), Communication::Indirect);
+        assert_eq!(Communication::from_config_str("direct"), Communication::Direct);
+        assert_eq!(Communication::from_config_str("whatever"), Communication::Direct);
+        // Default is Direct (today's behaviour, backward-compatible).
+        assert_eq!(Communication::default(), Communication::Direct);
+        assert!(Communication::Indirect.is_indirect());
+        assert!(!Communication::Direct.is_indirect());
+    }
 
     #[test]
     fn sbi_config_defaults() {
