@@ -264,7 +264,7 @@ impl BsfClient {
         &self,
         key: &BindingQuery,
     ) -> Result<Option<PcfBinding>, BsfError> {
-        let url = format!("{}/bsf-management/v1/pcfBindings", self.base_url);
+        let url = format!("{}/nbsf-management/v1/pcfBindings", self.base_url);
         let query: [(&str, &str); 1] = match key {
             BindingQuery::Ipv4(address) => [("ipv4Addr", address.as_str())],
             BindingQuery::Ipv6Prefix(prefix) => [("ipv6Prefix", prefix.as_str())],
@@ -439,7 +439,7 @@ mod tests {
     async fn discover_200_returns_some() {
         use axum::routing::get;
         let router = axum::Router::new().route(
-            "/bsf-management/v1/pcfBindings",
+            "/nbsf-management/v1/pcfBindings",
             get(|| async { ([("content-type", "application/json")], FULL_BINDING_JSON) }),
         );
         let base = spawn_mock(router).await;
@@ -456,7 +456,7 @@ mod tests {
     async fn discover_404_returns_none() {
         use axum::routing::get;
         let router = axum::Router::new().route(
-            "/bsf-management/v1/pcfBindings",
+            "/nbsf-management/v1/pcfBindings",
             get(|| async { axum::http::StatusCode::NOT_FOUND }),
         );
         let base = spawn_mock(router).await;
@@ -472,7 +472,7 @@ mod tests {
     async fn discover_500_returns_err() {
         use axum::routing::get;
         let router = axum::Router::new().route(
-            "/bsf-management/v1/pcfBindings",
+            "/nbsf-management/v1/pcfBindings",
             get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
         );
         let base = spawn_mock(router).await;
@@ -503,7 +503,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_handler = Arc::clone(&captured);
         let router = axum::Router::new().route(
-            "/bsf-management/v1/pcfBindings",
+            "/nbsf-management/v1/pcfBindings",
             get(move |RawQuery(query): RawQuery| {
                 let captured = Arc::clone(&captured_handler);
                 async move {
@@ -541,7 +541,7 @@ mod tests {
         use axum::http::HeaderMap;
         use axum::routing::get;
         axum::Router::new().route(
-            "/bsf-management/v1/pcfBindings",
+            "/nbsf-management/v1/pcfBindings",
             get(move |headers: HeaderMap| {
                 let captured = Arc::clone(&captured);
                 async move {
@@ -618,5 +618,36 @@ mod tests {
 
         let captured = captured.lock().unwrap();
         assert_eq!(captured[0].2.as_deref(), Some("PCF"));
+    }
+
+    /// Pin the spec-compliant resource path (TS 29.521): the request MUST hit
+    /// `/nbsf-management/v1/pcfBindings`. A catch-all fallback records the
+    /// actual path, independent of any mounted route, so a regression back to
+    /// the old `bsf-management` typo is caught even if a mock route is changed
+    /// in lockstep.
+    #[tokio::test]
+    async fn discover_uses_spec_compliant_nbsf_management_path() {
+        use axum::extract::Request;
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_handler = Arc::clone(&captured);
+        let router = axum::Router::new().fallback(move |request: Request| {
+            let captured = Arc::clone(&captured_handler);
+            async move {
+                captured.lock().unwrap().push(request.uri().path().to_string());
+                axum::http::StatusCode::NOT_FOUND
+            }
+        });
+        let base = spawn_mock(router).await;
+        let client = BsfClient::new(&base, reqwest::Client::new());
+
+        let _ = client
+            .discover_binding(&BindingQuery::Ipv4("10.45.0.7".into()))
+            .await
+            .unwrap();
+
+        let paths = captured.lock().unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "/nbsf-management/v1/pcfBindings");
     }
 }
