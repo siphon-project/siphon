@@ -530,11 +530,14 @@ mod tests {
         assert!(query.contains("%2F64"), "slash must be %2F encoded: {query}");
     }
 
+    /// Captured `(target-nf-type, service-names, requester-nf-type)` discovery
+    /// header values (each None when absent) per request.
+    type CapturedDiscoveryHeaders =
+        Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>>;
+
     /// A discovery router that records the `3gpp-Sbi-Discovery-*` headers
     /// (each None when absent) seen on the request, then 404s.
-    fn capturing_discovery_router(
-        captured: Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>>,
-    ) -> axum::Router {
+    fn capturing_discovery_router(captured: CapturedDiscoveryHeaders) -> axum::Router {
         use axum::http::HeaderMap;
         use axum::routing::get;
         axum::Router::new().route(
@@ -561,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn indirect_discover_emits_delegated_discovery_headers() {
-        let captured: Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>> =
+        let captured: CapturedDiscoveryHeaders =
             Arc::new(Mutex::new(Vec::new()));
         let scp = spawn_mock(capturing_discovery_router(Arc::clone(&captured))).await;
         let client = BsfClient::new(&scp, reqwest::Client::new())
@@ -583,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_discover_emits_no_discovery_headers() {
-        let captured: Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>> =
+        let captured: CapturedDiscoveryHeaders =
             Arc::new(Mutex::new(Vec::new()));
         let bsf = spawn_mock(capturing_discovery_router(Arc::clone(&captured))).await;
         // Direct by default.
@@ -601,7 +604,7 @@ mod tests {
 
     #[tokio::test]
     async fn indirect_requester_nf_type_override() {
-        let captured: Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>> =
+        let captured: CapturedDiscoveryHeaders =
             Arc::new(Mutex::new(Vec::new()));
         let scp = spawn_mock(capturing_discovery_router(Arc::clone(&captured))).await;
         let client = BsfClient::new(&scp, reqwest::Client::new())
