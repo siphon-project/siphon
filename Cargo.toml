@@ -54,7 +54,7 @@ pyo3 = { version = "0.28", features = ["py-clone"] }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 
 # DNS
-hickory-resolver = "0.25"
+hickory-resolver = "0.26"
 
 # Transport
 socket2 = "0.6"
