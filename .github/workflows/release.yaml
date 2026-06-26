@@ -196,10 +196,31 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64
 
+  # ── SBOM (SPDX + CycloneDX), attached to the GitHub Release ───────────
+  sbom:
+    runs-on: ubuntu-latest
+    needs: verify-version
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-sbom
+        run: cargo install cargo-sbom
+      - name: Generate SPDX + CycloneDX SBOMs
+        run: |
+          cargo sbom --output-format spdx_json_2_3 > "siphon-sip-${GITHUB_REF_NAME}.spdx.json"
+          cargo sbom --output-format cyclone_dx_json_1_4 > "siphon-sip-${GITHUB_REF_NAME}.cdx.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            siphon-sip-*.spdx.json
+            siphon-sip-*.cdx.json
+
   # ── GitHub Release with artifacts ──────────────────────────────────────
   github-release:
     runs-on: ubuntu-latest
-    needs: [build, crates-io, pypi, docker]
+    needs: [build, crates-io, pypi, docker, sbom]
     steps:
       - uses: actions/checkout@v4
 
@@ -217,3 +238,5 @@ jobs:
             artifacts/*.tar.gz
             artifacts/*.deb
             artifacts/*.rpm
+            artifacts/*.spdx.json
+            artifacts/*.cdx.json
