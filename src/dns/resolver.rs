@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use hickory_resolver::TokioResolver;
+use hickory_resolver::proto::rr::RData;
 use tracing::{debug, warn};
 
 use crate::sip::uri::strip_ipv6_brackets;
@@ -25,7 +26,8 @@ pub struct SipResolver {
 impl SipResolver {
     /// Create a resolver using system DNS configuration.
     pub fn from_system() -> Result<Self, Box<dyn std::error::Error>> {
-        let resolver = TokioResolver::builder_tokio()?.build();
+        // hickory 0.26: `ResolverBuilder::build` is now fallible.
+        let resolver = TokioResolver::builder_tokio()?.build()?;
         Ok(Self { resolver })
     }
 
@@ -116,17 +118,24 @@ impl SipResolver {
             let srv_name = format!("{service_prefix}.{host}.");
             match self.resolver.srv_lookup(&srv_name).await {
                 Ok(lookup) => {
+                    // hickory 0.26: typed lookups return a generic `Lookup`.
+                    // Pull SRV records out of the answer section by matching
+                    // on `RData::SRV`; the SRV fields are public.
                     let entries: Vec<SrvEntry> = lookup
+                        .answers()
                         .iter()
-                        .map(|record| SrvEntry {
-                            priority: record.priority(),
-                            weight: record.weight(),
-                            port: record.port(),
-                            target: record
-                                .target()
-                                .to_string()
-                                .trim_end_matches('.')
-                                .to_string(),
+                        .filter_map(|record| match &record.data {
+                            RData::SRV(srv) => Some(SrvEntry {
+                                priority: srv.priority,
+                                weight: srv.weight,
+                                port: srv.port,
+                                target: srv
+                                    .target
+                                    .to_string()
+                                    .trim_end_matches('.')
+                                    .to_string(),
+                            }),
+                            _ => None,
                         })
                         .collect();
 
@@ -169,20 +178,22 @@ impl SipResolver {
     /// NAPTR record whose service field contains "E2U+sip".
     pub async fn naptr_lookup(&self, query_name: &str) -> Option<String> {
         use hickory_resolver::proto::rr::RecordType;
-        use hickory_resolver::proto::rr::record_data::RData;
 
         match self.resolver.lookup(query_name, RecordType::NAPTR).await {
             Ok(lookup) => {
-                for rdata in lookup.iter() {
-                    if let RData::NAPTR(naptr) = rdata {
-                        let services = String::from_utf8_lossy(naptr.services());
+                // hickory 0.26: iterate the answer section's `Record`s and
+                // pull the typed `RData` via `Record::data()`. NAPTR fields
+                // (`services`, `regexp`, `replacement`) are now public.
+                for record in lookup.answers() {
+                    if let RData::NAPTR(naptr) = &record.data {
+                        let services = String::from_utf8_lossy(&naptr.services);
                         if services.contains("E2U+sip") || services.contains("e2u+sip") {
-                            let replacement = naptr.replacement().to_string();
+                            let replacement = naptr.replacement.to_string();
                             if !replacement.is_empty() && replacement != "." {
                                 return Some(replacement.trim_end_matches('.').to_string());
                             }
                             // Check regexp field for URI extraction
-                            let regexp = String::from_utf8_lossy(naptr.regexp());
+                            let regexp = String::from_utf8_lossy(&naptr.regexp);
                             if !regexp.is_empty() {
                                 // NAPTR regexp format: "!pattern!replacement!"
                                 let parts: Vec<&str> = regexp.split('!').collect();

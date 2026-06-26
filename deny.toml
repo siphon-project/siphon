@@ -14,7 +14,10 @@ all-features = true
 # RustSec advisory database. A yanked crate or an open advisory fails the audit.
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # paste — unmaintained transitive (no vuln); remove when the parent crate drops it.
+    "RUSTSEC-2024-0436",
+]
 
 [bans]
 multiple-versions = "warn"
