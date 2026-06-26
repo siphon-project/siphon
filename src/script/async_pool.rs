@@ -501,6 +501,21 @@ mod tests {
         })
     }
 
+    /// Tests share one process-global `AsyncPool` (`GLOBAL`) and the harness
+    /// runs them on parallel threads.  The leak probes (`pool_drains_*`,
+    /// `pool_steady_state_*`) read the per-driver asyncio task tables / the
+    /// process-global jemalloc `allocated` gauge — both of which a *sibling*
+    /// test dispatching to the same pool perturbs mid-probe.  That is a
+    /// cross-test race, not a leak.  Every pool test holds this guard for its
+    /// whole duration, so exactly one runs at a time and the probes observe a
+    /// quiescent pool.  Poison is recovered deliberately: a panicking test has
+    /// already failed and must not cascade a poison error into the others.
+    static POOL_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn pool_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        POOL_SERIAL.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn ensure_pool() -> Arc<AsyncPool> {
         Python::initialize();
         Python::attach(install_test_module);
@@ -533,6 +548,7 @@ mod tests {
 
     #[test]
     fn pool_runs_simple_coroutine() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -555,6 +571,7 @@ mod tests {
     /// stuck in `_ready` forever.
     #[test]
     fn pool_drives_create_task_to_completion() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -597,6 +614,7 @@ mod tests {
     /// and the task body must finish.
     #[test]
     fn pool_drives_create_task_through_pyo3_async_future() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -650,6 +668,7 @@ mod tests {
     /// distinct value.
     #[test]
     fn pool_handles_concurrent_submissions() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -691,6 +710,7 @@ mod tests {
     /// inside the API call panics with "there is no reactor running".
     #[test]
     fn pool_drivers_have_tokio_runtime_context() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -814,6 +834,7 @@ mod tests {
     /// returned Marker stays alive and the weakref keeps resolving.
     #[test]
     fn pool_releases_python_objects_after_handler() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -864,6 +885,7 @@ mod tests {
     /// being released, which would slowly accumulate frames + locals.
     #[test]
     fn pool_drains_asyncio_tasks_after_batch() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -918,6 +940,7 @@ mod tests {
     #[cfg(not(target_env = "msvc"))]
     #[test]
     fn pool_steady_state_allocated_does_not_grow() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -998,6 +1021,7 @@ mod tests {
     /// Coroutine that raises must surface the exception to the caller.
     #[test]
     fn pool_propagates_python_exception() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
