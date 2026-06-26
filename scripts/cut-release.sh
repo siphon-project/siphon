@@ -40,6 +40,10 @@ cd "$REPO_ROOT"
 [ -z "$(git status --porcelain)" ] || die "working tree not clean — commit or stash first"
 git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG already exists"
 
+# A release MUST document its version in CHANGELOG.md (CLAUDE.md rule; CI gates it too).
+grep -qE "^## \[?$(printf '%s' "$VERSION" | sed 's/\./\\./g')\]?" CHANGELOG.md \
+  || die "CHANGELOG.md has no '## [$VERSION]' section — write the release notes before cutting."
+
 echo "==> fetching origin"
 git fetch --quiet origin
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] \

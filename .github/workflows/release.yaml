@@ -33,6 +33,12 @@ jobs:
             echo "::error::Cargo.toml version ($cargo_version) does not match tag ($tag_version) — bump Cargo.toml in the release commit (use scripts/cut-release.sh)."
             exit 1
           fi
+          # A release must document its version in CHANGELOG.md (CLAUDE.md rule).
+          ver_re="$(printf '%s' "$tag_version" | sed 's/\./\\./g')"
+          if ! grep -qE "^## \[?${ver_re}\]?" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$tag_version]' section — add the release notes (scripts/cut-release.sh gates on this)."
+            exit 1
+          fi
 
   # ── Build release binary + packages ────────────────────────────────────
   build:
@@ -177,6 +183,10 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `latest=auto` tags :latest only for stable (non-prerelease) semver,
+          # so an -rc.N tag publishes its version but never moves :latest.
+          flavor: |
+            latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
