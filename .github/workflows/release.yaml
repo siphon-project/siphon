@@ -103,10 +103,12 @@ jobs:
             target/${{ matrix.target }}/debian/*.deb
             target/${{ matrix.target }}/generate-rpm/*.rpm
 
-  # ── Publish to crates.io ───────────────────────────────────────────────
+  # ── Publish to crates.io (Trusted Publishing — OIDC, no token) ─────────
   crates-io:
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      id-token: write   # mint a short-lived crates.io token via GitHub OIDC
     steps:
       - uses: actions/checkout@v4
 
@@ -120,15 +122,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Authenticate to crates.io (OIDC Trusted Publishing)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
       - name: Publish to crates.io
         run: PYO3_PYTHON=python3.14 cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
-  # ── Publish Python SDK to PyPI ────────────────────────────────────────
+  # ── Publish Python SDK to PyPI (Trusted Publishing — OIDC, no token) ───
   pypi:
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      id-token: write   # OIDC for PyPI Trusted Publishing
     steps:
       - uses: actions/checkout@v4
         with:
@@ -140,14 +148,15 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Build and publish siphon-sip (SDK; version from tag via hatch-vcs)
+      - name: Build siphon-sip (SDK; version from tag via hatch-vcs)
         run: |
-          pip install build twine
+          pip install build
           cd sdk && python -m build
-          twine upload dist/*
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+
+      - name: Publish to PyPI (Trusted Publishing — OIDC, no token)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/dist
 
   # ── Docker image → GHCR ───────────────────────────────────────────────
   docker:
