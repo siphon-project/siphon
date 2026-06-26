@@ -7,6 +7,8 @@
   <img src="https://img.shields.io/badge/Python_3.14t-3776AB?logo=python&logoColor=white" alt="Python 3.14t">
   <img src="https://img.shields.io/badge/Tokio-async-blue" alt="Tokio">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
+  <a href="https://crates.io/crates/siphon-sip"><img src="https://img.shields.io/crates/v/siphon-sip.svg?logo=rust" alt="crates.io"></a>
+  <a href="https://pypi.org/project/siphon-sip/"><img src="https://img.shields.io/pypi/v/siphon-sip.svg?logo=pypi&logoColor=white" alt="PyPI"></a>
   <a href="https://github.com/siphon-project/siphon-sip/actions/workflows/ci.yaml">
     <img src="https://github.com/siphon-project/siphon-sip/actions/workflows/ci.yaml/badge.svg" alt="CI">
   </a>
@@ -21,7 +23,8 @@
   <a href="#scripting">Scripting</a> &middot;
   <a href="#hybrid-proxysbc-mode">Hybrid Mode</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
-  <a href="#testing">Testing</a>
+  <a href="#testing">Testing</a> &middot;
+  <a href="#performance-targets">Performance</a>
 </p>
 
 ---
@@ -131,7 +134,7 @@ This isn't a replacement for Kamailio or OpenSIPS. It's what happens when someon
 
 ### Prerequisites
 
-SIPhon requires **Python 3.12+** at runtime for scripting support. For optimal performance, use **Python 3.14t** (free-threaded) which eliminates the GIL entirely.
+SIPhon requires **Python 3.12+** at runtime for scripting support. For optimal performance, use **Python 3.14t** (free-threaded) which eliminates the GIL entirely. (The pure-Python test SDK, `siphon-sip`, runs on Python 3.10+ — script unit tests don't need the proxy's runtime.)
 
 ### Option 1: cargo install (from crates.io)
 
@@ -185,7 +188,7 @@ Pre-built `.rpm` packages are also available from [GitHub Releases](https://gith
 
 ```bash
 git clone https://github.com/siphon-project/siphon-sip.git
-cd siphon
+cd siphon-sip
 
 # Build and install
 PYO3_PYTHON=python3 cargo build --release
@@ -310,8 +313,7 @@ def route(request):
     if request.method == "REGISTER":
         if not auth.require_digest(request, realm=DOMAIN):
             return
-        registrar.save(request)
-        request.reply(200, "OK")
+        registrar.save(request)   # save() sends the 200 OK itself
         return
 
     # Look up registered contacts and fork
@@ -428,8 +430,7 @@ def route(request):
     if request.method == "REGISTER":
         if not auth.require_digest(request, realm="example.com"):
             return
-        registrar.save(request)
-        request.reply(200, "OK")
+        registrar.save(request)   # save() sends the 200 OK itself
         return
 
     request.reply(405, "Method Not Allowed")
@@ -457,24 +458,27 @@ No entity IDs, no separate B2BUA process, no SIP handoff between a proxy and a m
 
 ## Testing Your Scripts
 
-SIPhon ships a pure-Python mock SDK for unit-testing routing scripts without the Rust binary:
+SIPhon ships a pure-Python mock SDK (`siphon-sip` on PyPI, imported as `siphon_sdk`) for unit-testing routing scripts without the Rust binary:
 
 ```bash
-pip install siphon-sdk
+pip install siphon-sip
 ```
 
 ```python
 from siphon_sdk import SipTestHarness
 
-harness = SipTestHarness("scripts/proxy_default.py")
+harness = SipTestHarness(local_domains=["example.com"])
+harness.load_script("scripts/proxy_default.py")
 
 def test_options_keepalive():
-    result = harness.send_request("OPTIONS", "sip:example.com", is_local=True)
-    assert result.replied_with == (200, "OK")
+    result = harness.send_request("OPTIONS", "sip:example.com")
+    assert result.action == "reply"
+    assert result.status_code == 200
 
 def test_register_requires_auth():
-    result = harness.send_request("REGISTER", "sip:example.com", is_local=True)
-    assert result.replied_with[0] == 401
+    result = harness.send_request("REGISTER", "sip:example.com",
+                                  from_uri="sip:alice@example.com")
+    assert result.status_code == 401
 ```
 
 See [sdk/README.md](sdk/README.md) for the full testing guide, async handler support, and B2BUA testing.
@@ -645,6 +649,8 @@ before siphon does — siphon still has CPU headroom at that point.
 - [x] Full IMS core roles (P-CSCF, I-CSCF, S-CSCF) — see `examples/ims_*.{py,yaml}`
 - [ ] ESL/ARI-style external control interface for B2BUA
 - [ ] RTP-to-WebSocket streaming for AI/ML processing
+
+Release history is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 ## Acknowledgments
 
