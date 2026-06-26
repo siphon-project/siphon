@@ -1,0 +1,34 @@
+# Dependabot — weekly, grouped to keep PR noise low.
+#
+# NOTE: cargo PRs must NOT be auto-merged. CLAUDE.md mandates the 16-row perf
+# baseline + mem-leak test before every commit, and CI does not run perf — a
+# crate bump that is green in CI can still regress throughput or leak. Treat
+# each cargo PR as "green CI AND I ran the perf/mem baseline". github-actions
+# and docker bumps are safe to merge on green CI.
+version: 2
+updates:
+  # Rust crate dependencies — one grouped PR for all minor/patch bumps;
+  # major bumps arrive as individual PRs to review deliberately.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Pinned action versions in the workflows (checkout, rust-cache, docker/*, …).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Dockerfile base image (debian:trixie-slim).
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
