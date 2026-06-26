@@ -98,14 +98,29 @@ jobs:
             dist/siphon.service LICENSE README.md
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
+      # Stage everything into one flat dir. v1.0.0 lost the deb/rpm because
+      # cargo-deb writes to target/debian/ (NOT target/<triple>/debian/, which
+      # the old glob assumed), and the multi-path upload preserved a target/...
+      # subtree so the github-release `artifacts/*.deb` glob (top-level only)
+      # never matched. `find` locates the packages wherever the tools put them;
+      # a flat upload + if-no-files-found:error makes a future drift fail loudly
+      # instead of silently dropping a package.
+      - name: Stage release artifacts (flat)
+        run: |
+          mkdir -p out
+          cp "$ARCHIVE" out/
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            find target -name '*.deb' -exec cp {} out/ \;
+            find target -name '*.rpm' -exec cp {} out/ \;
+          fi
+          ls -l out/
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
-          path: |
-            ${{ env.ARCHIVE }}
-            target/${{ matrix.target }}/debian/*.deb
-            target/${{ matrix.target }}/generate-rpm/*.rpm
+          path: out/*
+          if-no-files-found: error
 
   # ── Publish to crates.io (Trusted Publishing — OIDC, no token) ─────────
   crates-io:
