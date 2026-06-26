@@ -1790,7 +1790,7 @@ fn init_logging(
 /// stamp it onto the registrar so subsequent `save()`s carry it.
 ///
 /// Resolution order for `instance_id`:
-///   1. ``server.instance_id`` from siphon.yaml (env-expanded by serde_yml).
+///   1. ``server.instance_id`` from siphon.yaml (env-expanded by serde_yaml_ng).
 ///   2. The ``HOSTNAME`` environment variable (Linux default).
 ///   3. Literal ``"siphon"`` as a last-resort fallback.
 ///

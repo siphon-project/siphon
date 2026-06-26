@@ -622,7 +622,8 @@ mod tests {
         // Build a TLS client config that trusts our self-signed cert
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();
         let mut cursor = std::io::Cursor::new(cert_pem);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<_> = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let mut root_store = rustls::RootCertStore::empty();

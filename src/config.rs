@@ -1,4 +1,4 @@
-//! YAML configuration — `siphon.yaml` deserialization via serde_yml.
+//! YAML configuration — `siphon.yaml` deserialization via serde_yaml_ng.
 
 use indexmap::IndexMap;
 use regex::Regex;
@@ -154,7 +154,7 @@ pub struct Config {
     /// they expect an external file) or [`Config::extension_config`]
     /// (when they consume the value directly).
     #[serde(default)]
-    pub extensions: Option<IndexMap<String, serde_yml::Value>>,
+    pub extensions: Option<IndexMap<String, serde_yaml_ng::Value>>,
 }
 
 /// B2BUA-wide configuration knobs.
@@ -2234,7 +2234,7 @@ impl Config {
 
     /// Parse YAML without env-var expansion (used after expansion is already done).
     fn from_str_raw(yaml: &str) -> Result<Self> {
-        serde_yml::from_str(yaml)
+        serde_yaml_ng::from_str(yaml)
             .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))
     }
 
@@ -2250,7 +2250,7 @@ impl Config {
     /// file"). Returns `None` when the entry is absent or its value is an
     /// inline mapping/sequence — extensions that accept inline config
     /// should call [`Config::extension_config`] instead and walk the
-    /// `serde_yml::Value` themselves.
+    /// `serde_yaml_ng::Value` themselves.
     pub fn extension_path(&self, name: &str) -> Option<&Path> {
         self.extensions
             .as_ref()?
@@ -2262,7 +2262,7 @@ impl Config {
     /// Raw-value accessor for an extension entry. Returns the entry's
     /// YAML value (any shape) for the extension to interpret. Returns
     /// `None` when the entry is absent.
-    pub fn extension_config(&self, name: &str) -> Option<&serde_yml::Value> {
+    pub fn extension_config(&self, name: &str) -> Option<&serde_yaml_ng::Value> {
         self.extensions.as_ref()?.get(name)
     }
 }
@@ -4140,12 +4140,12 @@ log:
             .expect("bar extension should resolve to a value");
         let mapping = value.as_mapping().expect("bar should be a mapping");
         let listen = mapping
-            .get(serde_yml::Value::String("listen".to_owned()))
+            .get(serde_yaml_ng::Value::String("listen".to_owned()))
             .and_then(|v| v.as_str())
             .expect("listen key");
         assert_eq!(listen, "0.0.0.0:8080");
         let workers = mapping
-            .get(serde_yml::Value::String("workers".to_owned()))
+            .get(serde_yaml_ng::Value::String("workers".to_owned()))
             .and_then(|v| v.as_u64())
             .expect("workers key");
         assert_eq!(workers, 4);

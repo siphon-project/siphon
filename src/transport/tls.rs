@@ -36,7 +36,8 @@ const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 /// Build a `TlsAcceptor` from the certificate and key paths in config.
 pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
-    use rustls_pemfile::{certs, private_key};
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
     use std::fs::File;
     use std::io::BufReader;
     use tokio_rustls::rustls;
@@ -48,14 +49,15 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
             format!("failed to open certificate file '{}': {}", tls_config.certificate, error),
         )
     })?;
-    let certificates: Vec<_> = certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to parse certificate PEM: {}", error),
-            )
-        })?;
+    let certificates: Vec<_> =
+        CertificateDer::pem_reader_iter(&mut BufReader::new(cert_file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to parse certificate PEM: {}", error),
+                )
+            })?;
 
     if certificates.is_empty() {
         return Err(io::Error::new(
@@ -71,19 +73,22 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
             format!("failed to open private key file '{}': {}", tls_config.private_key, error),
         )
     })?;
-    let key = private_key(&mut BufReader::new(key_file))
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to parse private key PEM: {}", error),
-            )
-        })?
-        .ok_or_else(|| {
-            io::Error::new(
+    let key = PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_file)).map_err(|error| {
+        // `from_pem_reader` returns `Err(NoItemsFound)` when the file held no
+        // private key — the case `rustls_pemfile::private_key` signalled with
+        // `Ok(None)`. Preserve the original "contains no private key" message
+        // for that case, and the "failed to parse" message for everything else.
+        match error {
+            rustls_pki_types::pem::Error::NoItemsFound => io::Error::new(
                 io::ErrorKind::InvalidData,
                 "private key file contains no private key",
-            )
-        })?;
+            ),
+            other => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to parse private key PEM: {}", other),
+            ),
+        }
+    })?;
 
     // Honor `verify_client` (mutual TLS). Previously this was hardcoded to
     // `with_no_client_auth()`, so the config option was silently ignored —
@@ -105,7 +110,7 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
                 format!("failed to open client CA file '{ca_path}': {error}"),
             )
         })?;
-        let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
+        let ca_certs: Vec<_> = CertificateDer::pem_reader_iter(&mut BufReader::new(ca_file))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 io::Error::new(
@@ -671,9 +676,11 @@ mod tests {
         // Read the cert back to build a client config that trusts it
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();
         let mut cursor = std::io::Cursor::new(cert_pem);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<_> =
+            rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
 
         let mut root_store = rustls::RootCertStore::empty();
         for cert in &certs {
@@ -795,9 +802,11 @@ mod tests {
         // Build TLS client
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();
         let mut cursor = std::io::Cursor::new(cert_pem);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<_> =
+            rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
         let mut root_store = rustls::RootCertStore::empty();
         for cert in &certs {
             root_store.add(cert.clone()).unwrap();
