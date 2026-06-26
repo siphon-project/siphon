@@ -48,8 +48,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          # Native ARM runner. siphon embeds CPython via PyO3, so cross-compiling
+          # aarch64 from an x86 host needs a full cross-Python (PYO3_CROSS_LIB_DIR
+          # → an aarch64 libpython); building on a native aarch64 runner makes
+          # PyO3 resolve the host python3.14 and sidesteps cross-compilation.
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -61,11 +65,7 @@ jobs:
           python-version: "3.14-dev"
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y libsctp-dev
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -75,8 +75,6 @@ jobs:
 
       - name: Build release binary
         run: PYO3_PYTHON=python3.14 cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Build .deb package
         if: matrix.target == 'x86_64-unknown-linux-gnu'
