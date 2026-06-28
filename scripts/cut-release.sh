@@ -73,6 +73,19 @@ if [ "${PERF_OK:-0}" != "1" ]; then
   [ "$answer" = "y" ] || [ "$answer" = "Y" ] || die "aborted — run the perf/mem baseline first (or set PERF_OK=1)"
 fi
 
+# ── Criterion per-message hot-path regression gate (per CLAUDE.md) ──────────
+# Unlike the 16-row SIPp baseline this is fast + fully automated, so run it
+# here. It compares the per-message hot paths (parse / serialize / header touch
+# / transaction keying) against benches/baseline.json and fails on >10% slower.
+# The numbers are hardware-specific: if this machine differs from the one that
+# produced the committed baseline, re-baseline first and commit it:
+#     scripts/bench_regression.sh --save && git add benches/baseline.json
+if [ "${BENCH_OK:-0}" != "1" ]; then
+  echo "==> criterion hot-path regression gate"
+  scripts/bench_regression.sh \
+    || die "criterion regression gate failed — diagnose/roll back, or (if the bench hardware changed) re-baseline with scripts/bench_regression.sh --save (or set BENCH_OK=1 to skip)"
+fi
+
 # ── Set the version, commit, tag, push ─────────────────────────────────────
 echo "==> setting Cargo.toml version to $VERSION"
 # Only the package version (the first `version = ` under [package]).

@@ -145,6 +145,17 @@ proptest = "1"
 tokio-test = "0.4"
 tempfile = "3"
 rcgen = "0.14"
+# Per-message hot-path microbenchmarks (benches/sip_hot_path.rs). The
+# release-cut gate (scripts/cut-release.sh) runs these via `critcmp` against a
+# committed baseline; CI only proves they compile (`cargo bench --no-run`).
+criterion = "0.5"
+
+# Criterion perf gate for the per-message SIP hot paths (parse / serialize /
+# header touch / transaction keying). `harness = false` hands `main` to
+# criterion instead of the libtest harness.
+[[bench]]
+name = "sip_hot_path"
+harness = false
 
 [features]
 default = ["redis-backend", "postgres-backend"]

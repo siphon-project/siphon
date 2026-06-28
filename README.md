@@ -622,6 +622,41 @@ ceiling from ~28k to ~32k cps, at lower CPU than before:
 Beyond ~32k the benchmark rig (64 SIPp processes on a 24-core box) saturates
 before siphon does — siphon still has CPU headroom at that point.
 
+### Per-message microbenchmarks (criterion)
+
+The SIPp table above measures **aggregate throughput**. Criterion microbenches in
+[`benches/sip_hot_path.rs`](benches/sip_hot_path.rs) isolate the **per-message
+costs** that throughput averages over — parse, serialize, header access, and
+transaction-key extraction — so a hot-path change is visible directly instead of
+diluted into a CPS figure.
+
+```sh
+PYO3_PYTHON=python3 cargo bench --bench sip_hot_path
+```
+
+The benches measure the work the proxy/B2BUA repeats on every message:
+
+| Benchmark group | What it measures |
+|-----------------|------------------|
+| `parse/*`       | RFC 3261 parse of INVITE (±SDP), REGISTER, 200 OK |
+| `serialize/*`   | Wire serialization (`to_bytes`) of a parsed message |
+| `roundtrip/*`   | Full proxy touch: parse → serialize |
+| `headers/*`     | Header read (`get`/`has`) and copy-on-write mutate (`set`/`add`) |
+| `txn_key/*`     | Transaction-matching key extraction (RFC 3261 §17) |
+
+**Regression policy.** New code on the per-message dispatch / parse / transaction
+/ serialize path ships a criterion bench in the same change; code that carries no
+per-message cost (config, persistence, scripting glue) does not. The hard gate —
+**>10% slower than [`benches/baseline.json`](benches/baseline.json) fails** — runs
+at release cut on the reference machine via
+[`scripts/bench_regression.sh`](scripts/bench_regression.sh) (wired into
+[`scripts/cut-release.sh`](scripts/cut-release.sh)), **not** in normal CI, because
+absolute timings on shared CI runners are too noisy to gate on. CI only proves the
+benches compile. If a number improves, re-baseline to lock the new floor
+(`scripts/bench_regression.sh --save`); never raise the baseline to pass a
+regression. The baseline is hardware-specific — regenerate it on the same machine
+as the table above.
+
 ## Roadmap
 
 - [x] SIP parser (RFC 3261)

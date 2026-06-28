@@ -4,6 +4,19 @@ All notable changes to SIPhon are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com/). Versioning is lockstep across
 the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
+## [Unreleased]
+
+### Internal
+- Criterion microbenchmarks for the per-message SIP hot paths
+  (`benches/sip_hot_path.rs`): parse, serialize, roundtrip, header access/mutate,
+  and transaction-key extraction. They isolate the individual costs the SIPp
+  throughput baseline averages over.
+- Release-cut regression gate (`scripts/bench_regression.sh`, wired into
+  `scripts/cut-release.sh`): fails on >10% slowdown vs the committed
+  `benches/baseline.json`. Self-contained (reads criterion's own `estimates.json`,
+  no `critcmp`/`jq`). CI proves the benches compile; the hard timing gate runs at
+  release cut on fixed hardware, where absolute timings are meaningful.
+
 ## [1.0.0] — 2026-06-26
 
 First stable release. A love letter to Kamailio and OpenSIPS — their proven
