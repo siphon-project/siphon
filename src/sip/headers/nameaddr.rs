@@ -44,8 +44,13 @@ impl NameAddr {
                 Some(strip_quotes(display).to_string())
             };
 
-            let gt_pos = input
+            // Search for the closing '>' AFTER the '<'. Searching from offset 0
+            // would find a '>' that precedes the '<' (e.g. inside a quoted display
+            // name, or a malicious `From: ><sip:a@b>`), giving a reversed range
+            // that panics the slice below. (Live-confirmed unauthenticated DoS.)
+            let gt_pos = input[lt_pos + 1..]
                 .find('>')
+                .map(|offset| lt_pos + 1 + offset)
                 .ok_or_else(|| format!("NameAddr missing '>': {input}"))?;
             let uri_str = &input[lt_pos + 1..gt_pos];
             let params_str = input[gt_pos + 1..].trim();
@@ -334,5 +339,37 @@ mod tests {
         assert_eq!(na.uri.scheme, "tel");
         assert_eq!(na.uri.user.as_deref(), Some("+15551234567"));
         assert_eq!(na.tag.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn reversed_angle_brackets_do_not_panic() {
+        // Regression: a '>' appearing before the first '<' must NOT panic the
+        // `&input[lt_pos+1..gt_pos]` slice (reversed range). Live-confirmed DoS:
+        // `From: ><sip:a@b>` panicked at nameaddr.rs:50
+        // ("byte range starts at 2 but ends at 0") and dropped the request.
+        // Post-fix the parser is lenient: the stray leading '>' is swallowed and
+        // the bracketed URI still parses — the point is it does NOT panic.
+        let poisoned = NameAddr::parse("><sip:audit@example.com>;tag=poc1").unwrap();
+        assert_eq!(poisoned.uri.user.as_deref(), Some("audit"));
+        assert_eq!(poisoned.tag.as_deref(), Some("poc1"));
+        assert!(NameAddr::parse("><sip:alice@atlanta.com>").is_ok());
+        // Lone '>' with no '<' at all → bare-URI form → rejected as a bad URI
+        // (a graceful Err, never a panic).
+        assert!(NameAddr::parse(">").is_err());
+    }
+
+    #[test]
+    fn reversed_angle_brackets_multi_do_not_panic() {
+        // Same class via the Contact multi-value path used by registrar.save().
+        assert!(NameAddr::parse_multi("><sip:a@b>").is_ok());
+    }
+
+    #[test]
+    fn gt_inside_quoted_display_name_parses() {
+        // A '>' inside the quoted display name (before the real '<') is legal and
+        // must resolve to the actual closing bracket, not the inner '>'.
+        let na = NameAddr::parse("\"a>b\" <sip:alice@atlanta.com>;tag=1").unwrap();
+        assert_eq!(na.uri.user.as_deref(), Some("alice"));
+        assert_eq!(na.tag.as_deref(), Some("1"));
     }
 }

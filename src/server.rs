@@ -267,11 +267,12 @@ impl SiphonServer {
                     // thread) can take the per-thread state without conflict
                     // — but the underlying PyThreadState remains cached, so
                     // mimalloc heap teardown is avoided.
-                    let tstate = pyo3::ffi::PyEval_SaveThread();
-                    std::mem::forget(tstate);
-                    // Don't call PyGILState_Release: we want the gstate
-                    // lifetime to match the OS thread.
-                    std::mem::forget(_gstate);
+                    //
+                    // Don't call PyGILState_Release / PyEval_RestoreThread:
+                    // that omission is what pins the state to the OS thread.
+                    // Both handles are Copy with no Drop, so no mem::forget is
+                    // needed — the bindings simply fall out of scope.
+                    let _tstate = pyo3::ffi::PyEval_SaveThread();
                 }
             })
             .build()
@@ -347,20 +348,50 @@ impl SiphonServer {
         // their pinned free-threaded-CPython mimalloc heap (~2 MB each) — the
         // anonymous-heap leak under steady SIP signalling.  See
         // `script::py_executor` for the full story.
-        // Default to 2× CPUs: the hot inbound path runs here, and the elastic
-        // `spawn_blocking` pool this replaces absorbed bursts by spawning extra
-        // threads.  A fixed pool sized to just `num_cpus` adds queue latency at
-        // the throughput ceiling (≈28k cps → sipp retransmits), so 2× restores
-        // that burst headroom.  Idle workers are cheap (a per-thread Python heap
-        // only materialises under load); memory-constrained low-traffic NFs can
-        // lower `script.sync_pool_size`.
-        let sync_pool_size = config
+        //
+        // The pool is ELASTIC: `core_threads` always-on workers, growing on
+        // demand to `max_threads` when every worker is busy, then never
+        // shrinking. This is the proper fix for the regression where moving
+        // inbound dispatch off tokio's elastic `spawn_blocking` pool onto a
+        // FIXED pool removed the burst valve — a blocking-I/O handler (HTTP /
+        // Diameter digest auth, an `on_change` notify) pins a worker for the
+        // whole call, so on a small box a couple of concurrent blocking
+        // REGISTERs exhausted the fixed pool and wedged the engine. Growth-on-
+        // demand restores the headroom; never-reaping keeps the persistent
+        // free-threaded-CPython attach from leaking (the reason the pool stopped
+        // using `spawn_blocking`).
+        //
+        // core default = max(8, 2×CPUs): the always-on baseline. The floor of 8
+        // matters on small containers — a `cpus: 0.5` box reports
+        // `available_parallelism() == 1`, which 2× alone would make a 2-thread
+        // baseline. max default = max(32, 4×core): the burst ceiling. Each grown
+        // worker costs ~2 MB of persistent Python heap, so peak memory is
+        // ~max_threads × 2 MB — lower `script.sync_pool_max` on memory-
+        // constrained NFs (and prefer `auth.http.cache_ttl_secs`, which keeps
+        // the storm from ever needing to grow).
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let core_threads = config.script.sync_pool_size.unwrap_or((cpus * 2).max(8));
+        let max_threads = config
             .script
-            .sync_pool_size
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() * 2));
+            .sync_pool_max
+            .unwrap_or((core_threads * 4).max(32))
+            .max(core_threads);
+        // Bound the queue (load-shed under overload instead of unbounded growth)
+        // and arm the liveness watchdog (abort + supervisor-restart only if the
+        // pool reaches the cap and still wedges). `handler_stall_abort_secs == 0`
+        // disables the watchdog.
+        let executor_config = crate::script::py_executor::ExecutorConfig {
+            core_threads,
+            max_threads,
+            queue_capacity: config.script.executor_queue_capacity,
+            stall_abort: match config.script.handler_stall_abort_secs {
+                0 => None,
+                secs => Some(std::time::Duration::from_secs(secs)),
+            },
+        };
         crate::script::py_executor::PyExecutor::install(
-            sync_pool_size,
             tokio::runtime::Handle::current(),
+            executor_config,
         );
 
         dispatcher::inject_python_singletons(&config);
@@ -383,6 +414,9 @@ impl SiphonServer {
 
         // --- Presence singleton ---
         let presence_store = Arc::new(crate::presence::PresenceStore::new());
+        // Install the global handle so the dispatcher's cleanup tick can expire
+        // stale presence documents/subscriptions (L1 has no TTL reaper of its own).
+        crate::presence::set_global_store(Arc::clone(&presence_store));
         pyo3::Python::attach(|python| {
             let py_presence = crate::script::api::presence::PyPresence::new(Arc::clone(&presence_store));
             if let Err(error) = crate::script::api::set_presence_singleton(python, py_presence) {
@@ -578,6 +612,10 @@ impl SiphonServer {
             let manager = Arc::new(crate::ipsec::IpsecManager::with_partition(
                 backend, spi_start, spi_count,
             ));
+            // Register the process-wide handle so the dispatcher's 30 s
+            // cleanup tick can sweep abandoned SA pairs (states + policies +
+            // map entry) once they pass their own hard-lifetime + grace.
+            crate::ipsec::set_global_manager(Arc::clone(&manager));
             info!(
                 backend = ?backend,
                 spi_start,
@@ -619,6 +657,46 @@ impl SiphonServer {
             None
         };
 
+        // --- STIR/SHAKEN namespace (siphon.stir) ---
+        //
+        // Must be wired BEFORE `ScriptEngine::new()` so the script's top-level
+        // `from siphon import stir` resolves.  Loads the signing key + STI-CA
+        // trust anchors from disk and builds the x5u HTTP client; a bad path /
+        // unparseable key fails startup loudly rather than at first call.
+        if let Some(ref stir_config) = config.stir {
+            if stir_config.enabled
+                && (stir_config.signing.is_some() || stir_config.verification.is_some())
+            {
+                match crate::stir::StirService::from_config(stir_config) {
+                    Ok(service) => {
+                        let signing = service.signing_enabled();
+                        let verification = service.verification_enabled();
+                        pyo3::Python::attach(|python| {
+                            let py_stir = crate::script::api::stir::PyStir::new(service);
+                            if let Err(error) =
+                                crate::script::api::set_stir_singleton(python, py_stir)
+                            {
+                                error!("failed to store STIR singleton: {error}");
+                            } else {
+                                info!(
+                                    signing,
+                                    verification,
+                                    "stir namespace registered for injection (STIR/SHAKEN)"
+                                );
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        error!("failed to initialize STIR/SHAKEN service: {error}");
+                        eprintln!("STIR/SHAKEN configuration error: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                info!("stir block present but disabled or empty — STIR/SHAKEN not wired");
+            }
+        }
+
         // --- Subscribe-state namespace (proxy.subscribe_state) ---
         //
         // Must run BEFORE `ScriptEngine::new()` so that
@@ -651,6 +729,10 @@ impl SiphonServer {
                 }
             }
             let store_arc = Arc::new(store);
+            // Install the global handle so the dispatcher's cleanup tick can
+            // sweep expired/abandoned subscribe dialogs out of L1 (which, unlike
+            // L2, has no TTL reaper of its own).
+            crate::subscribe_state::set_global_store(Arc::clone(&store_arc));
             pyo3::Python::attach(|python| {
                 let namespace =
                     crate::script::api::subscribe_state::PySubscribeState::new(
@@ -663,6 +745,48 @@ impl SiphonServer {
                 }
             });
         }
+
+        // --- Registrant manager + registration namespace ---
+        //
+        // Create the manager and install the `registration` Python namespace
+        // BEFORE `ScriptEngine::new()` — same reason as subscribe_state above.
+        // A script's `from siphon import registration` binds whatever
+        // `siphon.registration` is at import time; if the Rust namespace is
+        // installed later (when the background loop is wired, which needs
+        // `outbound_senders`), the script keeps the no-op `_RegistrationNamespace`
+        // stub and `registration.flow()` / `service_route()` raise
+        // NotImplementedError at call time. The config entries + refresh loop
+        // are wired later in `init_registrant` using this same manager.
+        let registrant_manager: Option<Arc<crate::registrant::RegistrantManager>> =
+            config.registrant.as_ref().map(|registrant_config| {
+                let registrant_user_agent = config
+                    .server
+                    .as_ref()
+                    .and_then(|server| server.user_agent_header.clone())
+                    .or_else(|| Some(format!("{product_name}/{product_version}")));
+                let manager = Arc::new(crate::registrant::RegistrantManager::new(
+                    registrant_config.default_interval,
+                    std::time::Duration::from_secs(registrant_config.retry_interval),
+                    std::time::Duration::from_secs(registrant_config.max_retry_interval),
+                    registrant_user_agent,
+                ));
+                pyo3::Python::attach(|python| {
+                    // PyRegistration ignores local_addr (flow() takes ue_ip
+                    // explicitly); pass a placeholder.
+                    let py_registration = crate::script::api::registrant::PyRegistration::new(
+                        Arc::clone(&manager),
+                        std::net::SocketAddr::from(([0u8, 0, 0, 0], 0)),
+                    );
+                    if let Err(error) =
+                        crate::script::api::set_registration_singleton(python, py_registration)
+                    {
+                        error!("failed to store registration singleton: {error}");
+                    } else {
+                        info!("registration namespace registered for injection");
+                    }
+                });
+                manager
+            });
 
         // --- Script engine ---
         let engine = if let Some(bytecode) = self.embedded_bytecode {
@@ -708,6 +832,71 @@ impl SiphonServer {
 
         // --- Build transport ACL ---
         let transport_acl = build_transport_acl(&config);
+
+        // --- Auto-ban (failed_auth_ban scanner protection) ---
+        // Opt-in: only installed when configured. Once installed, the auth path
+        // (challenge/success), the dispatcher (non-ACK INVITE Timer H), and the
+        // transport ACL (is_allowed) all reach it via crate::security::auto_ban().
+        if let Some(ref sec) = config.security {
+            if let Some(ref fab) = sec.failed_auth_ban {
+                let store = Arc::new(crate::security::AutoBanStore::new(
+                    fab.threshold,
+                    fab.window_secs,
+                    fab.ban_duration_secs,
+                    &sec.trusted_cidrs,
+                    fab.strong_signal_weight,
+                ));
+                crate::security::set_auto_ban(Arc::clone(&store));
+                info!(
+                    threshold = fab.threshold,
+                    window_secs = fab.window_secs,
+                    ban_duration_secs = fab.ban_duration_secs,
+                    strong_signal_weight = fab.strong_signal_weight,
+                    trusted_cidrs = sec.trusted_cidrs.len(),
+                    "failed_auth_ban scanner protection enabled"
+                );
+                // Periodic prune (bounds memory under scanner churn) + publish the
+                // banned_ips gauge authoritatively each tick.
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                    loop {
+                        ticker.tick().await;
+                        store.prune();
+                        if let Some(metrics) = crate::metrics::try_metrics() {
+                            metrics.banned_ips.set(store.active_bans() as i64);
+                        }
+                    }
+                });
+            }
+
+            // --- Request security filter (rate_limit + scanner_block) ---
+            // Opt-in: only installed when `security.rate_limit` and/or
+            // `security.scanner_block` is set. Once installed, the dispatcher
+            // consults it on every inbound request (before transaction/dialog
+            // processing) via crate::security::security_filter(). trusted_cidrs
+            // are exempt from both checks.
+            if let Some(filter) = crate::security::SecurityFilter::from_config(sec) {
+                crate::security::set_security_filter(Arc::clone(&filter));
+                info!(
+                    rate_limit = sec.rate_limit.is_some(),
+                    scanner_user_agents = sec
+                        .scanner_block
+                        .as_ref()
+                        .map(|block| block.user_agents.len())
+                        .unwrap_or(0),
+                    trusted_cidrs = sec.trusted_cidrs.len(),
+                    "request security filter enabled (rate_limit / scanner_block)"
+                );
+                // Periodic prune to bound the rate-limiter maps under scanner churn.
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                    loop {
+                        ticker.tick().await;
+                        filter.prune();
+                    }
+                });
+            }
+        }
 
         // --- Transport channels ---
         let (inbound_tx, inbound_rx) = flume::unbounded();
@@ -822,6 +1011,55 @@ impl SiphonServer {
             .and_then(|nat_config| nat_config.crlf_keepalive.as_ref())
             .map(|_| Arc::new(transport::crlf_keepalive::CrlfPongTracker::new()));
 
+        // RFC 5626 §4.2.2 flow-failure deregistration.  When registration
+        // liveness is enabled, a closed stream connection (peer FIN/RST, read
+        // error, idle timeout, or CRLF-keepalive failure) deregisters the
+        // bindings that arrived on it.  Each stream listener (TCP/TLS/WS/WSS)
+        // is handed `close_tx` and enqueues the dead `ConnectionId.0`; this
+        // task drains the channel and calls `Registrar::unregister_flow`.
+        // Left `None` when liveness is disabled so transports never enqueue
+        // (an unbounded channel with no receiver would otherwise grow).
+        let connection_close_tx: Option<flume::Sender<u64>> =
+            if config.registrar.liveness.enabled {
+                let liveness = &config.registrar.liveness;
+                tracing::info!(
+                    keepalive_interval_secs = liveness.keepalive_interval_secs,
+                    idle_multiplier = liveness.idle_multiplier,
+                    probe_timeout_ms = liveness.probe_timeout_ms,
+                    dereg_mode = ?liveness.dereg_mode,
+                    "registrar liveness ENABLED — flow-failure dereg (TCP/TLS/WS/WSS) + UDP+IPsec idle sweep active"
+                );
+                let dereg_mode = liveness.dereg_mode;
+                let (close_tx, close_rx) = flume::unbounded::<u64>();
+                tokio::spawn(async move {
+                    while let Ok(connection_id) = close_rx.recv_async().await {
+                        if let Some(registrar) = crate::script::api::registrar_arc() {
+                            let removed = registrar.unregister_flow_collect(connection_id);
+                            if !removed.is_empty() {
+                                tracing::info!(
+                                    connection_id,
+                                    removed = removed.len(),
+                                    "registrar liveness: flow-failure deregistration (stream connection closed)"
+                                );
+                                // Cascade to the registrar of record: under
+                                // network_dereg, a P-CSCF cache binding also
+                                // de-REGISTERs (Expires: 0) toward the S-CSCF.
+                                crate::dispatcher::liveness_flow_failure_network_dereg(
+                                    removed, dereg_mode,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                });
+                Some(close_tx)
+            } else {
+                tracing::debug!(
+                    "registrar liveness disabled — Expires-only deregistration"
+                );
+                None
+            };
+
         // TCP
         let tcp_connection_map = Arc::new(dashmap::DashMap::new());
         // Resolve TCP listen addresses up-front so we know the
@@ -848,9 +1086,15 @@ impl SiphonServer {
             tcp_entries.push((addr, tos, entry.dscp().or(global_dscp)));
         }
 
-        // TLS maps — created before pool so pool can register connections for reuse.
-        let tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>> =
-            Arc::new(dashmap::DashMap::new());
+        // Stream-connection registry — created before the pool/listeners so all
+        // stream transports (TLS, WS, WSS) and the pool register here, and the
+        // dispatcher can reuse an inbound connection for MT routing (the only
+        // way to reach a WebSocket UE; RFC 7118 §5 / RFC 5626 §5.3).  Supersedes
+        // the former TLS-only `tls_addr_map`.
+        let stream_connections = transport::StreamConnections::new();
+        // Publish it process-globally so the Python `Flow.is_alive` getter can
+        // do a real liveness lookup against the live connection set.
+        crate::script::api::set_stream_connections(stream_connections.clone());
         let tls_connection_map: Arc<dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>> =
             Arc::new(dashmap::DashMap::new());
 
@@ -869,14 +1113,14 @@ impl SiphonServer {
             inbound_tx.clone(),
             pool_local_addr,
             pool_tos,
-            Some(Arc::clone(&tls_addr_map)),
+            Some(stream_connections.clone()),
             crlf_pong_tracker.clone(),
         ));
 
         // Spawn TCP listeners now that the pool exists.
         for (addr, tos, dscp) in tcp_entries {
             info!(addr = %addr, dscp = ?dscp, "starting TCP transport");
-            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone()).await;
+            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
         }
 
         if let Some(ref tls_config) = config.tls {
@@ -894,7 +1138,7 @@ impl SiphonServer {
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TLS transport");
-                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone()).await;
+                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
             }
         }
 
@@ -914,7 +1158,7 @@ impl SiphonServer {
             }
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WS transport");
-            transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl), tos).await;
+            transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, connection_close_tx.clone()).await;
         }
 
         // WSS
@@ -934,7 +1178,7 @@ impl SiphonServer {
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WSS transport");
-                transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl), tos).await;
+                transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, connection_close_tx.clone()).await;
             }
         }
 
@@ -1163,7 +1407,11 @@ impl SiphonServer {
         }
 
         // --- Outbound registration ---
-        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, Arc::clone(&tls_addr_map), product_name, product_version);
+        // `registrant_manager` was created (and its Python namespace installed)
+        // before ScriptEngine::new; here we wire its config entries + loop.
+        if let Some(ref manager) = registrant_manager {
+            init_registrant(manager, &config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, stream_connections.clone());
+        }
 
         // --- LI tasks ---
         spawn_li_tasks(li_state, &config);
@@ -1184,20 +1432,65 @@ impl SiphonServer {
 
             // Create NpcfClient and inject as Python singleton
             if let Some(ref npcf_url) = sbi_config.npcf_url {
+                // SBI communication model (TS 29.500 §6.10): direct to the NF
+                // (default) or indirect via the SCP with 3gpp-Sbi-* headers.
+                let communication = crate::sbi::Communication::from_config_str(
+                    sbi_config.communication.as_deref().unwrap_or("direct"),
+                );
+                let requester_nf_type =
+                    sbi_config.requester_nf_type.as_deref().unwrap_or("AF");
+
                 let http_client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(sbi_config.timeout_secs))
                     .build()
                     .unwrap_or_default();
                 let npcf_client = std::sync::Arc::new(
                     crate::sbi::npcf::NpcfClient::new(npcf_url, http_client)
+                        .with_communication(communication),
                 );
+
+                // Optional Nbsf_Management (BSF) discovery client. Its own
+                // reqwest client carries the BSF-specific timeout
+                // (bsf_timeout_ms, falling back to timeout_secs).
+                let bsf_client = sbi_config.bsf_url.as_ref().map(|bsf_url| {
+                    let bsf_timeout = std::time::Duration::from_millis(
+                        sbi_config
+                            .bsf_timeout_ms
+                            .unwrap_or(sbi_config.timeout_secs.saturating_mul(1000)),
+                    );
+                    let bsf_http = reqwest::Client::builder()
+                        .timeout(bsf_timeout)
+                        .build()
+                        .unwrap_or_default();
+                    std::sync::Arc::new(
+                        crate::sbi::nbsf::BsfClient::new(bsf_url, bsf_http)
+                            .with_communication(communication)
+                            .with_requester_nf_type(requester_nf_type),
+                    )
+                });
+                let pcf_scheme = crate::sbi::nbsf::Scheme::from_config_str(
+                    sbi_config.pcf_scheme.as_deref().unwrap_or("http"),
+                );
+
                 pyo3::Python::attach(|python| {
-                    let py_sbi = crate::script::api::sbi::PySbi::new(npcf_client);
+                    let py_sbi = crate::script::api::sbi::PySbi::new(
+                        npcf_client,
+                        bsf_client,
+                        pcf_scheme,
+                    );
                     if let Err(error) = crate::script::api::set_sbi_singleton(python, py_sbi) {
                         error!("failed to store SBI singleton: {error}");
                     }
                 });
                 info!(npcf_url = %npcf_url, "Npcf client initialized and exposed to Python");
+                if let Some(ref bsf_url) = sbi_config.bsf_url {
+                    info!(bsf_url = %bsf_url, "BSF (Nbsf_Management) discovery client initialized");
+                }
+            } else if sbi_config.bsf_url.is_some() {
+                tracing::warn!(
+                    "sbi.bsf_url is set but sbi.npcf_url is not — the sbi namespace \
+                     (and discover_pcf_binding) is only exposed when npcf_url is configured"
+                );
             }
 
             // Start SBI notification listener for PCF events (N5 callback)
@@ -1208,7 +1501,7 @@ impl SiphonServer {
                 });
                 let engine_for_sbi = Arc::clone(&engine);
                 tokio::spawn(async move {
-                    use axum::{routing::post, extract::State, Json, Router};
+                    use axum::{routing::post, extract::State, Router};
 
                     #[derive(Clone)]
                     struct SbiNotifState {
@@ -1217,9 +1510,21 @@ impl SiphonServer {
 
                     async fn handle_pcf_notification(
                         State(state): State<SbiNotifState>,
-                        Json(body): Json<crate::sbi::npcf::PcfEventNotification>,
+                        body: axum::body::Bytes,
                     ) -> axum::http::StatusCode {
-                        let _ = crate::script::py_executor::run(move || {
+                        // The full PCF document (TS 29.514 EventsNotification) is
+                        // handed to the script verbatim — never projected through a
+                        // typed struct (see pcf_notification_body_to_json).
+                        let json_str = match pcf_notification_body_to_json(&body) {
+                            Some(json_str) => json_str,
+                            None => {
+                                tracing::error!(
+                                    "PCF event notification body was not valid JSON"
+                                );
+                                return axum::http::StatusCode::BAD_REQUEST;
+                            }
+                        };
+                        let _ = crate::script::py_executor::try_run(move || {
                             pyo3::Python::attach(|python| {
                                 use pyo3::types::PyAnyMethods;
                                 let engine_state = state.engine.state();
@@ -1230,14 +1535,6 @@ impl SiphonServer {
                                     return;
                                 }
 
-                                // Convert PcfEventNotification to a Python dict via json.loads
-                                let json_str = match serde_json::to_string(&body) {
-                                    Ok(s) => s,
-                                    Err(error) => {
-                                        tracing::error!(%error, "failed to serialize PCF event");
-                                        return;
-                                    }
-                                };
                                 let py_dict: pyo3::Py<pyo3::PyAny> = {
                                     use pyo3::types::PyAnyMethods;
                                     match python.import("json")
@@ -1305,7 +1602,7 @@ impl SiphonServer {
                         keepalive_config.clone(),
                         Arc::clone(registrar),
                         Arc::clone(&uac_sender),
-                        Arc::clone(&tls_addr_map),
+                        stream_connections.clone(),
                     );
                 }
             }
@@ -1363,7 +1660,7 @@ impl SiphonServer {
             registrant_manager,
             ipsec_manager,
             config.ipsec.clone(),
-            tls_addr_map,
+            stream_connections,
             registrar_event_rx,
             diameter_incoming_rx,
             rtpengine_events_rx,
@@ -1509,7 +1806,7 @@ fn init_logging(
 /// stamp it onto the registrar so subsequent `save()`s carry it.
 ///
 /// Resolution order for `instance_id`:
-///   1. ``server.instance_id`` from siphon.yaml (env-expanded by serde_yml).
+///   1. ``server.instance_id`` from siphon.yaml (env-expanded by serde_yaml_ng).
 ///   2. The ``HOSTNAME`` environment variable (Linux default).
 ///   3. Literal ``"siphon"`` as a last-resort fallback.
 ///
@@ -1880,12 +2177,14 @@ fn spawn_rf_register_emitter(
                 RegistrationEvent::Deregistered { aor } => (aor.clone(), -200),
                 RegistrationEvent::Expired { aor } => (aor.clone(), -487),
             };
-            let mut ims_data = ImsChargingData::default();
-            ims_data.calling_party = Some(aor.clone());
-            ims_data.sip_method = Some("REGISTER".to_string());
-            ims_data.role_of_node = Some(NodeRole::OriginatingRole);
-            ims_data.node_functionality = service.node_functionality();
-            ims_data.cause_code = Some(cause_code);
+            let ims_data = ImsChargingData {
+                calling_party: Some(aor.clone()),
+                sip_method: Some("REGISTER".to_string()),
+                role_of_node: Some(NodeRole::OriginatingRole),
+                node_functionality: service.node_functionality(),
+                cause_code: Some(cause_code),
+                ..Default::default()
+            };
             let _ = service.acr_event(ims_data, Some(aor)).await;
         }
         info!("rf: registrar ACR-EVENT emitter stopped");
@@ -1926,31 +2225,26 @@ fn init_rf_charging(
     Some(service)
 }
 
+/// Wire the config entries + background refresh loop onto the registrant
+/// `manager` that was created (and whose Python namespace was installed) early
+/// in `serve()` — before `ScriptEngine::new()` — so the script's
+/// `registration` namespace is the real Rust one, not the stub.
 fn init_registrant(
+    manager: &Arc<crate::registrant::RegistrantManager>,
     config: &Config,
     outbound_senders: &Arc<transport::OutboundRouter>,
     local_addr: std::net::SocketAddr,
     listen_addrs: &std::collections::HashMap<transport::Transport, std::net::SocketAddr>,
     advertised_addrs: &std::collections::HashMap<transport::Transport, String>,
     hep_sender: &Option<Arc<HepSender>>,
-    tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>>,
-    product_name: &str,
-    product_version: &str,
-) -> Option<Arc<crate::registrant::RegistrantManager>> {
-    use crate::registrant::{RegistrantCredentials, RegistrantEntry, RegistrantManager};
+    stream_connections: transport::StreamConnections,
+) {
+    use crate::registrant::{RegistrantCredentials, RegistrantEntry};
 
-    let registrant_config = config.registrant.as_ref()?;
-
-    let registrant_user_agent = config.server.as_ref()
-        .and_then(|server| server.user_agent_header.clone())
-        .or_else(|| Some(format!("{product_name}/{product_version}")));
-
-    let manager = Arc::new(RegistrantManager::new(
-        registrant_config.default_interval,
-        std::time::Duration::from_secs(registrant_config.retry_interval),
-        std::time::Duration::from_secs(registrant_config.max_retry_interval),
-        registrant_user_agent,
-    ));
+    let registrant_config = match config.registrant.as_ref() {
+        Some(config) => config,
+        None => return,
+    };
 
     for entry_config in &registrant_config.entries {
         let registrar_host = entry_config.registrar
@@ -1999,6 +2293,93 @@ fn init_registrant(
         if is_hostname {
             entry.address_str = Some(address_str.clone());
         }
+
+        // IMS AKAv1-MD5 (3GPP TS 33.203): attach the USIM secrets so the 401
+        // runs through Milenage instead of password digest.
+        let entry = if entry_config
+            .auth
+            .as_deref()
+            .map(|mode| mode.eq_ignore_ascii_case("aka"))
+            .unwrap_or(false)
+        {
+            let aka_config = match &entry_config.aka {
+                Some(aka) => aka,
+                None => {
+                    error!(aor = %entry_config.aor, "auth: aka requires an `aka:` block, skipping entry");
+                    continue;
+                }
+            };
+            let credentials = match crate::registrant::aka::AkaCredentials::from_hex(
+                &aka_config.k,
+                aka_config.op.as_deref(),
+                aka_config.opc.as_deref(),
+                &aka_config.amf,
+            ) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    error!(aor = %entry_config.aor, %error, "invalid AKA credentials, skipping entry");
+                    continue;
+                }
+            };
+            let initial_sqn = match crate::ipsec::milenage::hex_to_bytes(&aka_config.sqn) {
+                Some(bytes) if bytes.len() == 6 => {
+                    let mut sqn = [0u8; 6];
+                    sqn.copy_from_slice(&bytes);
+                    sqn
+                }
+                _ => {
+                    error!(aor = %entry_config.aor, "sqn must be 12 hex chars, skipping entry");
+                    continue;
+                }
+            };
+            entry.with_aka(credentials, initial_sqn)
+        } else {
+            entry
+        };
+
+        // IPsec sec-agree (UE side) — only meaningful alongside auth: aka.
+        let entry = if let Some(ipsec_config) = &entry_config.ipsec {
+            if entry.auth_mode != crate::registrant::AuthMode::Aka {
+                error!(aor = %entry_config.aor, "registrant ipsec requires auth: aka, skipping entry");
+                continue;
+            }
+            let aalg = match crate::ipsec::IntegrityAlgorithm::from_sec_agree_name(&ipsec_config.alg) {
+                Some(alg) => alg,
+                None => {
+                    error!(aor = %entry_config.aor, alg = %ipsec_config.alg, "unknown ipsec alg, skipping entry");
+                    continue;
+                }
+            };
+            let ealg = match crate::ipsec::EncryptionAlgorithm::from_sec_agree_name(&ipsec_config.ealg) {
+                Some(ealg) => ealg,
+                None => {
+                    error!(aor = %entry_config.aor, ealg = %ipsec_config.ealg, "unknown ipsec ealg, skipping entry");
+                    continue;
+                }
+            };
+            entry.with_ipsec(crate::registrant::UeIpsec::new(
+                ipsec_config.ue_port_c,
+                ipsec_config.ue_port_s,
+                aalg,
+                ealg,
+            ))
+        } else {
+            entry
+        };
+
+        // IMS Contact feature tags (instance ID + MMTel/video/SMS).
+        let entry = if let Some(ims_config) = &entry_config.ims {
+            let has = |tag: &str| ims_config.features.iter().any(|f| f.eq_ignore_ascii_case(tag));
+            entry.with_ims_contact(crate::registrant::ImsContactParams {
+                instance_id: ims_config.imei.clone(),
+                mmtel: has("mmtel"),
+                video: has("video"),
+                smsip: has("smsip"),
+            })
+        } else {
+            entry
+        };
+
         manager.add(entry);
     }
 
@@ -2009,13 +2390,13 @@ fn init_registrant(
 
     // Spawn background registration loop
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let loop_manager = Arc::clone(&manager);
+    let loop_manager = Arc::clone(manager);
     let loop_outbound = Arc::clone(outbound_senders);
     let loop_listen_addrs = listen_addrs.clone();
     let loop_advertised_addrs = advertised_addrs.clone();
     let loop_advertised_address = config.advertised_address.clone();
     let loop_hep_sender = hep_sender.clone();
-    let loop_tls_addr_map = Some(tls_addr_map);
+    let loop_stream_connections = Some(stream_connections);
     tokio::spawn(async move {
         crate::registrant::registration_loop(
             loop_manager,
@@ -2025,7 +2406,7 @@ fn init_registrant(
             loop_advertised_addrs,
             loop_advertised_address,
             loop_hep_sender,
-            loop_tls_addr_map,
+            loop_stream_connections,
             shutdown_rx,
         ).await;
     });
@@ -2035,21 +2416,8 @@ fn init_registrant(
     // starving the sleep branch and preventing REGISTERs from being sent.
     std::mem::forget(shutdown_tx);
 
-    // Inject registration Python API
-    let py_manager = Arc::clone(&manager);
-    pyo3::Python::attach(|python| {
-        let py_registration = crate::script::api::registrant::PyRegistration::new(
-            py_manager,
-            local_addr,
-        );
-        if let Err(error) = crate::script::api::set_registration_singleton(python, py_registration) {
-            error!("failed to store registration singleton: {error}");
-        } else {
-            info!("registration namespace registered for injection");
-        }
-    });
-
-    Some(manager)
+    // The `registration` Python namespace was already installed early in
+    // `serve()` (before ScriptEngine::new) using this same manager.
 }
 
 fn spawn_li_tasks(
@@ -2175,10 +2543,68 @@ fn build_transport_acl(config: &Config) -> Arc<transport::acl::TransportAcl> {
     }
 }
 
+/// Decode a PCF event-notification callback body (TS 29.514 `EventsNotification`)
+/// into the JSON string handed verbatim to `@sbi.on_event`.
+///
+/// The body is passed through **losslessly** — never projected through a typed
+/// Rust struct. `EventsNotification` is large and evolving (`evSubsUri`,
+/// `qosMonReports`, `succResourcAllocReports`, `accessType`, `plmnId`, …); a
+/// typed model would silently drop every field it doesn't list — including the
+/// required `evSubsUri` the script needs to correlate the event with a session —
+/// and an unmodelled inner shape (e.g. `flows` = `{medCompN, fNums}`, not
+/// `{flowId, …}`) would fail deserialization and `422` the entire callback,
+/// dropping the event. Returns `None` only when the body is not well-formed
+/// JSON.
+fn pcf_notification_body_to_json(raw: &[u8]) -> Option<String> {
+    // Validate it parses as JSON (rejecting genuine garbage with a 400), then
+    // re-emit — every key/value is preserved.
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    serde_json::to_string(&value).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A real-shaped TS 29.514 `EventsNotification` (the body a PCF POSTs to the
+    /// AF callback) must reach the script with EVERY field intact. The old typed
+    /// projection both dropped `evSubsUri`/`succResourcAllocReports` and `422`'d
+    /// the whole callback because its `flows` model wanted `flowId` instead of
+    /// the spec's `{medCompN, fNums}`.
+    #[test]
+    fn pcf_notification_body_is_passed_through_losslessly() {
+        let body = r#"{
+            "evSubsUri": "http://pcf01:8080/npcf-policyauthorization/v1/app-sessions/sess-abc/events",
+            "evNotifs": [
+                {
+                    "event": "SUCCESSFUL_RESOURCES_ALLOCATION",
+                    "flows": [ { "medCompN": 1, "fNums": [1, 2] } ]
+                }
+            ],
+            "succResourcAllocReports": [ { "medComponents": {} } ]
+        }"#;
+        let out = pcf_notification_body_to_json(body.as_bytes())
+            .expect("well-formed JSON must decode");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        // evSubsUri — the correlation key — survives.
+        assert_eq!(
+            value["evSubsUri"].as_str(),
+            Some("http://pcf01:8080/npcf-policyauthorization/v1/app-sessions/sess-abc/events")
+        );
+        // The spec flow shape ({medCompN, fNums}) survives — would have 422'd before.
+        let flow = &value["evNotifs"][0]["flows"][0];
+        assert_eq!(flow["medCompN"].as_u64(), Some(1));
+        assert_eq!(flow["fNums"][1].as_u64(), Some(2));
+        // Fields outside the old typed model survive.
+        assert!(value.get("succResourcAllocReports").is_some());
+    }
+
+    #[test]
+    fn pcf_notification_body_rejects_non_json() {
+        assert!(pcf_notification_body_to_json(b"not json at all").is_none());
+    }
 
     #[test]
     fn register_task_records_in_order() {

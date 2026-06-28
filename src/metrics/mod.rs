@@ -74,6 +74,17 @@ pub struct SiphonMetrics {
     /// means completed-call dialog keys are leaking (`by_dialog_key`).
     pub proxy_dialog_sessions: IntGauge,
 
+    /// Live SUBSCRIBE dialogs in the L1 `subscribe_state` store.  A monotonic
+    /// climb under a steady subscribe/expire workload means expired dialogs
+    /// are leaking (L1 has no TTL; the sweep reaps them).
+    pub subscribe_dialogs: IntGauge,
+
+    /// Live P-CSCF IPsec SA pairs in the `IpsecManager` (one per registered
+    /// UE binding; each backs 4 XFRM states + 4 policies).  A monotonic climb
+    /// under a steady REGISTER/expire workload means abandoned-UE SAs are
+    /// leaking — the sweep reaps them on their own hard-lifetime + grace.
+    pub ipsec_sa_pairs: IntGauge,
+
     // --- Registration gauges ---
     pub registrations_active: IntGauge,
 
@@ -115,6 +126,67 @@ pub struct SiphonMetrics {
     pub script_executions_total: IntCounterVec,
     pub script_errors_total: IntCounter,
 
+    // --- Synchronous Python executor pool (handler dispatch) ---
+    /// Live worker-thread count of the synchronous Python executor pool. The
+    /// pool is elastic: this grows from the core size toward `pyexec_pool_max`
+    /// under load and never shrinks. Saturation = `pyexec_inflight == pyexec_pool_size`.
+    pub pyexec_pool_size: IntGauge,
+    /// Configured hard ceiling on executor worker threads. When `pyexec_pool_size`
+    /// reaches this and stays saturated, the pool can no longer absorb more
+    /// blocking handlers — the watchdog's abort condition.
+    pub pyexec_pool_max: IntGauge,
+    /// Handler jobs currently executing on a pool worker. Pinned at
+    /// `pyexec_pool_size` means the pool is fully saturated — every worker is
+    /// busy and new work is queueing. Sampled by the pool watchdog.
+    pub pyexec_inflight: IntGauge,
+    /// Handler jobs waiting in the pool's bounded queue. A sustained climb means
+    /// handlers are not draining fast enough (blocking I/O, a wedged backend).
+    /// Sampled by the pool watchdog.
+    pub pyexec_queue_depth: IntGauge,
+    /// Handler jobs completed by the pool. With `pyexec_inflight` pinned at the
+    /// pool size, a flat `completed` rate is the precise signal that the pool
+    /// has wedged (zero forward progress) — what the watchdog aborts on.
+    pub pyexec_jobs_completed_total: IntCounter,
+    /// Handler jobs shed because the pool's bounded queue was full (load-shed
+    /// under overload). Non-zero means inbound work was dropped; the SIP client
+    /// retransmits. Alert on a sustained rate.
+    pub pyexec_jobs_shed_total: IntCounter,
+
+    // --- Auth (HTTP backend) ---
+    /// HTTP-auth credential lookups served from the in-process HA1 cache
+    /// instead of a blocking backend fetch (`auth.http.cache_ttl_secs`). A high
+    /// hit ratio is what keeps a registration storm from translating 1:1 into
+    /// blocking HTTP on the executor pool.
+    pub auth_ha1_cache_hits_total: IntCounter,
+
+    // --- Security / abuse (failed_auth_ban scanner protection) ---
+    /// Source IPs currently auto-banned. Pruned periodically; trusted_cidrs are
+    /// never counted. Alert on a sustained rise to spot a scanning campaign.
+    pub banned_ips: IntGauge,
+    /// Total failures recorded toward the auto-ban: auth challenges that were not
+    /// followed by a success, plus non-ACK INVITE server-transaction timeouts.
+    pub auth_failures_total: IntCounter,
+    /// Total TLS/WSS/WS handshakes that failed or timed out before completing,
+    /// each recorded toward the auto-ban. These are TCP-validated source IPs
+    /// (no spoofing), so a sustained rise is an unambiguous scanning campaign.
+    pub handshake_failures_total: IntCounter,
+    /// Total digest attempts carrying present-but-invalid credentials (wrong
+    /// password) or a forged/stale/replayed nonce, each recorded toward the
+    /// auto-ban as a high-confidence signal. Distinct from `auth_failures_total`
+    /// (which counts credential-less challenge first-legs).
+    pub credential_failures_total: IntCounter,
+    /// Total non-SIP / unparseable messages received on a stream transport
+    /// (TCP/TLS) and dropped, each recorded toward the auto-ban. Excludes
+    /// incomplete-but-plausible frames, empty connections, and CRLF keepalives.
+    pub malformed_messages_total: IntCounter,
+    /// Total inbound requests dropped because the source's User-Agent matched a
+    /// `security.scanner_block` signature (sipvicious, friendly-scanner, …).
+    pub scanner_blocked_total: IntCounter,
+    /// Total inbound requests dropped because the source exceeded
+    /// `security.rate_limit.max_requests` within the window (PIKE-style flood
+    /// protection). trusted_cidrs are never counted.
+    pub rate_limited_total: IntCounter,
+
     // --- Diameter ---
     pub diameter_peers_connected: IntGauge,
     pub diameter_requests_total: IntCounterVec,
@@ -155,6 +227,16 @@ impl SiphonMetrics {
         let proxy_dialog_sessions = IntGauge::new(
             "siphon_proxy_dialog_sessions",
             "Live proxy dialog-key entries (INVITEs within their 2xx ACK window)",
+        )?;
+
+        let subscribe_dialogs = IntGauge::new(
+            "siphon_subscribe_dialogs",
+            "Live SUBSCRIBE dialogs in the L1 subscribe_state store",
+        )?;
+
+        let ipsec_sa_pairs = IntGauge::new(
+            "siphon_ipsec_sa_pairs",
+            "Live P-CSCF IPsec SA pairs in the IpsecManager (4 XFRM states + 4 policies each)",
         )?;
 
         let registrations_active = IntGauge::new(
@@ -230,6 +312,71 @@ impl SiphonMetrics {
             "Total Python script execution errors",
         )?;
 
+        let pyexec_pool_size = IntGauge::new(
+            "siphon_pyexec_pool_size",
+            "Live worker threads in the synchronous Python executor pool (elastic; grows to pool_max)",
+        )?;
+        let pyexec_pool_max = IntGauge::new(
+            "siphon_pyexec_pool_max",
+            "Configured hard ceiling on synchronous Python executor worker threads",
+        )?;
+        let pyexec_inflight = IntGauge::new(
+            "siphon_pyexec_inflight",
+            "Handler jobs currently executing on a Python executor pool worker",
+        )?;
+        let pyexec_queue_depth = IntGauge::new(
+            "siphon_pyexec_queue_depth",
+            "Handler jobs waiting in the Python executor pool's bounded queue",
+        )?;
+        let pyexec_jobs_completed_total = IntCounter::new(
+            "siphon_pyexec_jobs_completed_total",
+            "Total handler jobs completed by the Python executor pool",
+        )?;
+        let pyexec_jobs_shed_total = IntCounter::new(
+            "siphon_pyexec_jobs_shed_total",
+            "Total handler jobs shed because the Python executor pool queue was full",
+        )?;
+
+        let auth_ha1_cache_hits_total = IntCounter::new(
+            "siphon_auth_ha1_cache_hits_total",
+            "Total HTTP-auth credential lookups served from the in-process HA1 cache",
+        )?;
+
+        let banned_ips = IntGauge::new(
+            "siphon_banned_ips",
+            "Source IPs currently auto-banned by failed_auth_ban scanner protection",
+        )?;
+
+        let auth_failures_total = IntCounter::new(
+            "siphon_auth_failures_total",
+            "Total failures recorded toward the auto-ban (auth challenges without a subsequent success + non-ACK INVITE server-transaction timeouts)",
+        )?;
+
+        let handshake_failures_total = IntCounter::new(
+            "siphon_handshake_failures_total",
+            "Total TLS/WSS/WS handshakes that failed or timed out before completing, each recorded toward the auto-ban (TCP-validated source IPs)",
+        )?;
+
+        let credential_failures_total = IntCounter::new(
+            "siphon_credential_failures_total",
+            "Total digest attempts with present-but-invalid credentials or a forged/stale/replayed nonce, each recorded toward the auto-ban as a high-confidence signal",
+        )?;
+
+        let malformed_messages_total = IntCounter::new(
+            "siphon_malformed_messages_total",
+            "Total non-SIP / unparseable messages received on a stream transport (TCP/TLS) and dropped, each recorded toward the auto-ban",
+        )?;
+
+        let scanner_blocked_total = IntCounter::new(
+            "siphon_scanner_blocked_total",
+            "Total inbound requests dropped because the source User-Agent matched a security.scanner_block signature",
+        )?;
+
+        let rate_limited_total = IntCounter::new(
+            "siphon_rate_limited_total",
+            "Total inbound requests dropped because the source exceeded security.rate_limit.max_requests within the window",
+        )?;
+
         let diameter_peers_connected = IntGauge::new(
             "siphon_diameter_peers_connected",
             "Number of currently connected Diameter peers",
@@ -286,6 +433,8 @@ impl SiphonMetrics {
         registry.register(Box::new(transactions_active.clone()))?;
         registry.register(Box::new(uac_pending_requests.clone()))?;
         registry.register(Box::new(proxy_dialog_sessions.clone()))?;
+        registry.register(Box::new(subscribe_dialogs.clone()))?;
+        registry.register(Box::new(ipsec_sa_pairs.clone()))?;
         registry.register(Box::new(registrations_active.clone()))?;
         registry.register(Box::new(dialogs_active.clone()))?;
         registry.register(Box::new(connections_active.clone()))?;
@@ -300,6 +449,20 @@ impl SiphonMetrics {
         registry.register(Box::new(python_allocated_blocks.clone()))?;
         registry.register(Box::new(script_executions_total.clone()))?;
         registry.register(Box::new(script_errors_total.clone()))?;
+        registry.register(Box::new(pyexec_pool_size.clone()))?;
+        registry.register(Box::new(pyexec_pool_max.clone()))?;
+        registry.register(Box::new(pyexec_inflight.clone()))?;
+        registry.register(Box::new(pyexec_queue_depth.clone()))?;
+        registry.register(Box::new(pyexec_jobs_completed_total.clone()))?;
+        registry.register(Box::new(pyexec_jobs_shed_total.clone()))?;
+        registry.register(Box::new(auth_ha1_cache_hits_total.clone()))?;
+        registry.register(Box::new(banned_ips.clone()))?;
+        registry.register(Box::new(auth_failures_total.clone()))?;
+        registry.register(Box::new(handshake_failures_total.clone()))?;
+        registry.register(Box::new(credential_failures_total.clone()))?;
+        registry.register(Box::new(malformed_messages_total.clone()))?;
+        registry.register(Box::new(scanner_blocked_total.clone()))?;
+        registry.register(Box::new(rate_limited_total.clone()))?;
         registry.register(Box::new(diameter_peers_connected.clone()))?;
         registry.register(Box::new(diameter_requests_total.clone()))?;
         registry.register(Box::new(diameter_request_errors_total.clone()))?;
@@ -316,6 +479,8 @@ impl SiphonMetrics {
             transactions_active,
             uac_pending_requests,
             proxy_dialog_sessions,
+            subscribe_dialogs,
+            ipsec_sa_pairs,
             registrations_active,
             dialogs_active,
             connections_active,
@@ -330,6 +495,20 @@ impl SiphonMetrics {
             python_allocated_blocks,
             script_executions_total,
             script_errors_total,
+            pyexec_pool_size,
+            pyexec_pool_max,
+            pyexec_inflight,
+            pyexec_queue_depth,
+            pyexec_jobs_completed_total,
+            pyexec_jobs_shed_total,
+            auth_ha1_cache_hits_total,
+            banned_ips,
+            auth_failures_total,
+            handshake_failures_total,
+            credential_failures_total,
+            malformed_messages_total,
+            scanner_blocked_total,
+            rate_limited_total,
             diameter_peers_connected,
             diameter_requests_total,
             diameter_request_errors_total,

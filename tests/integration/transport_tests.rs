@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::net::{TcpStream, UdpSocket};
 
-use siphon::transport::{ConnectionId, OutboundMessage, Transport};
+use siphon::transport::{ConnectionId, OutboundMessage, StreamConnections, Transport};
 use siphon::transport::{udp, tcp, tls, ws};
 use siphon::transport::acl::TransportAcl;
 
@@ -126,7 +126,7 @@ async fn tcp_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    tcp::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None, None).await;
+    tcp::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None, None, None).await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect and send OPTIONS
@@ -167,6 +167,54 @@ async fn tcp_roundtrip() {
 
     let response = String::from_utf8_lossy(&buffer[..size]);
     assert!(response.contains("200 OK"), "expected 200 OK: {}", response);
+}
+
+/// RFC 5626 §4.2.2 flow failure: when a TCP connection closes, the listener
+/// must enqueue the dead `ConnectionId.0` on the close channel so the
+/// registrar can deregister bindings that arrived on it.  This validates the
+/// transport→registrar glue end-to-end on a real socket (the registrar-side
+/// removal is unit-tested in `registrar::tests::unregister_flow_*`).
+#[tokio::test]
+async fn tcp_close_notifies_flow_failure() {
+    let addr = free_port();
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+        Arc::new(DashMap::new());
+    let (close_tx, close_rx) = flume::unbounded::<u64>();
+
+    tcp::listen(
+        addr,
+        inbound_tx,
+        outbound_rx,
+        Arc::clone(&connection_map),
+        test_acl(),
+        None,
+        None,
+        None,
+        Some(close_tx),
+    )
+    .await;
+    tokio::time::sleep(SETTLE).await;
+
+    // Connect and send a request so we learn the assigned ConnectionId.
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(sip_options_request().as_bytes()).await.unwrap();
+    let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
+        .await
+        .expect("timed out waiting for TCP inbound")
+        .expect("inbound channel closed");
+    let connection_id = inbound.connection_id.0;
+    assert!(connection_map.contains_key(&inbound.connection_id));
+
+    // Drop the client → the connection closes → close notification fires.
+    drop(client);
+
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(2), close_rx.recv_async())
+        .await
+        .expect("no flow-failure close notification")
+        .expect("close channel closed");
+    assert_eq!(closed, connection_id, "close notification must carry the dead connection id");
 }
 
 /// Regression: fire-and-forget outbound TCP with `ConnectionId::default()`
@@ -228,6 +276,7 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
         test_acl(),
         None,
         Some(Arc::clone(&pool)),
+        None,
         None,
     )
     .await;
@@ -303,6 +352,7 @@ async fn tcp_responds_to_peer_crlf_ping_with_pong() {
         None,
         None,
         Some(Arc::clone(&tracker)),
+        None,
     )
     .await;
     tokio::time::sleep(SETTLE).await;
@@ -366,8 +416,7 @@ async fn tls_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    let addr_map: Arc<DashMap<SocketAddr, ConnectionId>> = Arc::new(DashMap::new());
-    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), addr_map, None, None, None).await;
+    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None, None, None).await;
     tokio::time::sleep(SETTLE).await;
 
     // Build a TLS client that trusts our self-signed cert
@@ -429,7 +478,7 @@ async fn ws_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    ws::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+    ws::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect via WebSocket
@@ -493,7 +542,7 @@ async fn wss_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    ws::listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+    ws::listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
     tokio::time::sleep(SETTLE).await;
 
     // Manual TLS connect then WebSocket upgrade
@@ -572,8 +621,8 @@ async fn multi_transport_shared_inbound_channel() {
 
     // Start all three transports with the same inbound_tx
     udp::listen(udp_addr, inbound_tx.clone(), udp_outbound_rx, test_acl(), None).await;
-    tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map), test_acl(), None, None, None).await;
-    ws::listen(ws_addr, inbound_tx.clone(), ws_outbound_rx, Arc::clone(&ws_connection_map), test_acl(), None).await;
+    tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map), test_acl(), None, None, None, None).await;
+    ws::listen(ws_addr, inbound_tx.clone(), ws_outbound_rx, Arc::clone(&ws_connection_map), test_acl(), StreamConnections::new(), None, None).await;
     drop(inbound_tx); // Only transport workers hold clones now
     tokio::time::sleep(SETTLE).await;
 
@@ -626,6 +675,7 @@ fn generate_test_tls_config(directory: &tempfile::TempDir) -> siphon::config::Tl
         private_key: key_path.to_str().unwrap().to_string(),
         method: "TLSv1_3".to_string(),
         verify_client: false,
+        client_ca: None,
     }
 }
 
@@ -634,7 +684,8 @@ fn build_test_tls_connector(tls_config: &siphon::config::TlsServerConfig) -> tok
 
     let cert_pem = std::fs::read(&tls_config.certificate).unwrap();
     let mut cursor = std::io::Cursor::new(cert_pem);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
+    use rustls_pki_types::pem::PemObject;
+    let certs: Vec<_> = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let mut root_store = rustls::RootCertStore::empty();

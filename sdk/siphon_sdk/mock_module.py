@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import uuid
 from types import ModuleType
 from typing import Any, Callable, Optional, Union
 
@@ -88,6 +89,7 @@ class MockProxy:
         - ``@proxy.on_request`` / ``@proxy.on_request("INVITE")``
         - ``@proxy.on_reply``
         - ``@proxy.on_failure``
+        - ``@proxy.on_cancel``
         - ``@proxy.on_register_reply``
 
     Example::
@@ -156,6 +158,32 @@ class MockProxy:
         return fn
 
     @staticmethod
+    def on_cancel(fn: Callable) -> Callable:
+        """Register a handler for a CANCELled INVITE (RFC 3261 §9).
+
+        Handler signature: ``(request) -> None``
+
+        Fires once, with the original INVITE, when a relayed INVITE is
+        CANCELled before any final response — the one teardown that neither
+        ``on_reply`` nor ``on_failure`` delivers (the proxy answers the CANCEL
+        with 487 at the transaction layer and the session is gone). Use it to
+        release per-call resources that no BYE will ever clear: Diameter
+        Rx / N5 QoS sessions, rtpengine media anchors, charging maps.
+
+        Fire-and-forget — it does not gate or alter the 487 sent to the UAC.
+
+        Example::
+
+            @proxy.on_cancel
+            async def handle_cancel(request):
+                await _release_qos(request.call_id)
+                await rtpengine.delete(request)
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("proxy.on_cancel", None, fn, is_async)
+        return fn
+
+    @staticmethod
     def on_register_reply(fn: Callable) -> Callable:
         """Register a handler for REGISTER replies.
 
@@ -180,9 +208,16 @@ class MockProxy:
         Args:
             method: SIP method name (e.g. "NOTIFY", "OPTIONS", "MESSAGE").
             ruri: Request-URI string (e.g. "sip:alice@10.0.0.1:5060").
-            headers: Optional dict of header name → value to add.
+            headers: Optional dict of header name → value to add.  When a
+                ``Route`` header is supplied without ``next_hop``, the request
+                is sent to the first ``Route`` entry's URI (its ``;lr``
+                loose-route target) per RFC 3261 §8.1.2 — the R-URI stays in
+                the Request-Line.  Use this to steer a request straight to a
+                known next hop (e.g. a served IMPU's serving S-CSCF) instead of
+                resolving the R-URI's home domain.
             body: Optional body — ``str`` or ``bytes``.
-            next_hop: Optional next-hop URI override.
+            next_hop: Optional next-hop URI override.  Outranks a ``Route``
+                header for next-hop selection.
             wait_for_response: When ``True``, return the configured mock reply.
             timeout_ms: Response timeout (not meaningfully enforced in the mock).
         """
@@ -222,6 +257,20 @@ class MockProxy:
         self._sent_requests: list[dict] = []
         self._send_request_responses: dict[tuple[str, str], Any] = {}
         self.subscribe_state = MockSubscribeState()
+
+    def __getattr__(self, name: str) -> Any:
+        # The real `proxy` exposes its utility helpers flat
+        # (``proxy.sanity_check``, ``proxy.rate_limit``, ``proxy.enum_lookup``,
+        # ``proxy.memory_used_pct``); the mock keeps them on ``_utils``, so
+        # delegate any otherwise-unknown attribute there. ``__getattr__`` only
+        # fires when normal lookup misses, so real attributes are unaffected.
+        if name != "_utils":
+            utils = self.__dict__.get("_utils")
+            if utils is not None and hasattr(utils, name):
+                return getattr(utils, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +568,7 @@ class MockB2bua:
         - ``@b2bua.on_failure`` — all B-legs failed
         - ``@b2bua.on_bye`` — call ended
         - ``@b2bua.on_refer`` — call transfer (RFC 3515)
+        - ``@b2bua.on_cancel`` — unanswered call cancelled (RFC 3261 §9)
     """
 
     @staticmethod
@@ -592,6 +642,30 @@ class MockB2bua:
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_refer", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_cancel(fn: Callable) -> Callable:
+        """Register handler for a CANCELled call (RFC 3261 §9).
+
+        Handler signature: ``(call) -> None``
+
+        Fires once, with the Call object, when an unanswered call
+        (Calling/Ringing) is CANCELled — the teardown that ``on_failure``
+        (B-leg error) and ``on_bye`` (answered call) never cover. A 2xx that
+        wins the CANCEL/answer glare is ACK+BYE'd by the framework and never
+        delivers ``on_answer``, so this hook only ever sees a genuinely
+        abandoned call. Use it to release per-call resources that no BYE will
+        clear: rtpengine media anchors, QoS sessions.
+
+        Example::
+
+            @b2bua.on_cancel
+            async def handle_cancel(call):
+                await rtpengine.delete(call)
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_cancel", None, fn, is_async)
         return fn
 
 
@@ -1490,13 +1564,18 @@ class MockCache:
             return None
         return store.get(key)
 
-    async def store(self, name: str, key: str, value: str) -> bool:
-        """Store a value in a named cache.
+    async def store(
+        self, name: str, key: str, value: str, ttl: Optional[int] = None
+    ) -> bool:
+        """Store a value in a named cache with optional TTL.
 
         Args:
             name: Cache name.
             key: Cache key.
             value: Value to store.
+            ttl: Optional TTL in seconds. Mirrors the real ``cache.store``
+                signature; the mock is in-memory and does not expire keys,
+                so the value is accepted and ignored.
 
         Returns:
             ``True`` if stored, ``False`` if cache name unknown.
@@ -2478,21 +2557,64 @@ class MockRegistration:
     def __init__(self) -> None:
         self._entries: dict[str, dict] = {}
 
-    def add(self, aor: str, registrar: str, *, user: str, password: str,
+    def add(self, aor: str, registrar: str, *, user: str, password: str = "",
             interval: Optional[int] = None, realm: Optional[str] = None,
-            contact: Optional[str] = None, transport: Optional[str] = None) -> None:
+            contact: Optional[str] = None, transport: Optional[str] = None,
+            auth: Optional[str] = None, k: Optional[str] = None,
+            op: Optional[str] = None, opc: Optional[str] = None,
+            amf: Optional[str] = None, sqn: Optional[str] = None,
+            ipsec: bool = False, ue_port_c: Optional[int] = None,
+            ue_port_s: Optional[int] = None, ipsec_alg: Optional[str] = None,
+            ipsec_ealg: Optional[str] = None, imei: Optional[str] = None,
+            ims_features: Optional[list[str]] = None) -> None:
         """Add a new outbound registration.
 
         Args:
-            aor: Address-of-Record (e.g. "sip:alice@carrier.com").
+            aor: Address-of-Record (e.g. "sip:alice@carrier.com"). For IMS AKA
+                this is the IMPU (e.g.
+                "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org").
             registrar: Registrar URI (e.g. "sip:registrar.carrier.com:5060").
-            user: Authentication username.
-            password: Authentication password.
+                For IMS this is the P-CSCF.
+            user: Authentication username. For IMS AKA this is the IMPI.
+            password: Authentication password (digest only; unused for AKA).
             interval: Registration interval in seconds.
-            realm: Optional realm hint.
+            realm: Optional realm hint (the home domain for IMS).
             contact: Optional Contact URI.
             transport: Transport protocol: "udp" (default), "tcp", "tls".
+            auth: "digest" (default) or "aka" for IMS AKAv1-MD5
+                (RFC 3310 / 3GPP TS 33.203).
+            k: Subscriber key K as 32 hex chars (required when auth="aka").
+            op: Operator variant OP as 32 hex chars (supply op OR opc for AKA).
+            opc: Pre-computed OPc as 32 hex chars (supply op OR opc for AKA).
+            amf: Authentication Management Field as 4 hex chars (default "8000").
+            sqn: Initial stored sequence number SQN_MS as 12 hex chars
+                (default all-zeros — correct for a fresh soft-UE).
+            ipsec: True to establish IPsec sec-agree with the P-CSCF
+                (3GPP TS 33.203). Requires auth="aka", ue_port_c, ue_port_s.
+            ue_port_c: UE protected client port (must also be a listen.udp port).
+            ue_port_s: UE protected server port (must also be a listen.udp port).
+            ipsec_alg: Offered integrity algorithm — "hmac-sha-1-96" (default),
+                "hmac-md5-96", or "hmac-sha-256-128".
+            ipsec_ealg: Offered encryption algorithm — "null" (default) or "aes-cbc".
+
+        Raises:
+            ValueError: when auth="aka" but `k` or an operator key (`op`/`opc`)
+                is missing; or when ipsec=True without auth="aka" /
+                ue_port_c / ue_port_s — mirroring the Rust binding.
         """
+        is_aka = auth is not None and auth.lower() == "aka"
+        if is_aka:
+            if not k:
+                raise ValueError("auth='aka' requires the subscriber key `k`")
+            if not op and not opc:
+                raise ValueError("auth='aka' requires either `op` or `opc`")
+        if ipsec:
+            if not is_aka:
+                raise ValueError("ipsec=True requires auth='aka'")
+            if ue_port_c is None:
+                raise ValueError("ipsec=True requires ue_port_c")
+            if ue_port_s is None:
+                raise ValueError("ipsec=True requires ue_port_s")
         self._entries[aor] = {
             "aor": aor,
             "registrar": registrar,
@@ -2502,9 +2624,25 @@ class MockRegistration:
             "realm": realm,
             "contact": contact,
             "transport": transport or "udp",
+            "auth": "aka" if is_aka else "digest",
+            "k": k,
+            "op": op,
+            "opc": opc,
+            "amf": amf or "8000",
+            "sqn": sqn or "000000000000",
+            "ipsec": bool(ipsec),
+            "ue_port_c": ue_port_c,
+            "ue_port_s": ue_port_s,
+            "ipsec_alg": ipsec_alg or "hmac-sha-1-96",
+            "ipsec_ealg": ipsec_ealg or "null",
+            "imei": imei,
+            "ims_features": list(ims_features) if ims_features else [],
             "state": "registered",
             "expires_in": interval or 3600,
             "failure_count": 0,
+            # Captured from the 200 OK on a real run (IMS); empty in the mock.
+            "service_route": [],
+            "associated_uris": [],
         }
         self._fire_on_change(aor, "registered")
 
@@ -2538,6 +2676,34 @@ class MockRegistration:
     def count(self) -> int:
         """Number of configured registrations."""
         return len(self._entries)
+
+    def service_route(self, aor: str) -> list[str]:
+        """The captured Service-Route set (RFC 3608) for an AoR — the Route a
+        B2BUA prepends to MO calls so they traverse the originating S-CSCF.
+        Empty in the mock unless populated on the entry dict by a test."""
+        entry = self._entries.get(aor)
+        return list(entry.get("service_route", [])) if entry else []
+
+    def associated_uris(self, aor: str) -> list[str]:
+        """The P-Associated-URI list (implicit registration set) for an AoR."""
+        entry = self._entries.get(aor)
+        return list(entry.get("associated_uris", [])) if entry else []
+
+    def flow(self, aor: str, ue_ip: str):
+        """A :class:`Flow` over the UE→P-CSCF IPsec SA for MO ``call.dial``.
+
+        Real runtime returns ``None`` until the sec-agree handshake completes;
+        the mock returns a Flow whenever the entry was added with
+        ``ipsec=True`` (so MO handlers can be unit-tested), else ``None``.
+        """
+        entry = self._entries.get(aor)
+        if not entry or not entry.get("ipsec"):
+            return None
+        from .types import Flow
+        return Flow(
+            transport="udp",
+            local_addr=f"{ue_ip}:{entry.get('ue_port_c')}",
+        )
 
     @staticmethod
     def on_change(fn: Callable) -> Callable:
@@ -4389,10 +4555,20 @@ class MockMetrics:
 _metrics = MockMetrics()
 
 
+class BsfError(RuntimeError):
+    """Raised by ``sbi.discover_pcf_binding()`` when the BSF is unhealthy
+    (5xx / timeout / transport / malformed body).
+
+    A 404 (no binding for the UE IP) is **not** a ``BsfError`` — it returns
+    ``None`` (the 4G UE case). Mirrors the Rust ``sbi.BsfError`` exception.
+    """
+
+
 class MockSbi:
     """Mock SBI namespace for testing scripts that use ``from siphon import sbi``.
 
-    Provides mock N5/Npcf policy authorization methods.
+    Provides mock N5/Npcf policy authorization methods plus Nbsf_Management
+    discovery (``discover_pcf_binding``).
 
     Example::
 
@@ -4404,10 +4580,24 @@ class MockSbi:
         assert result["authorized"] is True
     """
 
+    #: The ``sbi.BsfError`` exception type, so scripts can ``except sbi.BsfError``.
+    BsfError = BsfError
+
     def __init__(self) -> None:
         self._sessions: dict[str, dict] = {}
         self._next_session_id: int = 1
         self._authorized: bool = True
+        #: discover_pcf_binding result: a binding dict (5G) or None (404 / 4G).
+        self._binding: Optional[dict] = None
+        #: when True, discover_pcf_binding raises BsfError (BSF unhealthy).
+        self._bsf_error: bool = False
+
+    @staticmethod
+    def _session_id(session_ref: str) -> str:
+        """Resolve a bare id or an absolute ``app_session_uri`` to the id."""
+        if session_ref.startswith(("http://", "https://")):
+            return session_ref.rstrip("/").rsplit("/", 1)[-1]
+        return session_ref
 
     def create_session(self, af_app_id: str = "IMS Services",
                        sip_call_id: Optional[str] = None,
@@ -4416,7 +4606,8 @@ class MockSbi:
                        ue_ipv6: Optional[str] = None,
                        dnn: Optional[str] = None,
                        notif_uri: Optional[str] = None,
-                       media_components: Optional[list] = None) -> Optional[dict]:
+                       media_components: Optional[list] = None,
+                       pcf_uri: Optional[str] = None) -> Optional[dict]:
         """Create an N5 app session for QoS policy authorization.
 
         Args:
@@ -4429,56 +4620,105 @@ class MockSbi:
             notif_uri: Notification URI for PCF events.
             media_components: list of media-component dicts (same shape as
                 ``diameter.rx_aar``'s ``media_components``).
+            pcf_uri: per-call N5 target — address this session at the given PCF
+                base URL (e.g. a BSF-discovered ``pcf_uri``) instead of the
+                configured ``npcf_url``. ``None`` ⇒ configured PCF.
 
         Returns:
-            Dict with ``app_session_id`` and ``authorized``, or ``None``.
+            Dict with ``app_session_id``, ``authorized`` and ``app_session_uri``
+            (the absolute resource URI — persist it and hand it back to
+            ``update_session`` / ``delete_session`` for replica-independent
+            teardown), or ``None``.
         """
         session_id = f"mock-n5-{self._next_session_id}"
         self._next_session_id += 1
         self._sessions[session_id] = {
             "sip_call_id": sip_call_id,
             "ue_ipv4": ue_ipv4,
+            "pcf_uri": pcf_uri,
         }
-        return {"app_session_id": session_id, "authorized": self._authorized}
+        base = (pcf_uri or "http://mock-pcf").rstrip("/")
+        app_session_uri = (
+            f"{base}/npcf-policyauthorization/v1/app-sessions/{session_id}"
+        )
+        return {
+            "app_session_id": session_id,
+            "authorized": self._authorized,
+            "app_session_uri": app_session_uri,
+        }
 
     def delete_session(self, session_id: str) -> bool:
         """Delete an N5 app session.
 
         Args:
-            session_id: The app session ID from ``create_session()``.
+            session_id: The app session id from ``create_session()`` **or** the
+                absolute ``app_session_uri`` (replica-independent teardown).
 
         Returns:
             ``True`` on success, ``False`` if session not found.
         """
-        return self._sessions.pop(session_id, None) is not None
+        return self._sessions.pop(self._session_id(session_id), None) is not None
 
     def update_session(self, session_id: str,
                        media_components: Optional[list] = None) -> Optional[dict]:
         """Update an N5 app session (media renegotiation).
 
         Args:
-            session_id: The app session ID to update.
+            session_id: The app session id to update, or the absolute
+                ``app_session_uri`` from ``create_session``.
             media_components: list of media-component dicts (same shape as
                 ``create_session``).
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or ``None``.
         """
-        if session_id not in self._sessions:
+        resolved = self._session_id(session_id)
+        if resolved not in self._sessions:
             return None
-        return {"app_session_id": session_id, "authorized": self._authorized}
+        return {"app_session_id": resolved, "authorized": self._authorized}
+
+    def discover_pcf_binding(self, ue_ipv4: Optional[str] = None,
+                             ue_ipv6: Optional[str] = None) -> Optional[dict]:
+        """Nbsf_Management discovery — look up the PCF binding for a UE IP.
+
+        Returns a binding dict (5G; configure via ``set_binding``), ``None``
+        when the BSF has no binding (404 / 4G), or raises ``sbi.BsfError`` when
+        configured unhealthy via ``set_bsf_error``.
+
+        Exactly one of ``ue_ipv4`` / ``ue_ipv6`` must be supplied.
+
+        Args:
+            ue_ipv4: UE IPv4 address (the IPsec SA peer).
+            ue_ipv6: UE IPv6 address/prefix.
+
+        Returns:
+            The binding dict (incl. a ready-to-use ``pcf_uri``) or ``None``.
+        """
+        if (ue_ipv4 is None) == (ue_ipv6 is None):
+            raise ValueError(
+                "discover_pcf_binding: supply exactly one of ue_ipv4 / ue_ipv6"
+            )
+        if self._bsf_error:
+            raise BsfError("mock BSF unhealthy")
+        return self._binding
 
     @staticmethod
     def on_event(fn: Any) -> Any:
         """Register a handler for incoming PCF event notifications (N5).
 
-        Handler receives a dict with event notification data.
+        The handler receives the PCF's ``EventsNotification`` document
+        (TS 29.514 §5.6.2.6) verbatim as a dict — every field is preserved,
+        so the keys are the exact 3GPP wire names. Use ``evSubsUri`` to
+        correlate the event with the app-session you created, and ``evNotifs``
+        for the per-event list. Each entry's ``flows`` carries ``medCompN`` +
+        ``fNums`` (not flow descriptions).
 
         Example::
 
             @sbi.on_event
             def handle_pcf_event(event):
-                for notif in event.get("ev_notifs", []):
+                session_events_uri = event.get("evSubsUri")
+                for notif in event.get("evNotifs", []):
                     log.info(f"PCF event: {notif['event']}")
         """
         return fn
@@ -4491,11 +4731,29 @@ class MockSbi:
         """
         self._authorized = authorized
 
+    def set_binding(self, binding: Optional[dict]) -> None:
+        """Configure what ``discover_pcf_binding`` returns (test helper).
+
+        Args:
+            binding: a binding dict (5G case) or ``None`` (404 / 4G case).
+        """
+        self._binding = binding
+
+    def set_bsf_error(self, raise_error: bool) -> None:
+        """Configure ``discover_pcf_binding`` to raise ``BsfError`` (test helper).
+
+        Args:
+            raise_error: when True, ``discover_pcf_binding`` raises ``BsfError``.
+        """
+        self._bsf_error = raise_error
+
     def clear(self) -> None:
         """Reset all mock sessions (test helper)."""
         self._sessions.clear()
         self._next_session_id = 1
         self._authorized = True
+        self._binding = None
+        self._bsf_error = False
 
 
 class MockIsc:
@@ -4933,6 +5191,240 @@ _ipsec = MockIpsec()
 
 
 # ---------------------------------------------------------------------------
+# STIR/SHAKEN namespace (RFC 8224/8225/8226, ATIS-1000074)
+# ---------------------------------------------------------------------------
+
+class MockStirResult:
+    """Result of :meth:`MockStir.verify` — mirrors the Rust ``StirResult``.
+
+    Attributes:
+        verstat: ``"TN-Validation-Passed"`` | ``"TN-Validation-Failed"`` |
+            ``"No-TN-Validation"`` (ATIS-1000074 §5.3.1).
+        passed: ``True`` only when the SHAKEN PASSporT validated end to end.
+        attestation: ``"A"`` / ``"B"`` / ``"C"`` from the SHAKEN PASSporT.
+        origid: ``origid`` (UUID) from the SHAKEN PASSporT.
+        orig_tn: originating TN from the SHAKEN PASSporT.
+        reason: human-readable diagnostic / failure cause.
+        passports: decoded PASSporT claim dicts.
+    """
+
+    def __init__(
+        self,
+        verstat: str = "No-TN-Validation",
+        passed: bool = False,
+        attestation: Optional[str] = None,
+        origid: Optional[str] = None,
+        orig_tn: Optional[str] = None,
+        reason: str = "",
+        passports: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        self.verstat = verstat
+        self.passed = passed
+        self.attestation = attestation
+        self.origid = origid
+        self.orig_tn = orig_tn
+        self.reason = reason
+        self._passports = passports or []
+
+    @property
+    def passports(self) -> list[dict[str, Any]]:
+        """Decoded claim sets of every PASSporT that parsed."""
+        return list(self._passports)
+
+    def __repr__(self) -> str:
+        return (
+            f"StirResult(verstat={self.verstat!r}, passed={self.passed}, "
+            f"attestation={self.attestation!r}, reason={self.reason!r})"
+        )
+
+
+class MockStir:
+    """Mock ``stir`` namespace — STIR/SHAKEN signing and verification.
+
+    Scripts use::
+
+        from siphon import stir
+
+        @proxy.on_request("INVITE")
+        def on_invite(request):
+            origid = stir.sign(request, attestation="A")   # add Identity header
+            request.relay()
+
+        @proxy.on_request("INVITE")
+        def verify_inbound(request):
+            result = stir.verify(request)
+            if result.verstat == "TN-Validation-Failed":
+                request.reply(438, "Invalid Identity Header")
+                return
+            stir.apply_verstat(request, result)
+            request.relay()
+
+    Test helpers: set :attr:`signing_enabled` / :attr:`verification_enabled`
+    to simulate config; call :meth:`set_verify_result` to pin the next
+    :meth:`verify` outcome; inspect :attr:`signed` / :attr:`applied_verstats`.
+    """
+
+    def __init__(self) -> None:
+        self.signing_enabled: bool = True
+        self.verification_enabled: bool = True
+        self._next_result: Optional[MockStirResult] = None
+        self.signed: list[dict[str, Any]] = []
+        self.applied_verstats: list[str] = []
+
+    @staticmethod
+    def _uri_user(uri: Any) -> Optional[str]:
+        return getattr(uri, "user", None) if uri is not None else None
+
+    def sign(
+        self,
+        request: Any,
+        attestation: str = "A",
+        origid: Optional[str] = None,
+        orig_tn: Optional[str] = None,
+        dest_tn: Optional[str] = None,
+    ) -> str:
+        """Build a SHAKEN ``Identity`` header and add it to ``request``.
+
+        Args:
+            request: The outbound SIP request.
+            attestation: ``"A"`` / ``"B"`` / ``"C"`` (full / partial / gateway).
+            origid: UUID origin identifier; a fresh v4 is generated if ``None``.
+            orig_tn: Originating TN; defaults to the From user part.
+            dest_tn: Destination TN; defaults to the To / R-URI user part.
+
+        Returns:
+            The ``origid`` used.
+
+        Raises:
+            RuntimeError: if signing is not configured.
+            ValueError: if the orig/dest TN cannot be determined.
+        """
+        if not self.signing_enabled:
+            raise RuntimeError("STIR signing is not configured")
+        if attestation.upper() not in ("A", "B", "C"):
+            raise ValueError(f"invalid attestation level {attestation!r}")
+        orig = orig_tn or self._uri_user(getattr(request, "from_uri", None))
+        dest = dest_tn or self._uri_user(getattr(request, "to_uri", None)) \
+            or self._uri_user(getattr(request, "ruri", None))
+        if not orig:
+            raise ValueError("could not determine originating TN (pass orig_tn=)")
+        if not dest:
+            raise ValueError("could not determine destination TN (pass dest_tn=)")
+        used_origid = origid or str(uuid.uuid4())
+        # A structurally-valid-looking (but mock) Identity header value.
+        header = (
+            "eyJtb2NrIjoiaGVhZGVyIn0.eyJtb2NrIjoiY2xhaW1zIn0.bW9ja3NpZw"
+            ";info=<https://mock.invalid/sti.pem>;alg=ES256;ppt=shaken"
+        )
+        request.set_header("Identity", header)
+        self.signed.append(
+            {
+                "attestation": attestation.upper(),
+                "origid": used_origid,
+                "orig_tn": orig,
+                "dest_tn": dest,
+                "ppt": "shaken",
+            }
+        )
+        return used_origid
+
+    def sign_div(
+        self,
+        request: Any,
+        orig_tn: Optional[str] = None,
+        dest_tn: Optional[str] = None,
+        div_tn: Optional[str] = None,
+    ) -> None:
+        """Build a diverted-call (``div``) ``Identity`` header (RFC 8946).
+
+        Args:
+            request: The outbound (retargeted) SIP request.
+            orig_tn: Originating TN; defaults to the From user part.
+            dest_tn: New destination TN; defaults to the To / R-URI user part.
+            div_tn: Diverting TN; defaults to the History-Info / Diversion user.
+        """
+        if not self.signing_enabled:
+            raise RuntimeError("STIR signing is not configured")
+        orig = orig_tn or self._uri_user(getattr(request, "from_uri", None))
+        dest = dest_tn or self._uri_user(getattr(request, "to_uri", None)) \
+            or self._uri_user(getattr(request, "ruri", None))
+        if not orig:
+            raise ValueError("could not determine originating TN")
+        if not dest:
+            raise ValueError("could not determine destination TN")
+        if not div_tn:
+            raise ValueError("could not determine diverting TN (pass div_tn=)")
+        request.set_header("Identity", (
+            "eyJtb2NrIjoiZGl2In0.eyJtb2NrIjoiZGl2In0.bW9ja2Rpdg"
+            ";info=<https://mock.invalid/sti.pem>;alg=ES256;ppt=div"
+        ))
+        self.signed.append(
+            {"orig_tn": orig, "dest_tn": dest, "div_tn": div_tn, "ppt": "div"}
+        )
+
+    def verify(self, request: Any) -> MockStirResult:
+        """Verify the ``Identity`` header(s) on ``request``.
+
+        Returns a :class:`MockStirResult`. By default returns a passing result
+        when an ``Identity`` header is present, else ``No-TN-Validation``;
+        override with :meth:`set_verify_result`.
+
+        Raises:
+            RuntimeError: if verification is not configured.
+        """
+        if not self.verification_enabled:
+            raise RuntimeError("STIR verification is not configured")
+        if self._next_result is not None:
+            return self._next_result
+        if request.get_header("Identity"):
+            orig = self._uri_user(getattr(request, "from_uri", None))
+            return MockStirResult(
+                verstat="TN-Validation-Passed",
+                passed=True,
+                attestation="A",
+                orig_tn=orig,
+                reason="ok",
+            )
+        return MockStirResult(
+            verstat="No-TN-Validation",
+            passed=False,
+            reason="no Identity header present",
+        )
+
+    def apply_verstat(self, request: Any, result: MockStirResult) -> None:
+        """Stamp the ``verstat`` parameter onto the asserted identity
+        (P-Asserted-Identity if present, else From) per ATIS-1000074 §5.3.1."""
+        self.applied_verstats.append(result.verstat)
+
+    # -- Test helpers -------------------------------------------------------
+
+    def set_verify_result(
+        self,
+        verstat: str = "TN-Validation-Passed",
+        passed: bool = True,
+        attestation: Optional[str] = None,
+        origid: Optional[str] = None,
+        orig_tn: Optional[str] = None,
+        reason: str = "ok",
+        passports: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        """Pin the result returned by the next :meth:`verify` call(s)."""
+        self._next_result = MockStirResult(
+            verstat, passed, attestation, origid, orig_tn, reason, passports
+        )
+
+    def clear(self) -> None:
+        self._next_result = None
+        self.signed.clear()
+        self.applied_verstats.clear()
+        self.signing_enabled = True
+        self.verification_enabled = True
+
+
+_stir = MockStir()
+
+
+# ---------------------------------------------------------------------------
 # SDP namespace
 # ---------------------------------------------------------------------------
 
@@ -5192,6 +5684,7 @@ def install() -> ModuleType:
     mod.isc = _isc  # type: ignore[attr-defined]
     mod.sbi = _sbi  # type: ignore[attr-defined]
     mod.ipsec = _ipsec  # type: ignore[attr-defined]
+    mod.stir = _stir  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
     mod.qos = _qos  # type: ignore[attr-defined]
 
@@ -5237,6 +5730,7 @@ def reset() -> None:
     _metrics.clear()
     _isc.clear()
     _ipsec.clear()
+    _stir.clear()
     _auth._allow = False
     _auth._credentials.clear()
     _proxy._utils._rate_limit_allow = True
@@ -5333,3 +5827,8 @@ def get_isc() -> MockIsc:
 def get_ipsec() -> MockIpsec:
     """Access the mock IPsec singleton."""
     return _ipsec
+
+
+def get_stir() -> MockStir:
+    """Access the mock STIR/SHAKEN singleton."""
+    return _stir

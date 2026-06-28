@@ -1,16 +1,18 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/siphon-project/siphon/main/assets/logo.svg" alt="SIPhon" width="100">
+  <img src="https://raw.githubusercontent.com/siphon-project/siphon-sip/main/assets/logo.svg" alt="SIPhon" width="100">
 </p>
 
-# siphon-sdk
+# siphon-sip
 
-Mock library and type stubs for [SIPhon](https://github.com/siphon-project/siphon) scripts — enables unit testing without the Rust binary and provides rich context for LLM-assisted script authoring.
+Mock library and type stubs for [SIPhon](https://github.com/siphon-project/siphon-sip) scripts — enables unit testing without the Rust binary and provides rich context for LLM-assisted script authoring.
 
 ## Install
 
 ```bash
-pip install siphon-sdk
+pip install siphon-sip
 ```
+
+> The PyPI distribution is **`siphon-sip`** (matching the `siphon-sip` crate). The import package is still **`siphon_sdk`** — `from siphon_sdk import …`.
 
 ## What is SIPhon?
 

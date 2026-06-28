@@ -44,6 +44,14 @@
 //! diameter.rx_str("rx-sess-1")
 //! ```
 
+// The Rf charging builders (`build_ims_data`, `build_sms_data`, `rf_acr_*`)
+// carry the full TS 32.299 IMS/SMS-Information envelope — 20-40+ optional
+// protocol fields each — so `too_many_arguments` fires module-wide here even
+// at the raised threshold. Allow it for the whole module rather than scatter
+// per-function attributes; a params-struct refactor is the proper long-term
+// fix but is out of scope for lint hygiene.
+#![allow(clippy::too_many_arguments)]
+
 use std::sync::Arc;
 
 use pyo3::prelude::*;
@@ -51,7 +59,7 @@ use pyo3::types::PyDict;
 use tracing::warn;
 
 use crate::diameter::codec::{
-    self, encode_avp_address_ipv4, encode_avp_grouped, encode_avp_grouped_3gpp, encode_avp_octet,
+    encode_avp_address_ipv4, encode_avp_grouped, encode_avp_grouped_3gpp, encode_avp_octet,
     encode_avp_octet_3gpp, encode_avp_u32, encode_avp_u32_3gpp, encode_avp_u64, encode_avp_utf8,
     encode_avp_utf8_3gpp, encode_diameter_message, encode_vendor_specific_app_id, FLAG_PROXIABLE,
     FLAG_REQUEST,
@@ -423,7 +431,6 @@ impl PyDiameter {
 /// shouldn't also drop an empty IMS-Information envelope on the wire).
 /// Returns a `PyValueError` on unrecognized role / functionality strings
 /// so script errors fail loudly rather than silently dropping the AVP.
-#[allow(clippy::too_many_arguments)]
 fn build_ims_data(
     calling_party: Option<&str>,
     called_party: Option<&str>,
@@ -529,7 +536,6 @@ fn parse_optional_ip(label: &str, value: Option<&str>) -> PyResult<Option<std::n
 /// script that only passes IOIs gets IMS-Information (current behavior);
 /// a script that passes any SMS-specific kwarg gets SMS-Information with
 /// the shared fields propagated.
-#[allow(clippy::too_many_arguments)]
 fn build_sms_data(
     originator_address: Option<&str>,
     recipient_address: Option<&str>,
@@ -690,10 +696,9 @@ impl PyDiameter {
         };
 
         let visited = visited_network_id.unwrap_or("");
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(client.send_uar(public_identity, visited, user_auth_type))
-        });
+        let answer = crate::script::detach_block_on(
+            client.send_uar(public_identity, visited, user_auth_type),
+        );
 
         match answer {
             Ok(message) => {
@@ -742,10 +747,9 @@ impl PyDiameter {
         };
 
         let name = server_name.unwrap_or("");
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(client.send_sar(public_identity, name, assignment_type))
-        });
+        let answer = crate::script::detach_block_on(
+            client.send_sar(public_identity, name, assignment_type),
+        );
 
         match answer {
             Ok(message) => {
@@ -790,10 +794,9 @@ impl PyDiameter {
             }
         };
 
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(client.send_lir(public_identity))
-        });
+        let answer = crate::script::detach_block_on(
+            client.send_lir(public_identity),
+        );
 
         match answer {
             Ok(message) => {
@@ -1107,9 +1110,7 @@ impl PyDiameter {
             &payload,
         );
 
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(peer.send_request(wire))
-        });
+        let answer = crate::script::detach_block_on(peer.send_request(wire));
 
         match answer {
             Ok(message) => {
@@ -1327,13 +1328,11 @@ impl PyDiameter {
 
         let references = extract_references(data_reference)?;
 
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.send_udr(
-                public_identity,
-                &references,
-                service_indication,
-            ))
-        });
+        let answer = crate::script::detach_block_on(client.send_udr(
+            public_identity,
+            &references,
+            service_indication,
+        ));
 
         match answer {
             Ok(message) => {
@@ -1385,14 +1384,12 @@ impl PyDiameter {
             }
         };
 
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.send_pur(
-                public_identity,
-                data_reference,
-                xml,
-                service_indication,
-            ))
-        });
+        let answer = crate::script::detach_block_on(client.send_pur(
+            public_identity,
+            data_reference,
+            xml,
+            service_indication,
+        ));
 
         match answer {
             Ok(message) => {
@@ -1444,14 +1441,12 @@ impl PyDiameter {
 
         let references = extract_references(data_reference)?;
 
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.send_snr(
-                public_identity,
-                &references,
-                subs_req_type,
-                service_indication,
-            ))
-        });
+        let answer = crate::script::detach_block_on(client.send_snr(
+            public_identity,
+            &references,
+            subs_req_type,
+            service_indication,
+        ));
 
         match answer {
             Ok(message) => {
@@ -1478,13 +1473,11 @@ impl PyDiameter {
         };
 
         let peer = client.peer();
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(crate::diameter::rx::send_str(
-                peer,
-                session_id,
-                crate::diameter::rx::TERMINATION_CAUSE_LOGOUT,
-            ))
-        });
+        let answer = crate::script::detach_block_on(crate::diameter::rx::send_str(
+            peer,
+            session_id,
+            crate::diameter::rx::TERMINATION_CAUSE_LOGOUT,
+        ));
 
         match answer {
             Ok(result_code) => Ok(Some(result_code)),
@@ -1529,10 +1522,9 @@ impl PyDiameter {
                 return Ok(None);
             }
         };
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(client.send_srr(msisdn, sc_address, sm_rp_mti))
-        });
+        let answer = crate::script::detach_block_on(
+            client.send_srr(msisdn, sc_address, sm_rp_mti),
+        );
         match answer {
             Ok(message) => match crate::diameter::s6c::parse_sra(&message) {
                 Some(sra) => {
@@ -1585,11 +1577,9 @@ impl PyDiameter {
                 return Ok(None);
             }
         };
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                client.send_rsr(user_name, sc_address, delivery_outcome),
-            )
-        });
+        let answer = crate::script::detach_block_on(
+            client.send_rsr(user_name, sc_address, delivery_outcome),
+        );
         match answer {
             Ok(message) => match crate::diameter::s6c::parse_rsa(&message) {
                 Some(rsa) => {
@@ -1643,15 +1633,13 @@ impl PyDiameter {
                 return Ok(None);
             }
         };
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.send_tfr(
-                user_name,
-                sc_address,
-                sm_rp_ui,
-                smsmi_correlation_id,
-                sm_rp_mti,
-            ))
-        });
+        let answer = crate::script::detach_block_on(client.send_tfr(
+            user_name,
+            sc_address,
+            sm_rp_ui,
+            smsmi_correlation_id,
+            sm_rp_mti,
+        ));
         match answer {
             Ok(message) => match crate::diameter::sgd::parse_tfa(&message) {
                 Some(tfa) => {
@@ -1807,10 +1795,7 @@ impl PyDiameter {
             &avp_bytes,
         );
 
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(client.peer().send_request(wire))
-        });
+        let answer = crate::script::detach_block_on(client.peer().send_request(wire));
         let message = match answer {
             Ok(message) => message,
             Err(error) => {
@@ -1862,7 +1847,6 @@ impl PyDiameter {
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn rf_acr_start<'py>(
         &self,
         python: Python<'py>,
@@ -1941,9 +1925,7 @@ impl PyDiameter {
         params.service_context_id = service_context_id;
 
         let peer_handle = client.peer().clone();
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(rf::send_acr(&peer_handle, &params))
-        });
+        let answer = crate::script::detach_block_on(rf::send_acr(&peer_handle, &params));
         match answer {
             Ok(answer) => Ok(Some(accounting_answer_to_dict(python, answer, None)?)),
             Err(error) => {
@@ -1980,7 +1962,6 @@ impl PyDiameter {
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn rf_acr_interim<'py>(
         &self,
         python: Python<'py>,
@@ -2063,9 +2044,7 @@ impl PyDiameter {
         params.service_context_id = service_context_id;
 
         let peer_handle = client.peer().clone();
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(rf::send_acr(&peer_handle, &params))
-        });
+        let answer = crate::script::detach_block_on(rf::send_acr(&peer_handle, &params));
         match answer {
             Ok(answer) => Ok(Some(accounting_answer_to_dict(
                 python,
@@ -2110,7 +2089,6 @@ impl PyDiameter {
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn rf_acr_stop<'py>(
         &self,
         python: Python<'py>,
@@ -2195,9 +2173,7 @@ impl PyDiameter {
         params.termination_cause = Some(termination_cause);
 
         let peer_handle = client.peer().clone();
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(rf::send_acr(&peer_handle, &params))
-        });
+        let answer = crate::script::detach_block_on(rf::send_acr(&peer_handle, &params));
         match answer {
             Ok(answer) => Ok(Some(accounting_answer_to_dict(
                 python,
@@ -2237,7 +2213,6 @@ impl PyDiameter {
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn rf_acr_event<'py>(
         &self,
         python: Python<'py>,
@@ -2316,9 +2291,7 @@ impl PyDiameter {
         params.service_context_id = service_context_id;
 
         let peer_handle = client.peer().clone();
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(rf::send_acr(&peer_handle, &params))
-        });
+        let answer = crate::script::detach_block_on(rf::send_acr(&peer_handle, &params));
         match answer {
             Ok(answer) => Ok(Some(accounting_answer_to_dict(python, answer, None)?)),
             Err(error) => {
@@ -2527,6 +2500,10 @@ fn json_to_py<'py>(
 mod tests {
     use super::*;
     use crate::diameter::DiameterManager;
+
+    /// One decorator-registry entry as extracted in the tests:
+    /// `(event_key, command_name, handler, is_async, marker)`.
+    type RegistryEntry = (String, Option<String>, Py<PyAny>, bool, Py<PyAny>);
 
     #[test]
     fn empty_manager_no_peers() {

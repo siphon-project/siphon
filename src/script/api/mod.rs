@@ -30,6 +30,7 @@ pub mod sbi;
 pub mod sdp;
 pub mod sip_uri;
 pub mod srs;
+pub mod stir;
 pub mod subscribe_state;
 pub mod timer;
 
@@ -66,6 +67,7 @@ pub const BUILT_IN_NAMESPACE_NAMES: &[&str] = &[
     "subscribe_state",
     "ipsec",
     "qos",
+    "stir",
 ];
 
 /// Host-registered Python namespaces. Populated by `SiphonServer` at
@@ -122,6 +124,9 @@ static SUBSCRIBE_STATE_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 /// Optional IPsec singleton — set only when `ipsec` is configured (P-CSCF role).
 static IPSEC_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
+/// Optional STIR/SHAKEN singleton — set only when `stir` is configured.
+static STIR_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
 /// The IfcStore Arc — stored so the backend can wire Redis persistence.
 static IFC_STORE_ARC: OnceLock<std::sync::Arc<crate::ifc::IfcStore>> = OnceLock::new();
 
@@ -136,6 +141,22 @@ static REGISTRAR_ARC: OnceLock<std::sync::Arc<crate::registrar::Registrar>> = On
 /// Get the shared Registrar (set during `set_rust_singletons`).
 pub fn registrar_arc() -> Option<&'static std::sync::Arc<crate::registrar::Registrar>> {
     REGISTRAR_ARC.get()
+}
+
+/// The unified stream-connection registry — stored so `Flow.is_alive` can do a
+/// real cross-transport liveness lookup (is this UE's stream connection still
+/// open on this process?).  Set once at server startup.
+static STREAM_CONNECTIONS: OnceLock<crate::transport::StreamConnections> = OnceLock::new();
+
+/// Get the shared stream-connection registry.  `None` in unit tests / headless
+/// contexts that never wired transports — callers stay conservative there.
+pub fn stream_connections() -> Option<&'static crate::transport::StreamConnections> {
+    STREAM_CONNECTIONS.get()
+}
+
+/// Set the shared stream-connection registry (idempotent — first writer wins).
+pub fn set_stream_connections(registry: crate::transport::StreamConnections) {
+    let _ = STREAM_CONNECTIONS.set(registry);
 }
 
 /// Store Rust-backed singletons for injection into the siphon module.
@@ -268,6 +289,25 @@ pub fn set_sbi_singleton(
     let sbi_py: Py<PyAny> = Py::new(python, py_sbi)
         .map_err(|error| SiphonError::Script(format!("Py::new(sbi): {error}")))?
         .into_any();
+
+    // Live-patch an already-installed siphon module. The SBI singleton is wired
+    // after `ScriptEngine::new`, so on a cold start the script already did
+    // `from siphon import sbi` and holds the `_SbiNamespace` stub — the same
+    // object as `sys.modules["siphon"].sbi`. Setting its `_inner` makes it
+    // forward to the Rust impl on the next request, without waiting for a
+    // hot-reload. Future re-installs pick the singleton up via SBI_SINGLETON.
+    if let Ok(modules) = python.import("sys").and_then(|sys| sys.getattr("modules")) {
+        if let Ok(siphon_module) = modules.get_item("siphon") {
+            if !siphon_module.is_none() {
+                if let Ok(sbi_ns) = siphon_module.getattr("sbi") {
+                    if let Err(error) = sbi_ns.setattr("_inner", sbi_py.bind(python)) {
+                        tracing::warn!(%error, "failed to live-patch siphon.sbi._inner");
+                    }
+                }
+            }
+        }
+    }
+
     let _ = SBI_SINGLETON.set(sbi_py);
     Ok(())
 }
@@ -382,6 +422,18 @@ pub fn set_ipsec_singleton(
         .map_err(|error| SiphonError::Script(format!("Py::new(ipsec): {error}")))?
         .into_any();
     let _ = IPSEC_SINGLETON.set(ipsec_py);
+    Ok(())
+}
+
+/// Store the STIR/SHAKEN singleton for injection into the siphon module.
+///
+/// Called at startup only when `stir` is configured. Wires the shared
+/// [`crate::stir::StirService`] into the Python `stir` namespace.
+pub fn set_stir_singleton(python: Python<'_>, py_stir: stir::PyStir) -> Result<()> {
+    let stir_py: Py<PyAny> = Py::new(python, py_stir)
+        .map_err(|error| SiphonError::Script(format!("Py::new(stir): {error}")))?
+        .into_any();
+    let _ = STIR_SINGLETON.set(stir_py);
     Ok(())
 }
 
@@ -650,11 +702,18 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
             .map_err(|error| SiphonError::Script(format!("setattr isc: {error}")))?;
     }
 
-    // Inject optional SBI singleton.
+    // Inject optional SBI singleton onto the existing `_SbiNamespace` stub as
+    // `_inner` (rather than replacing the module attribute), so the Python
+    // `@sbi.on_event` decorator survives (the Rust namespace has no on_event)
+    // and a script that already imported the stub still forwards to the Rust
+    // impl via the stub's __getattr__.
     if let Some(sbi_py) = SBI_SINGLETON.get() {
-        module
-            .setattr("sbi", sbi_py.bind(python))
-            .map_err(|error| SiphonError::Script(format!("setattr sbi: {error}")))?;
+        let sbi_ns = module
+            .getattr("sbi")
+            .map_err(|error| SiphonError::Script(format!("getattr sbi: {error}")))?;
+        sbi_ns
+            .setattr("_inner", sbi_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr sbi._inner: {error}")))?;
     }
 
     // Inject optional IPsec singleton (P-CSCF role).
@@ -662,6 +721,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("ipsec", ipsec_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr ipsec: {error}")))?;
+    }
+
+    // Inject optional STIR/SHAKEN singleton.
+    if let Some(stir_py) = STIR_SINGLETON.get() {
+        module
+            .setattr("stir", stir_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr stir: {error}")))?;
     }
 
     // Inject host-registered user namespaces. These were validated against

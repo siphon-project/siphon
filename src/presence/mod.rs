@@ -12,10 +12,27 @@ pub mod winfo;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tracing::{debug, warn};
+
+/// Process-wide presence store, installed at startup so background tasks
+/// (the dispatcher cleanup tick) can reach it to expire stale documents and
+/// subscriptions without going through the Python namespace singleton.
+/// Mirrors [`crate::subscribe_state`]'s global handle.
+static GLOBAL_STORE: OnceLock<Arc<PresenceStore>> = OnceLock::new();
+
+/// Install the global presence store. Idempotent (first writer wins).
+pub fn set_global_store(store: Arc<PresenceStore>) {
+    let _ = GLOBAL_STORE.set(store);
+}
+
+/// Borrow the installed global presence store, if any.
+pub fn global_store() -> Option<Arc<PresenceStore>> {
+    GLOBAL_STORE.get().cloned()
+}
 
 /// Subscription dialog state per RFC 3265 §3.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +122,6 @@ impl Subscription {
     }
 
     /// Create a subscription with full dialog state from a SUBSCRIBE request.
-    #[allow(clippy::too_many_arguments)]
     pub fn with_dialog(
         id: String,
         subscriber: String,
@@ -227,6 +243,11 @@ fn generate_etag(entity: &str, body: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Dialog state required to build an in-dialog NOTIFY, as returned by
+/// [`PresenceStore::prepare_notify`]:
+/// `(subscriber, event, call_id, from_tag, to_tag, route_set, cseq)`.
+type NotifyDialogState = (String, String, String, String, String, Vec<String>, u32);
+
 /// Concurrent presence store — manages subscriptions and published documents.
 ///
 /// All operations are safe for concurrent access from multiple Tokio tasks
@@ -280,7 +301,7 @@ impl PresenceStore {
     ///
     /// Returns `(subscriber, event, call_id, from_tag, to_tag, route_set, cseq)`
     /// or `None` if the subscription doesn't exist or has no dialog state.
-    pub fn prepare_notify(&self, id: &str) -> Option<(String, String, String, String, String, Vec<String>, u32)> {
+    pub fn prepare_notify(&self, id: &str) -> Option<NotifyDialogState> {
         let mut entry = self.subscriptions.get_mut(id)?;
         let subscription = entry.value_mut();
         let call_id = subscription.call_id.clone()?;

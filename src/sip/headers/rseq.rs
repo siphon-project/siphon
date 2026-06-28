@@ -124,6 +124,68 @@ pub fn requires_100rel(headers: &super::SipHeaders) -> bool {
     false
 }
 
+/// Strip the `100rel` reliability contract from a response being forwarded
+/// toward a peer that never advertised `100rel`.
+///
+/// Removes the `RSeq` header and the `100rel` option-tag from `Require`
+/// (dropping `Require` entirely when no other option-tags remain). Returns
+/// `true` when anything changed.
+///
+/// No-op when `peer_supports_100rel` is true — the reliable provisional then
+/// flows end-to-end (RFC 3262 §3) — or when the response carries no
+/// reliability markers, so it is safe to call on every forwarded response,
+/// including 2xx/non-2xx that never carry `RSeq`.
+///
+/// A B2BUA that PRACKs a B-leg's reliable provisional locally must not present
+/// the same contract to an A-leg that can't honour it: a plain SIP trunk that
+/// never offered `100rel` will CANCEL a `183` carrying `Require: 100rel` rather
+/// than PRACK it.
+pub fn strip_100rel_for_unsupported_peer(
+    headers: &mut super::SipHeaders,
+    peer_supports_100rel: bool,
+) -> bool {
+    if peer_supports_100rel {
+        return false;
+    }
+    let mut changed = false;
+    if headers.has("RSeq") {
+        headers.remove("RSeq");
+        changed = true;
+    }
+    // Remove the `100rel` option-tag from any `Require` value, preserving the
+    // others (e.g. `precondition`). Drop the header when nothing remains.
+    if let Some(values) = headers.get_all("Require").cloned() {
+        let mut kept: Vec<String> = Vec::new();
+        let mut removed_any = false;
+        for value in &values {
+            let remaining: Vec<&str> = value
+                .split(',')
+                .map(|token| token.trim())
+                .filter(|token| {
+                    if token.eq_ignore_ascii_case("100rel") {
+                        removed_any = true;
+                        false
+                    } else {
+                        !token.is_empty()
+                    }
+                })
+                .collect();
+            if !remaining.is_empty() {
+                kept.push(remaining.join(", "));
+            }
+        }
+        if removed_any {
+            changed = true;
+            if kept.is_empty() {
+                headers.remove("Require");
+            } else {
+                headers.set_all("Require", kept);
+            }
+        }
+    }
+    changed
+}
+
 /// Extract `RSeq` from SIP headers.
 pub fn parse_rseq(headers: &super::SipHeaders) -> Option<RSeq> {
     headers.get("RSeq").and_then(|v| RSeq::parse(v))
@@ -310,5 +372,61 @@ mod tests {
         // 31-bit ceiling
         assert!(a <= 0x7FFF_FFFF);
         assert!(c <= 0x7FFF_FFFF);
+    }
+
+    // --- 100rel strip for an unsupported peer ---
+
+    #[test]
+    fn strip_100rel_removes_rseq_and_require_when_peer_unsupported() {
+        let mut headers = super::super::SipHeaders::new();
+        headers.set("Require", "100rel".to_string());
+        headers.set("RSeq", "1".to_string());
+        let changed = strip_100rel_for_unsupported_peer(&mut headers, false);
+        assert!(changed);
+        assert!(!headers.has("RSeq"));
+        assert!(!headers.has("Require"));
+    }
+
+    #[test]
+    fn strip_100rel_preserves_other_require_tags() {
+        let mut headers = super::super::SipHeaders::new();
+        headers.set("Require", "100rel, precondition".to_string());
+        headers.set("RSeq", "7".to_string());
+        let changed = strip_100rel_for_unsupported_peer(&mut headers, false);
+        assert!(changed);
+        assert!(!headers.has("RSeq"));
+        assert_eq!(headers.get("Require"), Some(&"precondition".to_string()));
+    }
+
+    #[test]
+    fn strip_100rel_noop_when_peer_supports() {
+        let mut headers = super::super::SipHeaders::new();
+        headers.set("Require", "100rel".to_string());
+        headers.set("RSeq", "1".to_string());
+        let changed = strip_100rel_for_unsupported_peer(&mut headers, true);
+        assert!(!changed);
+        assert!(headers.has("RSeq"));
+        assert_eq!(headers.get("Require"), Some(&"100rel".to_string()));
+    }
+
+    #[test]
+    fn strip_100rel_noop_without_markers() {
+        let mut headers = super::super::SipHeaders::new();
+        headers.set("Require", "precondition".to_string());
+        let changed = strip_100rel_for_unsupported_peer(&mut headers, false);
+        assert!(!changed);
+        assert!(!headers.has("RSeq"));
+        assert_eq!(headers.get("Require"), Some(&"precondition".to_string()));
+    }
+
+    #[test]
+    fn strip_100rel_case_insensitive() {
+        let mut headers = super::super::SipHeaders::new();
+        headers.set("Require", "100REL".to_string());
+        headers.set("RSeq", "1".to_string());
+        let changed = strip_100rel_for_unsupported_peer(&mut headers, false);
+        assert!(changed);
+        assert!(!headers.has("RSeq"));
+        assert!(!headers.has("Require"));
     }
 }

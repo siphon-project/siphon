@@ -29,6 +29,13 @@ pub struct PyReply {
     /// to automatically correlate with the earlier `offer()` (which used the
     /// A-leg Call-ID/From-tag).
     a_leg_message: Option<Arc<Mutex<SipMessage>>>,
+    /// Reply-time reject requested by the script (`reply.reject(code, reason)`).
+    /// `Some((code, reason))` only when the script rejected an in-progress
+    /// proxied INVITE from a provisional (1xx) response — the dispatcher then
+    /// sends `code reason` upstream to the UAC and CANCELs the pending
+    /// downstream branch(es).  Stays `None` for a 2xx (a proxy cannot retract a
+    /// final answer) so the normal forward path runs unchanged.
+    reject_action: Option<(u16, String)>,
 }
 
 impl PyReply {
@@ -48,6 +55,7 @@ impl PyReply {
             response_source_ip: None,
             response_source_port: None,
             a_leg_message: None,
+            reject_action: None,
         }
     }
 
@@ -71,6 +79,16 @@ impl PyReply {
     /// Whether the script called `relay()` or `forward()`.
     pub fn was_forwarded(&self) -> bool {
         self.forwarded
+    }
+
+    /// The reply-time reject the script requested, if any.
+    ///
+    /// `Some((code, reason))` when the script called `reply.reject(code,
+    /// reason)` on a provisional (1xx) response.  The dispatcher consumes this
+    /// to send a final error upstream and CANCEL the pending downstream
+    /// branch(es).  Takes precedence over `relay()`/`forward()`.
+    pub fn reject_action(&self) -> Option<(u16, String)> {
+        self.reject_action.clone()
     }
 
     /// Get the underlying message (for Rust-side forwarding).
@@ -139,6 +157,32 @@ impl PyReply {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
         Ok(message.headers.call_id().cloned())
+    }
+
+    /// Message body as bytes, or None if empty.
+    ///
+    /// Mirrors `request.body` so SDP-handling scripts can read a response
+    /// body symmetrically (e.g. `answer = reply.body` in a `@proxy.on_reply`
+    /// media-authorization handler).
+    #[getter]
+    fn body(&self) -> PyResult<Option<Vec<u8>>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        if message.body.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(message.body.clone()))
+        }
+    }
+
+    /// Content-Type header value.
+    #[getter]
+    fn content_type(&self) -> PyResult<Option<String>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        Ok(message.headers.content_type().cloned())
     }
 
     /// Check if a header exists.
@@ -254,6 +298,87 @@ impl PyReply {
         self.forwarded = true;
     }
 
+    /// Reject an in-progress proxied INVITE from the reply context.
+    ///
+    /// Fail the leg with a SIP error (e.g. ``503``) from inside
+    /// ``@proxy.on_reply``.  This is the proxy-side equivalent of the B2BUA's
+    /// ``call.reject()`` — needed because media authorization
+    /// (``sbi.create_session`` / ``diameter.rx_aar``) necessarily runs at
+    /// answer time, when the negotiated SDP is available, and the P-CSCF spec
+    /// says a media-authorization failure MUST reject the leg rather than
+    /// proceed medialess.
+    ///
+    /// Behaviour depends on the stage of the response this handler is running
+    /// for:
+    ///
+    /// - **Provisional (1xx) — no final answer yet:** records the reject and
+    ///   returns ``True``.  After the handler returns, siphon sends ``code
+    ///   reason`` upstream to the UAC and CANCELs the pending downstream
+    ///   branch(es), reusing the fork/CANCEL machinery.  This is the clean
+    ///   path — typically reached on a reliable ``183 Session Progress`` in the
+    ///   VoLTE preconditions / early-media flow, where the SDP answer the
+    ///   authorization needs rides the provisional.
+    /// - **Final (>= 200) — UAS already answered:** a proxy cannot retract a
+    ///   2xx, so this is a no-op and returns ``False``.  The script should
+    ///   branch on the return value — log the failed authorization and
+    ///   ``reply.relay()`` to let the answer through (best-effort, no dedicated
+    ///   bearer).
+    ///
+    /// Takes precedence over ``relay()`` / ``forward()`` when it returns
+    /// ``True``.
+    ///
+    /// Args:
+    ///     code: SIP final-response code in the 400–699 range (e.g. ``503``).
+    ///     reason: optional reason phrase; a sensible default is derived from
+    ///         ``code`` when omitted.
+    ///
+    /// Raises:
+    ///     ValueError: if ``code`` is outside 400–699.
+    ///
+    /// Example:
+    ///
+    /// ```python,ignore
+    /// @proxy.on_reply
+    /// async def on_reply(request, reply):
+    ///     if request.method == "INVITE" and reply.has_body("application/sdp"):
+    ///         authorized = await authorize_media(request, reply)
+    ///         if not authorized:
+    ///             if reply.reject(503, "Media Authorization Failed"):
+    ///                 return            # 503 + CANCEL sent by siphon
+    ///             log.warn("could not reject answered call; proceeding best-effort")
+    ///     reply.relay()
+    /// ```
+    #[pyo3(signature = (code, reason=None))]
+    fn reject(&mut self, code: u16, reason: Option<&str>) -> PyResult<bool> {
+        if !(400..=699).contains(&code) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "reply.reject() code must be a 400–699 SIP error code, got {code}"
+            )));
+        }
+
+        let status_code = {
+            let message = self.message.lock().map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+            })?;
+            message.status_code().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("not a response message")
+            })?
+        };
+
+        // A proxy can only fail a leg before the UAS commits a final response.
+        // Once a 2xx (or any final) is on the wire it cannot be retracted, so
+        // the reject is a no-op the script must handle.
+        if status_code >= 200 {
+            return Ok(false);
+        }
+
+        let reason = reason
+            .map(str::to_string)
+            .unwrap_or_else(|| default_reject_reason(code).to_string());
+        self.reject_action = Some((code, reason));
+        Ok(true)
+    }
+
     /// Fix NAT for Contact in this response: rewrite Contact URI host:port
     /// with the observed source IP:port of the entity that sent this reply.
     ///
@@ -280,6 +405,30 @@ impl PyReply {
             }
         }
         Ok(())
+    }
+}
+
+/// Default reason phrase for a reject code when the script omits one.
+///
+/// Covers the codes a media-authorization reject realistically uses; anything
+/// else falls back to a generic phrase per response class.
+fn default_reject_reason(code: u16) -> &'static str {
+    match code {
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        480 => "Temporarily Unavailable",
+        486 => "Busy Here",
+        488 => "Not Acceptable Here",
+        500 => "Server Internal Error",
+        503 => "Service Unavailable",
+        600 => "Busy Everywhere",
+        603 => "Decline",
+        _ => match code {
+            400..=499 => "Client Error",
+            500..=599 => "Server Error",
+            _ => "Global Failure",
+        },
     }
 }
 
@@ -444,6 +593,48 @@ mod tests {
     }
 
     #[test]
+    fn body_returns_bytes_when_present() {
+        let mut response = make_response(200, "OK");
+        response.headers.set("Content-Type", "application/sdp".to_string());
+        response.body = b"v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n".to_vec();
+
+        let message = Arc::new(Mutex::new(response));
+        let reply = PyReply::new(message);
+
+        assert_eq!(
+            reply.body().unwrap(),
+            Some(b"v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn body_is_none_when_empty() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message);
+
+        assert_eq!(reply.body().unwrap(), None);
+    }
+
+    #[test]
+    fn content_type_getter() {
+        let mut response = make_response(200, "OK");
+        response.headers.set("Content-Type", "application/sdp".to_string());
+
+        let message = Arc::new(Mutex::new(response));
+        let reply = PyReply::new(message);
+
+        assert_eq!(reply.content_type().unwrap(), Some("application/sdp".to_string()));
+    }
+
+    #[test]
+    fn content_type_none_when_absent() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message);
+
+        assert_eq!(reply.content_type().unwrap(), None);
+    }
+
+    #[test]
     fn relay_and_forward_set_forwarded() {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
         let mut reply = PyReply::new(message);
@@ -460,6 +651,90 @@ mod tests {
 
         reply.forward();
         assert!(reply.was_forwarded());
+    }
+
+    #[test]
+    fn reject_on_provisional_records_action_and_returns_true() {
+        let message = Arc::new(Mutex::new(make_response(183, "Session Progress")));
+        let mut reply = PyReply::new(message);
+
+        assert_eq!(reply.reject_action(), None);
+        let took = reply.reject(503, Some("Media Authorization Failed")).unwrap();
+        assert!(took, "reject on a provisional must take");
+        assert_eq!(
+            reply.reject_action(),
+            Some((503, "Media Authorization Failed".to_string()))
+        );
+    }
+
+    #[test]
+    fn reject_default_reason_when_omitted() {
+        let message = Arc::new(Mutex::new(make_response(180, "Ringing")));
+        let mut reply = PyReply::new(message);
+
+        assert!(reply.reject(503, None).unwrap());
+        assert_eq!(
+            reply.reject_action(),
+            Some((503, "Service Unavailable".to_string()))
+        );
+    }
+
+    #[test]
+    fn reject_on_final_is_noop_and_returns_false() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let mut reply = PyReply::new(message);
+
+        let took = reply.reject(503, Some("Service Unavailable")).unwrap();
+        assert!(!took, "a 2xx cannot be retracted");
+        assert_eq!(reply.reject_action(), None);
+    }
+
+    #[test]
+    fn reject_on_error_final_is_noop() {
+        // An already-final error response is moot to reject — the leg is failing
+        // anyway.  Return false and record nothing.
+        let message = Arc::new(Mutex::new(make_response(486, "Busy Here")));
+        let mut reply = PyReply::new(message);
+
+        assert!(!reply.reject(503, None).unwrap());
+        assert_eq!(reply.reject_action(), None);
+    }
+
+    #[test]
+    fn reject_rejects_out_of_range_code() {
+        let message = Arc::new(Mutex::new(make_response(183, "Session Progress")));
+        let mut reply = PyReply::new(message);
+
+        // Below 400 (provisional/success/redirect) and above 699 are invalid.
+        assert!(reply.reject(200, None).is_err());
+        assert!(reply.reject(100, None).is_err());
+        assert!(reply.reject(700, None).is_err());
+        // Nothing recorded after the errors.
+        assert_eq!(reply.reject_action(), None);
+    }
+
+    #[test]
+    fn reject_takes_precedence_over_relay() {
+        let message = Arc::new(Mutex::new(make_response(183, "Session Progress")));
+        let mut reply = PyReply::new(message);
+
+        reply.relay();
+        assert!(reply.reject(503, None).unwrap());
+        // Both signals are set; the dispatcher checks reject_action() first.
+        assert!(reply.was_forwarded());
+        assert!(reply.reject_action().is_some());
+    }
+
+    #[test]
+    fn default_reject_reason_covers_classes_and_known_codes() {
+        assert_eq!(default_reject_reason(503), "Service Unavailable");
+        assert_eq!(default_reject_reason(403), "Forbidden");
+        assert_eq!(default_reject_reason(488), "Not Acceptable Here");
+        assert_eq!(default_reject_reason(603), "Decline");
+        // Unmapped codes fall back to a per-class phrase.
+        assert_eq!(default_reject_reason(451), "Client Error");
+        assert_eq!(default_reject_reason(599), "Server Error");
+        assert_eq!(default_reject_reason(699), "Global Failure");
     }
 
     #[test]

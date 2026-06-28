@@ -4,7 +4,7 @@
 //! registrar lookups for routing B2BUA calls, and transaction key handling.
 
 use siphon::b2bua::actor::{
-    CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor, LegMessage, TransportInfo,
+    CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor, TransportInfo,
     SessionTimerState, generate_call_id, generate_tag,
 };
 use siphon::b2bua::header_policy::{
@@ -296,6 +296,122 @@ fn b2bua_full_call_lifecycle() {
     store.remove_call(&call_id);
     assert_eq!(store.count(), 0);
     assert!(store.call_id_for_branch(&b_branch).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// B2BUA auth/422 retry supersede: the retry INVITE must replace the failed
+// B-leg in place, not append a second leg. Otherwise a caller CANCEL during
+// alerting fans out to the dead pre-auth transaction too (→ a spurious 481,
+// RFC 3261 §9.1) on top of the live one.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b2bua_auth_retry_supersedes_failed_leg_for_single_cancel() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("b2b-supersede@test"));
+
+    // CSeq-1 INVITE (no creds) went out and drew a 401. Its leg carries the
+    // pre-auth INVITE, stashed so a CANCEL can be rebuilt from it.
+    let cseq1 = concat!(
+        "INVITE sip:bob@10.0.0.2:5060 SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-cseq1-687e\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: <sip:alice@10.0.0.1>;tag=alice-tag\r\n",
+        "To: <sip:bob@10.0.0.2>\r\n",
+        "Call-ID: b2b-supersede@test\r\n",
+        "CSeq: 1 INVITE\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+    let cseq1_invite = parse_sip_message(cseq1).expect("cseq1 fixture parses").1;
+    let mut leg1 = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "sip:bob@10.0.0.2:5060".to_string(),
+        "z9hG4bK-cseq1-687e".to_string(),
+        TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    leg1.b_leg_invite = Some(Arc::new(Mutex::new(cseq1_invite)));
+    store.add_b_leg(&call_id, leg1);
+    assert_eq!(
+        store.call_id_for_branch("z9hG4bK-cseq1-687e"),
+        Some(call_id.clone())
+    );
+
+    // The 401 retry: same dialog, new branch + CSeq, Authorization added. It
+    // supersedes the failed leg in place at index 0 (what the dispatcher does
+    // via replace_b_leg + spawn_b_leg_actor_at).
+    let cseq2 = concat!(
+        "INVITE sip:bob@10.0.0.2:5060 SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-cseq2-4a39\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: <sip:alice@10.0.0.1>;tag=alice-tag\r\n",
+        "To: <sip:bob@10.0.0.2>\r\n",
+        "Call-ID: b2b-supersede@test\r\n",
+        "CSeq: 2 INVITE\r\n",
+        "Authorization: Digest username=\"alice\", realm=\"trunk\", nonce=\"abc\"\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+    let cseq2_invite = parse_sip_message(cseq2).expect("cseq2 fixture parses").1;
+    let mut leg2 = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "sip:bob@10.0.0.2:5060".to_string(),
+        "z9hG4bK-cseq2-4a39".to_string(),
+        TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    leg2.b_leg_invite = Some(Arc::new(Mutex::new(cseq2_invite)));
+    assert!(store.replace_b_leg(&call_id, 0, leg2));
+
+    // The dead pre-auth branch no longer routes; the retry branch does.
+    assert!(store.call_id_for_branch("z9hG4bK-cseq1-687e").is_none());
+    assert_eq!(
+        store.call_id_for_branch("z9hG4bK-cseq2-4a39"),
+        Some(call_id.clone())
+    );
+
+    // Single-CANCEL invariant: handle_b2bua_cancel builds one CANCEL per leg
+    // that carries a stashed b_leg_invite. Exactly one such leg must remain,
+    // on the live CSeq-2 branch — never the dead CSeq-1 one.
+    let call = store.get_call(&call_id).expect("call exists");
+    let cancelable_vias: Vec<String> = call
+        .b_legs
+        .iter()
+        .filter_map(|leg| leg.b_leg_invite.as_ref())
+        .map(|invite| {
+            invite
+                .lock()
+                .unwrap()
+                .headers
+                .get("Via")
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(call.b_legs.len(), 1, "retry must supersede, not append");
+    assert_eq!(
+        cancelable_vias.len(),
+        1,
+        "exactly one CANCEL would be sent"
+    );
+    assert!(
+        cancelable_vias[0].contains("z9hG4bK-cseq2-4a39"),
+        "the single CANCEL must target the live CSeq-2 branch, got: {}",
+        cancelable_vias[0]
+    );
+    assert!(
+        !cancelable_vias[0].contains("z9hG4bK-cseq1-687e"),
+        "no CANCEL must target the dead CSeq-1 branch"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1576,6 +1692,118 @@ fn intentional_proxy_authenticate_strip_works_for_every_preset() {
             "preset {preset_name} must strip Proxy-Authenticate on B→A responses"
         );
     }
+}
+
+#[test]
+fn framework_auto_100rel_strip_is_preset_independent() {
+    // RFC 3262 — a B2BUA that PRACKs a B-leg's reliable provisional locally
+    // must not leak the `100rel` contract to an A-leg that never advertised it
+    // (a plain trunk would CANCEL the call rather than PRACK).  The strip is a
+    // correctness invariant applied framework-auto in sanitize_b2bua_response,
+    // NOT a preset override — so it must hold even under presets (like
+    // sip-trunk-edge@2026) whose response policy is `default → Copy` and would
+    // otherwise pass `Require`/`RSeq` straight through.
+    let preset = builtin_presets()
+        .get("sip-trunk-edge@2026")
+        .unwrap()
+        .clone();
+    let policy = ResolvedPolicy::from_preset(preset);
+
+    // First confirm the preset itself leaves the markers (this is the bug the
+    // framework-auto strip exists to backstop).
+    let mut passed_through = make_response_200(&[
+        ("Require", "100rel"),
+        ("RSeq", "1"),
+        ("Supported", "timer, 100rel"),
+    ]);
+    apply_to_response(&mut passed_through, &policy, &test_ctx());
+    assert!(
+        passed_through.headers.has("Require") && passed_through.headers.has("RSeq"),
+        "sip-trunk-edge@2026 Copy policy is expected to leave Require/RSeq — \
+         the framework-auto strip is what removes them"
+    );
+
+    // Non-100rel A-leg: framework-auto strip removes the contract on top of any
+    // preset's output.
+    let removed = siphon::sip::headers::rseq::strip_100rel_for_unsupported_peer(
+        &mut passed_through.headers,
+        false,
+    );
+    assert!(removed);
+    assert!(!passed_through.headers.has("Require"));
+    assert!(!passed_through.headers.has("RSeq"));
+
+    // 100rel-capable A-leg: the reliable provisional still flows end-to-end.
+    let mut for_capable_peer = make_response_200(&[
+        ("Require", "100rel"),
+        ("RSeq", "1"),
+    ]);
+    apply_to_response(&mut for_capable_peer, &policy, &test_ctx());
+    let removed = siphon::sip::headers::rseq::strip_100rel_for_unsupported_peer(
+        &mut for_capable_peer.headers,
+        true,
+    );
+    assert!(!removed);
+    assert!(for_capable_peer.headers.has("Require"));
+    assert!(for_capable_peer.headers.has("RSeq"));
+}
+
+#[test]
+fn a_leg_100rel_capability_is_snapshotted_not_re_derived_from_mutable_invite() {
+    // Regression: the A-leg's reliable-provisional capability MUST be captured
+    // from the on-wire INVITE before the @b2bua.on_invite script runs and stored
+    // immutably on the call — NOT re-derived from `a_leg_invite`, which the script
+    // can mutate via `call.set_header("Supported", "…100rel")` to advertise
+    // reliable provisionals toward the B-leg (IR.92).  Re-deriving from the
+    // mutated message falsely reports the A-leg trunk as 100rel-capable, defeats
+    // the reliable-1xx strip, and the trunk CANCELs the call.
+    let raw = concat!(
+        "INVITE sip:bob@biloxi.com SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP trunk.example.com;branch=z9hG4bK-onwire\r\n",
+        "From: <sip:alice@trunk.example.com>;tag=a\r\n",
+        "To: <sip:bob@biloxi.com>\r\n",
+        "Call-ID: gate-poison@test\r\n",
+        "CSeq: 1 INVITE\r\n",
+        "Supported: timer, path, replaces\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+    let invite = parse_sip_message(raw).expect("fixture parses").1;
+
+    // siphon snapshots the on-wire capability before the script runs.
+    let snapshot = siphon::sip::headers::rseq::supports_100rel(&invite.headers);
+    assert!(!snapshot, "on-wire trunk INVITE must not advertise 100rel");
+
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("gate-poison@test"));
+    {
+        let mut call = store.get_call_mut(&call_id).unwrap();
+        call.a_leg_supports_100rel = snapshot;
+    }
+
+    // Script mutates the SHARED INVITE to advertise 100rel toward the B-leg.
+    let invite_arc = Arc::new(Mutex::new(invite));
+    store.set_a_leg_invite(&call_id, Arc::clone(&invite_arc));
+    invite_arc
+        .lock()
+        .unwrap()
+        .headers
+        .set("Supported", "timer, 100rel".to_string());
+
+    let call = store.get_call(&call_id).unwrap();
+    // The mutated INVITE now *reads* as 100rel-capable — exactly what poisoned
+    // the old gate that re-derived from `a_leg_invite`.
+    assert!(
+        siphon::sip::headers::rseq::supports_100rel(
+            &call.a_leg_invite.as_ref().unwrap().lock().unwrap().headers
+        ),
+        "the script-mutated INVITE reads as 100rel-capable"
+    );
+    // The snapshot stays false — the gate is immune to script header shaping.
+    assert!(
+        !call.a_leg_supports_100rel,
+        "snapshotted capability must reflect the on-wire INVITE, not the mutated one"
+    );
 }
 
 #[test]

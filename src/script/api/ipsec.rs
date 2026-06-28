@@ -234,6 +234,69 @@ pub fn find_sa_for_ue(ue_addr: &IpAddr, ue_port: u16) -> Option<SecurityAssociat
     manager.find_sa_by_ue(ue_addr, ue_port)
 }
 
+/// Re-pin the kernel hard-lifetime of the IPsec SA pair bound to a UE flow
+/// to `hard_lifetime_secs` (measured from now), fire-and-forget.
+///
+/// This is the framework-side hook the registrar calls on every accepted
+/// REGISTER refresh for an IPsec-protected UE (3GPP TS 33.203 §7.4: the SA
+/// lifetime tracks the SIP registration lifetime).  IR.92 refreshes carry no
+/// AKA challenge, so without this an actively-refreshing UE's SA would age out
+/// of the kernel under it and be reaped + de-REGISTERed — see
+/// `IpsecManager::update_sa_pair_lifetime` for the elapsed-since-install
+/// arithmetic that makes the kernel deadline actually move forward.
+///
+/// `ue_addr` / `ue_port` are the UE's source address and port as seen on the
+/// protected REGISTER (`ue_port` is the UE's protected client port — the SA's
+/// `contact_key`).  No-ops cleanly when:
+///
+/// - no IPsec manager is wired (siphon isn't a P-CSCF),
+/// - no SA matches the flow (e.g. the binding predates the SA, or it was
+///   already reaped),
+/// - or no Tokio runtime is in scope to spawn the async UPDSA work.
+///
+/// Mirrors `PyPendingSA.activate`'s fire-and-forget shape: a missed re-pin only
+/// widens (never tightens) the window relative to the spec, and the next
+/// refresh retries.
+pub fn repin_sa_for_ue(ue_addr: &IpAddr, ue_port: u16, hard_lifetime_secs: u64) {
+    let Some(manager) = IPSEC_MANAGER_REF.get() else {
+        return;
+    };
+    // Resolve to the canonical (ue_addr, ue_port_c) the SA is keyed on — the
+    // refresh may arrive from the UE's client *or* server port, but the
+    // re-pin must target the contact_key.
+    let Some(sa) = find_sa_for_ue(ue_addr, ue_port) else {
+        return;
+    };
+    let runtime = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle,
+        Err(_) => {
+            warn!(
+                ue = %ue_addr,
+                ue_port_c = sa.ue_port_c,
+                "ipsec.repin_sa_for_ue: no Tokio runtime in scope; skipping SA re-pin"
+            );
+            return;
+        }
+    };
+    let manager = Arc::clone(manager);
+    let ue_addr = sa.ue_addr;
+    let ue_port_c = sa.ue_port_c;
+    runtime.spawn(async move {
+        if let Err(error) = manager
+            .update_sa_pair_lifetime(&ue_addr, ue_port_c, Some(hard_lifetime_secs))
+            .await
+        {
+            warn!(
+                %error,
+                ue = %ue_addr,
+                ue_port_c,
+                hard_lifetime_secs,
+                "ipsec.repin_sa_for_ue: kernel hard-lifetime re-pin failed"
+            );
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // SecurityOffer — parsed UE proposal from the Security-Client header.
 // ---------------------------------------------------------------------------
@@ -241,7 +304,7 @@ pub fn find_sa_for_ue(ue_addr: &IpAddr, ue_port: u16) -> Option<SecurityAssociat
 /// One UE-side IPsec proposal from a ``Security-Client`` header
 /// (3GPP TS 33.203 §6.1, RFC 3329).  A header may carry multiple
 /// comma-separated offers; each is exposed as one :class:`SecurityOffer`.
-#[pyclass(name = "SecurityOffer")]
+#[pyclass(name = "SecurityOffer", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PySecurityOffer {
     /// Security mechanism, typically ``"ipsec-3gpp"``.
@@ -319,7 +382,7 @@ impl PySecurityOffer {
 ///
 /// All transforms install identical xfrm policies; only the algorithm
 /// IDs and key material change.
-#[pyclass(name = "Transform", eq, eq_int)]
+#[pyclass(name = "Transform", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PyTransform {
     /// HMAC-SHA-1-96 integrity, NULL encryption.
@@ -488,7 +551,7 @@ impl PyAuthVectorHandle {
 /// protected request.  Distinct from :class:`PendingSA` (which is
 /// script-owned and supports lifecycle transitions); this handle is
 /// purely informational — for logging, metrics, audit trail, etc.
-#[pyclass(name = "SAHandle")]
+#[pyclass(name = "SAHandle", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PySAHandle {
     #[pyo3(get)]
@@ -564,7 +627,7 @@ impl PySAHandle {
 
 /// Snapshot of the chosen ``Security-Server`` parameters after
 /// :func:`siphon.ipsec.allocate` has run.  All fields are read-only.
-#[pyclass(name = "SecurityServerParams")]
+#[pyclass(name = "SecurityServerParams", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PySecurityServerParams {
     /// Always ``"ipsec-3gpp"`` in Phase 1.
@@ -1136,6 +1199,13 @@ impl PyIpsec {
                 integrity_key,
                 hard_lifetime_secs: expires_secs,
                 protocol: sa_protocol,
+                // Placeholders — create_sa_pair recomputes the authoritative
+                // sweep deadline (expires_at) and install anchor (created_at)
+                // from hard_lifetime_secs + grace at the kernel install moment.
+                expires_at: std::time::Instant::now(),
+                created_at: std::time::Instant::now(),
+                // This namespace is the P-CSCF (network) side.
+                role: crate::ipsec::SaRole::PCscf,
             };
             manager
                 .create_sa_pair(sa.clone())
@@ -1256,6 +1326,9 @@ pub fn parse_security_client_multi(value: &str, ue_addr: &str) -> Vec<PySecurity
         .collect()
 }
 
+/// A parsed (CK, IK) key pair extracted from an auth header — two 128-bit keys.
+type CkIkPair = ([u8; 16], [u8; 16]);
+
 /// Strip ``ck=…`` and ``ik=…`` parameters from a single auth header value
 /// (e.g. a ``Digest …`` ``WWW-Authenticate`` value).  Returns the rewritten
 /// header and the extracted (CK, IK) pair only when **both** parsed
@@ -1267,7 +1340,7 @@ pub fn parse_security_client_multi(value: &str, ue_addr: &str) -> Vec<PySecurity
 /// ``ik`` (case-insensitive), and rejoins the surviving tokens with
 /// ``", "`` separators.  Quoting style of untouched parameters is
 /// preserved byte-for-byte.
-pub fn strip_ck_ik(value: &str) -> (String, Option<([u8; 16], [u8; 16])>) {
+pub fn strip_ck_ik(value: &str) -> (String, Option<CkIkPair>) {
     let (scheme, rest) = match value.split_once(char::is_whitespace) {
         Some((scheme, rest)) => (scheme, rest),
         None => return (value.to_string(), None),
@@ -1671,6 +1744,9 @@ mod tests {
             integrity_key: "deadbeefdeadbeefdeadbeefdeadbeef".into(),
             hard_lifetime_secs: Some(600_000),
             protocol: SaProtocol::Udp,
+            expires_at: std::time::Instant::now(),
+            created_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1722,6 +1798,9 @@ mod tests {
             integrity_key: "cafebabecafebabecafebabecafebabe".into(),
             hard_lifetime_secs: Some(600_000),
             protocol: SaProtocol::Udp,
+            expires_at: std::time::Instant::now(),
+            created_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1769,6 +1848,9 @@ mod tests {
             integrity_key: "11111111111111111111111111111111".into(),
             hard_lifetime_secs: None,
             protocol: SaProtocol::Udp,
+            expires_at: std::time::Instant::now(),
+            created_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1806,6 +1888,9 @@ mod tests {
             integrity_key: "deadbeef".into(),
             hard_lifetime_secs: None,
             protocol: SaProtocol::Tcp,
+            expires_at: std::time::Instant::now(),
+            created_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
         };
         let handle = PySAHandle::from_sa(&sa);
         assert_eq!(handle.protocol, "tcp");
@@ -1830,6 +1915,9 @@ mod tests {
             integrity_key: "deadbeefdeadbeefdeadbeefdeadbeef".into(),
             hard_lifetime_secs: None,
             protocol: SaProtocol::Udp,
+            expires_at: std::time::Instant::now(),
+            created_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
         }
     }
 

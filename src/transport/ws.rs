@@ -18,11 +18,16 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::config::TlsServerConfig;
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
+use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
 
 /// Handle a single WebSocket connection after the upgrade handshake.
 /// Generic over the underlying stream (plain TCP for WS, TLS for WSS).
+// The `accept_hdr_async` upgrade callback below must return the
+// tungstenite-dictated `Result<Response, ErrorResponse>`. Its Err variant
+// (`http::Response<Option<String>>`) is large, but the type is fixed by the
+// callback contract — it can't be boxed — so allow the lint here.
+#[allow(clippy::result_large_err)]
 async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     transport_variant: Transport,
@@ -31,11 +36,43 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     remote_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    stream_connections: StreamConnections,
+    close_tx: Option<flume::Sender<u64>>,
 ) {
-    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    // RFC 7118 §4: a SIP-over-WebSocket server MUST confirm the "sip"
+    // subprotocol the UA offers in `Sec-WebSocket-Protocol`.  Without it,
+    // browser / JS WebSocket clients (sip.js, JsSIP) abort the connection
+    // immediately after the handshake (close 1006).  `accept_async` ignores
+    // subprotocols entirely, so negotiate it here.
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(
+        stream,
+        |request: &Request, mut response: Response| {
+            let offers_sip = request
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(',').any(|proto| proto.trim().eq_ignore_ascii_case("sip")))
+                .unwrap_or(false);
+            if offers_sip {
+                response
+                    .headers_mut()
+                    .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("sip"));
+            }
+            Ok(response)
+        },
+    )
+    .await
+    {
         Ok(stream) => stream,
         Err(error) => {
             warn!("WebSocket upgrade failed from {}: {}", remote_addr, error);
+            crate::security::record_handshake_failure(
+                remote_addr.ip(),
+                &transport_variant.to_string(),
+            );
             return;
         }
     };
@@ -45,6 +82,11 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // Per-connection outbound channel
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
     connection_map.insert(connection_id, outbound_tx);
+    // Register in the unified stream registry so the relay path can reach this
+    // UE — for WebSocket this is the *only* way back (client-initiated; RFC 7118
+    // §5 / RFC 5626 §5.3).  Keyed by the UE source address, tagged with the
+    // WS/WSS transport so a TLS relay never picks it up.
+    stream_connections.register(remote_addr, transport_variant, connection_id);
 
     // Read task: WebSocket frames → InboundMessage (with idle timeout)
     let inbound_tx_clone = inbound_tx.clone();
@@ -120,6 +162,12 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     }
 
     connection_map.remove(&connection_id);
+    stream_connections.unregister(&remote_addr);
+    // RFC 5626 §4.2.2 flow failure: notify the registrar so it can deregister
+    // any binding that arrived on this WS/WSS connection.  Best-effort.
+    if let Some(close_tx) = &close_tx {
+        let _ = close_tx.send(connection_id.0);
+    }
     info!("WS connection {:?} cleaned up", connection_id);
 }
 
@@ -133,8 +181,20 @@ fn spawn_outbound_dispatcher(
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
             if let Some(sender) = connection_map.get(&outbound.connection_id) {
-                if let Err(error) = sender.send(outbound.data).await {
-                    warn!("{} outbound send failed for connection {:?}: {}", label, outbound.connection_id, error);
+                // Non-blocking: NEVER park in `send().await` here (see tcp.rs for
+                // the full rationale). Awaiting a send to a non-reading peer's full
+                // bounded channel would park this single distributor while holding
+                // the `connection_map` shard guard — stalling all outbound and
+                // blocking accept's `insert` on the same shard. `try_send` sheds
+                // for a backed-up (stuck) peer instead.
+                match sender.try_send(outbound.data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!("{} outbound dropped: connection {:?} send buffer full (slow/stuck peer)", label, outbound.connection_id);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("{} outbound dropped: connection {:?} closed", label, outbound.connection_id);
+                    }
                 }
             } else {
                 debug!("{} outbound: connection {:?} not found (may have closed)", label, outbound.connection_id);
@@ -175,7 +235,9 @@ pub async fn listen(
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
+    stream_connections: StreamConnections,
     tos: Option<u32>,
+    close_tx: Option<flume::Sender<u64>>,
 ) {
     spawn_outbound_dispatcher(outbound_rx, connection_map.clone(), "WS");
 
@@ -198,6 +260,8 @@ pub async fn listen(
                     let connection_id = next_connection_id();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
+                    let stream_connections = stream_connections.clone();
+                    let close_tx = close_tx.clone();
 
                     configure_tcp_socket(&tcp_stream, tos);
                     info!("WS accepted {} as {:?}", remote_addr, connection_id);
@@ -212,6 +276,8 @@ pub async fn listen(
                             remote_addr,
                             inbound_tx,
                             connection_map,
+                            stream_connections,
+                            close_tx,
                         )
                         .await;
                     });
@@ -233,7 +299,9 @@ pub async fn listen_secure(
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
+    stream_connections: StreamConnections,
     tos: Option<u32>,
+    close_tx: Option<flume::Sender<u64>>,
 ) {
     let acceptor = crate::transport::tls::build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor for WSS: {error}");
@@ -262,6 +330,8 @@ pub async fn listen_secure(
                     let acceptor = (**acceptor.load()).clone();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
+                    let stream_connections = stream_connections.clone();
+                    let close_tx = close_tx.clone();
 
                     configure_tcp_socket(&tcp_stream, tos);
 
@@ -271,6 +341,7 @@ pub async fn listen_secure(
                             Ok(stream) => stream,
                             Err(error) => {
                                 warn!("WSS TLS handshake failed from {}: {}", remote_addr, error);
+                                crate::security::record_handshake_failure(remote_addr.ip(), "WSS");
                                 return;
                             }
                         };
@@ -287,6 +358,8 @@ pub async fn listen_secure(
                             remote_addr,
                             inbound_tx,
                             connection_map,
+                            stream_connections,
+                            close_tx,
                         )
                         .await;
                     });
@@ -322,7 +395,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Connect as a WebSocket client
@@ -366,6 +439,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_registers_in_stream_connections_and_clears_on_close() {
+        // RFC 7118 §5 / RFC 5626 §5.3: a WS connection must appear in the
+        // unified stream registry (keyed by UE source address, tagged WS) so
+        // the relay path can reach the UE — the only way back over WebSocket —
+        // and must clear on close so a stale flow reports dead.
+        let addr = free_port();
+        let (inbound_tx, inbound_rx) = flume::unbounded();
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
+        let registry = StreamConnections::new();
+
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), registry.clone(), None, None).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws_stream
+            .send(Message::text("REGISTER sip:test SIP/2.0\r\n\r\n"))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            inbound_rx.recv_async(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // The UE source address is the registry key; the relay path reuses it.
+        assert_eq!(
+            registry.reuse(message.remote_addr, Transport::WebSocket),
+            Some(message.connection_id),
+            "WS connection must be registered for MT routing"
+        );
+        assert!(registry.is_alive(message.remote_addr, Transport::WebSocket, message.connection_id));
+        // Must never be handed back for a TLS relay.
+        assert_eq!(registry.reuse(message.remote_addr, Transport::Tls), None);
+
+        // Close → registry entry must clear (RFC 5626 §4.2.2 flow failure).
+        ws_stream.close(None).await.ok();
+        drop(ws_stream);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            registry.reuse(message.remote_addr, Transport::WebSocket),
+            None,
+            "registry entry must clear on connection close"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_echoes_sip_subprotocol() {
+        // RFC 7118 §4: a UA that offers the "sip" subprotocol must get it back
+        // in the handshake response, or browser/JS WebSocket clients (sip.js,
+        // JsSIP) abort the connection right after the upgrade (close 1006).
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+        let addr = free_port();
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
+
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut request = format!("ws://127.0.0.1:{}", addr.port())
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("sip"));
+        let (_ws_stream, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("WS connect offering the sip subprotocol failed");
+        assert_eq!(
+            response
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some("sip"),
+            "server must echo the sip subprotocol (RFC 7118 §4)"
+        );
+    }
+
+    #[tokio::test]
     async fn ws_connection_cleanup() {
         let addr = free_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
@@ -373,7 +533,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -416,7 +576,7 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -456,13 +616,14 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Build a TLS client config that trusts our self-signed cert
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();
         let mut cursor = std::io::Cursor::new(cert_pem);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<_> = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let mut root_store = rustls::RootCertStore::empty();
@@ -534,6 +695,7 @@ mod tests {
             private_key: key_path.to_str().unwrap().to_string(),
             method: "TLSv1_3".to_string(),
             verify_client: false,
+            client_ca: None,
         }
     }
 }

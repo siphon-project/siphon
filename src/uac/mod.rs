@@ -160,7 +160,38 @@ impl UacSender {
         request_uri: SipUri,
         connection_id: ConnectionId,
     ) -> oneshot::Receiver<UacResult> {
-        self.send_options_on_connection_inner(destination, transport, request_uri, connection_id, None, None)
+        self.send_options_on_connection_inner(destination, transport, request_uri, connection_id, None, None, None)
+    }
+
+    /// Send an OPTIONS over a captured inbound flow: egress from
+    /// `source_local_addr` (the listener the UE's REGISTER landed on),
+    /// addressed to `destination` (the UE's source address), on
+    /// `connection_id`.
+    ///
+    /// Mirrors the flow-relay `OutboundMessage` shape (`source_local_addr`
+    /// set) so egress leaves the correct listener and the kernel IPsec XFRM
+    /// egress policy — which keys on the P-CSCF source address/port — matches.
+    /// The Via host/port is taken from `source_local_addr` for the same
+    /// reason: the UE's 200 OK must come back to the protected port.  Used by
+    /// the registrar UDP+IPsec idle-liveness probe (Part B): one OPTIONS, with
+    /// the caller applying a short timeout + at most one retry.
+    pub fn send_options_over_flow(
+        &self,
+        destination: SocketAddr,
+        source_local_addr: SocketAddr,
+        transport: Transport,
+        connection_id: ConnectionId,
+        request_uri: SipUri,
+    ) -> oneshot::Receiver<UacResult> {
+        self.send_options_on_connection_inner(
+            destination,
+            transport,
+            request_uri,
+            connection_id,
+            None,
+            None,
+            Some(source_local_addr),
+        )
     }
 
     /// Send an OPTIONS request with custom From identity.
@@ -174,11 +205,17 @@ impl UacSender {
     ) -> oneshot::Receiver<UacResult> {
         self.send_options_on_connection_inner(
             destination, transport, request_uri,
-            ConnectionId::default(), from_user, from_domain,
+            ConnectionId::default(), from_user, from_domain, None,
         )
     }
 
-    /// Inner OPTIONS send — supports both default (pool) and specific connection ID.
+    /// Inner OPTIONS send — supports both default (pool) and specific
+    /// connection ID, and an optional captured-flow source address.
+    ///
+    /// When `source_local_addr` is `Some`, the egress message carries it (so
+    /// it leaves the right listener / matches the IPsec egress policy) and the
+    /// Via reflects it; when `None`, behaviour is unchanged (Via from the
+    /// configured listen address, `source_local_addr` unset).
     fn send_options_on_connection_inner(
         &self,
         destination: SocketAddr,
@@ -187,13 +224,17 @@ impl UacSender {
         connection_id: ConnectionId,
         from_user: Option<&str>,
         from_domain: Option<&str>,
+        source_local_addr: Option<SocketAddr>,
     ) -> oneshot::Receiver<UacResult> {
         let branch = format!("z9hG4bK-uac-{}", uuid::Uuid::new_v4());
         let cseq = self
             .cseq_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let addr = self.addr_for(&transport);
+        // For a captured-flow probe the Via must reflect the listener the UE
+        // will reply to (the protected P-CSCF port); otherwise use the
+        // configured per-transport address.
+        let addr = source_local_addr.unwrap_or_else(|| self.addr_for(&transport));
         let via = format!(
             "SIP/2.0/{} {}:{};branch={}",
             transport, addr.ip(), addr.port(), branch
@@ -242,7 +283,7 @@ impl UacSender {
             transport,
             destination,
             data,
-            source_local_addr: None,
+            source_local_addr,
         };
 
         let (sender, receiver) = oneshot::channel();

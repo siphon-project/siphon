@@ -6,6 +6,9 @@
 #[path = "integration/auth_tests.rs"]
 mod auth_tests;
 
+#[path = "integration/security_tests.rs"]
+mod security_tests;
+
 #[path = "integration/b2bua_tests.rs"]
 mod b2bua_tests;
 
@@ -53,3 +56,6 @@ mod srs_tests;
 
 #[path = "integration/ipsec_tests.rs"]
 mod ipsec_tests;
+
+#[path = "integration/stir_tests.rs"]
+mod stir_tests;

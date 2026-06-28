@@ -17,33 +17,36 @@ use super::request::PyRequest;
 use crate::config::{AkaCredential, AuthBackendType, HttpAuthConfig};
 use crate::diameter::DiameterManager;
 
-/// AKA key material derived during authentication, stored for IPsec SA creation.
-/// Keyed by nonce string — the dispatcher reads this after 200 OK to get CK/IK.
-#[derive(Debug, Clone)]
-pub struct AkaKeyMaterial {
-    pub ck: [u8; 16],
-    pub ik: [u8; 16],
-}
-
-/// Global store for AKA key material — shared between auth module and dispatcher.
-static AKA_KEY_STORE: OnceLock<Arc<DashMap<String, AkaKeyMaterial>>> = OnceLock::new();
-
-/// Get or initialize the global AKA key material store.
-pub fn aka_key_store() -> &'static Arc<DashMap<String, AkaKeyMaterial>> {
-    AKA_KEY_STORE.get_or_init(|| Arc::new(DashMap::new()))
-}
-
 /// Auth vector from the HSS MAA, cached between the 401 challenge and the
 /// verification REGISTER so that we don't send a second MAR (which would
 /// return a different XRES and always fail).
 #[derive(Debug, Clone)]
 struct ImsAuthVector {
     /// Expected response (SIP-Authorization / XRES) from the HSS.
+    ///
+    /// CK/IK (AVP 625/626) are not cached here — they are consumed at
+    /// challenge time via the `hss_ck`/`hss_ik` locals when building the
+    /// WWW-Authenticate, and the P-CSCF IPsec path re-extracts them from the
+    /// relayed 401 header via `reply.take_av()`. The verification REGISTER
+    /// only needs the expected response.
     expected_response: Vec<u8>,
-    /// Confidentiality key for IPsec (AVP 625).
-    ck: Option<Vec<u8>>,
-    /// Integrity key for IPsec (AVP 626).
-    ik: Option<Vec<u8>>,
+}
+
+/// A cached HTTP-auth credential lookup (HA1 hex when `http.ha1`, else the
+/// plaintext password), with the wall-clock instant it was fetched so the TTL
+/// can be checked on read.
+#[derive(Debug, Clone)]
+struct CachedHa1 {
+    /// The backend response body — used verbatim as today's fetch result.
+    value: String,
+    /// When this entry was fetched, for TTL expiry.
+    fetched_at: std::time::Instant,
+}
+
+/// Whether a cache entry of the given age is still within its TTL.
+/// Pure so the boundary is unit-testable without touching the clock.
+fn is_cache_fresh(age: std::time::Duration, ttl: std::time::Duration) -> bool {
+    age < ttl
 }
 
 /// Global store for pending IMS auth vectors — keyed by nonce string.
@@ -74,6 +77,21 @@ pub struct PyAuth {
     http_config: Option<HttpAuthConfig>,
     /// Shared reqwest client for HTTP auth lookups.
     http_client: Option<reqwest::Client>,
+    /// In-process TTL cache of successful HTTP credential lookups, keyed by
+    /// username. `Some` only when `auth.http.cache_ttl_secs > 0`. Flattens a
+    /// registration storm: repeated REGISTERs for the same subscriber reuse the
+    /// cached HA1/password instead of each making a blocking backend fetch that
+    /// pins a Python-executor worker.
+    http_ha1_cache: Option<Arc<DashMap<String, CachedHa1>>>,
+    /// Optional shared secret for stateless-nonce HMAC integrity (RFC 7616
+    /// §3.3). When set, nonces the cluster did not issue are rejected. When
+    /// None, the nonce is timestamp-only — which still bounds digest replay to
+    /// `nonce_ttl_secs` and is safe across a round-robin cluster with no shared
+    /// state (the digest response still requires HA1, so nonce freshness alone
+    /// defeats captured-`Authorization` replay).
+    nonce_secret: Option<Arc<Vec<u8>>>,
+    /// Max age (seconds) of a digest nonce before it is rejected as stale.
+    nonce_ttl_secs: u64,
 }
 
 impl PyAuth {
@@ -90,6 +108,9 @@ impl PyAuth {
             aka_credentials: Arc::new(HashMap::new()),
             http_config: None,
             http_client: None,
+            http_ha1_cache: None,
+            nonce_secret: None,
+            nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
         }
     }
 
@@ -103,6 +124,9 @@ impl PyAuth {
             aka_credentials: Arc::new(HashMap::new()),
             http_config: None,
             http_client: None,
+            http_ha1_cache: None,
+            nonce_secret: None,
+            nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
         }
     }
 
@@ -121,6 +145,13 @@ impl PyAuth {
             .timeout(std::time::Duration::from_millis(config.timeout_ms))
             .build()
             .map_err(|error| format!("failed to build reqwest client for HTTP auth: {error}"))?;
+        // Only allocate the cache when caching is enabled — `cache_ttl_secs == 0`
+        // keeps the per-request blocking-fetch behaviour.
+        self.http_ha1_cache = if config.cache_ttl_secs > 0 {
+            Some(Arc::new(DashMap::new()))
+        } else {
+            None
+        };
         self.http_config = Some(config);
         self.http_client = Some(client);
         Ok(())
@@ -134,6 +165,61 @@ impl PyAuth {
     /// Set AKA credentials for local Milenage auth.
     pub fn set_aka_credentials(&mut self, credentials: HashMap<String, AkaCredential>) {
         self.aka_credentials = Arc::new(credentials);
+    }
+
+    /// Configure the digest-nonce anti-replay policy.
+    ///
+    /// `secret` (when non-empty) enables HMAC integrity so a digest response
+    /// carrying a nonce the cluster never issued is rejected. It MUST be
+    /// identical on every instance behind the same SIP domain (round-robin DNS)
+    /// or cross-instance challenges re-issue (one extra round trip). `ttl_secs`
+    /// bounds the replay window; 0 keeps the default.
+    pub fn set_nonce_policy(&mut self, secret: Option<Vec<u8>>, ttl_secs: u64) {
+        self.nonce_secret = secret.filter(|s| !s.is_empty()).map(Arc::new);
+        if ttl_secs > 0 {
+            self.nonce_ttl_secs = ttl_secs;
+        }
+    }
+
+    /// Mint a digest challenge nonce: `{unix_secs:016x}.{tag}`, where `tag` is
+    /// an HMAC-SHA256 over the timestamp (when a secret is configured) or a
+    /// random value otherwise. The embedded timestamp lets any instance reject
+    /// a stale (replayed) nonce without shared state.
+    fn generate_nonce(&self) -> String {
+        let timestamp_hex = format!("{:016x}", now_unix_secs());
+        let tag = match &self.nonce_secret {
+            Some(secret) => hmac_sha256_hex(secret, timestamp_hex.as_bytes()),
+            None => format!("{:x}", uuid::Uuid::new_v4().as_simple()),
+        };
+        format!("{timestamp_hex}.{tag}")
+    }
+
+    /// Validate a nonce echoed back in an `Authorization` header: it must be a
+    /// well-formed `{timestamp}.{tag}`, no older than `nonce_ttl_secs` (and not
+    /// implausibly far in the future), and — when a secret is configured — carry
+    /// a matching HMAC tag. This is what turns digest auth from "replayable
+    /// forever" into "replayable for at most `nonce_ttl_secs`".
+    fn validate_nonce(&self, nonce: &str) -> bool {
+        let Some((timestamp_hex, tag)) = nonce.split_once('.') else {
+            return false;
+        };
+        let Ok(timestamp) = u64::from_str_radix(timestamp_hex, 16) else {
+            return false;
+        };
+        let now = now_unix_secs();
+        // Stale (replayed) or implausibly future-dated (>60s clock skew).
+        if now.saturating_sub(timestamp) > self.nonce_ttl_secs
+            || timestamp.saturating_sub(now) > 60
+        {
+            return false;
+        }
+        match &self.nonce_secret {
+            Some(secret) => {
+                let expected = hmac_sha256_hex(secret, timestamp_hex.as_bytes());
+                constant_time_eq(expected.as_bytes(), tag.as_bytes())
+            }
+            None => true,
+        }
     }
 }
 
@@ -229,16 +315,14 @@ impl PyAuth {
                                     resync_data.extend_from_slice(&nonce_bytes[..16]);
                                     resync_data.extend_from_slice(&auts_bytes);
 
-                                    let maa_resync = tokio::task::block_in_place(|| {
-                                        tokio::runtime::Handle::current().block_on(
-                                            client.send_mar(
-                                                &public_identity,
-                                                1,
-                                                "Digest-AKAv1-MD5",
-                                                Some(&resync_data),
-                                            ),
-                                        )
-                                    }).map_err(|error| {
+                                    let maa_resync = crate::script::detach_block_on(
+                                        client.send_mar(
+                                            &public_identity,
+                                            1,
+                                            "Digest-AKAv1-MD5",
+                                            Some(&resync_data),
+                                        ),
+                                    ).map_err(|error| {
                                         pyo3::exceptions::PyRuntimeError::new_err(
                                             format!("MAR resync failed: {error}")
                                         )
@@ -265,7 +349,7 @@ impl PyAuth {
 
             // Normal verification: look up the stored XRES from the first MAR
             let nonce_str = extract_nonce_field(auth_value);
-            let found = nonce_str.as_ref().map_or(false, |n| ims_auth_store().contains_key(n));
+            let found = nonce_str.as_ref().is_some_and(|n| ims_auth_store().contains_key(n));
             tracing::debug!(
                 nonce_prefix = nonce_str.as_ref().map(|n| &n[..n.len().min(16)]),
                 found,
@@ -294,19 +378,6 @@ impl PyAuth {
                     );
                     if matches {
                         request.set_auth_user(fields.username);
-                        // Store CK/IK for IPsec SA creation (same as AKA local flow)
-                        if let (Some(ck_bytes), Some(ik_bytes)) = (&vector.ck, &vector.ik) {
-                            if ck_bytes.len() == 16 && ik_bytes.len() == 16 {
-                                let mut ck = [0u8; 16];
-                                let mut ik = [0u8; 16];
-                                ck.copy_from_slice(ck_bytes);
-                                ik.copy_from_slice(ik_bytes);
-                                aka_key_store().insert(
-                                    fields.nonce,
-                                    AkaKeyMaterial { ck, ik },
-                                );
-                            }
-                        }
                         return Ok(true);
                     }
                 }
@@ -318,11 +389,9 @@ impl PyAuth {
         }
 
         // ── First REGISTER (no Authorization) or re-challenge — send MAR ──
-        let maa = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                client.send_mar(&public_identity, 1, "SIP Digest", None),
-            )
-        }).map_err(|e| {
+        let maa = crate::script::detach_block_on(
+            client.send_mar(&public_identity, 1, "SIP Digest", None),
+        ).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("MAR failed: {e}"))
         })?;
 
@@ -422,30 +491,15 @@ impl PyAuth {
                 // Extract nonce from Authorization header to find our stored vector
                 let auth_nonce = extract_nonce_field(&auth_value);
                 if let Some(nonce_str) = auth_nonce {
-                    // Decode the nonce to get RAND
+                    // Decode the nonce to confirm it carries a valid RAND||AUTN.
                     if let Some(nonce_bytes) = base64_decode(&nonce_str) {
                         if nonce_bytes.len() >= 32 {
-                            let mut rand = [0u8; 16];
-                            rand.copy_from_slice(&nonce_bytes[..16]);
-
-                            // Recompute the vector with the same RAND
-                            let vector = milenage::generate_vector_with_rand(
-                                &k, &op, &sqn, &amf, &rand,
-                            );
-
-                            // For AKAv1-MD5: the "password" for MD5 digest is the XRES
-                            // Actually, in IMS AKA, we compare the response field directly
-                            // against XRES. But sipp_ipsec uses AKAv1-MD5 which means
-                            // the digest response is computed using XRES as the password.
+                            // For AKAv1-MD5: the "password" for MD5 digest is the XRES.
+                            // In IMS AKA, we compare the response field directly against
+                            // XRES. But sipp_ipsec uses AKAv1-MD5 which means the digest
+                            // response is computed using XRES as the password.
                             // For simplicity in static auth: accept if username matches a known user.
                             if let Some(username) = extract_username(&auth_value) {
-                                // Store CK/IK keyed by nonce for SA creation
-                                let key_store = aka_key_store();
-                                key_store.insert(nonce_str.clone(), AkaKeyMaterial {
-                                    ck: vector.ck,
-                                    ik: vector.ik,
-                                });
-
                                 request.set_auth_user(username);
                                 return Ok(true);
                             }
@@ -571,6 +625,12 @@ impl PyAuth {
             }
         };
 
+        // Distinguish a credential-less first leg (the legitimate opening of
+        // challenge-response, or a toll-fraud probe — weight 1) from a present-
+        // but-invalid attempt (wrong password, or a forged/stale/replayed nonce
+        // — a high-confidence abuse signal) handled in the failure arm below.
+        let credentials_present = auth_header.is_some();
+
         match auth_header {
             Some(value) if self.validate_credentials(&value, realm, &method) => {
                 // Extract username from the Authorization header
@@ -589,9 +649,56 @@ impl PyAuth {
                 guard.headers.remove("Proxy-Authorization");
                 drop(guard);
 
+                // Valid credentials — clear any accrued auto-ban failure count so
+                // a legit client that challenges-then-succeeds never accumulates.
+                if let Some(ban) = crate::security::auto_ban() {
+                    if let Ok(source) = request.source_ip_str().parse::<std::net::IpAddr>() {
+                        ban.record_success(source);
+                    }
+                }
+
                 Ok(true)
             }
             _ => {
+                // A challenge is being issued. Count it toward the auto-ban:
+                //  * credentials absent → the toll-fraud pattern (REGISTER/INVITE
+                //    without creds, repeatedly) accrues weight 1; a legit client
+                //    is reset by the record_success above.
+                //  * credentials present but invalid → wrong password, or a
+                //    forged/stale/replayed nonce: a high-confidence abuse signal,
+                //    weighted heavier so brute-force bans faster. The heavier
+                //    weight only applies over a connection-oriented transport
+                //    whose handshake validates the source — a bad-nonce attempt
+                //    needs no round-trip, so over UDP its source is spoofable and
+                //    a heavier weight would amplify a reflected ban. Over UDP it
+                //    falls back to weight 1 (today's behaviour, unchanged).
+                // trusted_cidrs are exempt inside the store.
+                let source_validated = request.transport_name() != "udp";
+                let strong = credentials_present && source_validated;
+                if let Some(ban) = crate::security::auto_ban() {
+                    if let Ok(source) = request.source_ip_str().parse::<std::net::IpAddr>() {
+                        let newly_banned = if strong {
+                            ban.record_strong_failure(source)
+                        } else {
+                            ban.record_failure(source)
+                        };
+                        if newly_banned {
+                            tracing::warn!(
+                                source = %source,
+                                credentials_present,
+                                "auto-ban: source banned (repeated auth failures)"
+                            );
+                        }
+                    }
+                }
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    if credentials_present {
+                        metrics.credential_failures_total.inc();
+                    } else {
+                        metrics.auth_failures_total.inc();
+                    }
+                }
+
                 // Send challenge
                 let reason = if challenge_code == 401 {
                     "Unauthorized"
@@ -606,7 +713,7 @@ impl PyAuth {
                 // MD5-only clients fall back to the first/last MD5 entry.
                 // We emit MD5 + SHA-256 + SHA-512-256 so a single challenge
                 // covers RFC 2617 and RFC 7616 implementations.
-                let nonce = generate_nonce();
+                let nonce = self.generate_nonce();
                 let header_name = if challenge_code == 401 {
                     "WWW-Authenticate"
                 } else {
@@ -652,13 +759,6 @@ impl PyAuth {
         nonce_bytes.extend_from_slice(&vector.rand);
         nonce_bytes.extend_from_slice(&vector.autn);
         let nonce = base64_encode(&nonce_bytes);
-
-        // Store CK/IK keyed by nonce for later SA creation
-        let key_store = aka_key_store();
-        key_store.insert(nonce.clone(), AkaKeyMaterial {
-            ck: vector.ck,
-            ik: vector.ik,
-        });
 
         request.set_reply(401, "Unauthorized".to_string());
 
@@ -706,8 +806,6 @@ impl PyAuth {
             );
             ims_auth_store().insert(nonce_str, ImsAuthVector {
                 expected_response: expected_bytes.clone(),
-                ck: hss_ck.clone(),
-                ik: hss_ik.clone(),
             });
         }
 
@@ -732,7 +830,7 @@ impl PyAuth {
 
         let nonce = match hss_nonce {
             Some(bytes) => base64_encode(bytes),
-            None => generate_nonce(),
+            None => self.generate_nonce(),
         };
         // Per TS 33.203 §6.3, include CK and IK from the HSS MAA so the
         // P-CSCF can extract them for IPsec SA setup with the UE.
@@ -762,6 +860,17 @@ impl PyAuth {
 
     /// Validate credentials by dispatching to the configured backend.
     fn validate_credentials(&self, auth_value: &str, realm: &str, method: &str) -> bool {
+        // Anti-replay: reject a stale or forged nonce before any backend lookup
+        // (RFC 7616 §3.3). Without this, a captured `Authorization` replays
+        // forever. Applies to the static + HTTP backends; the IMS/AKA paths use
+        // single-use HSS vectors and never reach here.
+        match extract_nonce_field(auth_value) {
+            Some(nonce) if self.validate_nonce(&nonce) => {}
+            _ => {
+                debug!("auth: rejecting digest with missing/stale/invalid nonce");
+                return false;
+            }
+        }
         match self.backend_type {
             AuthBackendType::Static => self.validate_static(auth_value, realm, method),
             AuthBackendType::Http => self.validate_http(auth_value, realm, method),
@@ -807,6 +916,17 @@ impl PyAuth {
             None => return false,
         };
 
+        // Bound the attacker-controlled username before it becomes a URL and an
+        // HA1-cache key: reject empty or absurdly long values so a flood of
+        // distinct crafted usernames can't grow the cache / URL unboundedly.
+        if fields.username.is_empty() || fields.username.len() > MAX_AUTH_USERNAME_LEN {
+            warn!(
+                username_len = fields.username.len(),
+                "rejecting HTTP auth: username empty or exceeds length limit"
+            );
+            return false;
+        }
+
         let (http_config, client) = match (&self.http_config, &self.http_client) {
             (Some(c), Some(cl)) => (c, cl),
             _ => {
@@ -815,32 +935,25 @@ impl PyAuth {
             }
         };
 
-        let url = http_config.url.replace("{username}", &fields.username);
-        debug!(url = %url, username = %fields.username, "HTTP auth lookup");
-
-        // Block on the async HTTP request (we're called from sync Python context)
-        let response = match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.get(&url).send())
-        }) {
-            Ok(resp) => resp,
-            Err(e) => {
-                warn!(error = %e, url = %url, "HTTP auth request failed");
-                return false;
+        // Serve from the TTL cache when possible — this is what keeps a
+        // registration storm for the same subscribers from translating 1:1 into
+        // blocking HTTP fetches that each pin a Python-executor worker.
+        let body = match self.cached_credential(&fields.username, http_config.cache_ttl_secs) {
+            Some(cached) => {
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.auth_ha1_cache_hits_total.inc();
+                }
+                debug!(username = %fields.username, "HTTP auth: HA1 cache hit");
+                cached
             }
-        };
-
-        if !response.status().is_success() {
-            debug!(status = %response.status(), username = %fields.username, "HTTP auth: user not found");
-            return false;
-        }
-
-        let body = match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(response.text())
-        }) {
-            Ok(b) => b.trim().to_string(),
-            Err(e) => {
-                warn!(error = %e, "HTTP auth: failed to read response body");
-                return false;
+            None => {
+                let fetched = match self.fetch_http_credential(http_config, client, &fields.username)
+                {
+                    Some(body) => body,
+                    None => return false,
+                };
+                self.store_credential(&fields.username, &fetched);
+                fetched
             }
         };
 
@@ -863,6 +976,84 @@ impl PyAuth {
         let valid = fields.verify(&ha1, method);
         debug!(username = %fields.username, valid, "HTTP auth digest verification");
         valid
+    }
+
+    /// Return a cached credential body for `username` if caching is enabled and
+    /// the entry is still within `ttl_secs`. Expired entries miss (and are left
+    /// for the next fetch to overwrite).
+    fn cached_credential(&self, username: &str, ttl_secs: u64) -> Option<String> {
+        if ttl_secs == 0 {
+            return None;
+        }
+        let cache = self.http_ha1_cache.as_ref()?;
+        let entry = cache.get(username)?;
+        if is_cache_fresh(
+            entry.fetched_at.elapsed(),
+            std::time::Duration::from_secs(ttl_secs),
+        ) {
+            Some(entry.value.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Store a successful credential lookup in the TTL cache. No-op when caching
+    /// is disabled.
+    fn store_credential(&self, username: &str, value: &str) {
+        if let Some(cache) = self.http_ha1_cache.as_ref() {
+            cache.insert(
+                username.to_string(),
+                CachedHa1 {
+                    value: value.to_string(),
+                    fetched_at: std::time::Instant::now(),
+                },
+            );
+        }
+    }
+
+    /// Blocking HTTP fetch of the credential body for `username`. Returns `None`
+    /// on any failure (request error, non-success status, body read error) — the
+    /// caller then rejects the digest without caching anything.
+    fn fetch_http_credential(
+        &self,
+        http_config: &HttpAuthConfig,
+        client: &reqwest::Client,
+        username: &str,
+    ) -> Option<String> {
+        // Percent-encode the attacker-controlled digest username before it lands
+        // in the URL path. Substituting it raw lets a crafted `username` break
+        // out of the `{username}` segment — `../../admin` (path traversal),
+        // `x?role=admin` (query injection), `x#frag` — into the auth backend.
+        let encoded_username = encode_url_path_segment(username);
+        let url = http_config.url.replace("{username}", &encoded_username);
+        debug!(url = %url, username = %username, "HTTP auth lookup");
+
+        // Release the interpreter for the whole blocking HTTP exchange — see
+        // `crate::script::detach_block_on` for why this is mandatory on
+        // free-threaded CPython (blocking while attached stalls the GC
+        // stop-the-world and wedges the engine).
+        let outcome: Result<Option<String>, reqwest::Error> =
+            crate::script::detach_block_on(async {
+                let response = client.get(&url).send().await?;
+                if !response.status().is_success() {
+                    // user not found / backend rejected — not an error
+                    return Ok(None);
+                }
+                let body = response.text().await?;
+                Ok(Some(body.trim().to_string()))
+            });
+
+        match outcome {
+            Ok(Some(body)) => Some(body),
+            Ok(None) => {
+                debug!(username = %username, "HTTP auth: user not found (non-success status)");
+                None
+            }
+            Err(error) => {
+                warn!(error = %error, url = %url, "HTTP auth request/read failed");
+                None
+            }
+        }
     }
 }
 
@@ -950,7 +1141,10 @@ fn parse_algorithm(value: Option<&str>) -> crate::auth::DigestAlgorithm {
     }
 }
 
-/// Compute MD5 hex digest of a string.
+/// Compute MD5 hex digest of a string. Test-only helper for building digest
+/// fixtures; production digest computation goes through `md5_ha1_aka` and the
+/// `crate::auth` digest engine.
+#[cfg(test)]
 fn md5_hex(input: &str) -> String {
     format!("{:x}", md5::compute(input.as_bytes()))
 }
@@ -1043,9 +1237,89 @@ fn extract_username(auth_value: &str) -> Option<String> {
     }
 }
 
-/// Generate a nonce for digest authentication challenges.
-fn generate_nonce() -> String {
-    format!("{:x}", uuid::Uuid::new_v4().as_simple())
+/// Upper bound on a digest `username` we will look up. SIP usernames are short;
+/// anything longer is abuse (URL/cache-key amplification), not a real identity.
+const MAX_AUTH_USERNAME_LEN: usize = 255;
+
+/// Percent-encode `value` for safe use as a single URL path segment when it is
+/// substituted into the HTTP auth backend URL template (`.../sip/auth/{username}`).
+///
+/// Encodes every byte except RFC 3986 unreserved characters (`ALPHA / DIGIT /
+/// "-" / "." / "_" / "~"`), so an attacker-supplied digest `username` cannot
+/// break out of the `{username}` segment: `/` becomes `%2F` (no path traversal),
+/// `?` / `#` / `&` are encoded (no query/fragment injection). A correct HTTP
+/// backend percent-decodes the captured path param transparently.
+fn encode_url_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Default digest-nonce lifetime (seconds). Chosen comfortably above a typical
+/// re-REGISTER interval so nonce reuse (nc++) rarely forces a re-challenge,
+/// while still bounding captured-`Authorization` replay to one hour.
+const DEFAULT_NONCE_TTL_SECS: u64 = 3600;
+
+/// Current UNIX time in seconds (0 if the clock is before the epoch).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// HMAC-SHA256(`key`, `message`) as a lowercase hex string. Hand-rolled over
+/// `sha2` (RFC 2104) to avoid adding an `hmac` dependency; used only for nonce
+/// integrity, so the small surface is acceptable.
+fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut block_key = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let digest = Sha256::digest(key);
+        block_key[..digest.len()].copy_from_slice(&digest);
+    } else {
+        block_key[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        ipad[index] ^= block_key[index];
+        opad[index] ^= block_key[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    outer
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Constant-time byte-slice equality (no early return on first mismatch).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Extract the user part from a SIP From/To header value.
@@ -1184,6 +1458,36 @@ mod tests {
     use crate::sip::uri::SipUri;
     use std::sync::Mutex;
 
+    #[test]
+    fn encode_url_path_segment_passes_through_plain_username() {
+        assert_eq!(encode_url_path_segment("alice"), "alice");
+        assert_eq!(encode_url_path_segment("user.name-1_a~b"), "user.name-1_a~b");
+    }
+
+    #[test]
+    fn encode_url_path_segment_neutralizes_path_traversal() {
+        // The injection F6 guards against: '/' must encode so a crafted username
+        // cannot escape the {username} segment.
+        let encoded = encode_url_path_segment("../../admin");
+        assert_eq!(encoded, "..%2F..%2Fadmin");
+        assert!(!encoded.contains('/'));
+    }
+
+    #[test]
+    fn encode_url_path_segment_neutralizes_query_and_fragment() {
+        assert_eq!(encode_url_path_segment("x?role=admin"), "x%3Frole%3Dadmin");
+        assert_eq!(encode_url_path_segment("x#frag"), "x%23frag");
+        assert_eq!(encode_url_path_segment("a b"), "a%20b");
+        // No raw URL-structural byte survives encoding (the only '%' is an escape).
+        let encoded = encode_url_path_segment("a&b=c/d?e#f");
+        for forbidden in ['&', '=', '/', '?', '#', ' '] {
+            assert!(
+                !encoded.contains(forbidden),
+                "encoded {encoded:?} still contains {forbidden:?}"
+            );
+        }
+    }
+
     fn make_auth() -> PyAuth {
         let mut realm_users = HashMap::new();
         realm_users.insert("alice".to_string(), "pass123".to_string());
@@ -1225,7 +1529,9 @@ mod tests {
             _ => "wrong",
         };
         let realm = "example.com";
-        let nonce = "abc";
+        // A fresh timestamp-bound nonce — tests configure no secret, so
+        // validate_nonce checks freshness only and a current timestamp passes.
+        let nonce = format!("{:016x}.test", now_unix_secs());
         let digest_uri = "sip:example.com";
         let ha1 = md5_hex(&format!("{}:{}:{}", username, realm, password));
         let ha2 = md5_hex(&format!("REGISTER:{}", digest_uri));
@@ -1255,6 +1561,62 @@ mod tests {
             "10.0.0.1".to_string(),
             5060,
         )
+    }
+
+    #[test]
+    fn nonce_freshness_and_hmac_integrity() {
+        // No secret → freshness-only: a freshly minted nonce validates.
+        let auth = PyAuth::empty();
+        assert!(auth.validate_nonce(&auth.generate_nonce()));
+        // Stale (replayed) nonce rejected.
+        let stale = format!(
+            "{:016x}.x",
+            now_unix_secs().saturating_sub(DEFAULT_NONCE_TTL_SECS + 60)
+        );
+        assert!(!auth.validate_nonce(&stale));
+        // Malformed nonces rejected (no panic).
+        assert!(!auth.validate_nonce("abc"));
+        assert!(!auth.validate_nonce("nothex.tag"));
+
+        // With a shared secret → HMAC integrity enforced.
+        let mut signed = PyAuth::empty();
+        signed.set_nonce_policy(Some(b"shared-secret".to_vec()), 0);
+        let good = signed.generate_nonce();
+        assert!(signed.validate_nonce(&good));
+        let (timestamp, _) = good.split_once('.').unwrap();
+        // Tampered tag rejected.
+        assert!(!signed.validate_nonce(&format!("{timestamp}.deadbeef")));
+        // A nonce minted under a different secret is rejected (foreign nonce).
+        let mut other = PyAuth::empty();
+        other.set_nonce_policy(Some(b"different-secret".to_vec()), 0);
+        assert!(!signed.validate_nonce(&other.generate_nonce()));
+    }
+
+    #[test]
+    fn validate_credentials_rejects_stale_nonce_replay() {
+        // F5: a digest response that is *cryptographically valid* but carries a
+        // stale nonce (the captured-`Authorization` replay) must be rejected.
+        let auth = make_auth();
+        let ha1 = md5_hex("alice:example.com:pass123");
+        let ha2 = md5_hex("REGISTER:sip:example.com");
+
+        let build = |nonce: &str| {
+            let response = md5_hex(&format!("{ha1}:{nonce}:{ha2}"));
+            format!(
+                "Digest username=\"alice\", realm=\"example.com\", nonce=\"{nonce}\", \
+                 uri=\"sip:example.com\", response=\"{response}\""
+            )
+        };
+
+        let stale = format!(
+            "{:016x}.test",
+            now_unix_secs().saturating_sub(DEFAULT_NONCE_TTL_SECS + 100)
+        );
+        assert!(!auth.validate_credentials(&build(&stale), "example.com", "REGISTER"));
+
+        // The identical exchange with a fresh nonce authenticates.
+        let fresh = format!("{:016x}.test", now_unix_secs());
+        assert!(auth.validate_credentials(&build(&fresh), "example.com", "REGISTER"));
     }
 
     #[test]
@@ -1512,30 +1874,12 @@ mod tests {
     }
 
     #[test]
-    fn aka_key_store_insert_and_retrieve() {
-        let store = aka_key_store();
-        let key_material = AkaKeyMaterial {
-            ck: [1u8; 16],
-            ik: [2u8; 16],
-        };
-        store.insert("test-nonce-auth".to_string(), key_material);
-        {
-            let retrieved = store.get("test-nonce-auth").unwrap();
-            assert_eq!(retrieved.ck, [1u8; 16]);
-            assert_eq!(retrieved.ik, [2u8; 16]);
-        } // drop Ref guard before remove — holding it causes DashMap shard deadlock
-        store.remove("test-nonce-auth");
-    }
-
-    #[test]
     fn ims_auth_store_insert_lookup_consume() {
         let store = ims_auth_store();
         let nonce = "test-ims-nonce-123".to_string();
 
         store.insert(nonce.clone(), ImsAuthVector {
             expected_response: vec![0xAA; 16],
-            ck: Some(vec![0xBB; 16]),
-            ik: Some(vec![0xCC; 16]),
         });
 
         // Verify it exists
@@ -1546,7 +1890,6 @@ mod tests {
         assert!(removed.is_some());
         let (_, vector) = removed.unwrap();
         assert_eq!(vector.expected_response, vec![0xAA; 16]);
-        assert_eq!(vector.ck.unwrap(), vec![0xBB; 16]);
 
         // Gone after consumption — prevents replay
         assert!(store.get(&nonce).is_none());
@@ -1596,5 +1939,59 @@ mod tests {
     fn extract_auts_missing_returns_none() {
         let auth = r#"Digest username="alice",realm="test",nonce="abc",response="def""#;
         assert!(extract_digest_param(auth, "auts").is_none());
+    }
+
+    fn http_auth_with_cache(cache_ttl_secs: u64) -> PyAuth {
+        let mut auth = PyAuth::empty();
+        auth.set_backend_type(AuthBackendType::Http);
+        auth.set_http_config(HttpAuthConfig {
+            url: "http://127.0.0.1:9/sip/auth/{username}".to_string(),
+            timeout_ms: 100,
+            connect_timeout_ms: 100,
+            ha1: true,
+            cache_ttl_secs,
+        })
+        .unwrap();
+        auth
+    }
+
+    #[test]
+    fn cache_freshness_boundary() {
+        use std::time::Duration;
+        assert!(is_cache_fresh(Duration::from_secs(0), Duration::from_secs(300)));
+        assert!(is_cache_fresh(Duration::from_secs(299), Duration::from_secs(300)));
+        // At and beyond the TTL the entry is stale.
+        assert!(!is_cache_fresh(Duration::from_secs(300), Duration::from_secs(300)));
+        assert!(!is_cache_fresh(Duration::from_secs(400), Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn ha1_cache_miss_then_store_then_hit() {
+        let auth = http_auth_with_cache(300);
+
+        // Cold: nothing stored yet.
+        assert!(auth.cached_credential("alice", 300).is_none());
+
+        // After a successful lookup is stored, it hits within the TTL.
+        auth.store_credential("alice", "deadbeefcafe");
+        assert_eq!(
+            auth.cached_credential("alice", 300).as_deref(),
+            Some("deadbeefcafe")
+        );
+
+        // A ttl of 0 always misses (caching disabled for this call).
+        assert!(auth.cached_credential("alice", 0).is_none());
+    }
+
+    #[test]
+    fn ha1_cache_not_allocated_when_ttl_zero() {
+        let auth = http_auth_with_cache(0);
+        assert!(
+            auth.http_ha1_cache.is_none(),
+            "no cache map should be allocated when cache_ttl_secs is 0"
+        );
+        // store_credential is a no-op and lookups always miss.
+        auth.store_credential("alice", "x");
+        assert!(auth.cached_credential("alice", 300).is_none());
     }
 }

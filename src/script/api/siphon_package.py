@@ -105,6 +105,32 @@ class _ProxyNamespace:
         return fn
 
     @staticmethod
+    def on_cancel(fn):
+        """
+        Register a handler for a CANCELled INVITE (RFC 3261 §9).
+
+        Fires once, with the original INVITE, when a relayed INVITE is
+        CANCELled before any final response — the one teardown that
+        neither ``on_reply`` nor ``on_failure`` ever delivers (the proxy
+        answers the CANCEL with 487 at the transaction layer and the call
+        is gone). Use it to release per-call resources that no BYE will
+        ever clear: Diameter Rx / N5 QoS sessions, rtpengine media
+        anchors, charging correlation maps.
+
+        It is fire-and-forget cleanup — it does not gate or alter the 487
+        sent to the UAC, so there is no ``relay()``/``reply()`` decision.
+
+        Usage:
+            @proxy.on_cancel
+            async def handle_cancel(request):
+                await _release_qos(request.call_id)
+                await rtpengine.delete(request)
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("proxy.on_cancel", None, fn, is_async)
+        return fn
+
+    @staticmethod
     def on_register_reply(fn):
         """
         Register a handler for REGISTER replies.
@@ -176,6 +202,27 @@ class _B2buaNamespace:
         """Register handler for REFER (call transfer, RFC 3515)."""
         is_async = _asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_refer", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_cancel(fn):
+        """Register handler for a CANCELled call (RFC 3261 §9).
+
+        Fires once, with the Call object, when an unanswered call
+        (Calling/Ringing) is CANCELled — the teardown that ``on_failure``
+        (B-leg error) and ``on_bye`` (answered call) never cover. A 2xx
+        that wins the CANCEL/answer glare is ACK+BYE'd by the framework
+        and never delivers ``on_answer``, so this hook only ever sees a
+        genuinely abandoned call. Use it to release per-call resources
+        that no BYE will clear: rtpengine media anchors, QoS sessions.
+
+        Usage:
+            @b2bua.on_cancel
+            async def handle_cancel(call):
+                await rtpengine.delete(call)
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_cancel", None, fn, is_async)
         return fn
 
 
@@ -383,9 +430,20 @@ class _LiNamespace:
 # ---------------------------------------------------------------------------
 
 class _RegistrationNamespace:
-    """Outbound registration operations (stub)."""
+    """Outbound registration operations (stub).
 
-    def add(self, aor, registrar, *, user, password, interval=None, realm=None, contact=None, transport=None):
+    Replaced by the Rust-backed namespace when a ``registrant:`` block is
+    configured. NOTE: that replacement happens at server init AFTER the script
+    module is first loaded, so calling ``registration.add(...)`` at script
+    *top level* always lands on this stub — declare registrations in YAML
+    (``registrant.entries``) or call ``registration.add`` from a runtime
+    handler/timer instead.
+    """
+
+    def add(self, aor, registrar, *, user, password="", interval=None, realm=None,
+            contact=None, transport=None, auth=None, k=None, op=None, opc=None,
+            amf=None, sqn=None, ipsec=False, ue_port_c=None, ue_port_s=None,
+            ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None):
         raise NotImplementedError("registration.add() not available — no registrant in config")
 
     def remove(self, aor):
@@ -402,6 +460,15 @@ class _RegistrationNamespace:
 
     def count(self):
         raise NotImplementedError("registration.count() not available — no registrant in config")
+
+    def service_route(self, aor):
+        raise NotImplementedError("registration.service_route() not available — no registrant in config")
+
+    def associated_uris(self, aor):
+        raise NotImplementedError("registration.associated_uris() not available — no registrant in config")
+
+    def flow(self, aor, ue_ip):
+        raise NotImplementedError("registration.flow() not available — no registrant in config")
 
     @staticmethod
     def on_change(fn):
@@ -619,15 +686,53 @@ diameter = _DiameterNamespace()
 # SBI namespace (5G Service Based Interfaces — N5/Npcf policy authorization)
 # ---------------------------------------------------------------------------
 
-class _SbiNamespace:
-    """Stub SBI namespace with decorator support.
+class BsfError(RuntimeError):
+    """Raised by ``sbi.discover_pcf_binding()`` when the BSF is unhealthy
+    (5xx / timeout / transport / malformed body).
 
-    When ``sbi:`` is configured, the Rust SbiNamespace replaces this.
-    The ``@on_event`` decorator still needs to be available for registration
-    even before the Rust instance is injected (decorators run at import time).
+    A 404 (no binding for the UE IP) is **not** a ``BsfError`` — it returns
+    ``None`` (the 4G UE case).  This Python class is only a pre-injection
+    fallback so ``except sbi.BsfError`` resolves before the Rust singleton is
+    wired; once ``sbi._inner`` is injected, ``sbi.BsfError`` forwards to the
+    Rust exception type (which is what ``discover_pcf_binding`` actually
+    raises).
     """
 
-    def create_session(self, **kwargs):
+
+class _SbiNamespace:
+    """SBI namespace façade.
+
+    Data methods (``create_session``, ``discover_pcf_binding``, …) forward to
+    the Rust-backed singleton, injected at startup as ``self._inner`` — the
+    same pattern ``_ProxyNamespace`` uses for ``_utils``.  Forwarding (rather
+    than replacing the module attribute) means a script that did
+    ``from siphon import sbi`` before the singleton was wired still reaches the
+    Rust impl, and the Python ``@on_event`` decorator (which the Rust namespace
+    does not implement) keeps working.
+
+    ``__getattr__`` delegates any other attribute (notably ``BsfError``) to the
+    injected singleton so ``except sbi.BsfError`` catches the actual Rust
+    exception type once wired.
+    """
+
+    def __init__(self):
+        # Replaced at startup by the Rust SbiNamespace (set_sbi_singleton /
+        # install_siphon_module).  None until then.
+        self._inner = None
+
+    def __getattr__(self, name):
+        inner = object.__getattribute__(self, "__dict__").get("_inner")
+        if inner is not None:
+            return getattr(inner, name)
+        if name == "BsfError":
+            # Pre-injection fallback so `except sbi.BsfError` resolves.
+            return BsfError
+        raise AttributeError(
+            f"sbi.{name} not available — sbi: not configured "
+            "(needs npcf_url and/or bsf_url)"
+        )
+
+    def create_session(self, *args, **kwargs):
         """Create an N5 app session for QoS policy authorization.
 
         Requires ``sbi:`` configuration with ``npcf_url``.
@@ -643,41 +748,74 @@ class _SbiNamespace:
             media_components: list of media-component dicts.  See the
                 project docs for the full shape (mirrors
                 ``diameter.rx_aar``).
+            pcf_uri: per-call N5 target — the discovered PCF.  In ``indirect``
+                communication mode it becomes the ``3gpp-Sbi-Target-apiRoot``
+                routed via the SCP; in ``direct`` mode it is the POST base.
 
         Returns:
-            Dict with ``app_session_id`` and ``authorized``, or None.
+            Dict with ``app_session_id``, ``authorized`` and
+            ``app_session_uri``, or None.
         """
-        raise NotImplementedError(
-            "sbi.create_session() requires sbi: with npcf_url in config"
-        )
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise NotImplementedError(
+                "sbi.create_session() requires sbi: with npcf_url in config"
+            )
+        return inner.create_session(*args, **kwargs)
 
-    def delete_session(self, session_id):
+    def delete_session(self, *args, **kwargs):
         """Delete an N5 app session.
 
         Args:
-            session_id: The app session ID from create_session().
+            session_id: The app session id from create_session(), or the
+                absolute ``app_session_uri`` for replica-independent teardown.
 
         Returns:
             True on success, False on failure.
         """
-        raise NotImplementedError(
-            "sbi.delete_session() requires sbi: with npcf_url in config"
-        )
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise NotImplementedError(
+                "sbi.delete_session() requires sbi: with npcf_url in config"
+            )
+        return inner.delete_session(*args, **kwargs)
 
-    def update_session(self, session_id, **kwargs):
+    def update_session(self, *args, **kwargs):
         """Update an N5 app session (media renegotiation).
 
         Args:
-            session_id: The app session ID to update.
+            session_id: The app session id to update, or the absolute
+                ``app_session_uri``.
             media_components: list of media-component dicts (same shape as
                 ``create_session``).
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or None.
         """
-        raise NotImplementedError(
-            "sbi.update_session() requires sbi: with npcf_url in config"
-        )
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise NotImplementedError(
+                "sbi.update_session() requires sbi: with npcf_url in config"
+            )
+        return inner.update_session(*args, **kwargs)
+
+    def discover_pcf_binding(self, *args, **kwargs):
+        """Nbsf_Management discovery — look up the PCF binding for a UE IP.
+
+        Returns a binding dict (BSF 200, 5G; incl. a ready-to-use ``pcf_uri``),
+        ``None`` (BSF 404, 4G), or raises ``sbi.BsfError`` (BSF unhealthy).
+        Requires ``sbi:`` configuration with ``bsf_url``.
+
+        Args:
+            ue_ipv4: UE IPv4 address (the IPsec SA peer).
+            ue_ipv6: UE IPv6 address/prefix.  Exactly one of ue_ipv4 / ue_ipv6.
+        """
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise NotImplementedError(
+                "sbi.discover_pcf_binding() requires sbi: with bsf_url in config"
+            )
+        return inner.discover_pcf_binding(*args, **kwargs)
 
     @staticmethod
     def on_event(fn):

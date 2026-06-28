@@ -1,0 +1,49 @@
+# cargo-deny — dependency-graph security / license / source policy for siphon-sip.
+# Local: `cargo deny check`  ·  CI: RustSec advisories run on a schedule (.github/workflows/audit.yml).
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Evaluate the graph for the Linux targets we ship binaries/images for.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+all-features = true
+
+[advisories]
+# RustSec advisory database. A yanked crate or an open advisory fails the audit.
+version = 2
+yanked = "deny"
+ignore = [
+    # paste — unmaintained transitive (no vuln); remove when the parent crate drops it.
+    "RUSTSEC-2024-0436",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+# NOTE: unlike siphon-rtp (a zero-C project), siphon-sip legitimately links C
+# libraries — libsctp (tokio-sctp), jemalloc (tikv-jemallocator), netlink — and
+# embeds CPython via PyO3. So there is intentionally no C-FFI ban list here.
+
+[licenses]
+# The crate is MIT; keep dependencies OSI-permissive.
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

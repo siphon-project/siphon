@@ -8,12 +8,75 @@ pub mod milenage;
 #[cfg(target_os = "linux")]
 pub mod netlink;
 
+pub mod ue;
+
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
+
+/// Grace added on top of an SA's hard lifetime before the sweeper reaps
+/// its in-memory `associations` entry (RFC 3261 Timer F = 64·T1 = 64 s).
+///
+/// The kernel reaps the four XFRM states + four policies on the SA hard
+/// lifetime directly; this grace only governs when `sweep_expired` drops
+/// the manager's bookkeeping entry (and best-effort re-deletes the kernel
+/// objects, which are usually already gone).  Matching the 64 s Timer F
+/// window used elsewhere in the codebase keeps the in-memory view alive
+/// just long enough for any in-flight re-REGISTER to refresh the SA
+/// rather than race the sweep.
+const SA_SWEEP_GRACE_SECS: u64 = 64;
+
+/// Compute the wall-clock instant after which `sweep_expired` may reap an
+/// SA pair's in-memory entry.  For an SA with a hard lifetime this is
+/// `now + lifetime + grace`; an SA created with no hard lifetime
+/// (`None` — intentionally permanent, dev/test) is never swept by this
+/// path, so it gets a far-future instant.
+fn compute_sa_expires_at(hard_lifetime_secs: Option<u64>) -> Instant {
+    match hard_lifetime_secs {
+        Some(secs) => {
+            let total = secs.saturating_add(SA_SWEEP_GRACE_SECS);
+            Instant::now()
+                .checked_add(Duration::from_secs(total))
+                .unwrap_or_else(far_future_instant)
+        }
+        // No kernel-enforced expiry → never swept by the expiry path.
+        None => far_future_instant(),
+    }
+}
+
+/// A far-future `Instant` used as the "never sweep" sentinel.  ~100 years
+/// out — well past any realistic process lifetime, and saturating-add
+/// guards against overflow on platforms with a near-`now` epoch.
+fn far_future_instant() -> Instant {
+    Instant::now()
+        .checked_add(Duration::from_secs(100 * 365 * 24 * 60 * 60))
+        .unwrap_or_else(Instant::now)
+}
+
+/// Global `IpsecManager` handle, set once at server bootstrap so
+/// background sweeps (the dispatcher's 30 s cleanup tick) can reach the
+/// same manager the script API uses.  Mirrors
+/// `subscribe_state::set_global_store` / `global_store`.
+static GLOBAL_MANAGER: OnceLock<Arc<IpsecManager>> = OnceLock::new();
+
+/// Register the process-wide `IpsecManager`.  Idempotent — the first
+/// caller wins; later calls are ignored (returns the already-set handle
+/// via the `Err`-side of `OnceLock::set` being swallowed).  Called once
+/// where the manager is constructed during server startup.
+pub fn set_global_manager(manager: Arc<IpsecManager>) {
+    let _ = GLOBAL_MANAGER.set(manager);
+}
+
+/// Fetch the process-wide `IpsecManager`, if one has been registered.
+/// Returns `None` when IPsec is not configured (no P-CSCF role).
+pub fn global_manager() -> Option<Arc<IpsecManager>> {
+    GLOBAL_MANAGER.get().cloned()
+}
 
 // ---------------------------------------------------------------------------
 // Local helpers — HMAC-SHA-256, hex encoding, IPv4/IPv6 prefix length.
@@ -126,6 +189,34 @@ pub(crate) enum PolicyDir {
     Out,
 }
 
+/// Which end of the sec-agree association siphon is installing SAs for.
+///
+/// The four SA *states* (transforms) are identical regardless of role — both
+/// ends install the same `(src, dst, spi)` transforms because they describe
+/// the same encrypted packets on the wire. The four XFRM *policies* differ:
+/// a flow the P-CSCF sees as inbound is outbound from the UE's vantage, and
+/// vice versa. [`SaRole::policy_dir`] encodes that mirror so one
+/// `create_sa_pair`/`delete_sa_pair` serves both roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaRole {
+    /// Network side (P-CSCF): UE→net flows are inbound, net→UE are outbound.
+    #[default]
+    PCscf,
+    /// UE side (soft-UE registering into IMS): the directions invert.
+    Ue,
+}
+
+impl SaRole {
+    /// The XFRM policy direction for a flow, given whether the UE is the
+    /// flow's source. The UE's view is the exact mirror of the P-CSCF's.
+    pub(crate) fn policy_dir(self, src_is_ue: bool) -> PolicyDir {
+        match (self, src_is_ue) {
+            (SaRole::PCscf, true) | (SaRole::Ue, false) => PolicyDir::In,
+            (SaRole::PCscf, false) | (SaRole::Ue, true) => PolicyDir::Out,
+        }
+    }
+}
+
 /// Upper-layer protocol pinned into the XFRM selector for an SA pair —
 /// determines which inner-protocol frames the SA applies to.  IMS IPsec
 /// supports both ESP-over-UDP (the common deployment) and ESP-over-TCP
@@ -141,6 +232,7 @@ pub(crate) enum PolicyDir {
 /// stamps `proto = 0` (kernel-side "match any inner protocol"), so the
 /// same SPI pair covers both transports without doubling kernel state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SaProtocol {
     /// IPPROTO_UDP (17).
     Udp,
@@ -148,6 +240,7 @@ pub enum SaProtocol {
     Tcp,
     /// "Any" — selector_proto=0 in XFRM, matches both TCP and UDP inner
     /// flows.  Default when the script doesn't pin a transport.
+    #[default]
     Any,
 }
 
@@ -180,11 +273,6 @@ impl SaProtocol {
     }
 }
 
-impl Default for SaProtocol {
-    fn default() -> Self {
-        SaProtocol::Any
-    }
-}
 
 impl std::fmt::Display for SaProtocol {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -223,6 +311,28 @@ impl EncryptionAlgorithm {
             Self::Null => 0,
             Self::AesCbc128 => 16,
             Self::DesEde3Cbc => 24,
+        }
+    }
+
+    /// The `ealg=` token used on the RFC 3329 / TS 33.203 Security-Client /
+    /// Security-Server line (distinct from the `ip xfrm` and Display names).
+    pub fn sec_agree_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::AesCbc128 => "aes-cbc",
+            Self::DesEde3Cbc => "des-ede3-cbc",
+        }
+    }
+
+    /// Parse a Security-Server/Client `ealg=` token back into the enum.
+    /// An absent `ealg` is treated by callers as `Null`; this only maps
+    /// present tokens. Returns `None` for unknown tokens.
+    pub fn from_sec_agree_name(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "null" => Some(Self::Null),
+            "aes-cbc" => Some(Self::AesCbc128),
+            "des-ede3-cbc" => Some(Self::DesEde3Cbc),
+            _ => None,
         }
     }
 }
@@ -277,6 +387,27 @@ impl IntegrityAlgorithm {
             Self::HmacMd5 => 16,
             Self::HmacSha1 => 20,
             Self::HmacSha256 => 32,
+        }
+    }
+
+    /// The `alg=` token used on the RFC 3329 / TS 33.203 Security-Client /
+    /// Security-Server line (distinct from the `ip xfrm` and Display names).
+    pub fn sec_agree_name(&self) -> &'static str {
+        match self {
+            Self::HmacMd5 => "hmac-md5-96",
+            Self::HmacSha1 => "hmac-sha-1-96",
+            Self::HmacSha256 => "hmac-sha-256-128",
+        }
+    }
+
+    /// Parse a Security-Server/Client `alg=` token back into the enum.
+    /// Returns `None` for unknown tokens.
+    pub fn from_sec_agree_name(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "hmac-md5-96" => Some(Self::HmacMd5),
+            "hmac-sha-1-96" => Some(Self::HmacSha1),
+            "hmac-sha-256-128" => Some(Self::HmacSha256),
+            _ => None,
         }
     }
 }
@@ -348,6 +479,52 @@ pub struct SecurityAssociationPair {
     /// deployments or tests; a mismatched pin silently drops every
     /// frame the UE sends on the other transport.
     pub protocol: SaProtocol,
+    /// Wall-clock instant after which the background sweeper
+    /// (`IpsecManager::sweep_expired`) may reap this pair's in-memory
+    /// entry and best-effort re-delete its kernel objects.
+    ///
+    /// Computed in `create_sa_pair` from `hard_lifetime_secs` plus
+    /// `SA_SWEEP_GRACE_SECS` (RFC 3261 Timer F).  An SA created with no
+    /// hard lifetime gets a far-future instant and is never swept by the
+    /// expiry path (intentionally permanent — dev/test).  An ACTIVE
+    /// registration re-REGISTERs before this deadline, which replaces the
+    /// pair with a fresh `expires_at`, so only truly-abandoned UEs are
+    /// reaped.
+    pub expires_at: Instant,
+    /// Wall-clock instant the SA pair was installed in the kernel — the
+    /// local mirror of the kernel's `xfrm_state.curlft.add_time`.  Stamped
+    /// once in [`create_sa_pair`] and **never** moved by a re-pin, because
+    /// `XFRM_MSG_UPDSA` preserves `add_time`: the kernel always computes the
+    /// hard-expiry as `add_time + hard_add_expires_seconds`.  This anchor
+    /// lets [`update_sa_pair_lifetime`] translate a "lifetime from now" into
+    /// the "lifetime from install" the kernel actually wants — without it, a
+    /// re-pin on a long-lived registration would move the in-memory
+    /// `expires_at` forward but leave the kernel SA dying on its original
+    /// timer.
+    pub created_at: Instant,
+    /// Whether siphon is the network (P-CSCF) or the UE for this pair.
+    /// Determines the four policy directions in `create_sa_pair` /
+    /// `delete_sa_pair`; the SA states are identical either way.
+    pub role: SaRole,
+}
+
+/// A row of the SA-liveness snapshot ([`IpsecManager::liveness_snapshot`]):
+/// the inbound SPIs (the SAs the UE's own keepalive and MO requests land on)
+/// keyed to the UE's address and ports.  The registrar idle reaper correlates
+/// a UDP+IPsec binding to its SA via `ue_addr` and checks `spi_ps` / `spi_pc`
+/// against the kernel use-time map.
+#[derive(Debug, Clone)]
+pub struct SaLivenessRow {
+    /// UE IP address (matches a binding's `source_addr.ip()`).
+    pub ue_addr: IpAddr,
+    /// UE client port.
+    pub ue_port_c: u16,
+    /// UE server port.
+    pub ue_port_s: u16,
+    /// Inbound SA #1 SPI (UE:port_uc → PCSCF:port_ps).
+    pub spi_ps: u32,
+    /// Inbound SA #4 SPI (UE:port_us → PCSCF:port_pc).
+    pub spi_pc: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -466,17 +643,13 @@ impl std::error::Error for IpsecError {}
 /// on the netlink socket) or `/sbin/ip xfrm` shell-out (slower but
 /// works in any environment where ``ip`` itself works).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum XfrmBackend {
+    #[default]
     Netlink,
     IpCommand,
 }
 
-impl Default for XfrmBackend {
-    fn default() -> Self {
-        // Netlink is the production default; switch with `ipsec.backend: ip`.
-        Self::Netlink
-    }
-}
 
 /// Manages active IPsec SAs for UE registrations.
 ///
@@ -499,6 +672,13 @@ pub struct IpsecManager {
     spi_range_end: u32,
     /// XFRM backend.  Picked at startup from `IpsecConfig.backend`.
     backend: XfrmBackend,
+    /// Test-only in-memory kernel.  When set, the four kernel-op methods
+    /// (`add_sa` / `del_sa` / `add_policy` / `del_policy`) route through it
+    /// instead of netlink / `ip xfrm`, so the idempotency + atomicity of
+    /// `create_sa_pair` can be asserted deterministically without
+    /// `CAP_NET_ADMIN`.  Always `None` in production builds.
+    #[cfg(test)]
+    kernel_mock: Option<std::sync::Mutex<KernelMock>>,
 }
 
 impl Default for IpsecManager {
@@ -529,6 +709,8 @@ impl IpsecManager {
             spi_range_start,
             spi_range_end: end,
             backend,
+            #[cfg(test)]
+            kernel_mock: None,
         }
     }
 
@@ -569,9 +751,72 @@ impl IpsecManager {
     /// 4. UE:port_us → PCSCF:port_pc, SPI=spi_pc (inbound replies)
     pub async fn create_sa_pair(
         &self,
-        sa: SecurityAssociationPair,
+        mut sa: SecurityAssociationPair,
     ) -> Result<(), IpsecError> {
         let key = Self::contact_key(&sa.ue_addr, sa.ue_port_c);
+
+        // Stamp the authoritative sweep deadline from the SA's own hard
+        // lifetime (+ grace).  Computed here, ignoring whatever the caller
+        // pre-set, so the in-memory entry always agrees with the kernel
+        // hard-lifetime that the four states/policies were installed with.
+        sa.expires_at = compute_sa_expires_at(sa.hard_lifetime_secs);
+        // Anchor the install instant here too — this is the moment the four
+        // XFRM states get their kernel `add_time`.  A later re-pin measures
+        // elapsed-since-install from this anchor (see
+        // `update_sa_pair_lifetime`), so it must be stamped at the same point
+        // as the kernel install, ignoring any placeholder the caller pre-set.
+        sa.created_at = Instant::now();
+
+        // Idempotent install: clear any colliding kernel entry first
+        // (best-effort — `ENOENT` is fine). The four SA *states* rarely collide
+        // because the SPIs rotate per attempt, but the four XFRM *policy*
+        // selectors are keyed on `(src, dst, ports, proto, dir)` with no SPI —
+        // fixed across attempts/restarts/sessions. A leftover policy (a restart
+        // orphan, or a partial install from an earlier failed attempt) would
+        // otherwise `EEXIST` on the first `add_policy` and wedge every retry:
+        // the 200-OK-gated cleanup never runs after a failed allocate, so the
+        // colliding policy is never reaped. Clearing first makes allocate
+        // self-heal.
+        self.teardown_sa_kernel(&sa).await;
+
+        // Atomic: install all eight; on ANY failure, roll back THIS call's
+        // partial state before propagating. Otherwise a failure partway through
+        // (e.g. the first add_policy EEXISTs) strands the already-installed SAs
+        // in the kernel with no `associations` record — unreachable by
+        // delete_sa_pair / cleanup_other_pairs_for_ue / the sweeper, i.e. a
+        // permanent leak. Rollback guarantees a failed allocate leaves the
+        // kernel exactly as it found it, so the failure degrades to a clean
+        // retry instead of a wedge.
+        if let Err(error) = self.install_sa_kernel(&sa).await {
+            self.teardown_sa_kernel(&sa).await;
+            tracing::warn!(
+                ue = %sa.ue_addr,
+                ue_port_c = sa.ue_port_c,
+                %error,
+                "IPsec: SA pair install failed — rolled back partial state"
+            );
+            return Err(error);
+        }
+
+        info!(
+            ue = %sa.ue_addr,
+            ue_port_c = sa.ue_port_c,
+            spi_uc = sa.spi_uc,
+            spi_us = sa.spi_us,
+            spi_pc = sa.spi_pc,
+            spi_ps = sa.spi_ps,
+            protocol = %sa.protocol,
+            "IPsec: SA pair created"
+        );
+
+        self.associations.insert(key, sa);
+        Ok(())
+    }
+
+    /// Install the four XFRM states + four policies for `sa` (all `EXCL`).
+    /// Returns on the first failure with partial state installed — the caller
+    /// ([`create_sa_pair`]) rolls it back via [`teardown_sa_kernel`].
+    async fn install_sa_kernel(&self, sa: &SecurityAssociationPair) -> Result<(), IpsecError> {
         let proto = sa.protocol;
 
         // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps (inbound to P-CSCF server)
@@ -610,47 +855,103 @@ impl IpsecManager {
             proto, sa.hard_lifetime_secs,
         ).await?;
 
-        // Policy 1 (in): UE:port_uc → PCSCF:port_ps
+        // Policies get the SAME hard lifetime as the states so they self-reap
+        // on the same deadline (3GPP TS 33.203 §7.4); `None` = permanent.
+        let policy_lifetime = sa.hard_lifetime_secs;
+        // Policy directions mirror by role: a UE-sourced flow is the P-CSCF's
+        // `In` and the UE's `Out` (and vice versa).
+        let role = sa.role;
+
+        // Policy 1: UE:port_uc → PCSCF:port_ps (UE-sourced)
         self.add_policy(
             &sa.ue_addr, sa.ue_port_c,
             &sa.pcscf_addr, sa.pcscf_port_s,
-            PolicyDir::In, sa.spi_ps, proto,
+            role.policy_dir(true), sa.spi_ps, proto, policy_lifetime,
         ).await?;
 
-        // Policy 2 (out): PCSCF:port_ps → UE:port_uc
+        // Policy 2: PCSCF:port_ps → UE:port_uc (P-CSCF-sourced)
         self.add_policy(
             &sa.pcscf_addr, sa.pcscf_port_s,
             &sa.ue_addr, sa.ue_port_c,
-            PolicyDir::Out, sa.spi_uc, proto,
+            role.policy_dir(false), sa.spi_uc, proto, policy_lifetime,
         ).await?;
 
-        // Policy 3 (out): PCSCF:port_pc → UE:port_us
+        // Policy 3: PCSCF:port_pc → UE:port_us (P-CSCF-sourced)
         self.add_policy(
             &sa.pcscf_addr, sa.pcscf_port_c,
             &sa.ue_addr, sa.ue_port_s,
-            PolicyDir::Out, sa.spi_us, proto,
+            role.policy_dir(false), sa.spi_us, proto, policy_lifetime,
         ).await?;
 
-        // Policy 4 (in): UE:port_us → PCSCF:port_pc
+        // Policy 4: UE:port_us → PCSCF:port_pc (UE-sourced)
         self.add_policy(
             &sa.ue_addr, sa.ue_port_s,
             &sa.pcscf_addr, sa.pcscf_port_c,
-            PolicyDir::In, sa.spi_pc, proto,
+            role.policy_dir(true), sa.spi_pc, proto, policy_lifetime,
         ).await?;
 
-        info!(
-            ue = %sa.ue_addr,
-            ue_port_c = sa.ue_port_c,
-            spi_uc = sa.spi_uc,
-            spi_us = sa.spi_us,
-            spi_pc = sa.spi_pc,
-            spi_ps = sa.spi_ps,
-            protocol = %proto,
-            "IPsec: SA pair created"
-        );
-
-        self.associations.insert(key, sa);
         Ok(())
+    }
+
+    /// Best-effort teardown of the four XFRM states + four policies for `sa`
+    /// (ignores `ENOENT`). Used to clear a colliding orphan before install, to
+    /// roll back a partial install, and by [`delete_sa_pair`]. Every delete is
+    /// independent — one failure never skips the rest, so a single missing key
+    /// can't strand the other seven (the latent leak in the old `?`-chained
+    /// `delete_sa_pair`). Keys on exactly the kernel's own key, so it removes a
+    /// colliding orphan regardless of which registration created it.
+    async fn teardown_sa_kernel(&self, sa: &SecurityAssociationPair) {
+        let proto = sa.protocol;
+        let role = sa.role;
+
+        // States — keyed on (dst, spi); src is ignored by the kernel del.
+        self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_ps).await.ok();
+        self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_uc).await.ok();
+        self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_us).await.ok();
+        self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_pc).await.ok();
+
+        // Policies — the colliding objects; same four selectors + dirs as the
+        // install, so this clears exactly what install_sa_kernel would add.
+        self.del_policy(
+            &sa.ue_addr, sa.ue_port_c,
+            &sa.pcscf_addr, sa.pcscf_port_s,
+            role.policy_dir(true), proto,
+        ).await.ok();
+        self.del_policy(
+            &sa.pcscf_addr, sa.pcscf_port_s,
+            &sa.ue_addr, sa.ue_port_c,
+            role.policy_dir(false), proto,
+        ).await.ok();
+        self.del_policy(
+            &sa.pcscf_addr, sa.pcscf_port_c,
+            &sa.ue_addr, sa.ue_port_s,
+            role.policy_dir(false), proto,
+        ).await.ok();
+        self.del_policy(
+            &sa.ue_addr, sa.ue_port_s,
+            &sa.pcscf_addr, sa.pcscf_port_c,
+            role.policy_dir(true), proto,
+        ).await.ok();
+    }
+
+    /// Create the UE-side IPsec SAs for an outbound IMS registration.
+    ///
+    /// Identical kernel transforms to [`create_sa_pair`], but the four XFRM
+    /// policies are installed with inverted directions (a UE-sourced flow is
+    /// `Out`, a P-CSCF-sourced flow is `In`). Forces [`SaRole::Ue`] regardless
+    /// of the role pre-set on `sa`, so the registrant can't accidentally
+    /// install network-side policies.
+    ///
+    /// `sa.ue_addr`/`ue_port_c`/`ue_port_s`/`spi_uc`/`spi_us` are the UE's own
+    /// (what it offered in Security-Client); `pcscf_*`/`spi_pc`/`spi_ps` come
+    /// from the P-CSCF's Security-Server answer. Keys are CK (encryption) and
+    /// the IK-derived integrity key — same derivation as the network side.
+    pub async fn create_ue_sa_pair(
+        &self,
+        mut sa: SecurityAssociationPair,
+    ) -> Result<(), IpsecError> {
+        sa.role = SaRole::Ue;
+        self.create_sa_pair(sa).await
     }
 
     /// Delete IPsec SAs and SPs for a UE.
@@ -661,39 +962,13 @@ impl IpsecManager {
     ) -> Result<(), IpsecError> {
         let key = Self::contact_key(ue_addr, ue_port_c);
         if let Some((_, sa)) = self.associations.remove(&key) {
-            let proto = sa.protocol;
-            // Delete all 4 SAs.  Pairs mirror create_sa_pair's order so
-            // src/dst align with each SA's flow direction.
-            self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_ps).await?;
-            self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_uc).await?;
-            self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_us).await?;
-            self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_pc).await?;
-
-            // Delete policies (best-effort — ignore errors on cleanup).
-            // The selector proto must match what was used at install time
-            // — kernel keys policies on the full selector including the
-            // upper-layer protocol number.
-            self.del_policy(
-                &sa.ue_addr, sa.ue_port_c,
-                &sa.pcscf_addr, sa.pcscf_port_s,
-                PolicyDir::In, proto,
-            ).await.ok();
-            self.del_policy(
-                &sa.pcscf_addr, sa.pcscf_port_c,
-                &sa.ue_addr, sa.ue_port_s,
-                PolicyDir::Out, proto,
-            ).await.ok();
-            self.del_policy(
-                &sa.ue_addr, sa.ue_port_s,
-                &sa.pcscf_addr, sa.pcscf_port_c,
-                PolicyDir::In, proto,
-            ).await.ok();
-            self.del_policy(
-                &sa.pcscf_addr, sa.pcscf_port_s,
-                &sa.ue_addr, sa.ue_port_c,
-                PolicyDir::Out, proto,
-            ).await.ok();
-
+            // Best-effort teardown — every delete is independent, so a single
+            // missing key (e.g. an SA already reaped on hard-lifetime) can't
+            // skip the rest. (The old code `?`-chained the four del_sa, so the
+            // first ENOENT aborted before the policies, leaking them.) The
+            // in-memory entry is already removed above, so the manager's view
+            // stays authoritative regardless of kernel-side failures.
+            self.teardown_sa_kernel(&sa).await;
             info!(ue = %ue_addr, ue_port_c, "IPsec: SA pair deleted");
         }
         Ok(())
@@ -784,20 +1059,30 @@ impl IpsecManager {
     /// Re-pin the kernel hard-lifetime on all four SAs of an existing
     /// pair, without rekeying or disturbing selectors / SPIs.
     ///
-    /// Used by ``ipsec.PendingSA.activate(hard_lifetime_secs=…)`` to
-    /// tighten the SA expiry from whatever was installed at allocation
-    /// time (usually the UE's `Expires:` ask, commonly 600000 s for
-    /// VoLTE handsets) to the value the registrar of record actually
-    /// granted (3GPP TS 33.203 §7.4 ties IPsec SA lifetime to SIP
-    /// registration lifetime).
+    /// `hard_lifetime_secs` is the desired lifetime measured **from now**
+    /// (the registrar's granted Expires + grace).  Two callers:
+    /// * ``ipsec.PendingSA.activate(hard_lifetime_secs=…)`` on the
+    ///   200-after-401 — tightens from the allocation-time placeholder
+    ///   (usually the UE's `Expires:` ask, commonly 600000 s for VoLTE
+    ///   handsets) down to the granted value.
+    /// * `registrar.save_proxy` / `save` on every REGISTER refresh —
+    ///   extends an actively-refreshing UE's SA so it never ages out under
+    ///   it (3GPP TS 33.203 §7.4 ties IPsec SA lifetime to SIP registration
+    ///   lifetime; IR.92 refreshes carry no AKA, so this is the only path
+    ///   that moves the SA forward on a refresh).
     ///
     /// The kernel keys `XFRM_MSG_UPDSA` by `(daddr, spi, proto=ESP)` and
-    /// preserves `xfrm_state.curlft.add_time`, so the resulting deadline
-    /// is `add_time + hard_lifetime_secs` — i.e. the SA expires
-    /// `hard_lifetime_secs` after its **original** install, not from
-    /// "now".  For a typical IMS REGISTER → 401 → REGISTER → 200 OK
-    /// round-trip the install / repin gap is sub-second, so this is
-    /// indistinguishable from "expires after the granted Expires".
+    /// preserves `xfrm_state.curlft.add_time`, computing the hard-expiry as
+    /// `add_time + value`.  To land the deadline at `now + hard_lifetime_secs`
+    /// we therefore pass the kernel `hard_lifetime_secs + elapsed-since-install`
+    /// (the elapsed term comes from [`SecurityAssociationPair::created_at`]).
+    /// On the activate round-trip elapsed is sub-second (a no-op delta); on a
+    /// refresh hours later it is precisely what pushes the kernel deadline
+    /// forward instead of leaving it pinned to the original install.
+    ///
+    /// The in-memory `expires_at` and stored `hard_lifetime_secs` are refreshed
+    /// to the from-now value; `created_at` is left untouched (UPDSA preserves
+    /// `add_time`, so the anchor stays valid across any number of re-pins).
     ///
     /// Returns `Ok(())` even when the UE has no active SA pair (no-op).
     /// Errors from any of the four UPDSA messages are surfaced verbatim.
@@ -817,13 +1102,29 @@ impl IpsecManager {
         };
         let proto = sa.protocol;
 
+        // `hard_lifetime_secs` is the desired lifetime measured **from now**
+        // (e.g. the registrar's granted Expires + grace).  The kernel,
+        // however, computes the hard-expiry as `add_time + value` and
+        // preserves `add_time` across `XFRM_MSG_UPDSA`.  So to land the
+        // kernel deadline at `now + requested` we must pass
+        // `requested + elapsed_since_install`.  On the initial 200-after-401
+        // re-pin (`PendingSA.activate`) elapsed is sub-second, so this is a
+        // no-op delta; on a no-AKA REGISTER refresh hours later it is what
+        // actually pushes the kernel SA's deadline forward instead of
+        // leaving it pinned to the original install.  `None` (permanent SA)
+        // carries through untouched.
+        let kernel_lifetime_secs = hard_lifetime_secs.map(|requested| {
+            let elapsed = Instant::now().saturating_duration_since(sa.created_at).as_secs();
+            requested.saturating_add(elapsed)
+        });
+
         // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps
         self.update_sa_only(
             &sa.ue_addr, sa.ue_port_c,
             &sa.pcscf_addr, sa.pcscf_port_s,
             sa.spi_ps,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, hard_lifetime_secs,
+            proto, kernel_lifetime_secs,
         ).await?;
         // SA2: PCSCF:port_ps → UE:port_uc, SPI=spi_uc
         self.update_sa_only(
@@ -831,7 +1132,7 @@ impl IpsecManager {
             &sa.ue_addr, sa.ue_port_c,
             sa.spi_uc,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, hard_lifetime_secs,
+            proto, kernel_lifetime_secs,
         ).await?;
         // SA3: PCSCF:port_pc → UE:port_us, SPI=spi_us
         self.update_sa_only(
@@ -839,7 +1140,7 @@ impl IpsecManager {
             &sa.ue_addr, sa.ue_port_s,
             sa.spi_us,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, hard_lifetime_secs,
+            proto, kernel_lifetime_secs,
         ).await?;
         // SA4: UE:port_us → PCSCF:port_pc, SPI=spi_pc
         self.update_sa_only(
@@ -847,20 +1148,30 @@ impl IpsecManager {
             &sa.pcscf_addr, sa.pcscf_port_c,
             sa.spi_pc,
             &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, hard_lifetime_secs,
+            proto, kernel_lifetime_secs,
         ).await?;
 
         info!(
             ue = %sa.ue_addr,
             ue_port_c = sa.ue_port_c,
             hard_lifetime_secs = ?hard_lifetime_secs,
+            kernel_lifetime_secs = ?kernel_lifetime_secs,
             "IPsec: SA pair hard-lifetime re-pinned"
         );
 
-        // Mirror the new value into the cached SecurityAssociationPair so
-        // any subsequent inspection (or downstream re-pin) sees the
-        // tightened limit.  Re-insert under the same key.
+        // Mirror the new from-now value into the cached SecurityAssociationPair
+        // so any subsequent inspection (or downstream re-pin) sees it, and
+        // refresh the sweep deadline to `now + hard_lifetime_secs + grace`.
+        // The kernel was re-pinned with the elapsed-adjusted value above, so
+        // its true deadline is also `now + hard_lifetime_secs`; the two now
+        // agree (modulo the sub-second sweep grace), unlike before the
+        // elapsed adjustment where a late re-pin would leave the kernel SA
+        // dying early while `expires_at` claimed it was alive.  `created_at`
+        // is deliberately preserved (cloned through unchanged) — UPDSA keeps
+        // the kernel `add_time`, so the install anchor stays valid for the
+        // next re-pin's elapsed computation.
         sa.hard_lifetime_secs = hard_lifetime_secs;
+        sa.expires_at = compute_sa_expires_at(hard_lifetime_secs);
         self.associations.insert(key, sa);
         Ok(())
     }
@@ -868,6 +1179,130 @@ impl IpsecManager {
     /// Number of active SA pairs.
     pub fn active_count(&self) -> usize {
         self.associations.len()
+    }
+
+    /// Dump the kernel XFRM SAs' last-active times (`spi → last_active_secs`,
+    /// seconds since the UNIX epoch) for the registrar's UDP+IPsec
+    /// idle-liveness sweep.
+    ///
+    /// Always reads via netlink GETSA regardless of the configured write
+    /// backend (both talk to the same kernel XFRM tables).  Linux-only;
+    /// returns an empty map on other platforms or on any netlink error, so
+    /// the caller needs no `cfg` gating — an empty map simply means "no idle
+    /// signal available this sweep", and the other liveness paths
+    /// (flow-failure, abandoned-SA sweep) still run.
+    pub async fn dump_sa_use_times(&self) -> std::collections::HashMap<u32, u64> {
+        #[cfg(target_os = "linux")]
+        {
+            match netlink::dump_sa_use_times().await {
+                Ok(map) => map,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "IPsec: SA use-time dump failed; skipping idle-liveness this sweep"
+                    );
+                    std::collections::HashMap::new()
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::collections::HashMap::new()
+        }
+    }
+
+    /// Collect the contact keys of every SA pair whose sweep deadline
+    /// (`expires_at`) has already passed.
+    ///
+    /// Split out from [`sweep_expired`] so the selection logic is unit-
+    /// testable without `CAP_NET_ADMIN` / a live kernel netlink socket.
+    /// Snapshots into a `Vec` so the caller can `remove` while iterating
+    /// without holding a DashMap shard guard across the delete (avoids the
+    /// iterator/remove deadlock).
+    fn expired_keys(&self, now: Instant) -> Vec<String> {
+        self.associations
+            .iter()
+            .filter_map(|entry| {
+                if entry.value().expires_at <= now {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Sweep abandoned SA pairs whose own hard lifetime (+ grace) has
+    /// elapsed, tearing down their kernel states/policies and dropping the
+    /// in-memory entry.  Returns the number of pairs reaped.
+    ///
+    /// This is the background-cleanup counterpart to the re-REGISTER /
+    /// de-REGISTER paths (`cleanup_other_pairs_for_ue` / `delete_sa_pair`),
+    /// which only fire when the UE comes back.  A UE that registers once
+    /// and then vanishes (crash, radio loss, never refreshes) would
+    /// otherwise leak its four states + four policies + one map entry
+    /// forever.  Ageing on each pair's `expires_at` — its own SA lifetime
+    /// plus `SA_SWEEP_GRACE_SECS` — means an ACTIVE registration, which
+    /// re-REGISTERs and reinstalls a fresh SA (new `expires_at`) before the
+    /// deadline, is never disturbed; only truly-abandoned pairs pass their
+    /// `expires_at`.
+    ///
+    /// Collect-then-delete: snapshots the expired keys first (`expired_keys`)
+    /// then deletes each, so we never `remove` while holding a DashMap
+    /// iterator guard.  Per-victim kernel-delete failures are logged but
+    /// never propagated — `delete_sa_pair` removes the in-memory entry
+    /// before any kernel call, so the manager's view stays authoritative
+    /// even when the kernel objects were already reaped on hard-lifetime
+    /// (the common case, since the kernel deadline precedes the grace).
+    pub async fn sweep_expired(&self) -> usize {
+        self.sweep_expired_reaped().await.len()
+    }
+
+    /// Like [`sweep_expired`](Self::sweep_expired) but returns the
+    /// `(ue_addr, ue_port_c)` of every pair reaped, so the caller can also
+    /// clear the registrar binding tied to that UE.
+    ///
+    /// This is registrar-liveness Part B.4 (SA teardown → binding removal):
+    /// when an abandoned SA pair ages out of the kernel, the matching SIP
+    /// registration should go with it rather than linger to its own
+    /// `Expires`.  The IPsec module stays free of a registrar dependency —
+    /// the dispatcher correlates the returned UE addresses back to AoRs.
+    pub async fn sweep_expired_reaped(&self) -> Vec<(IpAddr, u16)> {
+        let victims = self.expired_keys(Instant::now());
+        if victims.is_empty() {
+            return Vec::new();
+        }
+
+        let mut reaped: Vec<(IpAddr, u16)> = Vec::new();
+        for key in victims {
+            // Re-read the entry to recover the UE address/port for
+            // delete_sa_pair; if it vanished between snapshot and now
+            // (concurrent re-REGISTER teardown), skip it.
+            let (ue_addr, ue_port_c) = match self.associations.get(&key) {
+                Some(entry) => {
+                    let sa = entry.value();
+                    (sa.ue_addr, sa.ue_port_c)
+                }
+                None => continue,
+            };
+            if let Err(error) = self.delete_sa_pair(&ue_addr, ue_port_c).await {
+                tracing::warn!(
+                    ue = %ue_addr,
+                    ue_port_c,
+                    %error,
+                    "IPsec: abandoned SA sweep — kernel delete failed (in-memory entry already removed)"
+                );
+            }
+            reaped.push((ue_addr, ue_port_c));
+        }
+
+        if !reaped.is_empty() {
+            info!(
+                reaped = reaped.len(),
+                "IPsec: swept abandoned SA pairs past their hard lifetime"
+            );
+        }
+        reaped
     }
 
     /// Check if a UE has an active SA pair.
@@ -906,12 +1341,38 @@ impl IpsecManager {
         None
     }
 
+    /// Snapshot the inbound SPIs of every active SA pair for the registrar's
+    /// UDP+IPsec idle-liveness sweep.
+    ///
+    /// One pass over the DashMap; the caller (the dispatcher's 30 s sweep)
+    /// builds whatever index it needs — typically keyed by `ue_addr` — and
+    /// checks each row's `spi_ps` / `spi_pc` against the kernel use-time map
+    /// from [`netlink::dump_sa_use_times`].  These two are the **inbound**
+    /// SAs (UE → P-CSCF, SA #1 and #4 in [`SecurityAssociationPair`]), which
+    /// the UE's RFC 6223 keepalive and every MO request land on — so their
+    /// `curlft.use_time` is the UE's liveness heartbeat.  Returning a flat
+    /// snapshot avoids the per-binding O(N) `find_sa_by_ue` walk.
+    pub fn liveness_snapshot(&self) -> Vec<SaLivenessRow> {
+        self.associations
+            .iter()
+            .map(|entry| {
+                let sa = entry.value();
+                SaLivenessRow {
+                    ue_addr: sa.ue_addr,
+                    ue_port_c: sa.ue_port_c,
+                    ue_port_s: sa.ue_port_s,
+                    spi_ps: sa.spi_ps,
+                    spi_pc: sa.spi_pc,
+                }
+            })
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // Backend dispatch — routes to either netlink or `ip xfrm` shell-out.
     // -----------------------------------------------------------------------
 
     /// Add an SA via the active backend.
-    #[allow(clippy::too_many_arguments)]
     async fn add_sa(
         &self,
         source: &IpAddr,
@@ -926,6 +1387,10 @@ impl IpsecManager {
         protocol: SaProtocol,
         hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
+        #[cfg(test)]
+        if let Some(result) = self.mock_add(format!("sa:{destination}:{spi}"), "add_sa") {
+            return result;
+        }
         match self.backend {
             #[cfg(target_os = "linux")]
             XfrmBackend::Netlink => {
@@ -978,7 +1443,6 @@ impl IpsecManager {
     /// IPCommand backend reuses the `xfrm_sa_add` path with `update`
     /// instead of `add` — iproute2 maps both to the same payload, only
     /// the netlink message type differs.
-    #[allow(clippy::too_many_arguments)]
     async fn update_sa_only(
         &self,
         source: &IpAddr,
@@ -993,6 +1457,12 @@ impl IpsecManager {
         protocol: SaProtocol,
         hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
+        #[cfg(test)]
+        if let Some(result) =
+            self.mock_update(format!("sa:{destination}:{spi}"), hard_lifetime_secs)
+        {
+            return result;
+        }
         match self.backend {
             #[cfg(target_os = "linux")]
             XfrmBackend::Netlink => {
@@ -1046,6 +1516,10 @@ impl IpsecManager {
         destination: &IpAddr,
         spi: u32,
     ) -> Result<(), IpsecError> {
+        #[cfg(test)]
+        if let Some(result) = self.mock_del(format!("sa:{destination}:{spi}"), "del_sa") {
+            return result;
+        }
         match self.backend {
             #[cfg(target_os = "linux")]
             XfrmBackend::Netlink => {
@@ -1060,7 +1534,6 @@ impl IpsecManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn add_policy(
         &self,
         source: &IpAddr,
@@ -1070,7 +1543,18 @@ impl IpsecManager {
         direction: PolicyDir,
         spi: u32,
         protocol: SaProtocol,
+        hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
+        #[cfg(test)]
+        if let Some(result) = self.mock_add(
+            format!(
+                "policy:{source}:{source_port}->{destination}:{destination_port}:{}",
+                policy_dir_str(direction)
+            ),
+            "add_policy",
+        ) {
+            return result;
+        }
         match self.backend {
             #[cfg(target_os = "linux")]
             XfrmBackend::Netlink => {
@@ -1086,6 +1570,7 @@ impl IpsecManager {
                     netlink_dir,
                     spi,
                     protocol.as_u8(),
+                    hard_lifetime_secs,
                 )
                 .await
             }
@@ -1106,6 +1591,7 @@ impl IpsecManager {
                     dir_str,
                     spi,
                     protocol,
+                    hard_lifetime_secs,
                 )
                 .await
             }
@@ -1121,6 +1607,16 @@ impl IpsecManager {
         direction: PolicyDir,
         protocol: SaProtocol,
     ) -> Result<(), IpsecError> {
+        #[cfg(test)]
+        if let Some(result) = self.mock_del(
+            format!(
+                "policy:{source}:{source_port}->{destination}:{destination_port}:{}",
+                policy_dir_str(direction)
+            ),
+            "del_policy",
+        ) {
+            return result;
+        }
         match self.backend {
             #[cfg(target_os = "linux")]
             XfrmBackend::Netlink => {
@@ -1164,7 +1660,6 @@ impl IpsecManager {
     // Legacy `ip xfrm` shell-out helpers — kept for the IpCommand backend.
     // -----------------------------------------------------------------------
 
-    #[allow(clippy::too_many_arguments)]
     async fn xfrm_sa_add(
         source: &IpAddr,
         source_port: u16,
@@ -1239,7 +1734,6 @@ impl IpsecManager {
     /// the kernel preserves `add_time`, so a tightened
     /// `limit time-hard` produces deadline = original install + new
     /// value, not now + new value.
-    #[allow(clippy::too_many_arguments)]
     async fn xfrm_sa_update(
         source: &IpAddr,
         source_port: u16,
@@ -1321,7 +1815,6 @@ impl IpsecManager {
         Self::run_ip_command(&args).await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn xfrm_policy_add(
         source: &IpAddr,
         source_port: u16,
@@ -1330,6 +1823,7 @@ impl IpsecManager {
         direction: &str,
         spi: u32,
         protocol: SaProtocol,
+        hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
         let source_cidr = format!("{}/{}", source, host_prefix(source));
         let destination_cidr = format!("{}/{}", destination, host_prefix(destination));
@@ -1339,10 +1833,11 @@ impl IpsecManager {
         let destination_str = destination.to_string();
         let spi_str = format!("0x{:x}", spi);
         let proto_str = protocol.as_str();
+        let lifetime_secs_str;
 
         // `proto X` must precede `sport`/`dport` per the iproute2 UPSPEC
         // grammar — see xfrm_sa_add for the same ordering constraint.
-        let args = vec![
+        let mut args = vec![
             "xfrm", "policy", "add",
             "src", &source_cidr,
             "dst", &destination_cidr,
@@ -1357,6 +1852,17 @@ impl IpsecManager {
             "spi", &spi_str,
             "mode", "transport",
         ];
+
+        // Optional hard lifetime — mirrors xfrm_sa_add so a policy reaps
+        // on the same deadline as its states.  `limit time-hard <secs>`
+        // sets xfrm_userpolicy_info.lft.hard_add_expires_seconds.
+        if let Some(secs) = hard_lifetime_secs {
+            lifetime_secs_str = secs.to_string();
+            args.push("limit");
+            args.push("time-hard");
+            args.push(&lifetime_secs_str);
+        }
+
         Self::run_ip_command(&args).await
     }
 
@@ -1444,6 +1950,115 @@ impl IpsecManager {
             )));
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test-only in-memory XFRM kernel
+// ---------------------------------------------------------------------------
+
+/// Render a [`PolicyDir`] the way the mock keys policies (matches the kernel's
+/// selector-by-direction).
+#[cfg(test)]
+fn policy_dir_str(direction: PolicyDir) -> &'static str {
+    match direction {
+        PolicyDir::In => "in",
+        PolicyDir::Out => "out",
+    }
+}
+
+/// An in-memory stand-in for the XFRM kernel used only in tests.  Records every
+/// state/policy as an opaque key (SAs by `(dst, spi)`, policies by their full
+/// `(src, dst, ports, dir)` selector — exactly how the kernel keys them), so a
+/// test can assert what `create_sa_pair` / `delete_sa_pair` left behind.  Two
+/// knobs drive the failure-mode tests: `reject_existing` makes an `EXCL` add of
+/// an already-live key fail (the real `EEXIST`), and `fail_add_at` injects a
+/// failure on the N-th add (the partial-install case).
+#[cfg(test)]
+#[derive(Default)]
+struct KernelMock {
+    /// Keys currently installed in the (fake) kernel.
+    live: std::collections::HashSet<String>,
+    /// Ordered log of every op, so tests can assert delete-before-add ordering.
+    ops: Vec<String>,
+    /// Count of add attempts so far (across `add_sa` + `add_policy`).
+    add_calls: usize,
+    /// When `Some(n)`, the n-th add (1-based) returns an injected error.
+    fail_add_at: Option<usize>,
+    /// When true, an add of an already-live key returns `EEXIST` (simulates the
+    /// kernel's `NLM_F_EXCL` semantics).
+    reject_existing: bool,
+    /// Ordered log of `update_sa` calls as `(key, hard_lifetime_secs)`, so
+    /// tests can assert the elapsed-adjusted kernel lifetime a re-pin sends.
+    updates: Vec<(String, Option<u64>)>,
+}
+
+#[cfg(test)]
+impl IpsecManager {
+    /// Construct a manager whose four kernel-op methods route through an
+    /// in-memory [`KernelMock`] instead of netlink / `ip xfrm`.
+    fn with_mock_kernel() -> Self {
+        let mut manager = Self::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        manager.kernel_mock = Some(std::sync::Mutex::new(KernelMock::default()));
+        manager
+    }
+
+    /// Lock the mock kernel (test inspection helper).
+    fn mock(&self) -> std::sync::MutexGuard<'_, KernelMock> {
+        self.kernel_mock
+            .as_ref()
+            .expect("mock kernel not installed")
+            .lock()
+            .expect("mock kernel lock poisoned")
+    }
+
+    /// Mock add-path: returns `Some(result)` when a mock kernel is installed
+    /// (so the real backend is bypassed), `None` otherwise.
+    fn mock_add(&self, key: String, op: &str) -> Option<Result<(), IpsecError>> {
+        let mock = self.kernel_mock.as_ref()?;
+        let mut state = mock.lock().expect("mock kernel lock poisoned");
+        state.add_calls += 1;
+        state.ops.push(format!("{op} {key}"));
+        if state.fail_add_at == Some(state.add_calls) {
+            return Some(Err(IpsecError::Command(format!(
+                "mock injected failure on add #{}",
+                state.add_calls
+            ))));
+        }
+        if state.reject_existing && state.live.contains(&key) {
+            return Some(Err(IpsecError::Command(
+                "xfrm netlink: File exists (mock EEXIST)".to_string(),
+            )));
+        }
+        state.live.insert(key);
+        Some(Ok(()))
+    }
+
+    /// Mock update-path: records the `(key, hard_lifetime_secs)` so tests can
+    /// assert the elapsed-adjusted kernel lifetime a re-pin sends, then
+    /// succeeds.  Returns `Some(Ok)` when a mock kernel is installed so the
+    /// real backend (`ip xfrm` shell-out / netlink) is bypassed, `None`
+    /// otherwise.
+    fn mock_update(
+        &self,
+        key: String,
+        hard_lifetime_secs: Option<u64>,
+    ) -> Option<Result<(), IpsecError>> {
+        let mock = self.kernel_mock.as_ref()?;
+        let mut state = mock.lock().expect("mock kernel lock poisoned");
+        state.ops.push(format!("update_sa {key}"));
+        state.updates.push((key, hard_lifetime_secs));
+        Some(Ok(()))
+    }
+
+    /// Mock delete-path: best-effort (always `Ok`), mirroring the kernel
+    /// ignoring `ENOENT` on delete.
+    fn mock_del(&self, key: String, op: &str) -> Option<Result<(), IpsecError>> {
+        let mock = self.kernel_mock.as_ref()?;
+        let mut state = mock.lock().expect("mock kernel lock poisoned");
+        state.ops.push(format!("{op} {key}"));
+        state.live.remove(&key);
+        Some(Ok(()))
     }
 }
 
@@ -1626,6 +2241,55 @@ mod tests {
     }
 
     #[test]
+    fn sa_role_policy_dir_mirrors_between_ends() {
+        // A UE-sourced flow is the P-CSCF's inbound and the UE's outbound;
+        // a P-CSCF-sourced flow is the reverse. The two roles are exact
+        // mirrors — that is what makes one create/delete serve both.
+        assert_eq!(SaRole::PCscf.policy_dir(true), PolicyDir::In);
+        assert_eq!(SaRole::PCscf.policy_dir(false), PolicyDir::Out);
+        assert_eq!(SaRole::Ue.policy_dir(true), PolicyDir::Out);
+        assert_eq!(SaRole::Ue.policy_dir(false), PolicyDir::In);
+
+        for src_is_ue in [true, false] {
+            assert_ne!(
+                SaRole::PCscf.policy_dir(src_is_ue),
+                SaRole::Ue.policy_dir(src_is_ue),
+                "UE and P-CSCF must disagree on every flow's direction"
+            );
+        }
+    }
+
+    #[test]
+    fn sa_role_default_is_pcscf() {
+        assert_eq!(SaRole::default(), SaRole::PCscf);
+    }
+
+    /// Root-gated: installs the UE-side four SAs + four (inverted-direction)
+    /// policies against the real kernel, then tears them down. Requires
+    /// CAP_NET_ADMIN; skipped in CI. Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires root / CAP_NET_ADMIN for XFRM"]
+    async fn create_ue_sa_pair_installs_and_deletes() {
+        let manager = IpsecManager::new();
+        let ue_addr: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50));
+        let mut sa = test_sa_pair(ue_addr, 6100, 20000);
+        // role is forced to Ue inside create_ue_sa_pair regardless.
+        sa.role = SaRole::PCscf;
+
+        manager
+            .create_ue_sa_pair(sa)
+            .await
+            .expect("UE SA pair installs");
+        assert_eq!(manager.active_count(), 1);
+
+        manager
+            .delete_sa_pair(&ue_addr, 6100)
+            .await
+            .expect("UE SA pair deletes");
+        assert_eq!(manager.active_count(), 0);
+    }
+
+    #[test]
     fn security_association_pair_clone() {
         let sa = SecurityAssociationPair {
             ue_addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
@@ -1644,6 +2308,9 @@ mod tests {
             integrity_key: "cafebabe".to_string(),
             hard_lifetime_secs: None,
             protocol: SaProtocol::Udp,
+            expires_at: Instant::now(),
+            created_at: Instant::now(),
+            role: SaRole::PCscf,
         };
         let cloned = sa.clone();
         assert_eq!(cloned.spi_uc, 10000);
@@ -1697,6 +2364,106 @@ mod tests {
         assert_eq!(manager.active_count(), 0);
     }
 
+    /// `create_sa_pair` must stamp `created_at` at the kernel-install moment,
+    /// overwriting whatever placeholder the caller pre-set — that anchor is
+    /// what every later re-pin measures elapsed-since-install against.
+    #[tokio::test]
+    async fn create_sa_pair_stamps_created_at_at_install() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "198.51.100.7".parse().unwrap();
+        let mut sa = test_sa_pair(ue, 50000, 20000);
+        // A distinctly-wrong placeholder far in the future; create_sa_pair
+        // must replace it with `now`.  (Future offset avoids the monotonic-
+        // clock underflow that a past offset risks on low-uptime CI.)
+        sa.created_at = Instant::now() + Duration::from_secs(10_000);
+        manager
+            .create_sa_pair(sa)
+            .await
+            .expect("create_sa_pair should succeed against the mock kernel");
+        let installed = manager.get_sa(&ue, 50000).expect("SA pair present after create");
+        assert!(
+            installed.created_at <= Instant::now() + Duration::from_secs(60),
+            "created_at must be re-stamped to install time, not the far-future placeholder"
+        );
+    }
+
+    /// Core of the refresh fix: a re-pin must push the **kernel** hard
+    /// lifetime to `requested + elapsed-since-install`, because XFRM UPDSA
+    /// preserves `add_time`.  Also proves the install anchor is preserved
+    /// across repeated re-pins (so the SA keeps moving forward on every
+    /// refresh, not just the first).
+    #[tokio::test]
+    async fn update_sa_pair_lifetime_adds_elapsed_and_keeps_anchor() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "198.51.100.8".parse().unwrap();
+        let mut sa = test_sa_pair(ue, 50000, 21000);
+        sa.hard_lifetime_secs = Some(100);
+        // `created_at` defaults to `now` (set in test_sa_pair).
+        let anchor = sa.created_at;
+        insert_test_pair(&manager, sa);
+
+        // Let real time pass so elapsed floors to exactly 1 s (the sleep
+        // guarantees ≥1.1 s; two fast re-pins keep it < 2 s).
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        manager
+            .update_sa_pair_lifetime(&ue, 50000, Some(100))
+            .await
+            .expect("re-pin should succeed");
+
+        // Four UPDSA messages, each carrying requested(100) + elapsed(1) = 101.
+        let first: Vec<Option<u64>> =
+            manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
+        assert_eq!(first.len(), 4, "one UPDSA per SA of the pair");
+        assert!(
+            first.iter().all(|lft| *lft == Some(101)),
+            "kernel lifetime must be requested + elapsed-since-install, got {first:?}"
+        );
+
+        // In-memory mirror keeps the *from-now* value (not the inflated kernel
+        // value) and moves the sweep deadline forward.
+        let cached = manager.get_sa(&ue, 50000).expect("SA still present");
+        assert_eq!(cached.hard_lifetime_secs, Some(100));
+        assert!(cached.expires_at > Instant::now() + Duration::from_secs(100));
+        assert_eq!(cached.created_at, anchor, "install anchor must not move on re-pin");
+
+        // A second re-pin still measures elapsed from the ORIGINAL install
+        // (≈1 s), not from the first re-pin — if the anchor had been reset to
+        // `now`, this would record 100 instead of 101.
+        manager.mock().updates.clear();
+        manager
+            .update_sa_pair_lifetime(&ue, 50000, Some(100))
+            .await
+            .expect("second re-pin should succeed");
+        let second: Vec<Option<u64>> =
+            manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
+        assert!(
+            second.iter().all(|lft| *lft == Some(101)),
+            "re-pin must stay anchored to original install, got {second:?}"
+        );
+    }
+
+    /// A permanent SA (`hard_lifetime_secs == None`) carries `None` through to
+    /// the kernel unchanged — no elapsed inflation, no spurious deadline.
+    #[tokio::test]
+    async fn update_sa_pair_lifetime_none_passes_through() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "198.51.100.9".parse().unwrap();
+        let mut sa = test_sa_pair(ue, 50000, 22000);
+        sa.hard_lifetime_secs = None;
+        insert_test_pair(&manager, sa);
+
+        manager
+            .update_sa_pair_lifetime(&ue, 50000, None)
+            .await
+            .expect("re-pin with None should succeed");
+
+        let updates: Vec<Option<u64>> =
+            manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
+        assert_eq!(updates.len(), 4);
+        assert!(updates.iter().all(|lft| lft.is_none()), "None must not inflate");
+    }
+
     #[test]
     fn sa_protocol_default_is_any() {
         // Spec-driven default change (3GPP TS 33.203 §7.2): an SA pair
@@ -1730,6 +2497,9 @@ mod tests {
             integrity_key: "00112233445566778899aabbccddeeff".to_string(),
             hard_lifetime_secs: Some(3600),
             protocol: SaProtocol::Any,
+            expires_at: compute_sa_expires_at(Some(3600)),
+            created_at: Instant::now(),
+            role: SaRole::PCscf,
         }
     }
 
@@ -1835,6 +2605,180 @@ mod tests {
         assert!(manager.has_sa(&ue, 6500));
     }
 
+    /// A leftover XFRM policy with the SAME selector as one this allocate
+    /// installs (a restart orphan, or a partial install from a prior failed
+    /// attempt) used to wedge registration forever: the `EXCL` `add_policy`
+    /// hit `EEXIST`, the whole allocate failed, and the 200-OK-gated cleanup
+    /// never ran to clear it. With `reject_existing` the mock reproduces that
+    /// `EEXIST`; `create_sa_pair` must clear the collider first
+    /// (delete-before-add) and still succeed.
+    #[tokio::test]
+    async fn create_sa_pair_idempotent_over_colliding_policy() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "192.0.2.80".parse().unwrap();
+        let sa = test_sa_pair(ue, 6100, 10000);
+
+        // Pre-seed Policy 1's selector (UE:port_uc → PCSCF:port_ps) and arm
+        // EEXIST-on-existing — exactly the kernel state that used to wedge.
+        let policy1_key = format!(
+            "policy:{}:{}->{}:{}:{}",
+            sa.ue_addr,
+            sa.ue_port_c,
+            sa.pcscf_addr,
+            sa.pcscf_port_s,
+            policy_dir_str(sa.role.policy_dir(true)),
+        );
+        {
+            let mut state = manager.mock();
+            state.reject_existing = true;
+            state.live.insert(policy1_key);
+        }
+
+        let result = manager.create_sa_pair(sa).await;
+        assert!(
+            result.is_ok(),
+            "idempotent install must clear the colliding policy and succeed, got {result:?}"
+        );
+        assert_eq!(manager.active_count(), 1);
+
+        let state = manager.mock();
+        assert_eq!(
+            state.live.iter().filter(|k| k.starts_with("sa:")).count(),
+            4,
+            "all four SAs installed"
+        );
+        assert_eq!(
+            state.live.iter().filter(|k| k.starts_with("policy:")).count(),
+            4,
+            "all four policies installed exactly once"
+        );
+    }
+
+    /// A failure partway through the eight installs must leave the kernel
+    /// exactly as it was found — no orphaned SAs, no `associations` entry — so
+    /// the failure degrades to a clean retry instead of stranding state that no
+    /// cleanup path can reach. Inject the failure on the 5th add: the first
+    /// `add_policy`, after all four `add_sa` succeed (the observed field
+    /// scenario — SPIs rotate so SAs never collide, the fixed-selector policy
+    /// does).
+    #[tokio::test]
+    async fn create_sa_pair_rolls_back_partial_install() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "192.0.2.81".parse().unwrap();
+        let sa = test_sa_pair(ue, 6100, 10000);
+
+        manager.mock().fail_add_at = Some(5);
+
+        let result = manager.create_sa_pair(sa).await;
+        assert!(result.is_err(), "injected install failure must propagate");
+        assert_eq!(
+            manager.active_count(),
+            0,
+            "failed allocate must leave no in-memory entry"
+        );
+        let live = manager.mock().live.clone();
+        assert!(
+            live.is_empty(),
+            "rollback must tear down the four already-installed SAs, found: {live:?}"
+        );
+    }
+
+    /// Process-restart scenario: the kernel netns still holds the previous
+    /// incarnation's SAs + policies (the UE side reuses deterministic SPIs and
+    /// config-fixed protected ports, so the keys are byte-identical across
+    /// restarts), but the new process's `associations` map is EMPTY — so
+    /// `delete_sa_pair` finds nothing and can't clear them. This is the
+    /// `docker restart` EEXIST wedge. `create_sa_pair`'s upfront teardown keys
+    /// off the new SA (not the map), so it clears the orphans regardless and
+    /// still installs. Proves the fix covers restart, not just in-process
+    /// re-REGISTER.
+    #[tokio::test]
+    async fn create_sa_pair_clears_restart_orphans_despite_empty_map() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "192.0.2.90".parse().unwrap();
+        let sa = test_sa_pair(ue, 6100, 10000);
+
+        // Pre-seed the kernel with the exact eight keys this install produces
+        // (the restart-orphan collision set) and arm EEXIST-on-existing — the
+        // `NEWSA | EXCL` collision that wedges a restarted registrant.
+        {
+            let mut state = manager.mock();
+            state.reject_existing = true;
+            state.live.insert(format!("sa:{}:{}", sa.pcscf_addr, sa.spi_ps));
+            state.live.insert(format!("sa:{}:{}", sa.ue_addr, sa.spi_uc));
+            state.live.insert(format!("sa:{}:{}", sa.ue_addr, sa.spi_us));
+            state.live.insert(format!("sa:{}:{}", sa.pcscf_addr, sa.spi_pc));
+            state.live.insert(format!(
+                "policy:{}:{}->{}:{}:{}",
+                sa.ue_addr, sa.ue_port_c, sa.pcscf_addr, sa.pcscf_port_s,
+                policy_dir_str(sa.role.policy_dir(true))
+            ));
+            state.live.insert(format!(
+                "policy:{}:{}->{}:{}:{}",
+                sa.pcscf_addr, sa.pcscf_port_s, sa.ue_addr, sa.ue_port_c,
+                policy_dir_str(sa.role.policy_dir(false))
+            ));
+            state.live.insert(format!(
+                "policy:{}:{}->{}:{}:{}",
+                sa.pcscf_addr, sa.pcscf_port_c, sa.ue_addr, sa.ue_port_s,
+                policy_dir_str(sa.role.policy_dir(false))
+            ));
+            state.live.insert(format!(
+                "policy:{}:{}->{}:{}:{}",
+                sa.ue_addr, sa.ue_port_s, sa.pcscf_addr, sa.pcscf_port_c,
+                policy_dir_str(sa.role.policy_dir(true))
+            ));
+        }
+        assert_eq!(
+            manager.active_count(),
+            0,
+            "empty map is the restart precondition — delete_sa_pair is a no-op here"
+        );
+
+        let result = manager.create_sa_pair(sa).await;
+        assert!(
+            result.is_ok(),
+            "must clear the restart orphans and install despite the empty map, got {result:?}"
+        );
+        assert_eq!(manager.active_count(), 1);
+
+        let state = manager.mock();
+        assert_eq!(state.live.iter().filter(|k| k.starts_with("sa:")).count(), 4);
+        assert_eq!(
+            state.live.iter().filter(|k| k.starts_with("policy:")).count(),
+            4
+        );
+    }
+
+    /// `delete_sa_pair` removes all eight kernel objects (four SAs + four
+    /// policies) and the map entry. The best-effort teardown runs every delete
+    /// independently — no `?`-chain that an early `ENOENT` could abort, leaking
+    /// the rest (the latent leak in the pre-fix `delete_sa_pair`).
+    #[tokio::test]
+    async fn delete_sa_pair_tears_down_all_kernel_objects() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "192.0.2.82".parse().unwrap();
+
+        manager
+            .create_sa_pair(test_sa_pair(ue, 6100, 10000))
+            .await
+            .expect("install must succeed on a clean mock kernel");
+        assert_eq!(manager.mock().live.len(), 8);
+        assert_eq!(manager.active_count(), 1);
+
+        manager
+            .delete_sa_pair(&ue, 6100)
+            .await
+            .expect("delete is best-effort, always Ok");
+
+        let live = manager.mock().live.clone();
+        assert!(
+            live.is_empty(),
+            "all eight kernel objects must be gone, found: {live:?}"
+        );
+        assert_eq!(manager.active_count(), 0);
+    }
+
     /// Cleanup must remain a no-op when called for a UE that has no
     /// pairs in the map at all — defends against the race where the
     /// stash TTL fires `cleanup` before `activate` runs.
@@ -1846,5 +2790,112 @@ mod tests {
         manager.cleanup_other_pairs_for_ue(&unknown_ue, 6500).await;
 
         assert_eq!(manager.active_count(), 0);
+    }
+
+    /// A pair with a hard lifetime gets a finite sweep deadline; one with
+    /// no hard lifetime is parked far in the future and is never reaped by
+    /// the expiry path.
+    #[test]
+    fn compute_sa_expires_at_finite_for_lifetime_and_far_for_none() {
+        let now = Instant::now();
+        let with_lifetime = compute_sa_expires_at(Some(3600));
+        // now + 3600 + grace, comfortably in the future but not far-future.
+        assert!(with_lifetime > now);
+        assert!(with_lifetime < now + Duration::from_secs(3600 + SA_SWEEP_GRACE_SECS + 60));
+
+        let none = compute_sa_expires_at(None);
+        // ~100 years out — well past the lifetime-based deadline.
+        assert!(none > now + Duration::from_secs(10 * 365 * 24 * 60 * 60));
+    }
+
+    /// `sweep_expired` reaps only pairs whose `expires_at` has passed; a
+    /// fresh pair (deadline in the future) survives.  Mirrors the
+    /// abandoned-UE scenario: a UE registers once and vanishes, so its SA
+    /// passes its own hard-lifetime+grace deadline and is swept, while an
+    /// actively-refreshing UE keeps a future deadline and is left alone.
+    #[tokio::test]
+    async fn sweep_expired_reaps_only_past_deadline_pairs() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        let abandoned: IpAddr = "192.0.2.60".parse().unwrap();
+        let active: IpAddr = "192.0.2.61".parse().unwrap();
+
+        // Abandoned UE: deadline already in the past.
+        let mut stale = test_sa_pair(abandoned, 6601, 10000);
+        stale.expires_at = Instant::now() - Duration::from_secs(1);
+        insert_test_pair(&manager, stale);
+
+        // Active UE: a fresh SA whose deadline is comfortably in the
+        // future (as if it just re-REGISTERed).
+        let fresh = test_sa_pair(active, 6701, 10004);
+        // test_sa_pair already sets expires_at = now + 3600 + grace.
+        insert_test_pair(&manager, fresh);
+
+        assert_eq!(manager.active_count(), 2);
+
+        let reaped = manager.sweep_expired().await;
+        assert_eq!(reaped, 1, "exactly the one past-deadline pair is reaped");
+
+        // The abandoned pair's map entry is gone; the active one survives.
+        assert!(
+            !manager.has_sa(&abandoned, 6601),
+            "abandoned SA past its deadline must be swept"
+        );
+        assert!(
+            manager.has_sa(&active, 6701),
+            "actively-refreshing SA with a future deadline must be left alone"
+        );
+        assert_eq!(manager.active_count(), 1);
+    }
+
+    /// `sweep_expired` on an empty / all-fresh manager reaps nothing.
+    #[tokio::test]
+    async fn sweep_expired_no_op_when_nothing_is_due() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        assert_eq!(manager.sweep_expired().await, 0);
+
+        // A single fresh pair (far-future deadline because it has no hard
+        // lifetime) is not swept.
+        let mut permanent = test_sa_pair("192.0.2.62".parse().unwrap(), 6801, 10000);
+        permanent.hard_lifetime_secs = None;
+        permanent.expires_at = compute_sa_expires_at(None);
+        insert_test_pair(&manager, permanent);
+
+        assert_eq!(manager.sweep_expired().await, 0);
+        assert_eq!(manager.active_count(), 1);
+    }
+
+    /// `liveness_snapshot` exposes each active pair's inbound SPIs and UE
+    /// ports so the registrar idle reaper can correlate a binding to its SA.
+    #[test]
+    fn liveness_snapshot_exposes_inbound_spis() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        let ue1: IpAddr = "192.0.2.70".parse().unwrap();
+        let ue2: IpAddr = "192.0.2.71".parse().unwrap();
+        insert_test_pair(&manager, test_sa_pair(ue1, 6900, 20000));
+        insert_test_pair(&manager, test_sa_pair(ue2, 6910, 20100));
+
+        let rows = manager.liveness_snapshot();
+        assert_eq!(rows.len(), 2);
+        let row = rows.iter().find(|r| r.ue_addr == ue1).expect("ue1 row");
+        // test_sa_pair: spi_pc = base + 2, spi_ps = base + 3.
+        assert_eq!(row.spi_ps, 20003);
+        assert_eq!(row.spi_pc, 20002);
+        assert_eq!(row.ue_port_c, 6900);
+        assert_eq!(row.ue_port_s, 6901);
+    }
+
+    /// `sweep_expired_reaped` returns the identity of each reaped pair so the
+    /// dispatcher can clear the matching registrar binding (Part B.4).
+    #[tokio::test]
+    async fn sweep_expired_reaped_returns_reaped_ue() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        let abandoned: IpAddr = "192.0.2.72".parse().unwrap();
+        let mut stale = test_sa_pair(abandoned, 6920, 20200);
+        stale.expires_at = Instant::now() - Duration::from_secs(1);
+        insert_test_pair(&manager, stale);
+
+        let reaped = manager.sweep_expired_reaped().await;
+        assert_eq!(reaped, vec![(abandoned, 6920)]);
+        assert!(!manager.has_sa(&abandoned, 6920));
     }
 }

@@ -101,8 +101,15 @@ pub enum RequestAction {
         flow: Option<super::registrar::PyFlow>,
     },
     /// Fork to multiple targets.
+    ///
+    /// `flows` is parallel to `targets`: when `flows[i]` is `Some`, that branch
+    /// is sent over the captured inbound flow (RFC 5626 §5.3 connection reuse —
+    /// the only way to reach a WebSocket UE) instead of DNS-resolving the URI.
+    /// A flow is only attached for a `Contact` the local process accepted
+    /// (`Contact.is_local`); bare-string targets always carry `None`.
     Fork {
         targets: Vec<String>,
+        flows: Vec<Option<super::registrar::PyFlow>>,
         strategy: String,
     },
 }
@@ -297,6 +304,35 @@ impl PyRequest {
             .map(|ip| std::net::SocketAddr::new(ip, self.source_port))
     }
 
+    /// Resolve the active IPsec SA pair that decrypted this request, if any.
+    ///
+    /// Rust-only shared core behind the `matched_sa` Python getter and the
+    /// registrar refresh re-pin (`protected_ue_flow`).  Returns `None` when
+    /// the request did not arrive on a configured P-CSCF protected port or no
+    /// active SA matches its source `(addr, port)`.
+    fn resolve_protected_sa(&self) -> Option<crate::ipsec::SecurityAssociationPair> {
+        let port = self.local_port?;
+        if !super::ipsec::is_protected_local_port(port) {
+            return None;
+        }
+        let ue_addr: std::net::IpAddr = self.source_ip.parse().ok()?;
+        super::ipsec::find_sa_for_ue(&ue_addr, self.source_port)
+    }
+
+    /// `(ue_addr, ue_port_c)` of the IPsec SA bound to this request's flow
+    /// when it arrived protected, else `None`.
+    ///
+    /// `ue_port_c` is the SA's canonical `contact_key` port (the UE's
+    /// protected client port), resolved even when the refresh arrived from
+    /// the UE's server port.  Consumed by `registrar.save_proxy` / `save` to
+    /// re-pin the SA hard-lifetime on a REGISTER refresh so an actively-
+    /// refreshing UE's SA tracks its binding (3GPP TS 33.203 §7.4) instead of
+    /// ageing out under it.
+    pub(crate) fn protected_ue_flow(&self) -> Option<(std::net::IpAddr, u16)> {
+        let sa = self.resolve_protected_sa()?;
+        Some((sa.ue_addr, sa.ue_port_c))
+    }
+
     /// Get Via transport override (set by `force_send_via`).
     pub fn via_transport_override(&self) -> Option<&str> {
         self.via_transport_override.as_deref()
@@ -320,6 +356,13 @@ impl PyRequest {
     /// Take the accumulated reply headers (consumed by the dispatcher).
     pub fn take_reply_headers(&mut self) -> Vec<(ReplyHeaderOp, String, String)> {
         std::mem::take(&mut self.reply_headers)
+    }
+
+    /// Queue a multi-value reply header (append semantics) from Rust-side
+    /// callers — e.g. the registrar enumerating REGISTER 200 OK `Contact`
+    /// bindings (RFC 3261 §10.3 step 8).
+    pub fn push_reply_header_add(&mut self, name: &str, value: String) {
+        self.reply_headers.push((ReplyHeaderOp::Add, name.to_string(), value));
     }
 
     /// Take the response body set by `set_reply_body()` (consumed by the dispatcher).
@@ -758,13 +801,9 @@ impl PyRequest {
     /// matches (including when `ipsec` is not configured).
     #[getter]
     fn matched_sa(&self) -> Option<super::ipsec::PySAHandle> {
-        let port = self.local_port?;
-        if !super::ipsec::is_protected_local_port(port) {
-            return None;
-        }
-        let ue_addr: std::net::IpAddr = self.source_ip.parse().ok()?;
-        let sa = super::ipsec::find_sa_for_ue(&ue_addr, self.source_port)?;
-        Some(super::ipsec::PySAHandle::from_sa(&sa))
+        self.resolve_protected_sa()
+            .as_ref()
+            .map(super::ipsec::PySAHandle::from_sa)
     }
 
     // -----------------------------------------------------------------------
@@ -815,12 +854,34 @@ impl PyRequest {
     }
 
     /// Fork to multiple targets.
+    ///
+    /// Each target is either a bare URI string or a `Contact` (from
+    /// `registrar.lookup()`).  When it is a `Contact` that the local process
+    /// accepted (`Contact.is_local`), the branch is routed over that binding's
+    /// captured inbound flow — RFC 5626 §5.3 connection reuse, mandatory for
+    /// WebSocket UEs (RFC 7118 §5).  Bare strings (and non-local contacts) are
+    /// DNS-resolved as before.
     #[pyo3(signature = (targets, strategy="parallel"))]
-    fn fork(&mut self, targets: Vec<String>, strategy: &str) {
+    fn fork(&mut self, targets: Vec<Bound<'_, PyAny>>, strategy: &str) -> PyResult<()> {
+        let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
+        let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
+        for item in targets {
+            if let Ok(contact) = item.extract::<PyRef<super::registrar::PyContact>>() {
+                let (uri, flow) = contact.fork_target();
+                target_uris.push(uri);
+                flows.push(flow);
+            } else {
+                // Bare URI string (or anything string-coercible).
+                target_uris.push(item.extract::<String>()?);
+                flows.push(None);
+            }
+        }
         self.action = RequestAction::Fork {
-            targets,
+            targets: target_uris,
+            flows,
             strategy: strategy.to_string(),
         };
+        Ok(())
     }
 
     /// Mark that Record-Route should be inserted.
@@ -1487,6 +1548,17 @@ mod tests {
     }
 
     #[test]
+    fn protected_ue_flow_none_when_not_ipsec_protected() {
+        // A request that never arrived on a configured P-CSCF protected port
+        // (here `local_port` is unset) exposes no IPsec flow, so the registrar
+        // refresh re-pin (`repin_protected_sa`) no-ops.  This keeps every
+        // non-IMS, non-IPsec REGISTER path unaffected by the SA-lifetime hook.
+        let request = make_request();
+        assert_eq!(request.protected_ue_flow(), None);
+        assert!(request.matched_sa().is_none());
+    }
+
+    #[test]
     fn ruri_properties() {
         let request = make_request();
         let ruri = request.ruri().unwrap();
@@ -1719,18 +1791,23 @@ mod tests {
 
     #[test]
     fn fork_sets_action() {
-        let mut request = make_request();
-        request.fork(
-            vec!["sip:a@host".to_string(), "sip:b@host".to_string()],
-            "sequential",
-        );
-        assert_eq!(
-            *request.action(),
-            RequestAction::Fork {
-                targets: vec!["sip:a@host".to_string(), "sip:b@host".to_string()],
-                strategy: "sequential".to_string(),
-            }
-        );
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let mut request = make_request();
+            let targets: Vec<Bound<'_, PyAny>> = vec![
+                pyo3::types::PyString::new(py, "sip:a@host").into_any(),
+                pyo3::types::PyString::new(py, "sip:b@host").into_any(),
+            ];
+            request.fork(targets, "sequential").unwrap();
+            assert_eq!(
+                *request.action(),
+                RequestAction::Fork {
+                    targets: vec!["sip:a@host".to_string(), "sip:b@host".to_string()],
+                    flows: vec![None, None],
+                    strategy: "sequential".to_string(),
+                }
+            );
+        });
     }
 
     #[test]

@@ -36,6 +36,11 @@ pub enum DigestAlgorithm {
     Sha256Sess,
     Sha512_256,
     Sha512_256Sess,
+    /// IMS AKAv1-MD5 (RFC 3310 / 3GPP TS 33.203). The underlying hash is MD5;
+    /// the difference is that the digest "password" is the binary AKA RES
+    /// (computed via Milenage from the RAND/AUTN carried base64 in `nonce`),
+    /// not a stored secret. See [`compute_aka_response`].
+    AkaV1Md5,
 }
 
 impl DigestAlgorithm {
@@ -58,6 +63,10 @@ impl DigestAlgorithm {
     /// (RFC 7616 §3.7). Higher strength = larger number.
     pub fn strength(self) -> u8 {
         match self {
+            // AKAv1-MD5 is network-selected (the IMS offers it alone for AKA),
+            // so it never competes in strength-based negotiation; rank it with
+            // its underlying MD5 hash.
+            DigestAlgorithm::AkaV1Md5 => 1,
             DigestAlgorithm::Md5 => 1,
             DigestAlgorithm::Md5Sess => 2,
             DigestAlgorithm::Sha256 => 3,
@@ -77,6 +86,7 @@ impl fmt::Display for DigestAlgorithm {
             DigestAlgorithm::Sha256Sess => write!(formatter, "SHA-256-sess"),
             DigestAlgorithm::Sha512_256 => write!(formatter, "SHA-512-256"),
             DigestAlgorithm::Sha512_256Sess => write!(formatter, "SHA-512-256-sess"),
+            DigestAlgorithm::AkaV1Md5 => write!(formatter, "AKAv1-MD5"),
         }
     }
 }
@@ -179,6 +189,7 @@ pub fn parse_challenge(header_value: &str) -> Option<DigestChallenge> {
                         "SHA-512-256-SESS" | "SHA512-256-SESS" => {
                             DigestAlgorithm::Sha512_256Sess
                         }
+                        "AKAV1-MD5" => DigestAlgorithm::AkaV1Md5,
                         _ => return None, // unsupported algorithm
                     };
                 }
@@ -239,16 +250,59 @@ pub fn compute_digest_response(
     nonce_count: Option<u32>,
     cnonce: Option<&str>,
 ) -> String {
-    let hash = challenge.algorithm;
-
-    let mut ha1 = hash_hex(
-        hash,
+    let base_ha1 = hash_hex(
+        challenge.algorithm,
         format!(
             "{}:{}:{}",
             credentials.username, challenge.realm, credentials.password
         )
         .as_bytes(),
     );
+    digest_response_from_ha1(challenge, base_ha1, method, digest_uri, nonce_count, cnonce)
+}
+
+/// Compute an IMS AKAv1-MD5 digest response (RFC 3310 §3.3).
+///
+/// Identical to [`compute_digest_response`] except that the digest "password"
+/// is the **binary** AKA RES (the UE's Milenage f2 output), not a stored text
+/// secret. RES bytes are not valid UTF-8, so HA1 must hash the raw octets —
+/// `H(username : realm : RES)` over bytes — which is why this can't go through
+/// the `String`-password path. The RAND/AUTN that produced RES are carried
+/// base64 in `challenge.nonce`, but the nonce is used *as-is* (the base64
+/// string) in the digest, exactly like a normal nonce (RFC 3310 §3.2).
+pub fn compute_aka_response(
+    challenge: &DigestChallenge,
+    username: &str,
+    res: &[u8],
+    method: &str,
+    digest_uri: &str,
+    nonce_count: Option<u32>,
+    cnonce: Option<&str>,
+) -> String {
+    let mut ha1_input = Vec::with_capacity(username.len() + challenge.realm.len() + res.len() + 2);
+    ha1_input.extend_from_slice(username.as_bytes());
+    ha1_input.push(b':');
+    ha1_input.extend_from_slice(challenge.realm.as_bytes());
+    ha1_input.push(b':');
+    ha1_input.extend_from_slice(res);
+
+    let base_ha1 = hash_hex(challenge.algorithm, &ha1_input);
+    digest_response_from_ha1(challenge, base_ha1, method, digest_uri, nonce_count, cnonce)
+}
+
+/// Finish a digest computation given a base HA1 (the `H(user:realm:secret)`
+/// hex string before any `-sess` re-hashing). Shared by the text-password
+/// ([`compute_digest_response`]) and AKA-RES ([`compute_aka_response`]) paths.
+fn digest_response_from_ha1(
+    challenge: &DigestChallenge,
+    base_ha1: String,
+    method: &str,
+    digest_uri: &str,
+    nonce_count: Option<u32>,
+    cnonce: Option<&str>,
+) -> String {
+    let hash = challenge.algorithm;
+    let mut ha1 = base_ha1;
 
     // RFC 7616 §3.4.2: -sess variants re-hash HA1 with nonce + cnonce so the
     // per-session key can't be replayed across sessions even if the raw
@@ -311,25 +365,9 @@ pub fn format_authorization_header(
     nonce_count: Option<u32>,
     cnonce: Option<&str>,
 ) -> String {
-    let has_qop_auth = challenge
-        .qop
-        .as_ref()
-        .map(|qop| qop.split(',').any(|token| token.trim() == "auth"))
-        .unwrap_or(false);
-
-    // Derive a single cnonce value up front so the response hash and the
-    // header's `cnonce=` parameter match. Without this, `compute_digest_response`
-    // and the header emission would each fall back to their own fresh random
-    // string, and the server's verification would fail every time.
-    let owned_cnonce;
-    let cnonce_ref: Option<&str> = if cnonce.is_some() {
-        cnonce
-    } else if has_qop_auth || challenge.algorithm.is_session() {
-        owned_cnonce = generate_cnonce();
-        Some(owned_cnonce.as_str())
-    } else {
-        None
-    };
+    let has_qop_auth = qop_has_auth(challenge);
+    let mut owned_cnonce: Option<String> = None;
+    let cnonce_ref = derive_cnonce(challenge, cnonce, has_qop_auth, &mut owned_cnonce);
 
     let response = compute_digest_response(
         challenge,
@@ -340,15 +378,116 @@ pub fn format_authorization_header(
         cnonce_ref,
     );
 
+    build_authorization_header(
+        &credentials.username,
+        challenge,
+        digest_uri,
+        &response,
+        has_qop_auth,
+        nonce_count,
+        cnonce_ref,
+        None,
+    )
+}
+
+/// Build a complete IMS AKAv1-MD5 `Authorization` header (RFC 3310).
+///
+/// Like [`format_authorization_header`] but the response is computed from the
+/// binary AKA RES via [`compute_aka_response`]. When `auts` is `Some` (a
+/// base64-encoded re-synchronisation token), it is appended as the `auts=`
+/// directive so the registrar of record re-bases its sequence counter
+/// (RFC 3310 §3.4 / 3GPP TS 33.102 §6.3.3).
+pub fn format_aka_authorization_header(
+    challenge: &DigestChallenge,
+    username: &str,
+    res: &[u8],
+    digest_uri: &str,
+    nonce_count: Option<u32>,
+    cnonce: Option<&str>,
+    auts: Option<&str>,
+) -> String {
+    let has_qop_auth = qop_has_auth(challenge);
+    let mut owned_cnonce: Option<String> = None;
+    let cnonce_ref = derive_cnonce(challenge, cnonce, has_qop_auth, &mut owned_cnonce);
+
+    let response = compute_aka_response(
+        challenge,
+        username,
+        res,
+        method_for(challenge),
+        digest_uri,
+        nonce_count,
+        cnonce_ref,
+    );
+
+    build_authorization_header(
+        username,
+        challenge,
+        digest_uri,
+        &response,
+        has_qop_auth,
+        nonce_count,
+        cnonce_ref,
+        auts,
+    )
+}
+
+/// AKA Authorization is only ever built for REGISTER in this codebase; keep the
+/// method local so [`format_aka_authorization_header`] needs no method param.
+fn method_for(_challenge: &DigestChallenge) -> &'static str {
+    "REGISTER"
+}
+
+/// Whether the challenge advertises `qop=auth` (the only qop we implement).
+fn qop_has_auth(challenge: &DigestChallenge) -> bool {
+    challenge
+        .qop
+        .as_ref()
+        .map(|qop| qop.split(',').any(|token| token.trim() == "auth"))
+        .unwrap_or(false)
+}
+
+/// Derive the single cnonce value shared by the response hash and the emitted
+/// `cnonce=` parameter. Without a shared value the two would each fall back to
+/// their own fresh random string and the server's verification would fail.
+/// `owned` provides storage for a generated cnonce that outlives the borrow.
+fn derive_cnonce<'a>(
+    challenge: &DigestChallenge,
+    cnonce: Option<&'a str>,
+    has_qop_auth: bool,
+    owned: &'a mut Option<String>,
+) -> Option<&'a str> {
+    if cnonce.is_some() {
+        cnonce
+    } else if has_qop_auth || challenge.algorithm.is_session() {
+        *owned = Some(generate_cnonce());
+        owned.as_deref()
+    } else {
+        None
+    }
+}
+
+/// Assemble the `Digest ...` Authorization header value from a precomputed
+/// response. Shared by the text-password and AKA-RES paths.
+fn build_authorization_header(
+    username: &str,
+    challenge: &DigestChallenge,
+    digest_uri: &str,
+    response: &str,
+    has_qop_auth: bool,
+    nonce_count: Option<u32>,
+    cnonce: Option<&str>,
+    auts: Option<&str>,
+) -> String {
     let mut header = format!(
         "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", algorithm={}, response=\"{}\"",
-        credentials.username, challenge.realm, challenge.nonce, digest_uri, challenge.algorithm, response
+        username, challenge.realm, challenge.nonce, digest_uri, challenge.algorithm, response
     );
 
     if has_qop_auth {
         let nc = nonce_count.unwrap_or(1);
-        // cnonce_ref is always Some when qop=auth because of the derivation above.
-        let cnonce_value = cnonce_ref.unwrap_or("");
+        // cnonce is always Some when qop=auth because of derive_cnonce above.
+        let cnonce_value = cnonce.unwrap_or("");
         header.push_str(&format!(
             ", qop=auth, nc={:08x}, cnonce=\"{cnonce_value}\"",
             nc
@@ -357,6 +496,10 @@ pub fn format_authorization_header(
 
     if let Some(opaque) = &challenge.opaque {
         header.push_str(&format!(", opaque=\"{opaque}\""));
+    }
+
+    if let Some(auts) = auts {
+        header.push_str(&format!(", auts=\"{auts}\""));
     }
 
     header
@@ -404,7 +547,7 @@ fn unquote(value: &str) -> String {
 fn hash_hex(algorithm: DigestAlgorithm, input: &[u8]) -> String {
     use sha2::Digest;
     match algorithm {
-        DigestAlgorithm::Md5 | DigestAlgorithm::Md5Sess => {
+        DigestAlgorithm::Md5 | DigestAlgorithm::Md5Sess | DigestAlgorithm::AkaV1Md5 => {
             let digest = md5::compute(input);
             format!("{digest:x}")
         }
@@ -1059,5 +1202,152 @@ mod tests {
         // Should use qop=auth since it's in the list
         assert!(header.contains("qop=auth"));
         assert!(header.contains("nc=00000001"));
+    }
+
+    // -- IMS AKAv1-MD5 (RFC 3310 / TS 33.203) --
+
+    #[test]
+    fn parse_challenge_akav1_md5() {
+        // The nonce carries base64(RAND||AUTN); parsing keeps it verbatim.
+        let header = r#"Digest realm="ims.mnc01.mcc001.3gppnetwork.org", nonce="I1U8vpY3qJ0hiuZN", qop="auth", algorithm=AKAv1-MD5"#;
+        let challenge = parse_challenge(header).unwrap();
+        assert_eq!(challenge.algorithm, DigestAlgorithm::AkaV1Md5);
+        assert!(!challenge.algorithm.is_session());
+        assert_eq!(challenge.nonce, "I1U8vpY3qJ0hiuZN");
+    }
+
+    #[test]
+    fn akav1_md5_displays_correctly() {
+        assert_eq!(DigestAlgorithm::AkaV1Md5.to_string(), "AKAv1-MD5");
+    }
+
+    /// AKAv1-MD5 response is MD5 digest with the **binary** RES as the password
+    /// (RFC 3310 §3.3). Cross-check against a manual computation using the
+    /// Milenage TS 35.208 Test Set 1 RES (a54211d5e3ba50bf).
+    #[test]
+    fn aka_response_matches_manual_with_binary_res() {
+        // 3GPP test IMSI range (MCC 001 / MNC 01) — never a real subscriber.
+        let realm = "ims.mnc01.mcc001.3gppnetwork.org";
+        let username = "001010000000001@ims.mnc01.mcc001.3gppnetwork.org";
+        let uri = "sip:ims.mnc01.mcc001.3gppnetwork.org";
+        let nonce = "I1U8vpY3qJ0hiuZNrkbN";
+        let res: [u8; 8] = [0xa5, 0x42, 0x11, 0xd5, 0xe3, 0xba, 0x50, 0xbf];
+
+        let challenge = DigestChallenge {
+            realm: realm.to_string(),
+            nonce: nonce.to_string(),
+            opaque: None,
+            qop: Some("auth".to_string()),
+            algorithm: DigestAlgorithm::AkaV1Md5,
+            stale: false,
+        };
+
+        // Manual HA1 over raw octets: H(user ":" realm ":" RES_bytes).
+        let mut ha1_input = Vec::new();
+        ha1_input.extend_from_slice(username.as_bytes());
+        ha1_input.push(b':');
+        ha1_input.extend_from_slice(realm.as_bytes());
+        ha1_input.push(b':');
+        ha1_input.extend_from_slice(&res);
+        let ha1 = format!("{:x}", md5::compute(&ha1_input));
+        let ha2 = format!("{:x}", md5::compute(format!("REGISTER:{uri}").as_bytes()));
+        let expected = format!(
+            "{:x}",
+            md5::compute(format!("{ha1}:{nonce}:00000001:abcd:auth:{ha2}").as_bytes())
+        );
+
+        let response =
+            compute_aka_response(&challenge, username, &res, "REGISTER", uri, Some(1), Some("abcd"));
+        assert_eq!(response, expected);
+    }
+
+    /// Lock in the binary semantics: feeding RES as a hex *string* through the
+    /// normal text-password path MUST differ from the binary-RES path. If these
+    /// ever matched, RES would be getting double-encoded.
+    #[test]
+    fn aka_response_is_binary_not_hex_string() {
+        let realm = "ims.mnc01.mcc001.3gppnetwork.org";
+        let username = "001010000000001@ims.mnc01.mcc001.3gppnetwork.org";
+        let uri = "sip:ims.mnc01.mcc001.3gppnetwork.org";
+        let res: [u8; 8] = [0xa5, 0x42, 0x11, 0xd5, 0xe3, 0xba, 0x50, 0xbf];
+
+        let challenge = DigestChallenge {
+            realm: realm.to_string(),
+            nonce: "nonce".to_string(),
+            opaque: None,
+            qop: Some("auth".to_string()),
+            algorithm: DigestAlgorithm::AkaV1Md5,
+            stale: false,
+        };
+
+        let binary = compute_aka_response(&challenge, username, &res, "REGISTER", uri, Some(1), Some("c"));
+
+        let hex_creds = DigestCredentials {
+            username: username.to_string(),
+            password: "a54211d5e3ba50bf".to_string(),
+        };
+        let as_hex = compute_digest_response(&challenge, &hex_creds, "REGISTER", uri, Some(1), Some("c"));
+
+        assert_ne!(binary, as_hex);
+    }
+
+    #[test]
+    fn format_aka_authorization_header_shape() {
+        let challenge = DigestChallenge {
+            realm: "ims.mnc01.mcc001.3gppnetwork.org".to_string(),
+            nonce: "I1U8vpY3qJ0hiuZN".to_string(),
+            opaque: Some("op".to_string()),
+            qop: Some("auth".to_string()),
+            algorithm: DigestAlgorithm::AkaV1Md5,
+            stale: false,
+        };
+        let username = "001010000000001@ims.mnc01.mcc001.3gppnetwork.org";
+        let res: [u8; 8] = [0xa5, 0x42, 0x11, 0xd5, 0xe3, 0xba, 0x50, 0xbf];
+
+        let header = format_aka_authorization_header(
+            &challenge,
+            username,
+            &res,
+            "sip:ims.mnc01.mcc001.3gppnetwork.org",
+            Some(1),
+            Some("deadbeef"),
+            None,
+        );
+
+        assert!(header.contains("algorithm=AKAv1-MD5"));
+        assert!(header.contains(&format!("username=\"{username}\"")));
+        assert!(header.contains("qop=auth"));
+        assert!(header.contains("nc=00000001"));
+        assert!(header.contains("cnonce=\"deadbeef\""));
+        assert!(header.contains("opaque=\"op\""));
+        assert!(!header.contains("auts="));
+        // 32-char MD5 response.
+        let response_start = header.find("response=\"").unwrap() + 10;
+        let response_end = header[response_start..].find('"').unwrap() + response_start;
+        assert_eq!(header[response_start..response_end].len(), 32);
+    }
+
+    #[test]
+    fn format_aka_authorization_header_includes_auts_on_resync() {
+        let challenge = DigestChallenge {
+            realm: "ims.mnc01.mcc001.3gppnetwork.org".to_string(),
+            nonce: "I1U8vpY3qJ0hiuZN".to_string(),
+            opaque: None,
+            qop: Some("auth".to_string()),
+            algorithm: DigestAlgorithm::AkaV1Md5,
+            stale: false,
+        };
+        let res: [u8; 8] = [0xa5, 0x42, 0x11, 0xd5, 0xe3, 0xba, 0x50, 0xbf];
+
+        let header = format_aka_authorization_header(
+            &challenge,
+            "001010000000001@ims.mnc01.mcc001.3gppnetwork.org",
+            &res,
+            "sip:ims.mnc01.mcc001.3gppnetwork.org",
+            Some(1),
+            Some("deadbeef"),
+            Some("RgXovKQ7VhY="),
+        );
+        assert!(header.contains("auts=\"RgXovKQ7VhY=\""));
     }
 }

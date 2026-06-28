@@ -68,6 +68,14 @@ pub struct ProxySession {
     pub client_branches: HashMap<TransactionKey, ClientBranch>,
     /// Fork aggregator for multi-target forking (None for single-target relay).
     pub fork_aggregator: Option<Arc<Mutex<ForkAggregator>>>,
+    /// Captured inbound flow per fork branch, parallel to the aggregator's
+    /// branches.  `Some` means that branch is routed over the captured
+    /// connection (RFC 5626 §5.3 connection reuse — the only way to reach a
+    /// WebSocket UE) instead of DNS-resolving the URI.  Stored on the session so
+    /// sequential forking (`start_next_fork_branch`) can recover the flow for
+    /// branches started after the first.  `PyFlow` is plain data (no
+    /// `Py<PyAny>`), so cloning it off the dispatcher thread is sound.
+    pub fork_flows: Vec<Option<crate::script::api::registrar::PyFlow>>,
     /// Maps client transaction key → branch index in the ForkAggregator.
     pub branch_index_map: HashMap<TransactionKey, usize>,
     /// Whether `record_route()` was called by the script.
@@ -78,6 +86,16 @@ pub struct ProxySession {
     pub on_reply_callback: Option<Py<PyAny>>,
     /// Per-relay on_failure Python callback (called with `(request, code, reason)`).
     pub on_failure_callback: Option<Py<PyAny>>,
+    /// Set once a final response has been committed upstream for this server
+    /// transaction by a reply-time reject (`reply.reject(code, reason)` from
+    /// `@proxy.on_reply`).  After a reject we send `code reason` to the UAC and
+    /// CANCEL the pending downstream branch(es); the CANCEL draws a `487` back
+    /// on each branch.  Without a fork aggregator (the single-target relay case,
+    /// e.g. the IMS P-CSCF), there is no `final_forwarded` guard, so this flag
+    /// is what tells the response path to ABSORB that straggler `487` (already
+    /// ACKed by the client transaction) instead of forwarding a second final
+    /// response upstream.
+    pub final_response_sent: bool,
 }
 
 impl ProxySession {
@@ -96,6 +114,7 @@ impl ProxySession {
             client_keys: Vec::new(),
             client_branches: HashMap::new(),
             fork_aggregator: None,
+            fork_flows: Vec::new(),
             branch_index_map: HashMap::new(),
             source_addr,
             inbound_local_addr,
@@ -106,6 +125,7 @@ impl ProxySession {
             created_at: Instant::now(),
             on_reply_callback: None,
             on_failure_callback: None,
+            final_response_sent: false,
         }
     }
 
@@ -122,6 +142,31 @@ impl ProxySession {
     /// Get downstream destination info for a client branch.
     pub fn get_client_branch(&self, key: &TransactionKey) -> Option<&ClientBranch> {
         self.client_branches.get(key)
+    }
+
+    /// Clone the per-relay `on_reply` / `on_failure` Python callbacks for use
+    /// on the response path.
+    ///
+    /// Free-threaded CPython (3.14t / PEP 703, pyo3 0.28) requires the calling
+    /// thread to be *attached* to the interpreter before a `Py<…>` refcount may
+    /// be touched: `Py::clone` panics with "Cannot clone pointer into Python
+    /// heap without the thread being attached" whenever it runs on a
+    /// dispatcher/executor worker that is not currently inside a
+    /// `Python::attach` scope. The dispatcher lifts these callbacks out of the
+    /// session read-guard on exactly such a worker, so the bare `Clone` impl is
+    /// unsound there. Clone through a `Python` token instead — matching the
+    /// request path (`script::handle::call_handler`, which uses `clone_ref`).
+    pub fn clone_relay_callbacks(&self) -> (Option<Py<PyAny>>, Option<Py<PyAny>>) {
+        Python::attach(|python| {
+            (
+                self.on_reply_callback
+                    .as_ref()
+                    .map(|callback| callback.clone_ref(python)),
+                self.on_failure_callback
+                    .as_ref()
+                    .map(|callback| callback.clone_ref(python)),
+            )
+        })
     }
 }
 
@@ -389,6 +434,24 @@ impl ProxySessionStore {
         }
     }
 
+    /// Drop only the `by_dialog_key` index entry for a request's dialog,
+    /// leaving the `by_client_key` / `server_to_clients` indices intact.
+    ///
+    /// Used when an INVITE is rejected from the reply path
+    /// (`reply.reject()` → no dialog is ever established): the `by_dialog_key`
+    /// entry exists solely to route the end-to-end 2xx ACK, which now can never
+    /// arrive, so it is dead.  Leaving it would let a stray/non-compliant ACK
+    /// (To-tag present, R-URI pointing at the proxy) match the rejected call's
+    /// dialog and reach `handle_ack_via_session`.  The client-key indices stay
+    /// so the CANCEL's `487` straggler is still matched and absorbed.
+    ///
+    /// No-op for non-INVITE requests (they create no `by_dialog_key` entry).
+    pub fn remove_dialog_key(&self, request: &SipMessage) {
+        if let Some(dialog_key) = Self::invite_dialog_key(request) {
+            self.by_dialog_key.remove(&dialog_key);
+        }
+    }
+
     /// Remove a single client key from the store.
     ///
     /// If the session has no remaining client keys, removes the session entirely.
@@ -600,6 +663,17 @@ mod tests {
         assert_eq!(session.client_keys.len(), 1);
         assert_eq!(session.source_addr, source_addr());
         assert!(!session.record_routed);
+        // A fresh session has not finalized a response — only a reply-time
+        // reject sets this.
+        assert!(!session.final_response_sent);
+    }
+
+    #[test]
+    fn final_response_sent_flag_toggles() {
+        let mut session = make_session();
+        assert!(!session.final_response_sent);
+        session.final_response_sent = true;
+        assert!(session.final_response_sent);
     }
 
     #[test]
@@ -608,6 +682,67 @@ mod tests {
         session.add_client_key(client_key("2"));
         session.add_client_key(client_key("3"));
         assert_eq!(session.client_keys.len(), 3);
+    }
+
+    /// Regression: the dispatcher response path clones a session's per-relay
+    /// `on_reply` / `on_failure` callbacks on a Python-executor worker that is
+    /// NOT inside a `Python::attach` scope. On free-threaded CPython (3.14t,
+    /// pyo3 0.28) a bare `Py::clone` from such a thread panics with "Cannot
+    /// clone pointer into Python heap without the thread being attached" — and
+    /// the panic check is thread-attachment based, so it reproduces on any
+    /// build from a freshly spawned (never-attached) OS thread.
+    /// `clone_relay_callbacks` must attach first; if it regresses to a bare
+    /// clone, the worker thread panics and `join()` returns `Err` here.
+    #[test]
+    fn clone_relay_callbacks_from_unattached_worker_thread() {
+        pyo3::Python::initialize();
+
+        // Real Python callables, built while attached on this (main) thread.
+        let (on_reply, on_failure): (Py<PyAny>, Py<PyAny>) = Python::attach(|python| {
+            let reply = python
+                .eval(c"lambda request, reply: None", None, None)
+                .expect("compile on_reply lambda")
+                .unbind();
+            let failure = python
+                .eval(c"lambda request, code, reason: None", None, None)
+                .expect("compile on_failure lambda")
+                .unbind();
+            (reply, failure)
+        });
+        let original_reply_ptr = on_reply.as_ptr() as usize;
+
+        let mut session = make_session();
+        session.on_reply_callback = Some(on_reply);
+        session.on_failure_callback = Some(on_failure);
+        let session = Arc::new(session);
+
+        // A freshly spawned OS thread has pyo3 ATTACH_COUNT == 0 — the exact
+        // precondition the dispatcher worker hits when a relayed response
+        // arrives.
+        let worker = {
+            let session = Arc::clone(&session);
+            std::thread::spawn(move || {
+                let (reply_callback, failure_callback) = session.clone_relay_callbacks();
+                let cloned_reply_ptr = reply_callback.as_ref().map(|cb| cb.as_ptr() as usize);
+                (
+                    reply_callback.is_some(),
+                    failure_callback.is_some(),
+                    cloned_reply_ptr,
+                )
+            })
+        };
+        let (has_reply, has_failure, cloned_reply_ptr) = worker
+            .join()
+            .expect("clone_relay_callbacks panicked on an unattached worker thread");
+
+        assert!(has_reply, "on_reply callback lost in cross-thread clone");
+        assert!(has_failure, "on_failure callback lost in cross-thread clone");
+        // `clone_ref` must alias the same Python object, not substitute a new one.
+        assert_eq!(
+            cloned_reply_ptr,
+            Some(original_reply_ptr),
+            "clone must reference the same callable object"
+        );
     }
 
     // -- ProxySessionStore tests --
@@ -1100,5 +1235,27 @@ mod tests {
         assert!(store.get_by_dialog_key("session-test", "abc").is_some());
         store.remove_by_server_key(&server_key());
         assert!(store.get_by_dialog_key("session-test", "abc").is_none());
+    }
+
+    #[test]
+    fn remove_dialog_key_drops_only_the_dialog_index() {
+        // reply.reject() hygiene: a rejected INVITE forms no dialog, so its
+        // by_dialog_key entry must be dropped — but the client-key index must
+        // survive so the CANCEL's 487 straggler is still matched and absorbed.
+        let store = ProxySessionStore::new();
+        let session = make_session();
+        let request = session.original_request.clone();
+        let client = client_key("1");
+        store.insert(session);
+
+        assert!(store.get_by_dialog_key("session-test", "abc").is_some());
+        assert!(store.get_by_client_key(&client).is_some());
+
+        store.remove_dialog_key(&request);
+
+        // Dialog index gone — a stray ACK can no longer match the dead dialog.
+        assert!(store.get_by_dialog_key("session-test", "abc").is_none());
+        // Client index intact — the 487 straggler still resolves to the session.
+        assert!(store.get_by_client_key(&client).is_some());
     }
 }

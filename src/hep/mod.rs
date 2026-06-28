@@ -295,8 +295,10 @@ fn build_tls_client_config(ca_cert: Option<&str>) -> io::Result<tokio_rustls::ru
         // Load custom CA certificate
         let ca_data = std::fs::read(ca_path)?;
         let mut cursor = io::Cursor::new(ca_data);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<_> = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         for cert in certs {
             root_store
                 .add(cert)

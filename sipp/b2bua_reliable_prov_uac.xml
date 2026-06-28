@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA reliable-provisional interworking — A-leg (models a non-100rel trunk).
+
+  INVITE (NO Supported: 100rel) → 100 → 183 → 200 → ACK → BYE → 200
+
+  The B-leg UAS (b2bua_reliable_prov_uas.xml) answers with a RELIABLE 183
+  (Require: 100rel + RSeq).  siphon must terminate the 100rel contract at the
+  B2BUA: it auto-PRACKs the B-leg locally and MUST strip Require:100rel / RSeq
+  from the 183 it forwards here, because this A-leg never advertised 100rel and
+  cannot PRACK.  A real trunk seeing the leaked contract would CANCEL the call.
+
+  The two `check_it_inverse` asserts FAIL the scenario if either reliability
+  marker leaks through — this is the regression guard for the framework-auto
+  strip in sanitize_b2bua_response.  No PRACK is ever sent (a non-100rel UAC
+  never PRACKs).
+
+  Pair with b2bua_reliable_prov_uas.xml on the B-leg side of siphon.
+-->
+<scenario name="B2BUA reliable-provisional UAC (non-100rel trunk)">
+
+  <!-- Send INVITE WITHOUT Supported: 100rel -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-non100rel-trunk
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- Reliable markers MUST NOT leak to a non-100rel A-leg.  check_it_inverse
+       marks the call failed if the regexp matches, so the scenario fails if
+       siphon forwarded Require:100rel or RSeq. -->
+  <recv response="183" crlf="true">
+    <action>
+      <ereg regexp="100rel" search_in="hdr" header="Require:"
+            check_it_inverse="true" assign_to="junk" />
+      <ereg regexp="[0-9]+" search_in="hdr" header="RSeq:"
+            check_it_inverse="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <!-- No PRACK is sent.  Expect the final 200 OK for the INVITE. -->
+  <recv response="200" rtd="true" crlf="true" />
+
+  <!-- ACK goes directly to the B2BUA (it owns the dialog — no Route set). -->
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

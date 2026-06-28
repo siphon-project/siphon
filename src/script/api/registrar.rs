@@ -21,6 +21,24 @@ use super::request::PyRequest;
 /// window to land before the proxy's cached binding evaporates.
 const PROXY_BINDING_GRACE_SECS: u32 = 32;
 
+/// Re-pin the IPsec SA pair bound to a REGISTER's UE flow to the granted
+/// binding lifetime (`granted_expires + PROXY_BINDING_GRACE_SECS`), so an
+/// IPsec-protected registration's SA tracks its binding across no-AKA
+/// refreshes (3GPP TS 33.203 §7.4).  Shared by [`save`](PyRegistrar::save)
+/// and [`save_proxy`](PyRegistrar::save_proxy).
+///
+/// No-op when the request did not arrive on a protected port or no SA
+/// matches (`protected_ue_flow` returns `None`) — i.e. every non-IMS,
+/// non-IPsec deployment.  The underlying `ipsec::repin_sa_for_ue` is itself
+/// fire-and-forget and guards against a missing IPsec manager / Tokio
+/// runtime, so this is safe to call unconditionally on the REGISTER path.
+fn repin_protected_sa(request: &PyRequest, granted_expires: u32) {
+    if let Some((ue_addr, ue_port_c)) = request.protected_ue_flow() {
+        let hard_lifetime = u64::from(granted_expires) + u64::from(PROXY_BINDING_GRACE_SECS);
+        super::ipsec::repin_sa_for_ue(&ue_addr, ue_port_c, hard_lifetime);
+    }
+}
+
 /// Python-visible contact object returned from `registrar.lookup()`.
 /// Opaque view of an inbound flow captured at REGISTER time.  Carries the
 /// transport, the UE's source address, the listener local address, and the
@@ -29,7 +47,7 @@ const PROXY_BINDING_GRACE_SECS: u32 = 32;
 /// REGISTER.  Treat as opaque from Python: scripts pass it back to
 /// `request.relay(flow=)` and read `is_alive` to defend against dead
 /// stream connections.
-#[pyclass(name = "Flow")]
+#[pyclass(name = "Flow", from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PyFlow {
     /// Lowercase transport name ("udp", "tcp", "tls", "ws", "wss").
@@ -73,23 +91,37 @@ impl PyFlow {
     /// just means the next datagram will land on a UE that may or
     /// may not still be listening.
     ///
-    /// For stream transports (TCP/TLS/WS/WSS) the flow is alive only
-    /// while the accepted connection that delivered the REGISTER is
-    /// still open on this process.  An accurate cross-transport check
-    /// requires wiring the per-listener `connection_map`s into a
-    /// shared registry; until that lands, this returns ``True`` for
-    /// stream transports too — scripts should defend against the
-    /// silent-drop case via :attr:`Contact.is_local` before calling
-    /// ``request.relay(flow=...)``.
+    /// For stream transports (TCP/TLS/WS/WSS) this is a real liveness
+    /// check against the process-global stream-connection registry:
+    /// ``True`` only while the *exact* accepted connection that
+    /// delivered the REGISTER is still open on **this** process.  A UE
+    /// that reconnected (new connection id) or whose socket closed
+    /// reports ``False``.  When the registry isn't wired (unit tests /
+    /// headless contexts) it stays conservatively ``True``.
+    /// Cross-instance bindings should additionally be gated on
+    /// :attr:`Contact.is_local` before ``request.relay(flow=...)``.
     #[getter]
     fn is_alive(&self) -> bool {
-        // Conservative: treat all flows as live.  When the dispatcher
-        // can't find the connection at send time, the message is
-        // silently dropped (logged) — same failure mode as a closed
-        // socket on any other path.  When the cross-transport
-        // connection registry lands, this becomes a real DashMap
-        // lookup against the right per-transport map.
-        true
+        if self.transport == "udp" {
+            return true;
+        }
+        let transport = match self.transport.as_str() {
+            "tcp" => crate::transport::Transport::Tcp,
+            "tls" => crate::transport::Transport::Tls,
+            "ws" => crate::transport::Transport::WebSocket,
+            "wss" => crate::transport::Transport::WebSocketSecure,
+            _ => return true, // unknown transport — stay conservative
+        };
+        match crate::script::api::stream_connections() {
+            Some(registry) => registry.is_alive(
+                self.source_addr,
+                transport,
+                crate::transport::ConnectionId(self.connection_id),
+            ),
+            // Registry not wired (unit tests / headless) — conservative,
+            // matching the pre-registry behaviour.
+            None => true,
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -287,6 +319,21 @@ impl PyContact {
         Self::from_rust_contact_with_registrar(contact, None)
     }
 
+    /// `(uri, flow)` for flow-aware `request.fork()` / `call.fork()`.
+    ///
+    /// The captured flow is only surfaced when this binding was accepted by the
+    /// **local** process (`is_local`); a binding restored from a shared backend
+    /// on another instance carries a `connection_id` that is meaningless here,
+    /// so it falls back to URI routing.  The URI is always the Contact URI.
+    pub fn fork_target(&self) -> (String, Option<PyFlow>) {
+        let flow = if self.is_local_value {
+            self.flow_value.clone()
+        } else {
+            None
+        };
+        (self.uri_string.clone(), flow)
+    }
+
     /// Same as [`from_rust_contact`] but resolves `is_local` against the
     /// running registrar's instance identity when one is available.
     pub fn from_rust_contact_with_registrar(
@@ -445,6 +492,31 @@ impl PyRegistrar {
         // AoR from To header, normalized to strip transport params etc.
         let aor = normalize_aor(&extract_aor(&message)?);
 
+        // F4: bind the registration to the authenticated identity. Without this,
+        // a subscriber authenticated as user A can REGISTER a Contact under user
+        // B's AoR (To header) — silently hijacking B's incoming calls, or
+        // deregistering B (Contact:* / Expires:0). Checked BEFORE the force-clear
+        // below so a spoofed AoR cannot first wipe the victim's bindings.
+        // Opt-in (default off) so IMS deployments (public identity != private
+        // auth identity, authorized via the implicit set) are unaffected.
+        if self.inner.config.enforce_auth_aor_match {
+            if let Some(auth_user) = request.get_auth_user() {
+                let aor_user = crate::sip::parser::parse_uri_standalone(&aor)
+                    .ok()
+                    .and_then(|uri| uri.user);
+                if aor_user.as_deref() != Some(auth_user) {
+                    tracing::warn!(
+                        auth_user = %auth_user,
+                        aor = %aor.escape_debug(),
+                        "rejecting REGISTER: AoR does not match authenticated user"
+                    );
+                    drop(message);
+                    request.set_reply(403, "Forbidden".to_string());
+                    return Ok(false);
+                }
+            }
+        }
+
         if force {
             self.inner.clear_bindings(&aor);
         }
@@ -464,17 +536,22 @@ impl PyRegistrar {
         let source_addr = request.source_socket_addr();
         let source_transport = Some(request.transport_name().to_string());
 
-        // Capture the inbound flow when the script asked for token-keyed MT
-        // routing.  Without `flow_token`, the FlowCapture is empty and the
-        // resulting Contact behaves like any pre-feature binding.
-        let flow_capture = if flow_token.is_some() {
-            crate::registrar::FlowCapture {
-                flow_token: flow_token.clone(),
-                inbound_local_addr: request.inbound_local_addr(),
-                inbound_connection_id: request.inbound_connection_id_u64(),
-            }
-        } else {
-            crate::registrar::FlowCapture::default()
+        // Capture the inbound flow for every binding this process accepts —
+        // `inbound_local_addr` + `inbound_connection_id` together let
+        // `Contact.flow` drive RFC 5626 §5.3 connection reuse on the MT side
+        // (`request.relay(flow=...)` / `fork`), which is the *only* way to
+        // reach a WebSocket UE (RFC 7118 §5).  Previously `inbound_local_addr`
+        // was gated on `flow_token`, so a plain `registrar.save()` left
+        // `Contact.flow == None` and WS MT routing silently failed.  Capturing
+        // it unconditionally is additive: scripts that ignore `contact.flow`
+        // are unaffected, and cross-instance staleness is guarded by
+        // `Contact.is_local` (the relay path only uses a flow for bindings the
+        // local process holds).  `inbound_connection_id` was already captured
+        // always (RFC 5626 §4.2.2 flow-failure deregistration relies on it).
+        let flow_capture = crate::registrar::FlowCapture {
+            flow_token: flow_token.clone(),
+            inbound_local_addr: request.inbound_local_addr(),
+            inbound_connection_id: request.inbound_connection_id_u64(),
         };
 
         // Extract expires from Expires header or default
@@ -582,6 +659,11 @@ impl PyRegistrar {
                                 "too many contacts (max: {max})"
                             ))
                         }
+                        RegistrarError::InvalidAor => {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "invalid AoR (unsafe storage key)".to_string(),
+                            )
+                        }
                     })?;
             }
         }
@@ -591,6 +673,14 @@ impl PyRegistrar {
         message.headers.set("Expires", granted_expires.to_string());
         drop(message);
 
+        // Extend the bound IPsec SA pair on a protected refresh (TS 33.203
+        // §7.4) — same rationale as save_proxy.  Skipped for a de-REGISTER
+        // (granted_expires == 0): that tears the binding (and its SA) down via
+        // the dedicated paths, not a lifetime bump.  No-op for non-IPsec saves.
+        if granted_expires > 0 {
+            repin_protected_sa(request, granted_expires);
+        }
+
         // Declare the implicit registration set (3GPP TS 23.228) — each
         // alias URI becomes resolvable to this AoR for subsequent
         // `registrar.lookup(alias)` calls.  Empty list is intentionally
@@ -599,8 +689,21 @@ impl PyRegistrar {
             self.inner.set_associated_uris(&aor, aliases);
         }
 
-        // Send 200 OK — the dispatcher's build_response() will include
-        // the Expires header we just set.
+        // RFC 3261 §10.3 step 8: the 200 OK MUST enumerate all current bindings
+        // as Contact headers, each with an `expires` parameter.  Strict UAs
+        // (sip.js / JsSIP / browser WebRTC clients) drop a REGISTER 200 OK that
+        // carries no Contact and the registration fails — the top-level Expires
+        // header set above is not sufficient for them.
+        for binding in self.inner.lookup(&aor) {
+            let mut value = format!("<{}>;expires={}", binding.uri, binding.remaining_seconds());
+            if (binding.q - 1.0).abs() > f32::EPSILON {
+                value.push_str(&format!(";q={}", binding.q));
+            }
+            request.push_reply_header_add("Contact", value);
+        }
+
+        // Send 200 OK — build_response() includes the Expires header set above
+        // and the Contact bindings queued here.
         request.set_reply(200, "OK".to_string());
 
         Ok(true)
@@ -680,21 +783,28 @@ impl PyRegistrar {
             return Ok(true);
         }
 
+        // 3GPP TS 33.203 §7.4: an IPsec-protected REGISTER refresh must extend
+        // the bound SA pair's hard lifetime in step with the binding it is
+        // refreshing.  IR.92 refreshes carry no AKA challenge (no 401 → no
+        // PendingSA → `activate` never runs), so this registrar hook is the
+        // only path that moves the SA forward — without it an actively-
+        // refreshing UE's SA ages out of the kernel under it and gets reaped +
+        // network-de-REGISTERed.  Match the per-contact binding grace applied
+        // below (granted + PROXY_BINDING_GRACE_SECS).  No-op when the request
+        // didn't arrive protected / no SA matches.
+        repin_protected_sa(request, granted_expires);
+
         let source_addr = request.source_socket_addr();
         let source_transport = Some(request.transport_name().to_string());
 
-        // Capture the inbound flow for token-keyed MT routing.  Same
-        // semantics as `save(flow_token=...)` — empty FlowCapture when
-        // the script didn't pass a token, so existing callers behave
-        // identically.
-        let flow_capture = if flow_token.is_some() {
-            crate::registrar::FlowCapture {
-                flow_token: flow_token.clone(),
-                inbound_local_addr: request.inbound_local_addr(),
-                inbound_connection_id: request.inbound_connection_id_u64(),
-            }
-        } else {
-            crate::registrar::FlowCapture::default()
+        // Capture the inbound flow unconditionally (same rationale as `save()`):
+        // `inbound_local_addr` + `inbound_connection_id` populate `Contact.flow`
+        // so RFC 5626 §5.3 connection reuse works on the MT side without
+        // requiring `flow_token`.  Additive and guarded by `Contact.is_local`.
+        let flow_capture = crate::registrar::FlowCapture {
+            flow_token: flow_token.clone(),
+            inbound_local_addr: request.inbound_local_addr(),
+            inbound_connection_id: request.inbound_connection_id_u64(),
         };
 
         let cseq_seq = request_msg
@@ -786,6 +896,11 @@ impl PyRegistrar {
                                 "too many contacts (max: {max})"
                             ))
                         }
+                        RegistrarError::InvalidAor => {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "invalid AoR (unsafe storage key)".to_string(),
+                            )
+                        }
                     })?;
             }
         }
@@ -829,14 +944,16 @@ impl PyRegistrar {
     /// against an unregistered user — TS 24.229 §5.4.2.1.2 keeps AS
     /// records' lifetime tied to the registration).
     ///
-    /// Example::
+    /// Example:
     ///
-    ///     @proxy.on_reply
-    ///     def on_reply(request, reply):
-    ///         if request.method == "REGISTER" and reply.status_code == 200:
-    ///             impu = str(request.to_uri)
-    ///             registrar.save_as_contact(impu, reply)
-    ///         reply.relay()
+    /// ```python,ignore
+    /// @proxy.on_reply
+    /// def on_reply(request, reply):
+    ///     if request.method == "REGISTER" and reply.status_code == 200:
+    ///         impu = str(request.to_uri)
+    ///         registrar.save_as_contact(impu, reply)
+    ///     reply.relay()
+    /// ```
     #[pyo3(signature = (aor, reply, expires_secs=None))]
     fn save_as_contact(
         &self,
@@ -893,10 +1010,7 @@ impl PyRegistrar {
                 // We do NOT special-case `+sip.instance` or `reg-id` for
                 // AS contacts — those are meaningful only on the UE side.
                 let params: Vec<(String, Option<String>)> = nameaddr
-                    .other_params
-                    .iter()
-                    .cloned()
-                    .collect();
+                    .other_params.to_vec();
 
                 let saved = self
                     .inner
@@ -911,6 +1025,11 @@ impl PyRegistrar {
                             pyo3::exceptions::PyValueError::new_err(format!(
                                 "too many contacts (max: {max})"
                             ))
+                        }
+                        RegistrarError::InvalidAor => {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "invalid AoR (unsafe storage key)".to_string(),
+                            )
                         }
                     })?;
                 wrote = wrote || saved;
@@ -1228,6 +1347,7 @@ mod tests {
             max_expires: 7200,
             min_expires: 60,
             max_contacts: 10,
+            ..Default::default()
         }))
     }
 
@@ -1273,6 +1393,111 @@ mod tests {
         assert!(contacts[0].uri().contains("10.0.0.1"));
         assert_eq!(contacts[0].q(), 1.0);
         assert!(contacts[0].expires() > 3500);
+    }
+
+    #[test]
+    fn save_without_token_captures_connection_id_for_flow_failure() {
+        // RFC 5626 §4.2.2: an ordinary stream registration (no flow_token)
+        // must still record its inbound connection id so a connection close
+        // can deregister it via Registrar::unregister_flow.
+        let registrar = make_registrar();
+        let uri = SipUri::new("example.com".to_string());
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, uri)
+            .via("SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK-reg".to_string())
+            .to("<sip:alice@example.com>".to_string())
+            .from("<sip:alice@example.com>;tag=reg-tag".to_string())
+            .call_id("reg-call@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header("Contact", "<sip:alice@10.0.0.1:5060;transport=tcp>".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let mut request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "tcp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+        );
+        request.set_inbound_flow("127.0.0.1:5060".parse().unwrap(), 4242);
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        // No flow_token passed — the residential/general registrar path.
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+        assert!(registrar.is_registered("sip:alice@example.com"));
+
+        // A flow failure on connection 4242 deregisters the binding.
+        assert_eq!(registrar.unregister_flow(4242), 1);
+        assert!(!registrar.is_registered("sip:alice@example.com"));
+    }
+
+    #[test]
+    fn save_without_token_populates_contact_flow_for_stream() {
+        // RFC 5626 §5.3 connection reuse: a plain `registrar.save()` (no
+        // flow_token) must still expose `Contact.flow` so the MT side can
+        // `relay(flow=...)` back over the captured connection.  Before the
+        // unconditional-capture fix, `inbound_local_addr` was gated on
+        // flow_token and `Contact.flow` came back `None`, silently breaking
+        // WS/WSS MT routing.
+        let registrar = make_registrar();
+        let uri = SipUri::new("example.com".to_string());
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, uri)
+            .via("SIP/2.0/WSS 10.0.0.1:5060;branch=z9hG4bK-reg".to_string())
+            .to("<sip:bob@example.com>".to_string())
+            .from("<sip:bob@example.com>;tag=reg-tag".to_string())
+            .call_id("reg-call@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header("Contact", "<sip:bob@df7jal23ls0d.invalid;transport=wss>".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let mut request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "wss".to_string(),
+            "10.0.0.1".to_string(),
+            50000,
+        );
+        request.set_inbound_flow("127.0.0.1:443".parse().unwrap(), 4242);
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        // No flow_token — the plain residential/WebRTC path.
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+
+        let contacts = py_reg.lookup_str("sip:bob@example.com");
+        assert_eq!(contacts.len(), 1);
+        let flow = contacts[0]
+            .flow()
+            .expect("Contact.flow must be populated without flow_token");
+        assert_eq!(flow.transport, "wss");
+        assert_eq!(flow.source_addr.to_string(), "10.0.0.1:50000");
+        assert_eq!(flow.local_addr.to_string(), "127.0.0.1:443");
+        assert_eq!(flow.connection_id, 4242);
+        // No token was passed, so flow_token stays absent.
+        assert_eq!(contacts[0].flow_token(), None);
+    }
+
+    #[test]
+    fn save_enumerates_contact_in_register_ok() {
+        // RFC 3261 §10.3 step 8: the REGISTER 200 OK must enumerate the bound
+        // Contact(s) with an `expires` param.  Strict UAs (sip.js) drop a 200
+        // with no Contact, so the registration silently fails without this.
+        let registrar = make_registrar();
+        let (mut request, py_reg) = make_register_request(
+            "<sip:alice@example.com>",
+            "<sip:alice@10.0.0.1:5060>",
+            &registrar,
+        );
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+
+        let reply_headers = request.take_reply_headers();
+        let contact = reply_headers
+            .iter()
+            .find(|(_, name, _)| name == "Contact")
+            .map(|(_, _, value)| value)
+            .expect("REGISTER 200 OK must carry a Contact binding (RFC 3261 §10.3 step 8)");
+        assert!(contact.contains("alice@10.0.0.1"), "contact value: {contact}");
+        assert!(contact.contains("expires="), "contact must carry an expires param: {contact}");
     }
 
     #[test]
@@ -1647,6 +1872,7 @@ mod tests {
             max_expires: 600,
             min_expires: 60,
             max_contacts: 10,
+            ..Default::default()
         }));
 
         let uri = SipUri::new("example.com".to_string());
@@ -1911,6 +2137,7 @@ mod tests {
             max_expires: 600,
             min_expires: 60,
             max_contacts: 10,
+            ..Default::default()
         }));
         let py_reg = PyRegistrar::new(Arc::clone(&registrar));
 
@@ -1947,6 +2174,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn save_enforces_auth_aor_match_when_configured() {
+        let registrar = Arc::new(Registrar::new(RegistrarConfig {
+            enforce_auth_aor_match: true,
+            ..Default::default()
+        }));
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        let build_register = |to_user: &str| {
+            let uri = SipUri::new("example.com".to_string());
+            let message = SipMessageBuilder::new()
+                .request(Method::Register, uri)
+                .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK".to_string())
+                .to(format!("<sip:{to_user}@example.com>"))
+                .from(format!("<sip:{to_user}@example.com>;tag=t"))
+                .call_id("c@h".to_string())
+                .cseq("1 REGISTER".to_string())
+                .header("Contact", "<sip:x@10.0.0.2:5060>".to_string())
+                .content_length(0)
+                .build()
+                .unwrap();
+            PyRequest::new(
+                Arc::new(Mutex::new(message)),
+                "udp".to_string(),
+                "10.0.0.2".to_string(),
+                5060,
+            )
+        };
+
+        // Authenticated as "attacker" but REGISTER binds victim's AoR → rejected,
+        // and the victim's keyspace is left empty (no binding, no force-clear).
+        let mut spoof = build_register("victim");
+        spoof.set_auth_user("attacker".to_string());
+        assert!(matches!(py_reg.save(&mut spoof, true, vec![], None), Ok(false)));
+        assert!(py_reg.lookup_str("sip:victim@example.com").is_empty());
+
+        // Authenticated as "victim" binding own AoR → allowed.
+        let mut legit = build_register("victim");
+        legit.set_auth_user("victim".to_string());
+        assert!(matches!(py_reg.save(&mut legit, true, vec![], None), Ok(true)));
+        assert!(!py_reg.lookup_str("sip:victim@example.com").is_empty());
+    }
+
     // -----------------------------------------------------------------------
     // Phase 2 — Path-token MT routing: Python surface
     // -----------------------------------------------------------------------
@@ -1981,6 +2251,72 @@ mod tests {
         assert_eq!(flow.local_addr.to_string(), "127.0.0.1:5066");
         assert_eq!(flow.connection_id, 0xc0ffee);
         assert_eq!(py.flow_token(), Some("tok"));
+    }
+
+    #[test]
+    fn flow_is_alive_udp_true_and_stream_conservative_without_registry() {
+        // UDP: always alive (listener socket survives; deterministic id).
+        let udp = PyFlow {
+            transport: "udp".into(),
+            source_addr: "10.0.0.1:5060".parse().unwrap(),
+            local_addr: "127.0.0.1:5060".parse().unwrap(),
+            connection_id: 1,
+        };
+        assert!(udp.is_alive());
+        // Stream transport with no process-global registry wired (the unit-test
+        // context): stays conservatively alive, matching pre-registry behaviour.
+        // The registry-backed liveness path is covered by
+        // `transport::tests::stream_connections_is_alive_tracks_exact_triple`.
+        let wss = PyFlow {
+            transport: "wss".into(),
+            source_addr: "10.0.0.1:50000".parse().unwrap(),
+            local_addr: "127.0.0.1:443".parse().unwrap(),
+            connection_id: 2,
+        };
+        assert!(wss.is_alive());
+    }
+
+    #[test]
+    fn fork_target_surfaces_flow_only_for_local_binding() {
+        // The safety guard: fork/relay route over a captured flow ONLY for a
+        // binding this process holds (is_local).  A cross-instance binding
+        // (is_local=false) falls back to URI routing — its connection_id is
+        // meaningless on this process.
+        let contact = Contact {
+            uri: SipUri::new("df7jal23ls0d.invalid".to_string()).with_user("bob".into()),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires: std::time::Duration::from_secs(3600),
+            call_id: "c1".into(),
+            cseq: 1,
+            source_addr: Some("10.0.0.1:50000".parse().unwrap()),
+            source_transport: Some("wss".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: Some("127.0.0.1:443".parse().unwrap()),
+            inbound_connection_id: Some(0xc0ffee),
+            params: Vec::new(),
+            kind: crate::registrar::ContactKind::Ue,
+        };
+        let mut py = PyContact::from_rust_contact(&contact);
+
+        // Non-local → flow withheld, URI carried for DNS routing.
+        py.is_local_value = false;
+        let (uri, flow) = py.fork_target();
+        assert!(flow.is_none(), "non-local binding must not surface its flow");
+        assert!(uri.contains("bob@df7jal23ls0d.invalid"));
+
+        // Local → flow surfaced for connection reuse.
+        py.is_local_value = true;
+        let (_, flow) = py.fork_target();
+        let flow = flow.expect("local binding must surface its captured flow");
+        assert_eq!(flow.transport, "wss");
+        assert_eq!(flow.connection_id, 0xc0ffee);
     }
 
     #[test]

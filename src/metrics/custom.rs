@@ -339,7 +339,9 @@ mod tests {
         custom.counter_inc("test_requests_total", &[], 1.0).unwrap();
 
         let counter = custom.counters.get("test_requests_total").unwrap();
-        assert_eq!(counter.with_label_values(&[]).get(), 2.0);
+        // prometheus 0.14: `with_label_values` infers its element type from the
+        // slice, so an empty slice needs an explicit `&[&str]` annotation.
+        assert_eq!(counter.with_label_values(&[] as &[&str]).get(), 2.0);
     }
 
     #[test]
@@ -387,7 +389,7 @@ mod tests {
         custom.gauge_dec("test_active", &[], 1.0).unwrap();
 
         let gauge = custom.gauges.get("test_active").unwrap();
-        assert_eq!(gauge.with_label_values(&[]).get(), 1.0);
+        assert_eq!(gauge.with_label_values(&[] as &[&str]).get(), 1.0);
     }
 
     #[test]
@@ -425,7 +427,7 @@ mod tests {
             .unwrap();
 
         let histogram = custom.histograms.get("test_duration_seconds").unwrap();
-        assert_eq!(histogram.with_label_values(&[]).get_sample_count(), 2);
+        assert_eq!(histogram.with_label_values(&[] as &[&str]).get_sample_count(), 2);
     }
 
     #[test]

@@ -30,6 +30,11 @@ RUN_REINVITE=false
 RUN_B2BUA=false
 RUN_GATEWAY=false
 RUN_AUTO100=false
+RUN_HTTP_AUTH=false
+RUN_WEDGE=false
+RUN_BANSCAN=false
+RUN_SECURITY=false
+RUN_WEBRTC=false
 SKIP_RUST=false
 
 for arg in "$@"; do
@@ -42,9 +47,14 @@ for arg in "$@"; do
     --b2bua)      RUN_B2BUA=true ;;
     --gateway)    RUN_GATEWAY=true ;;
     --auto100)    RUN_AUTO100=true ;;
+    --http-auth)  RUN_HTTP_AUTH=true ;;
+    --wedge)      RUN_WEDGE=true ;;
+    --banscan)    RUN_BANSCAN=true ;;
+    --security)   RUN_SECURITY=true ;;
+    --webrtc)     RUN_WEBRTC=true ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--skip-rust]"
+      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--webrtc] [--skip-rust]"
       exit 0
       ;;
     *)
@@ -141,6 +151,16 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-early-media up --abort-on-container-exit --exit-code-from sipp-b2bua-early-media-uac sipp-b2bua-early-media-uac sipp-b2bua-early-media-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-early-media rm -sf sipp-b2bua-early-media-uac sipp-b2bua-early-media-uas 2>/dev/null || true
 
+  echo "=== B2BUA reliable-provisional interworking test (100rel B-leg → non-100rel A-leg) ==="
+  # Dedicated siphon instance pinned to sip-trunk-edge@2026 (does NOT strip
+  # Require/RSeq via preset) — proves the 100rel strip is framework-auto.
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov build siphon-b2bua-trunk-edge
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov up -d --wait siphon-b2bua-trunk-edge
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov run --rm sipp-b2bua-trunk-edge-register
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov rm -sf sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uas 2>/dev/null || true
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov stop siphon-b2bua-trunk-edge 2>/dev/null || true
+
   echo "=== B2BUA session timer test (Session-Expires negotiation) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-session-timer up --abort-on-container-exit --exit-code-from sipp-b2bua-st-uac sipp-b2bua-st-uac sipp-b2bua-st-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-session-timer rm -sf sipp-b2bua-st-uac sipp-b2bua-st-uas 2>/dev/null || true
@@ -195,6 +215,86 @@ fi
 if [[ "$RUN_IPSEC" == true ]]; then
   echo "=== SIPp IPsec VoLTE registration test ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile ipsec run --rm sipp-ipsec
+fi
+
+# ── Step 12: HTTP-auth deadlock regression (optional) ────────────────────────
+# Drives sustained REGISTER load through the blocking HTTP HA1-fetch path. On an
+# unfixed build the handler stays attached to the free-threaded interpreter
+# while blocking, stalling the GC stop-the-world, and the engine deadlocks — the
+# load then fails to complete (non-zero exit). With the `py.detach()` fix every
+# registration succeeds. The --exit-code-from makes the load container's result
+# the gate; a deadlock is a hard FAIL, not a tolerated dead-call (255).
+if [[ "$RUN_HTTP_AUTH" == true ]]; then
+  echo "=== Building siphon-http-auth image ==="
+  docker compose -f "$COMPOSE_FILE" --profile http-auth build siphon-http-auth
+
+  echo "=== HTTP-auth deadlock regression (REGISTER storm → blocking HA1 fetch) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile http-auth \
+    up --abort-on-container-exit --exit-code-from sipp-http-auth-load \
+    mock-http-auth siphon-http-auth sipp-http-auth-load
+  docker compose -f "$COMPOSE_FILE" --profile http-auth rm -sf \
+    mock-http-auth siphon-http-auth sipp-http-auth-load 2>/dev/null || true
+
+  echo "=== on_change blocking-notify regression (REGISTER storm → blocking notify per save) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile http-auth \
+    up --abort-on-container-exit --exit-code-from sipp-onchange-load \
+    mock-http-auth siphon-onchange sipp-onchange-load
+  docker compose -f "$COMPOSE_FILE" --profile http-auth rm -sf \
+    mock-http-auth siphon-onchange sipp-onchange-load 2>/dev/nu
+    ll || true
+fi
+
+# ── Outbound-drain wedge regression (optional) ───────────────────────────────
+# A single non-reading peer (toll-fraud scanner that never ACKs its 401s, or a
+# stream peer whose far end stalls) must not be able to stall the per-listener
+# outbound distributor. Pre-fix, send().await on the full bounded channel parked
+# the drain while it held the connection-map shard guard, stalling ALL outbound
+# and blocking accept(). run_sipp tolerates 255; this is a hard exit 1 on wedge.
+if [[ "$RUN_WEDGE" == true ]]; then
+  echo "=== outbound-drain wedge regression (non-reading peer @ cpus 0.5) ==="
+  run_sipp bash scripts/wedge_test.sh
+fi
+
+# ── failed_auth_ban auto-ban regression (optional) ───────────────────────────
+# A scanner that repeatedly fails auth must be banned at accept (dropped before
+# SIP parsing). Hard exit 1 if the second connection still gets a 401.
+if [[ "$RUN_BANSCAN" == true ]]; then
+  echo "=== failed_auth_ban auto-ban regression (scanner banned at accept) ==="
+  run_sipp bash scripts/banscan_test.sh
+fi
+
+# ── rate_limit + scanner_block regression (optional) ─────────────────────────
+# A scanner User-Agent must be silently dropped, and a source that exceeds
+# security.rate_limit.max_requests must be rate-limited. Hard exit 1 if either
+# blocked request still gets answered.
+if [[ "$RUN_SECURITY" == true ]]; then
+  echo "=== rate_limit + scanner_block regression (request filter) ==="
+  run_sipp bash scripts/security_test.sh
+fi
+
+# ── WebRTC (SIP-over-WebSocket) two-UA call test (optional) ───────────────────
+# Two real sip.js WS user agents register and call each other through siphon.
+# Proves RFC 7118 / RFC 5626 §5.3 flow-based MT routing: the INVITE reaches a
+# WS-registered UE over its captured inbound connection (the Contact host is an
+# unresolvable .invalid). Tests MT and MO toward/from both WebRTC legs. The
+# webrtc-client container exits non-zero if any callee never receives the INVITE.
+if [[ "$RUN_WEBRTC" == true ]]; then
+  echo "=== Building siphon-webrtc images (proxy + b2bua) ==="
+  docker compose -f "$COMPOSE_FILE" --profile webrtc build siphon-webrtc siphon-webrtc-b2bua
+
+  echo "=== WebRTC (WS) two-UA call test — PROXY mode (MT + MO toward/from WebRTC legs) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile webrtc \
+    up --abort-on-container-exit --exit-code-from webrtc-client \
+    siphon-webrtc webrtc-client
+  docker compose -f "$COMPOSE_FILE" --profile webrtc rm -sf \
+    siphon-webrtc webrtc-client 2>/dev/null || true
+
+  echo "=== WebRTC (WS) two-UA call test — B2BUA mode (MT + MO toward/from WebRTC legs) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile webrtc \
+    up --abort-on-container-exit --exit-code-from webrtc-b2bua-client \
+    siphon-webrtc-b2bua webrtc-b2bua-client
+  docker compose -f "$COMPOSE_FILE" --profile webrtc rm -sf \
+    siphon-webrtc-b2bua webrtc-b2bua-client 2>/dev/null || true
 fi
 
 echo ""

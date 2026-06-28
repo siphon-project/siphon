@@ -1,0 +1,57 @@
+# siphon.b2bua-trunk-edge-test.yaml — B2BUA functional test configuration with
+# the `sip-trunk-edge@2026` header policy (the BGCF/trunk-edge setup).
+#
+# Used with: sipp/docker-compose.yaml (b2bua-reliable-prov profile)
+# Script:    scripts/b2bua_100rel_advertise.py  (IR.92-style — adds
+#            `Supported: 100rel` to the shared INVITE for the B-leg, which is
+#            the regression guard for the gate-poisoning bug: the A-leg's
+#            on-wire 100rel capability must be snapshotted before the script
+#            runs, so the reliable-1xx strip toward the non-100rel trunk holds)
+# Tests:     reliable-provisional (100rel) interworking — a B-leg reliable 183
+#            must NOT leak Require:100rel / RSeq to a non-100rel A-leg.
+#
+# This instance pins `sip-trunk-edge@2026`, whose response policy is
+# `default → Copy` and does NOT strip Require/RSeq.  The 100rel strip must
+# therefore come from the framework-auto path in sanitize_b2bua_response, not
+# the preset — which is exactly what this test guards.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.58"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_100rel_advertise.py"
+  reload: auto
+
+advertised_address: "172.20.0.58"
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+b2bua:
+  default_header_policy: "sip-trunk-edge@2026"
+
+session_timer:
+  session_expires: 1800
+  min_se: 90
+  refresher: b2bua
+  enabled: true
+
+log:
+  level: debug
+  format: pretty

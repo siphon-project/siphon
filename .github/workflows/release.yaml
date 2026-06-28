@@ -15,19 +15,49 @@ permissions:
   packages: write
 
 jobs:
+  # ── Version gate ───────────────────────────────────────────────────────
+  # Lockstep versioning: the git tag is the single source of truth. Refuse to
+  # publish anything if Cargo.toml's version doesn't match the tag, so a stray
+  # in-tree bump can never ship a mismatched crate/image. The SDK takes its
+  # version from the tag directly (hatch-vcs), so it needs no separate check.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cargo.toml version must equal the tag
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
+          echo "tag=$tag_version cargo=$cargo_version"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Cargo.toml version ($cargo_version) does not match tag ($tag_version) — bump Cargo.toml in the release commit (use scripts/cut-release.sh)."
+            exit 1
+          fi
+          # A release must document its version in CHANGELOG.md (CLAUDE.md rule).
+          ver_re="$(printf '%s' "$tag_version" | sed 's/\./\\./g')"
+          if ! grep -qE "^## \[?${ver_re}\]?" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$tag_version]' section — add the release notes (scripts/cut-release.sh gates on this)."
+            exit 1
+          fi
+
   # ── Build release binary + packages ────────────────────────────────────
   build:
+    needs: verify-version
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          # Native ARM runner. siphon embeds CPython via PyO3, so cross-compiling
+          # aarch64 from an x86 host needs a full cross-Python (PYO3_CROSS_LIB_DIR
+          # → an aarch64 libpython); building on a native aarch64 runner makes
+          # PyO3 resolve the host python3.14 and sidesteps cross-compilation.
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Python 3.14 (free-threaded)
         uses: deadsnakes/action@v3.2.0
@@ -35,11 +65,7 @@ jobs:
           python-version: "3.14-dev"
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y libsctp-dev
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,8 +75,6 @@ jobs:
 
       - name: Build release binary
         run: PYO3_PYTHON=python3.14 cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Build .deb package
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -74,21 +98,38 @@ jobs:
             dist/siphon.service LICENSE README.md
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
+      # Stage everything into one flat dir. v1.0.0 lost the deb/rpm because
+      # cargo-deb writes to target/debian/ (NOT target/<triple>/debian/, which
+      # the old glob assumed), and the multi-path upload preserved a target/...
+      # subtree so the github-release `artifacts/*.deb` glob (top-level only)
+      # never matched. `find` locates the packages wherever the tools put them;
+      # a flat upload + if-no-files-found:error makes a future drift fail loudly
+      # instead of silently dropping a package.
+      - name: Stage release artifacts (flat)
+        run: |
+          mkdir -p out
+          cp "$ARCHIVE" out/
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            find target -name '*.deb' -exec cp {} out/ \;
+            find target -name '*.rpm' -exec cp {} out/ \;
+          fi
+          ls -l out/
+
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
-          path: |
-            ${{ env.ARCHIVE }}
-            target/${{ matrix.target }}/debian/*.deb
-            target/${{ matrix.target }}/generate-rpm/*.rpm
+          path: out/*
+          if-no-files-found: error
 
-  # ── Publish to crates.io ───────────────────────────────────────────────
+  # ── Publish to crates.io (Trusted Publishing — OIDC, no token) ─────────
   crates-io:
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      id-token: write   # mint a short-lived crates.io token via GitHub OIDC
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Python 3.14 (free-threaded)
         uses: deadsnakes/action@v3.2.0
@@ -100,87 +141,196 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Authenticate to crates.io (OIDC Trusted Publishing)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
       - name: Publish to crates.io
         run: PYO3_PYTHON=python3.14 cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
-  # ── Publish Python SDK to PyPI ────────────────────────────────────────
+  # ── Publish Python SDK to PyPI (Trusted Publishing — OIDC, no token) ───
   pypi:
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      id-token: write   # OIDC for PyPI Trusted Publishing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          # hatch-vcs derives the version from the git tag; the default shallow
+          # clone hides tags/history and breaks version resolution.
+          fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
-      - name: Build and publish siphon-sdk
+      - name: Build siphon-sip (SDK; version from tag via hatch-vcs)
         run: |
-          pip install build twine
+          pip install build
           cd sdk && python -m build
-          twine upload dist/*
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 
-  # ── Docker image → GHCR ───────────────────────────────────────────────
+      - name: Publish to PyPI (Trusted Publishing — OIDC, no token)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/dist
+
+  # ── Docker image → GHCR (native multi-arch: amd64 + arm64) ────────────
+  # Each platform builds on its OWN native runner — no QEMU. siphon's
+  # pyo3 + aws-lc-sys compile is far too heavy to emulate (arm64 under QEMU
+  # would risk a multi-hour build / timeout). Each leg pushes the image by
+  # digest (untagged); `docker-merge` then stitches the per-arch digests
+  # into a single multi-arch manifest list and applies the version tags.
   docker:
-    runs-on: ubuntu-latest
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-latest
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Normalise platform name
+        run: echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+        env:
+          platform: ${{ matrix.platform }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: Image labels
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build + push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${digest#sha256:}"
+        env:
+          digest: ${{ steps.build.outputs.digest }}
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Merge per-arch digests into one multi-arch manifest + tag it ──────
+  docker-merge:
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `latest=auto` tags :latest only for stable (non-prerelease) semver,
+          # so an -rc.N tag publishes its version but never moves :latest.
+          flavor: |
+            latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - name: Create + push the multi-arch manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect manifest
+        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+  # ── SBOM (SPDX + CycloneDX), attached to the GitHub Release ───────────
+  sbom:
+    runs-on: ubuntu-latest
+    needs: verify-version
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-sbom
+        run: cargo install cargo-sbom
+      - name: Generate SPDX + CycloneDX SBOMs
+        run: |
+          cargo sbom --output-format spdx_json_2_3 > "siphon-sip-${GITHUB_REF_NAME}.spdx.json"
+          cargo sbom --output-format cyclone_dx_json_1_4 > "siphon-sip-${GITHUB_REF_NAME}.cdx.json"
+      - uses: actions/upload-artifact@v7
         with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64
+          name: sbom
+          path: |
+            siphon-sip-*.spdx.json
+            siphon-sip-*.cdx.json
 
   # ── GitHub Release with artifacts ──────────────────────────────────────
   github-release:
     runs-on: ubuntu-latest
-    needs: [build, crates-io, pypi, docker]
+    needs: [build, crates-io, pypi, docker-merge, sbom]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
             artifacts/*.deb
             artifacts/*.rpm
+            artifacts/*.spdx.json
+            artifacts/*.cdx.json

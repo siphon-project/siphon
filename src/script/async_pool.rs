@@ -122,17 +122,6 @@ impl AsyncPool {
         self.drivers.len()
     }
 
-    /// Test-only accessor that hands back fresh `Py` references to each
-    /// driver's asyncio loop so leak tests can call
-    /// `asyncio.all_tasks(loop)` on them.  Caller must hold `python`.
-    #[cfg(test)]
-    pub(crate) fn driver_loops(&self, python: Python<'_>) -> Vec<Py<PyAny>> {
-        self.drivers
-            .iter()
-            .map(|d| d.loop_obj.clone_ref(python))
-            .collect()
-    }
-
     fn spawn(size: usize, tokio_handle: TokioHandle) -> Self {
         let mut drivers = Vec::with_capacity(size);
         for index in 0..size {
@@ -268,11 +257,13 @@ fn driver_main(
     //
     // SAFETY: the gstate is intentionally leaked.  The OS thread runs for
     // the lifetime of the process; the gstate is reclaimed on thread exit.
+    // We never call PyGILState_Release / PyEval_RestoreThread — that omission
+    // is what keeps the per-thread state alive.  The returned handles are
+    // Copy (an enum + a raw pointer, no Drop), so they need no mem::forget;
+    // letting the bindings fall out of scope is a no-op by construction.
     unsafe {
-        let gstate = pyo3::ffi::PyGILState_Ensure();
-        let tstate = pyo3::ffi::PyEval_SaveThread();
-        std::mem::forget(tstate);
-        std::mem::forget(gstate);
+        let _gstate = pyo3::ffi::PyGILState_Ensure();
+        let _tstate = pyo3::ffi::PyEval_SaveThread();
     }
 
     // Phase 1: build the loop and hand a handle back to the spawning thread.
@@ -510,6 +501,21 @@ mod tests {
         })
     }
 
+    /// Tests share one process-global `AsyncPool` (`GLOBAL`) and the harness
+    /// runs them on parallel threads.  The leak probes (`pool_drains_*`,
+    /// `pool_steady_state_*`) read the per-driver asyncio task tables / the
+    /// process-global jemalloc `allocated` gauge — both of which a *sibling*
+    /// test dispatching to the same pool perturbs mid-probe.  That is a
+    /// cross-test race, not a leak.  Every pool test holds this guard for its
+    /// whole duration, so exactly one runs at a time and the probes observe a
+    /// quiescent pool.  Poison is recovered deliberately: a panicking test has
+    /// already failed and must not cascade a poison error into the others.
+    static POOL_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn pool_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        POOL_SERIAL.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn ensure_pool() -> Arc<AsyncPool> {
         Python::initialize();
         Python::attach(install_test_module);
@@ -542,6 +548,7 @@ mod tests {
 
     #[test]
     fn pool_runs_simple_coroutine() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -564,6 +571,7 @@ mod tests {
     /// stuck in `_ready` forever.
     #[test]
     fn pool_drives_create_task_to_completion() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -606,6 +614,7 @@ mod tests {
     /// and the task body must finish.
     #[test]
     fn pool_drives_create_task_through_pyo3_async_future() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -659,6 +668,7 @@ mod tests {
     /// distinct value.
     #[test]
     fn pool_handles_concurrent_submissions() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -700,6 +710,7 @@ mod tests {
     /// inside the API call panics with "there is no reactor running".
     #[test]
     fn pool_drivers_have_tokio_runtime_context() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -823,6 +834,7 @@ mod tests {
     /// returned Marker stays alive and the weakref keeps resolving.
     #[test]
     fn pool_releases_python_objects_after_handler() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -873,6 +885,7 @@ mod tests {
     /// being released, which would slowly accumulate frames + locals.
     #[test]
     fn pool_drains_asyncio_tasks_after_batch() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -910,15 +923,24 @@ mod tests {
         });
     }
 
-    /// Leak test 3 — RSS must reach a steady state.  Run a warm-up
-    /// batch (allocator free-list grows), measure RSS, run an equal
-    /// batch, measure RSS again.  The delta amortised per handler
-    /// should be tiny.  10k handlers × <0.5KB/req gives plenty of
-    /// signal-to-noise on Linux glibc malloc.
+    /// Leak test 3 — live allocated bytes must reach a steady state.  Run a
+    /// warm-up batch (allocator free-lists, Python interp caches grow),
+    /// snapshot jemalloc `stats.allocated`, run an equal batch, snapshot
+    /// again.  The delta amortised per handler should be tiny.
     ///
-    /// Skipped on non-Linux because we can't read VmRSS without it.
+    /// Gates on jemalloc `allocated` (live bytes), **not** RSS.  jemalloc
+    /// retains freed pages, so RSS stays elevated under a constant,
+    /// completed-call workload even with zero leak — per CLAUDE.md, "RSS
+    /// alone is too noisy to gate on (jemalloc retains freed pages) — gate
+    /// on `allocated`".  `allocated` is the precise leak signal; RSS is
+    /// still printed for context.
+    ///
+    /// Skipped if jemalloc stats are unavailable.  jemalloc-gated because the
+    /// stats interface only exists when jemalloc is the global allocator.
+    #[cfg(not(target_env = "msvc"))]
     #[test]
-    fn pool_steady_state_rss_does_not_grow() {
+    fn pool_steady_state_allocated_does_not_grow() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -932,8 +954,19 @@ mod tests {
                 ))
             });
 
-            let Some(_) = read_rss_kb() else {
-                eprintln!("[pool_steady_state_rss_does_not_grow] no /proc/self/status — skipping");
+            // jemalloc snapshots its stats at epoch advance; without the
+            // advance the reads are stale.
+            fn allocated_bytes() -> Option<u64> {
+                tikv_jemalloc_ctl::epoch::advance().ok()?;
+                tikv_jemalloc_ctl::stats::allocated::read()
+                    .ok()
+                    .map(|value| value as u64)
+            }
+
+            let Some(_) = allocated_bytes() else {
+                eprintln!(
+                    "[pool_steady_state_allocated_does_not_grow] jemalloc stats unavailable — skipping"
+                );
                 return;
             };
 
@@ -949,7 +982,8 @@ mod tests {
             force_python_gc();
             flush_drivers().await;
 
-            let rss_baseline = read_rss_kb().unwrap();
+            let rss_baseline = read_rss_kb();
+            let allocated_baseline = allocated_bytes().unwrap();
 
             for _ in 0..BATCH {
                 let factory = Arc::clone(&factory);
@@ -959,15 +993,27 @@ mod tests {
             force_python_gc();
             flush_drivers().await;
 
-            let rss_after = read_rss_kb().unwrap();
-            let delta_kb = rss_after.saturating_sub(rss_baseline);
-            let budget_kb = (BATCH as u64 * PER_HANDLER_BUDGET_BYTES) / 1024;
+            let allocated_delta = allocated_bytes().unwrap().saturating_sub(allocated_baseline);
+            let budget_bytes = BATCH as u64 * PER_HANDLER_BUDGET_BYTES;
+
+            // RSS is logged for context only — jemalloc page retention makes
+            // it climb without a real leak, which is exactly why the gate is
+            // on `allocated` rather than RSS.
+            if let (Some(before), Some(after)) = (rss_baseline, read_rss_kb()) {
+                eprintln!(
+                    "[pool_steady_state_allocated_does_not_grow] RSS delta {} KB (context only) \
+                     vs allocated delta {} bytes (budget {} bytes)",
+                    after.saturating_sub(before),
+                    allocated_delta,
+                    budget_bytes,
+                );
+            }
 
             assert!(
-                delta_kb < budget_kb,
-                "RSS grew {} KB across {} steady-state handlers \
-                 (budget {} KB ≈ {} bytes/handler) — likely a leak",
-                delta_kb, BATCH, budget_kb, PER_HANDLER_BUDGET_BYTES,
+                allocated_delta < budget_bytes,
+                "jemalloc allocated grew {} bytes across {} steady-state handlers \
+                 (budget {} bytes ≈ {} bytes/handler) — likely a leak",
+                allocated_delta, BATCH, budget_bytes, PER_HANDLER_BUDGET_BYTES,
             );
         });
     }
@@ -975,6 +1021,7 @@ mod tests {
     /// Coroutine that raises must surface the exception to the caller.
     #[test]
     fn pool_propagates_python_exception() {
+        let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {

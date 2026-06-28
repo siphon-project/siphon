@@ -1,0 +1,37 @@
+# siphon-onchange.yaml — config for the on_change blocking-notify regression.
+#
+# STATIC auth (no HTTP HA1 fetch) so the only blocking call in the REGISTER path
+# is the @registrar.on_change notify — isolates the Python-level blocking case.
+#
+# Used by: sipp/docker-compose.yaml (profile: http-auth, service siphon-onchange)
+# Script:  sipp/http_auth/registrar_onchange.py (mounted at /etc/siphon/test_scripts)
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "example.com"
+    - "172.20.0.63"
+    - "127.0.0.1"
+
+script:
+  path: "/etc/siphon/test_scripts/registrar_onchange.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+
+auth:
+  realm: "example.com"
+  backend: static
+  users:
+    bob: "secret"
+
+log:
+  level: warn
+  format: pretty

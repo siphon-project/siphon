@@ -30,7 +30,7 @@ use crate::sip::headers::via::Via;
 use crate::sip::message::{Method, RequestLine, SipMessage, StartLine, StatusLine, Version};
 use crate::sip::headers::SipHeaders;
 use crate::sip::uri::SipUri;
-use crate::sip::parser::{parse_sip_message, parse_sip_message_bytes, parse_uri_standalone};
+use crate::sip::parser::{parse_sip_message_bytes, parse_uri_standalone};
 use crate::sip::uri::format_sip_host;
 use crate::transaction::key::TransactionKey;
 use crate::transaction::state::{
@@ -40,9 +40,18 @@ use crate::transaction::state::{
 use crate::transaction::{TransactionManager, ServerEvent, ClientEvent};
 use crate::transaction::timer::TimerConfig;
 use crate::hep::HepSender;
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, OutboundRouter, Transport};
+use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, OutboundRouter, StreamConnections, Transport};
 use crate::transport::pool::ConnectionPool;
 use crate::uac::UacSender;
+
+/// RTPEngine wiring produced by [`init_rtpengine`]: the engine set, the media
+/// session store, and the profile registry. Each component is present only
+/// when `media.rtpengine` is configured (otherwise all three are `None`).
+type RtpEngineComponents = (
+    Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
+    Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
+    Option<Arc<crate::rtpengine::ProfileRegistry>>,
+);
 
 /// A pending timer entry in the timer wheel.
 #[derive(Debug, Clone)]
@@ -132,12 +141,19 @@ struct DispatcherState {
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     /// IPsec config (P-CSCF ports).
     ipsec_config: Option<crate::config::IpsecConfig>,
+    /// Registrar liveness knobs (network-initiated deregistration).  Cloned
+    /// from `config.registrar.liveness`; `enabled == false` (the default)
+    /// makes the whole UDP+IPsec idle sweep a no-op.
+    registrar_liveness: crate::config::RegistrarLivenessConfig,
     /// Outbound TCP/TLS connection pool for relay to new destinations.
     connection_pool: Arc<ConnectionPool>,
-    /// Reverse map: TLS remote SocketAddr → ConnectionId for connection reuse.
-    /// Populated by the TLS listener; used by send_to_target to reuse inbound
-    /// TLS connections when relaying to registered endpoints (like OpenSIPS).
-    tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
+    /// Unified stream-connection registry: peer SocketAddr → (Transport,
+    /// ConnectionId).  Populated by the TLS/WS/WSS listeners (inbound) and the
+    /// connection pool (outbound TLS); used by `send_to_target` to reuse an
+    /// existing connection when relaying to a registered endpoint (like
+    /// OpenSIPS), and — for WebSocket — the only way to reach the UE at all
+    /// (RFC 7118 §5 / RFC 5626 §5.3).
+    stream_connections: StreamConnections,
     /// Automatically rewrite Contact URI in responses with the observed source
     /// address (from `nat.fix_contact` config).
     nat_fix_contact: bool,
@@ -195,6 +211,11 @@ pub(crate) struct ProxyRfState {
     /// the STOP path so a single found-by-X lookup can clean up all
     /// the aliases without scanning the map.
     storage_keys: Vec<String>,
+    /// When this record was created.  Used by the orphan backstop sweep
+    /// (`sweep_stale_entries`) to reap Rf sessions whose ACR-STOP never
+    /// fired (call torn down without a BYE reaching the dispatcher).
+    /// Normal calls are reaped on BYE; this only catches orphans.
+    created_at: std::time::Instant,
 }
 
 impl ProxyRfState {
@@ -317,6 +338,8 @@ impl DispatcherState {
 ///
 /// Reads inbound messages from transport, parses, invokes Python handlers,
 /// and sends responses back via the outbound channel.
+// Wide by necessity: the dispatcher loop is wired to every transport channel,
+// store, and engine handle at startup, exceeding the configured threshold.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     inbound_rx: flume::Receiver<InboundMessage>,
@@ -329,15 +352,11 @@ pub async fn run(
     hep_sender: Option<Arc<HepSender>>,
     uac_sender: Arc<UacSender>,
     connection_pool: Arc<ConnectionPool>,
-    pre_rtpengine: (
-        Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
-        Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
-        Option<Arc<crate::rtpengine::ProfileRegistry>>,
-    ),
+    pre_rtpengine: RtpEngineComponents,
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     ipsec_config: Option<crate::config::IpsecConfig>,
-    tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
+    stream_connections: StreamConnections,
     registrar_event_rx: Option<tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>>,
     diameter_incoming_rx: tokio::sync::mpsc::Receiver<(
         crate::diameter::peer::IncomingRequest,
@@ -488,8 +507,9 @@ pub async fn run(
             .map(|srs_config| Arc::new(crate::srs::SrsManager::new(srs_config.clone()))),
         ipsec_manager,
         ipsec_config,
+        registrar_liveness: config.registrar.liveness.clone(),
         connection_pool,
-        tls_addr_map,
+        stream_connections,
         nat_fix_contact: config.nat.as_ref().map(|n| n.fix_contact).unwrap_or(false),
         sdp_name: config.media.as_ref()
             .and_then(|m| m.sdp_name.clone())
@@ -562,7 +582,7 @@ pub async fn run(
                         fire_expired_timers(&state);
                     }
                     _ = cleanup_interval.tick() => {
-                        sweep_stale_entries(&state);
+                        sweep_stale_entries(&state).await;
                     }
                 }
             }
@@ -630,7 +650,7 @@ pub async fn run(
                 let state_ref = Arc::clone(&state_for_events);
 
                 // Invoke Python handlers in a blocking context
-                crate::script::py_executor::run(move || {
+                let _ = crate::script::py_executor::try_run(move || {
                     let engine_state = state_ref.engine.state();
                     let handlers =
                         engine_state.handlers_for(&HandlerKind::RegistrarOnChange);
@@ -725,7 +745,7 @@ pub async fn run(
                 let state_ref = Arc::clone(&state_for_events);
 
                 // Invoke Python handlers in a blocking context
-                crate::script::py_executor::run(move || {
+                let _ = crate::script::py_executor::try_run(move || {
                     let engine_state = state_ref.engine.state();
                     let handlers =
                         engine_state.handlers_for(&HandlerKind::RegistrantOnChange);
@@ -836,7 +856,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let dtmf_clone = dtmf.clone();
-                        crate::script::py_executor::run(move || {
+                        let _ = crate::script::py_executor::try_run(move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state
                                 .dtmf_handlers(&dtmf_clone.call_id, &dtmf_clone.from_tag);
@@ -918,6 +938,26 @@ fn fire_expired_timers(state: &DispatcherState) {
     });
 
     for entry in fired {
+        // Non-ACK INVITE auto-ban signal. Timer H is the INVITE *server*
+        // transaction timeout (RFC 3261 §17.2.1 — a non-2xx final was sent and no
+        // ACK arrived within 64*T1). That is exactly the toll-fraud-scanner
+        // pattern: the peer sent an INVITE, got the 401/403, and walked away
+        // without ACKing. `entry.destination` is the UAC (the source), so this can
+        // only ever count against the originator — never a downstream relay/trunk
+        // (whose failures would surface as ICT Timer B, deliberately not counted).
+        if matches!(entry.name, TimerName::H) {
+            if let (Some(ban), Some(dest)) =
+                (crate::security::auto_ban(), entry.destination)
+            {
+                if ban.record_failure(dest.ip()) {
+                    warn!(source = %dest.ip(), "auto-ban: source banned (non-ACK INVITE timeout)");
+                }
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.auth_failures_total.inc();
+                }
+            }
+        }
+
         let event = match entry.name {
             // Server transaction timers
             TimerName::J => Some(ServerEvent::Nist(NistEvent::TimerJ)),
@@ -1035,8 +1075,18 @@ fn process_timer_actions(
     }
 }
 
+/// Backstop TTL for call-lifetime stores (rtpengine sessions, B2BUA call
+/// actors, proxy Rf charging sessions, SIPREC recordings).
+///
+/// Normal calls reap their entries on BYE / teardown within seconds-to-minutes;
+/// this only catches truly-orphaned entries whose teardown path never fired.
+/// A call still alive after 24 h is abnormal/nonexistent, so ageing strictly
+/// by creation time at this TTL never drops an active call.
+const ORPHAN_CALL_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 /// Sweep stale proxy sessions.
-fn sweep_stale_entries(state: &DispatcherState) {
+async fn sweep_stale_entries(state: &DispatcherState) {
+    let now = std::time::Instant::now();
     let ttl = state.transaction_timeout;
     let expired_sessions = state.session_store.sweep_stale(ttl) as u64;
 
@@ -1048,9 +1098,96 @@ fn sweep_stale_entries(state: &DispatcherState) {
     let expired_uac = state.uac_sender.sweep_stale(ttl) as u64;
     let uac_pending = state.uac_sender.pending_count();
     let dialog_sessions = state.session_store.dialog_key_count();
+    // Reap expired/abandoned SUBSCRIBE dialogs from the L1 store (L2 expires
+    // via its own TTL; L1 has no reaper, so a subscriber that vanishes without
+    // an un-SUBSCRIBE would otherwise pin its dialog forever).
+    let (expired_subs, subscribe_dialogs) = match crate::subscribe_state::global_store() {
+        Some(store) => (store.sweep_stale() as u64, store.local_count()),
+        None => (0, 0),
+    };
+
+    // ── Orphan backstop sweeps (call-lifetime stores) ──────────────────────
+    // These are reaped promptly on BYE for normal calls; the backstop only
+    // catches entries whose teardown path never fired. Age strictly by
+    // creation with a long TTL so active calls are never disturbed.
+
+    // RTPEngine media sessions — ages by MediaSession::created_at, returns ().
+    if let Some(store) = &state.rtpengine_sessions {
+        store.sweep_stale(ORPHAN_CALL_TTL);
+    }
+
+    // B2BUA answer-timeout: fail calls still un-answered past their
+    // fork/dial `timeout=` deadline with a 408 (CANCEL pending legs, fire
+    // @b2bua.on_failure, respond to the A-leg). Without this a non-responding
+    // B-leg would only be caught by the 24h orphan backstop below.
+    for timed_out in state.call_actors.take_timed_out_calls(now) {
+        fail_b2bua_call_on_timeout(&timed_out, state);
+    }
+
+    // B2BUA call actors — ages by CallActor::created_at (set once at creation,
+    // never refreshed), returns the number reaped.
+    let expired_calls = state.call_actors.sweep_stale(ORPHAN_CALL_TTL) as u64;
+
+    // Proxy Rf charging sessions — one Arc may be filed under several keys
+    // (storage_keys aliases), so retain on the value's age to drop every alias
+    // of an orphan in one pass.
+    let rf_before = state.rf_sessions.len();
+    state
+        .rf_sessions
+        .retain(|_, st| now.duration_since(st.created_at) < ORPHAN_CALL_TTL);
+    let expired_rf = rf_before.saturating_sub(state.rf_sessions.len()) as u64;
+
+    // SIPREC recording sessions — ages by RecordingSession::created_at, and
+    // clears the call_sessions / branch_to_session aliases too.
+    let expired_recordings = state.recording_manager.sweep_stale(ORPHAN_CALL_TTL) as u64;
+
+    // Expire stale presence documents/subscriptions from the L1 store (no TTL
+    // reaper of its own; only removes already-expired entries, so it's safe).
+    if let Some(presence) = crate::presence::global_store() {
+        presence.expire_stale();
+    }
+
+    // Reap expired registrar bindings + emit RegistrationEvent::Expired. Only
+    // removes entries whose own `expires` already elapsed, so an actively-
+    // refreshing binding (future expires) is never disturbed. In production
+    // nothing else calls this, so without it expired AoRs would pin memory
+    // until the next REGISTER for the same AoR.
+    let expired_registrations = match crate::script::api::registrar_arc() {
+        Some(reg) => reg.expire_stale() as u64,
+        None => 0,
+    };
+
+    // Sweep abandoned P-CSCF IPsec SA pairs whose own hard lifetime + grace
+    // has elapsed (tears down the 4 XFRM states + 4 policies + the in-memory
+    // entry). An ACTIVE registration re-REGISTERs and reinstalls a fresh SA
+    // (new expires_at) before this deadline, so only truly-abandoned UEs are
+    // reaped. None when no P-CSCF/ipsec role is configured.
+    let (expired_ipsec_sas, ipsec_sa_pairs) = match crate::ipsec::global_manager() {
+        Some(manager) => {
+            let reaped = manager.sweep_expired_reaped().await;
+            // Registrar-liveness Part B.4: an abandoned UE's SA pair just
+            // aged out of the kernel — its SIP registration should go with it
+            // rather than linger to its own Expires.  Only when liveness is on.
+            if state.registrar_liveness.enabled && !reaped.is_empty() {
+                liveness_dereg_reaped_sas(state, &reaped).await;
+            }
+            (reaped.len() as u64, manager.active_count())
+        }
+        None => (0, 0),
+    };
+
+    // Registrar-liveness Part B: UDP+IPsec idle detection (kernel SA use-time
+    // poll → one OPTIONS probe → deregister on no answer).  No-op unless
+    // enabled and a P-CSCF IPsec role is configured.
+    if state.registrar_liveness.enabled {
+        sweep_registrar_liveness(state).await;
+    }
+
     if let Some(metrics) = crate::metrics::try_metrics() {
         metrics.uac_pending_requests.set(uac_pending as i64);
         metrics.proxy_dialog_sessions.set(dialog_sessions as i64);
+        metrics.subscribe_dialogs.set(subscribe_dialogs as i64);
+        metrics.ipsec_sa_pairs.set(ipsec_sa_pairs as i64);
     }
     // Refresh allocator memory gauges (jemalloc live/resident/retained bytes)
     // so operators can alert on `siphon_memory_allocated_bytes` growth — the
@@ -1059,16 +1196,503 @@ fn sweep_stale_entries(state: &DispatcherState) {
     crate::metrics::update_memory_stats();
     crate::metrics::update_python_stats();
 
-    if expired_sessions > 0 || expired_uac > 0 {
+    if expired_sessions > 0
+        || expired_uac > 0
+        || expired_subs > 0
+        || expired_calls > 0
+        || expired_rf > 0
+        || expired_recordings > 0
+        || expired_registrations > 0
+        || expired_ipsec_sas > 0
+    {
         info!(
             expired_sessions,
             expired_uac,
+            expired_subs,
+            expired_calls,
+            expired_rf,
+            expired_recordings,
+            expired_registrations,
+            expired_ipsec_sas,
             uac_pending,
             sessions = state.session_store.session_count(),
             transactions = state.transaction_manager.count(),
             "stale entry cleanup"
         );
     }
+}
+
+// ===========================================================================
+// Registrar liveness — UDP+IPsec idle detection + network-initiated dereg.
+// (TCP/TLS flow-failure dereg is handled at the transport layer via the
+// connection-close channel → Registrar::unregister_flow.)
+// ===========================================================================
+
+/// Everything a detached liveness-dereg task needs, cloned out of
+/// `DispatcherState` so the task is `'static`.
+#[derive(Clone)]
+struct LivenessDeregCtx {
+    registrar: Arc<Registrar>,
+    ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
+    uac_sender: Arc<UacSender>,
+    dns_resolver: Arc<SipResolver>,
+    dereg_mode: crate::config::LivenessDeregMode,
+}
+
+impl LivenessDeregCtx {
+    fn from_state(state: &DispatcherState, registrar: Arc<Registrar>) -> Self {
+        Self {
+            registrar,
+            ipsec_manager: state.ipsec_manager.clone(),
+            uac_sender: Arc::clone(&state.uac_sender),
+            dns_resolver: Arc::clone(&state.dns_resolver),
+            dereg_mode: state.registrar_liveness.dereg_mode,
+        }
+    }
+
+    /// Build the funnel context from process globals, for the flow-failure
+    /// close-drain task (`server.rs`) which has no `DispatcherState`.  Returns
+    /// `None` if the registrar / UAC / resolver globals aren't installed yet.
+    fn from_globals(dereg_mode: crate::config::LivenessDeregMode) -> Option<Self> {
+        Some(Self {
+            registrar: crate::script::api::registrar_arc()?.clone(),
+            ipsec_manager: crate::ipsec::global_manager(),
+            uac_sender: crate::script::api::proxy_utils::uac_sender()?.clone(),
+            dns_resolver: crate::script::api::proxy_utils::send_resolver()?.clone(),
+            dereg_mode,
+        })
+    }
+}
+
+/// Run the network-dereg cascade for bindings removed by the **flow-failure**
+/// close path (`server.rs` drain task).  Under `network_dereg`, a P-CSCF cache
+/// binding (one carrying a `flow_token`) additionally synthesizes an
+/// `Expires: 0` REGISTER toward the S-CSCF via its stored Service-Route, so
+/// the registrar of record clears it too — matching the SA-idle path.  No-op
+/// under `local_only`, or when none of the removed bindings is a P-CSCF cache
+/// binding.  The local removal + `on_change` cascade already happened in
+/// `unregister_flow_collect`; this adds only the upstream de-REGISTER.
+pub(crate) async fn liveness_flow_failure_network_dereg(
+    removed: Vec<(crate::registrar::Aor, crate::registrar::Contact)>,
+    dereg_mode: crate::config::LivenessDeregMode,
+) {
+    if dereg_mode != crate::config::LivenessDeregMode::NetworkDereg
+        || !removed.iter().any(|(_, contact)| contact.flow_token.is_some())
+    {
+        return;
+    }
+    let context = match LivenessDeregCtx::from_globals(dereg_mode) {
+        Some(context) => context,
+        None => return,
+    };
+    for (aor, contact) in removed {
+        if contact.flow_token.is_some() {
+            send_liveness_network_dereg(&context, &aor, &contact.uri.to_string()).await;
+        }
+    }
+}
+
+/// Part B.4 — an abandoned UE's SA pair was just reaped from the kernel;
+/// remove the matching registrar binding(s) so the registration doesn't
+/// linger to its own `Expires`.  Runs synchronously in the sweep because the
+/// reaped set is small and the dereg is local + (optionally) one upstream
+/// REGISTER.
+async fn liveness_dereg_reaped_sas(state: &DispatcherState, reaped: &[(std::net::IpAddr, u16)]) {
+    let registrar = match crate::script::api::registrar_arc() {
+        Some(registrar) => Arc::clone(registrar),
+        None => return,
+    };
+    let context = LivenessDeregCtx::from_state(state, registrar);
+    let reaped_ips: std::collections::HashSet<std::net::IpAddr> =
+        reaped.iter().map(|(ip, _)| *ip).collect();
+    let port_for: std::collections::HashMap<std::net::IpAddr, u16> =
+        reaped.iter().map(|(ip, port)| (*ip, *port)).collect();
+
+    for (aor, contact) in context.registrar.all_contacts() {
+        let ue_ip = match contact.source_addr {
+            Some(addr) => addr.ip(),
+            None => continue,
+        };
+        if !reaped_ips.contains(&ue_ip) {
+            continue;
+        }
+        let ue_port_c = port_for.get(&ue_ip).copied();
+        liveness_dereg_contact(
+            &context,
+            &aor,
+            &contact,
+            ue_port_c,
+            "ipsec SA torn down (abandoned-SA sweep)",
+        )
+        .await;
+    }
+}
+
+/// Part B — UDP+IPsec idle-liveness sweep.  Polls the kernel SA use-times,
+/// flags bindings whose SA has been silent beyond
+/// `idle_multiplier × keepalive_interval`, and spawns a one-shot OPTIONS
+/// probe that deregisters on no answer.  A live UE's response is itself
+/// inbound protected traffic, so it refreshes the SA use-time and clears the
+/// suspect state on the next sweep.
+async fn sweep_registrar_liveness(state: &DispatcherState) {
+    let manager = match &state.ipsec_manager {
+        Some(manager) => manager,
+        None => return, // no P-CSCF IPsec role → no UDP+IPsec bindings to age
+    };
+    let registrar = match crate::script::api::registrar_arc() {
+        Some(registrar) => Arc::clone(registrar),
+        None => return,
+    };
+
+    let use_times = manager.dump_sa_use_times().await;
+    if use_times.is_empty() {
+        return; // no SAs, or the dump is unavailable on this platform
+    }
+    let snapshot = manager.liveness_snapshot();
+    if snapshot.is_empty() {
+        return;
+    }
+    // One registration per UE IP in an IPsec P-CSCF — index the SA rows by IP.
+    let mut sa_by_ip: std::collections::HashMap<std::net::IpAddr, crate::ipsec::SaLivenessRow> =
+        std::collections::HashMap::with_capacity(snapshot.len());
+    for row in snapshot {
+        sa_by_ip.insert(row.ue_addr, row);
+    }
+
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_secs(),
+        Err(_) => return,
+    };
+    let liveness = &state.registrar_liveness;
+    let idle_window =
+        liveness.keepalive_interval_secs as u64 * liveness.idle_multiplier.max(1) as u64;
+    let probe_timeout = std::time::Duration::from_millis(liveness.probe_timeout_ms);
+    let context = LivenessDeregCtx::from_state(state, registrar);
+    let mut total = 0usize;
+    let mut ipsec_protected = 0usize;
+    let mut suspects = 0usize;
+
+    for (aor, contact) in context.registrar.all_contacts() {
+        total += 1;
+        let ue_addr = match contact.source_addr {
+            Some(addr) => addr,
+            None => continue,
+        };
+        // Any IPsec-protected binding is eligible — UDP *or* TCP/TLS/WS.  The
+        // XFRM SA use-time is the authoritative liveness signal regardless of
+        // SIP transport: a Gm registration over TCP whose UE silently dies
+        // (radio loss, no FIN/RST) is invisible to flow-failure dereg until
+        // the CRLF-keepalive timeout (minutes), but its SA goes stale at the
+        // same rate as a UDP UE's.  Matching on the SA (by UE IP) also
+        // naturally excludes non-IPsec bindings, which have no use-time signal
+        // and rely on flow-failure (Part A) alone.
+        let row = match sa_by_ip.get(&ue_addr.ip()) {
+            Some(row) => row,
+            None => continue, // not an IPsec-protected UE
+        };
+        ipsec_protected += 1;
+
+        // Most recent inbound activity across the two inbound SAs (the SAs the
+        // UE's keepalive / MO requests land on).
+        let last_active = use_times
+            .get(&row.spi_ps)
+            .copied()
+            .unwrap_or(0)
+            .max(use_times.get(&row.spi_pc).copied().unwrap_or(0));
+        if last_active == 0 {
+            // Neither inbound SA is currently in the kernel dump — likely a
+            // dump/snapshot race or an SA mid-teardown.  Genuine teardown is
+            // handled by the abandoned-SA sweep (Part B.4); skip here to avoid
+            // false deregistration.
+            continue;
+        }
+        if now.saturating_sub(last_active) <= idle_window {
+            continue; // recently active
+        }
+
+        // Suspect.  Probe over the binding's *actual* transport — for a stream
+        // binding the OPTIONS rides the captured inbound connection, so a dead
+        // half-open socket simply yields no answer within probe_timeout.
+        // Detach so a slow UE can't stall the sweep.
+        suspects += 1;
+        let binding_transport = transport_from_name(contact.source_transport.as_deref());
+        debug!(
+            aor = %aor,
+            ue = %ue_addr,
+            transport = %binding_transport,
+            idle_secs = now.saturating_sub(last_active),
+            idle_window,
+            "registrar liveness: binding idle past window — probing with OPTIONS"
+        );
+        let (source_local_addr, transport) =
+            crate::script::api::ipsec::outbound_for(ue_addr, binding_transport).unwrap_or((
+                contact.inbound_local_addr.unwrap_or(ue_addr),
+                binding_transport,
+            ));
+        // Stream: ride the captured inbound connection (a dead half-open socket
+        // times out → dereg).  UDP routes by source_local_addr, so the sentinel
+        // id is correct there.
+        let connection_id = if matches!(transport, Transport::Udp) {
+            ConnectionId::default()
+        } else {
+            contact
+                .inbound_connection_id
+                .map(ConnectionId)
+                .unwrap_or_default()
+        };
+        let context = context.clone();
+        let aor = aor.clone();
+        let contact = contact.clone();
+        let ue_port_c = row.ue_port_c;
+        tokio::spawn(async move {
+            liveness_probe_then_dereg(
+                context,
+                aor,
+                contact,
+                ue_port_c,
+                source_local_addr,
+                transport,
+                connection_id,
+                probe_timeout,
+            )
+            .await;
+        });
+    }
+
+    // Census so an operator can see why a dead UE is (or isn't) being reaped.
+    debug!(
+        contacts = total,
+        ipsec_protected,
+        idle_suspect = suspects,
+        idle_window_secs = idle_window,
+        "registrar liveness: idle sweep census"
+    );
+}
+
+/// Map a stored `source_transport` string to a `Transport` (defaults to UDP).
+fn transport_from_name(name: Option<&str>) -> Transport {
+    match name.map(|n| n.to_ascii_lowercase()).as_deref() {
+        Some("tcp") => Transport::Tcp,
+        Some("tls") => Transport::Tls,
+        Some("ws") => Transport::WebSocket,
+        Some("wss") => Transport::WebSocketSecure,
+        _ => Transport::Udp,
+    }
+}
+
+/// Send one OPTIONS over the captured flow (with a single retry); if the UE
+/// answers, leave the binding alone — its response refreshed the SA use-time.
+/// On no answer, run the dereg funnel.
+async fn liveness_probe_then_dereg(
+    context: LivenessDeregCtx,
+    aor: String,
+    contact: crate::registrar::Contact,
+    ue_port_c: u16,
+    source_local_addr: SocketAddr,
+    transport: Transport,
+    connection_id: ConnectionId,
+    probe_timeout: std::time::Duration,
+) {
+    let destination = match contact.source_addr {
+        Some(addr) => addr,
+        None => return,
+    };
+    let request_uri = contact.uri.clone();
+
+    for attempt in 0..2 {
+        let receiver = context.uac_sender.send_options_over_flow(
+            destination,
+            source_local_addr,
+            transport,
+            connection_id,
+            request_uri.clone(),
+        );
+        if let Ok(Ok(crate::uac::UacResult::Response(_))) =
+            tokio::time::timeout(probe_timeout, receiver).await
+        {
+            debug!(aor = %aor, attempt, "registrar liveness: UE answered OPTIONS probe — keeping binding");
+            return;
+        }
+    }
+
+    liveness_dereg_contact(
+        &context,
+        &aor,
+        &contact,
+        Some(ue_port_c),
+        "ipsec idle (no OPTIONS answer)",
+    )
+    .await;
+}
+
+/// The shared dereg funnel for both the idle-probe path and the SA-teardown
+/// path.  Removes the local binding (which emits `Deregistered` →
+/// `@registrar.on_change` → the terminated reg-event NOTIFY), tears down the
+/// UE's IPsec SA, and — for a P-CSCF cache binding under `network_dereg` —
+/// synthesizes a de-REGISTER (`Expires: 0`) toward the S-CSCF so the
+/// registrar of record clears the binding too.
+async fn liveness_dereg_contact(
+    context: &LivenessDeregCtx,
+    aor: &str,
+    contact: &crate::registrar::Contact,
+    ue_port_c: Option<u16>,
+    reason: &str,
+) {
+    let contact_uri = contact.uri.to_string();
+    let network_dereg = context.dereg_mode == crate::config::LivenessDeregMode::NetworkDereg
+        && contact.flow_token.is_some();
+    info!(
+        aor = %aor,
+        contact = %contact_uri,
+        reason,
+        network_dereg,
+        "registrar liveness: deregistering binding"
+    );
+
+    // 1. P-CSCF network de-REGISTER (before dropping local state, while the
+    //    Service-Route is still available).  Only for a proxy-cached binding
+    //    (one carrying a flow_token) under network-dereg mode.
+    if network_dereg {
+        send_liveness_network_dereg(context, aor, &contact_uri).await;
+    }
+
+    // 2. Drop the local binding — emits Deregistered → on_change cascade.
+    context.registrar.remove_contact(aor, &contact_uri);
+
+    // 3. Tear down the UE's IPsec SA so the kernel state goes with the binding.
+    if let (Some(manager), Some(ue_addr), Some(ue_port_c)) =
+        (&context.ipsec_manager, contact.source_addr, ue_port_c)
+    {
+        if let Err(error) = manager.delete_sa_pair(&ue_addr.ip(), ue_port_c).await {
+            debug!(aor = %aor, %error, "registrar liveness: IPsec SA teardown failed (may already be gone)");
+        }
+    }
+}
+
+/// Synthesize and fire-and-forget a de-REGISTER (`Expires: 0`) toward the
+/// S-CSCF via the binding's stored Service-Route, on the UE's behalf.
+async fn send_liveness_network_dereg(context: &LivenessDeregCtx, aor: &str, contact_uri: &str) {
+    let routes = context.registrar.service_routes(aor);
+    let top_route = match routes.first() {
+        Some(route) => route.clone(),
+        None => {
+            debug!(aor = %aor, "registrar liveness: no Service-Route — skipping network de-REGISTER");
+            return;
+        }
+    };
+
+    // Resolve the top Service-Route to a next hop.
+    let route_uri = match parse_route_uri(&top_route) {
+        Some(uri) => uri,
+        None => {
+            warn!(aor = %aor, route = %top_route, "registrar liveness: unparseable Service-Route");
+            return;
+        }
+    };
+    let scheme = if route_uri.scheme == "sips" { "sips" } else { "sip" };
+    let targets = context
+        .dns_resolver
+        .resolve(&route_uri.host, route_uri.port, scheme, Some("udp"))
+        .await;
+    let destination = match targets.first() {
+        Some(target) => target.address,
+        None => {
+            warn!(aor = %aor, host = %route_uri.host, "registrar liveness: Service-Route did not resolve");
+            return;
+        }
+    };
+
+    let register = match build_dereg_register(aor, contact_uri, &routes, destination) {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(aor = %aor, %error, "registrar liveness: failed to build de-REGISTER");
+            return;
+        }
+    };
+    info!(aor = %aor, %destination, "registrar liveness: sending network de-REGISTER (Expires: 0) to S-CSCF");
+    context
+        .uac_sender
+        .send_request(register, destination, Transport::Udp);
+}
+
+/// Parse a Route/Service-Route header value (`<sip:host:port;lr>`) into a
+/// `SipUri`.
+fn parse_route_uri(route: &str) -> Option<SipUri> {
+    let trimmed = route.trim();
+    let inner = trimmed
+        .strip_prefix('<')
+        .and_then(|rest| rest.split('>').next())
+        .unwrap_or(trimmed);
+    parse_uri_standalone(inner).ok()
+}
+
+/// Build a de-REGISTER (REGISTER with `Expires: 0`) on the UE's behalf,
+/// routed to the S-CSCF via the stored Service-Route(s).
+///
+/// - R-URI is the registrar domain (the AoR's host).
+/// - To/From are the AoR; Contact is the UE's binding with `;expires=0`.
+/// - `Route` carries the Service-Route set so the request reaches the same
+///   S-CSCF that granted the registration.
+fn build_dereg_register(
+    aor: &str,
+    contact_uri: &str,
+    routes: &[String],
+    destination: SocketAddr,
+) -> Result<SipMessage, String> {
+    let aor_uri = parse_uri_standalone(aor).ok();
+    let domain = aor_uri
+        .as_ref()
+        .map(|uri| uri.host.clone())
+        .unwrap_or_else(|| destination.ip().to_string());
+    // The S-CSCF skips the IMS-AKA re-challenge on a re-/de-REGISTER only when
+    // it arrives integrity-protected (TS 24.229 §5.4.1.2.2): a real UE de-REG
+    // rides the IPsec SA and the P-CSCF stamps `integrity-protected="ip-assoc-yes"`
+    // (§5.2.6.3).  This synthesized de-REGISTER asserts that same protection on
+    // the (now-torn-down) SA's behalf — the P-CSCF *was* the entity holding the
+    // SA — so it must carry the marker; without it the S-CSCF challenges
+    // (401/403) and the de-registration never completes (no SAR
+    // User-Deregistration, no AS 3rd-party de-REGISTER, no terminated NOTIFY).
+    // The S-CSCF keys the skip on the marker substring + `is_registered(pub_id)`
+    // (pub_id from To/From, not the Authorization username), so the digest
+    // fields are placeholders.
+    let username = aor_uri
+        .as_ref()
+        .and_then(|uri| uri.user.clone())
+        .map(|user| format!("{user}@{domain}"))
+        .unwrap_or_else(|| domain.clone());
+    let authorization = format!(
+        "Digest username=\"{username}\", realm=\"{domain}\", nonce=\"\", \
+         uri=\"sip:{domain}\", response=\"\", integrity-protected=\"ip-assoc-yes\""
+    );
+    let request_uri = SipUri::new(domain);
+
+    let branch = format!("z9hG4bK-liveness-{}", uuid::Uuid::new_v4());
+    let via = format!(
+        "SIP/2.0/UDP {}:{};branch={}",
+        destination.ip(),
+        destination.port(),
+        branch
+    );
+    let from_tag = uuid::Uuid::new_v4();
+    let call_id = format!("liveness-dereg-{}", uuid::Uuid::new_v4());
+
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Register, request_uri)
+        .via(via)
+        .from(format!("<{aor}>;tag=liveness-{from_tag}"))
+        .to(format!("<{aor}>"))
+        .call_id(call_id)
+        .cseq("1 REGISTER".to_string())
+        .max_forwards(70)
+        .header("Authorization", authorization)
+        .header("Contact", format!("<{contact_uri}>;expires=0"))
+        .header("Expires", "0".to_string());
+
+    for route in routes {
+        builder = builder.header("Route", route.clone());
+    }
+
+    builder.content_length(0).build()
 }
 
 /// Handle a single inbound SIP message (request or response).
@@ -1128,6 +1752,47 @@ fn handle_request(
     method: String,
     state: &Arc<DispatcherState>,
 ) {
+    // --- Request security filter (scanner_block + rate_limit) ---
+    // Runs before any transaction/dialog/script processing. trusted_cidrs are
+    // exempt (handled inside the filter). A blocked request is dropped silently
+    // (no response) so we never fingerprint the server to scanners — the same
+    // silent-drop policy the Python blocking API uses. Opt-in: a cheap OnceLock
+    // read that no-ops until security.rate_limit / security.scanner_block is set.
+    if let Some(filter) = crate::security::security_filter() {
+        let source = inbound.remote_addr.ip();
+        let user_agent = message.headers.get("User-Agent").map(String::as_str);
+        match filter.evaluate(source, user_agent) {
+            crate::security::SecurityVerdict::Allow => {}
+            crate::security::SecurityVerdict::Scanner => {
+                debug!(source = %source, %method, "security: dropping request (scanner User-Agent)");
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.scanner_blocked_total.inc();
+                }
+                // Escalate to an IP ban so the scanner's *other* probes (across
+                // methods and transports) are dropped at the ACL too — but only
+                // over a connection-oriented transport, where the TCP/TLS/WS/SCTP
+                // handshake validates the source address. A scanner User-Agent in
+                // a lone UDP datagram has a spoofable source, so banning on it
+                // would let an attacker get a victim's IP banned (reflected ban).
+                if inbound.transport != crate::transport::Transport::Udp {
+                    if let Some(ban) = crate::security::auto_ban() {
+                        if ban.record_strong_failure(source) {
+                            warn!(source = %source, "auto-ban: source banned (scanner User-Agent)");
+                        }
+                    }
+                }
+                return;
+            }
+            crate::security::SecurityVerdict::RateLimited => {
+                debug!(source = %source, %method, "security: dropping request (rate limit exceeded)");
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.rate_limited_total.inc();
+                }
+                return;
+            }
+        }
+    }
+
     // --- Extract the UAC's Via branch and sent-by ---
     let uac_via = message
         .headers
@@ -1554,6 +2219,24 @@ fn handle_request(
     match &action {
         RequestAction::None => {
             debug!("silent drop (no action from script)");
+            // Reap the server transaction created for this request. A NIST/IST
+            // whose TU never sends a final response never reaches Terminated
+            // (RFC 3261 §17.2 has no absolute server-side timeout — it assumes
+            // the TU always responds), so a silent drop would otherwise strand
+            // it in the transaction map forever, each entry holding a full
+            // SipMessage clone. Under unhandled-request churn (e.g. SUBSCRIBE to
+            // a call-only B2BUA) or a scanner / rate-limit flood that is an
+            // unbounded leak — and a memory-DoS vector. A dropped request has
+            // nothing to retransmit-absorb; a later UDP retransmit just
+            // recreates a fresh transaction and re-runs the handler (which drops
+            // again). Also drop the auto-100 timer so the wheel entry is freed
+            // immediately and the drop stays silent (no synthesized 100 Trying).
+            if let Some(ref key) = server_key {
+                state.transaction_manager.remove(key);
+                state
+                    .timer_wheel
+                    .remove(&format!("{}:{:?}", key, TimerName::Trying100));
+            }
         }
         RequestAction::Reply { code, reason, reliable } => {
             let mut response = build_response(&message_guard, *code, reason, state.server_header.as_deref(), &reply_headers);
@@ -1700,7 +2383,7 @@ fn handle_request(
                 flow.as_ref(),
             );
         }
-        RequestAction::Fork { targets, strategy } => {
+        RequestAction::Fork { targets, flows, strategy } => {
             if targets.is_empty() {
                 warn!("fork with empty targets list");
                 let response = build_response(&message_guard, 500, "No Targets", state.server_header.as_deref(), &[]);
@@ -1717,6 +2400,7 @@ fn handle_request(
                 relay_fork_request(
                     &message_guard,
                     targets,
+                    flows,
                     fork_strategy,
                     record_routed,
                     &inbound,
@@ -1747,7 +2431,6 @@ fn handle_request(
 /// REGISTER.  Via host/port are derived from `flow.local_addr` so
 /// the UE's response routes back to the right port (load-bearing for
 /// IPSec sec-agree port pairs — 3GPP TS 33.203 §7.4).
-#[allow(clippy::too_many_arguments)]
 fn relay_request(
     message: &SipMessage,
     next_hop: Option<&str>,
@@ -1811,10 +2494,26 @@ fn relay_request(
             let target = match resolve_target(&target_uri_string, &state.dns_resolver) {
                 Some(t) => t,
                 None => {
-                    warn!(target = %target_uri_string, "cannot resolve relay target");
-                    let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref(), &[]);
-                    send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
-                    return;
+                    // The next hop didn't resolve.  For an in-dialog request to
+                    // a WebSocket UE this is expected — its Contact is an
+                    // unresolvable `<uuid>.invalid` host (RFC 7118), so fall
+                    // back to the connection the dialog was established on
+                    // (RFC 5923 / RFC 5626 §5.3).  `send_to_target` then reuses
+                    // the live WS/WSS/TLS connection.  Mirrors the 2xx-ACK path
+                    // (`handle_ack_via_session`), which already does this — that
+                    // is why the ACK reaches the UE but the BYE used to 502.
+                    match in_dialog_reuse_destination(message, state) {
+                        Some((dest, transport)) => RelayTarget {
+                            address: dest,
+                            transport: Some(transport),
+                        },
+                        None => {
+                            warn!(target = %target_uri_string, "cannot resolve relay target");
+                            let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref(), &[]);
+                            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                            return;
+                        }
+                    }
                 }
             };
             (target_uri_string, target.address, target.transport.unwrap_or(inbound.transport), None)
@@ -2109,6 +2808,7 @@ fn relay_request(
 fn relay_fork_request(
     message: &SipMessage,
     targets: &[String],
+    flows: &[Option<crate::script::api::registrar::PyFlow>],
     strategy: crate::proxy::fork::ForkStrategy,
     record_routed: bool,
     inbound: &InboundMessage,
@@ -2138,8 +2838,9 @@ fn relay_fork_request(
     let srv_key = match server_key {
         Some(key) => key.clone(),
         None => {
-            // Fall back to single-target relay if no server transaction
-            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None, None, None, None);
+            // Fall back to single-target relay if no server transaction —
+            // carry the first branch's flow so a single WS contact still routes.
+            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None, None, None, flows.first().and_then(|f| f.as_ref()));
             return;
         }
     };
@@ -2154,6 +2855,7 @@ fn relay_fork_request(
         record_routed,
     );
     session.fork_aggregator = Some(Arc::clone(&aggregator));
+    session.fork_flows = flows.to_vec();
 
     // Determine which branches to start now
     let branches_to_start: Vec<usize> = match strategy {
@@ -2180,6 +2882,7 @@ fn relay_fork_request(
             &srv_key,
             &session_arc,
             &aggregator,
+            flows.get(branch_index).and_then(|f| f.as_ref()),
             state,
         );
     }
@@ -2189,7 +2892,6 @@ fn relay_fork_request(
 ///
 /// Resolves the target, adds Via, sends the request, creates a client transaction,
 /// and registers the branch in the ProxySession.
-#[allow(clippy::too_many_arguments)]
 fn relay_fork_branch(
     message: &SipMessage,
     target: &str,
@@ -2199,18 +2901,35 @@ fn relay_fork_branch(
     server_key: &TransactionKey,
     session_arc: &Arc<RwLock<ProxySession>>,
     aggregator: &Arc<std::sync::Mutex<crate::proxy::fork::ForkAggregator>>,
+    flow: Option<&crate::script::api::registrar::PyFlow>,
     state: &DispatcherState,
 ) {
-    // Resolve target
-    let relay_target = match resolve_target(target, &state.dns_resolver) {
-        Some(t) => t,
-        None => {
-            warn!(target = %target, branch = branch_index, "fork: cannot resolve target");
-            return;
-        }
+    // Resolve the branch destination + transport: over the captured inbound flow
+    // (RFC 5626 §5.3 connection reuse — the only way back to a WebSocket UE,
+    // RFC 7118 §5) when one is attached, else by DNS-resolving the target URI.
+    let (destination, outbound_transport) = if let Some(flow) = flow {
+        let transport = match flow.transport.as_str() {
+            "udp" => Transport::Udp,
+            "tcp" => Transport::Tcp,
+            "tls" => Transport::Tls,
+            "ws" => Transport::WebSocket,
+            "wss" => Transport::WebSocketSecure,
+            other => {
+                warn!(target = %target, branch = branch_index, transport = %other, "fork: unknown flow transport");
+                return;
+            }
+        };
+        (flow.source_addr, transport)
+    } else {
+        let relay_target = match resolve_target(target, &state.dns_resolver) {
+            Some(t) => t,
+            None => {
+                warn!(target = %target, branch = branch_index, "fork: cannot resolve target");
+                return;
+            }
+        };
+        (relay_target.address, relay_target.transport.unwrap_or(inbound.transport))
     };
-    let destination = relay_target.address;
-    let outbound_transport = relay_target.transport.unwrap_or(inbound.transport);
 
     // Loop detection — check all listen addresses (including per-transport)
     if state.is_own_address(&destination) {
@@ -2309,8 +3028,26 @@ fn relay_fork_branch(
         }
     };
 
-    // Send via pool for TCP/TLS, direct channel for UDP
-    let connection_id = send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state);
+    // Send: over the captured flow (direct OutboundMessage, bypassing DNS/pool
+    // — mirrors the relay(flow=...) path) when one is attached, else via the
+    // normal resolver/pool path.
+    let connection_id = if let Some(flow) = flow {
+        let outbound_message = OutboundMessage {
+            connection_id: ConnectionId(flow.connection_id),
+            transport: outbound_transport,
+            destination,
+            data,
+            source_local_addr: Some(flow.local_addr),
+        };
+        let cid = outbound_message.connection_id;
+        if let Err(error) = state.outbound.send(outbound_message) {
+            error!(branch = %branch, destination = %destination, transport = %outbound_transport, "fork: flow send failed: {error}");
+        }
+        cid
+    } else {
+        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport) };
+        send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state)
+    };
 
     debug!(
         branch = %branch,
@@ -2318,6 +3055,7 @@ fn relay_fork_branch(
         branch_index = branch_index,
         destination = %destination,
         transport = %outbound_transport,
+        flow = flow.is_some(),
         "fork: sent branch"
     );
 
@@ -2458,8 +3196,42 @@ fn handle_response(
 
     // RFC 3261 §16.7 step 3: a proxy MUST NOT forward 100 Trying upstream.
     // It is hop-by-hop; the proxy already sends its own 100 Trying to the UAC.
+    //
+    // BUT the 100 still has to drive the *client* transaction: RFC 3261
+    // §17.1.1.2 says the first provisional moves an INVITE client transaction
+    // Calling -> Proceeding and cancels Timer A (the INVITE retransmit timer).
+    // Returning here without feeding the FSM (the old behaviour) leaves Timer A
+    // armed, so the proxy spuriously retransmits the forwarded INVITE at ~T1
+    // (~500 ms) even though it already holds a 100 — wasted signalling, and on a
+    // lossy/slow trunk the duplicate can trip the peer's merged-request/loop
+    // detection (482). Feed the transaction here (cancelling Timer A / capping
+    // Timer E for NICT), then absorb without forwarding.
+    //
+    // For a B2BUA leg there is no client transaction registered under this key
+    // (the B2BUA manages its own legs and does not arm Timer A here), so
+    // process_client_event returns Err and this is a harmless no-op.
     if status_code == 100 {
-        debug!("absorbing 100 Trying from downstream");
+        // Drive only the INVITE client transaction (cancel Timer A). A
+        // non-INVITE client transaction (NICT) treats a provisional as a
+        // Timer-E cap rather than a stop, and 100 Trying is INVITE-specific in
+        // practice, so for non-INVITE we keep the historical absorb-only
+        // behaviour to avoid disturbing the NICT retransmit timer's pinned
+        // destination.
+        if let Ok(key) = TransactionManager::key_from_message(&message) {
+            if key.method == crate::sip::message::Method::Invite {
+                if let Ok(actions) = state.transaction_manager.process_client_event(
+                    &key,
+                    ClientEvent::Ict(IctEvent::Provisional(message.clone())),
+                ) {
+                    for action in &actions {
+                        if let Action::CancelTimer(name) = action {
+                            state.timer_wheel.remove(&format!("{}:{:?}", key, name));
+                        }
+                    }
+                }
+            }
+        }
+        debug!("absorbing 100 Trying from downstream (cancelled INVITE client Timer A; not forwarded)");
         return;
     }
 
@@ -2538,6 +3310,26 @@ fn handle_response(
                             call_id = sip_call_id,
                             "B2BUA: zombie re-ACK for post-teardown re-INVITE 200 OK retransmission"
                         );
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Post-CANCEL glare (RFC 3261 §9.1): a 2xx that raced an outbound CANCEL.
+    // handle_b2bua_cancel removed the call (unregistering the B-leg branch), so
+    // this 2xx no longer resolves above. ACK it (§13.2.2.4) and BYE it (§15) via
+    // the captured leg so the callee stops retransmitting and the dialog it just
+    // established is released.
+    if (200..300).contains(&status_code) {
+        if let Some(cseq_raw) = message.headers.get("CSeq") {
+            if cseq_raw.contains("INVITE") {
+                if let Some(sip_call_id) = message.headers.call_id() {
+                    if let Some((leg, first_2xx)) =
+                        state.call_actors.zombie_cancelled_for_2xx(sip_call_id)
+                    {
+                        handle_zombie_cancelled_2xx(leg, first_2xx, &message, state);
                         return;
                     }
                 }
@@ -2626,7 +3418,7 @@ fn handle_response(
 
     if let Some(ref client_key) = client_txn_key {
         if let Some(session_arc) = state.session_store.get_by_client_key(client_key) {
-            let (source_addr, inbound_local_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure, client_branch) = {
+            let (source_addr, inbound_local_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure, client_branch, final_response_sent) = {
                 let session = match session_arc.read() {
                     Ok(s) => s,
                     Err(error) => {
@@ -2634,6 +3426,12 @@ fn handle_response(
                         return;
                     }
                 };
+                // Free-threaded CPython (3.14t) requires an attached thread to
+                // touch a `Py<…>` refcount; clone the relay callbacks through a
+                // `Python` token rather than the bare `Clone` impl, which would
+                // panic on this (unattached) executor worker. See
+                // `ProxySession::clone_relay_callbacks`.
+                let (relay_on_reply, relay_on_failure) = session.clone_relay_callbacks();
                 (
                     session.source_addr,
                     session.inbound_local_addr,
@@ -2643,9 +3441,10 @@ fn handle_response(
                     session.fork_aggregator.clone(),
                     session.branch_index_map.get(client_key).copied(),
                     session.original_request.clone(),
-                    session.on_reply_callback.clone(),
-                    session.on_failure_callback.clone(),
+                    relay_on_reply,
+                    relay_on_failure,
                     session.client_branches.get(client_key).cloned(),
+                    session.final_response_sent,
                 )
             };
 
@@ -2682,11 +3481,31 @@ fn handle_response(
                 }
             }
 
+            // A reply-time `reply.reject()` already committed a final response
+            // upstream for this server transaction and CANCELled the pending
+            // branch(es).  This response is the straggler that CANCEL drew back
+            // (typically the `487` answering it, or a late provisional).  Any
+            // non-2xx final was ACKed downstream just above (and by the client
+            // transaction), so absorb it here — forwarding it would put a second
+            // final response on the wire to the UAC.  The single-target relay
+            // path has no fork aggregator to dedup, so this flag is the guard.
+            if final_response_sent {
+                debug!(
+                    status = status_code,
+                    branch = %branch,
+                    "absorbing straggler after reply-time reject (final already sent)"
+                );
+                if status_code >= 200 {
+                    state.session_store.remove_client_key(client_key);
+                }
+                return;
+            }
+
             // Strip our topmost Via before forwarding
             core::strip_top_via(&mut message.headers);
 
             // Run Python reply handlers
-            let (updated_message, should_forward) = run_reply_handlers(
+            let (updated_message, should_forward, reject_action) = run_reply_handlers(
                 message,
                 status_code,
                 &branch,
@@ -2698,6 +3517,29 @@ fn handle_response(
                 inbound_local_addr,
                 connection_id,
             );
+
+            // `reply.reject(code, reason)` from `@proxy.on_reply`: fail the
+            // in-progress INVITE.  Send the error upstream to the UAC and
+            // CANCEL the pending downstream branch(es).  Takes precedence over
+            // the relay/drop decision.  Only ever `Some` for a provisional
+            // (the PyReply method no-ops on a final), so this never races a
+            // real upstream 2xx.
+            if let Some((reject_code, reject_reason)) = reject_action {
+                reject_pending_invite(
+                    &server_key,
+                    &session_arc,
+                    reject_code,
+                    &reject_reason,
+                    &original_request,
+                    transport,
+                    source_addr,
+                    connection_id,
+                    inbound_local_addr,
+                    state,
+                );
+                return;
+            }
+
             if !should_forward {
                 state.session_store.remove_client_key(client_key);
                 return;
@@ -2713,13 +3555,13 @@ fn handle_response(
             if relay_on_reply.is_some() || (relay_on_failure.is_some() && status_code >= 400) {
                 let msg_arc = Arc::new(std::sync::Mutex::new(message));
                 let req_arc = Arc::new(std::sync::Mutex::new(original_request.clone()));
-                let (updated_msg, cb_forward): (Option<SipMessage>, bool) = Python::attach(|python| {
+                let (updated_msg, cb_forward, cb_reject): (Option<SipMessage>, bool, Option<(u16, String)>) = Python::attach(|python| {
                     let py_reply_obj = PyReply::new(Arc::clone(&msg_arc));
                     let py_reply = match Py::new(python, py_reply_obj) {
                         Ok(obj) => obj,
                         Err(error) => {
                             error!("failed to create PyReply for relay callback: {error}");
-                            return (None, true);
+                            return (None, true, None);
                         }
                     };
                     let py_req = {
@@ -2742,7 +3584,7 @@ fn handle_response(
                             Ok(obj) => obj,
                             Err(error) => {
                                 error!("failed to create PyRequest for relay callback: {error}");
-                                return (None, true);
+                                return (None, true, None);
                             }
                         }
                     };
@@ -2784,10 +3626,29 @@ fn handle_response(
                         }
                     }
 
-                    let forwarded = py_reply.borrow(python).was_forwarded();
-                    (None, forwarded)
+                    let reply_ref = py_reply.borrow(python);
+                    (None, reply_ref.was_forwarded(), reply_ref.reject_action())
                 });
                 let _ = updated_msg; // unused — message stays in msg_arc
+                // A per-relay on_reply callback can reject too (same contract as
+                // the global `@proxy.on_reply` handler) — fail the in-progress
+                // INVITE upstream + CANCEL downstream.  Reached only when the
+                // global handler did not already reject (that path returned).
+                if let Some((reject_code, reject_reason)) = cb_reject {
+                    reject_pending_invite(
+                        &server_key,
+                        &session_arc,
+                        reject_code,
+                        &reject_reason,
+                        &original_request,
+                        transport,
+                        source_addr,
+                        connection_id,
+                        inbound_local_addr,
+                        state,
+                    );
+                    return;
+                }
                 if !cb_forward {
                     state.session_store.remove_client_key(client_key);
                     return;
@@ -3015,12 +3876,16 @@ fn handle_response(
 
 /// Run `@proxy.on_reply` Python handlers on a response message.
 ///
-/// Returns `(message, forwarded)` — if `forwarded` is false, the script
-/// chose to drop the response (no `relay()` called).
+/// Returns `(message, forwarded, reject_action)`:
+/// - `forwarded` is false when the script chose to drop the response (no
+///   `relay()` called).
+/// - `reject_action` is `Some((code, reason))` when the script called
+///   `reply.reject(code, reason)` on a provisional — the caller then sends a
+///   final error upstream and CANCELs the pending downstream branch(es).  When
+///   set it takes precedence over `forwarded`.
 ///
 /// `response_source` is the observed source address of the entity that sent
 /// this response (for `reply.fix_nated_contact()`).
-#[allow(clippy::too_many_arguments)]
 fn run_reply_handlers(
     message: SipMessage,
     status_code: u16,
@@ -3032,7 +3897,7 @@ fn run_reply_handlers(
     response_source: SocketAddr,
     inbound_local_addr: SocketAddr,
     inbound_connection_id: ConnectionId,
-) -> (SipMessage, bool) {
+) -> (SipMessage, bool, Option<(u16, String)>) {
     // Automatic NAT Contact fixup on responses (nat.fix_contact: true).
     // Rewrites the Contact URI host:port with the observed source address
     // of the entity that sent this response — before Python handlers run,
@@ -3047,7 +3912,7 @@ fn run_reply_handlers(
     let reply_handlers = engine_state.handlers_for(&HandlerKind::ProxyReply);
 
     if reply_handlers.is_empty() {
-        return (message, true);
+        return (message, true, None);
     }
 
     let message_arc = Arc::new(std::sync::Mutex::new(message));
@@ -3075,19 +3940,19 @@ fn run_reply_handlers(
     py_request_obj.set_local_port(inbound_local_addr.port());
     py_request_obj.set_inbound_flow(inbound_local_addr, inbound_connection_id.0);
 
-    let forwarded = Python::attach(|python| {
+    let (forwarded, reject_action) = Python::attach(|python| {
         let py_reply = match Py::new(python, reply) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyReply: {error}");
-                return true; // forward on error
+                return (true, None); // forward on error
             }
         };
         let py_request = match Py::new(python, py_request_obj) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyRequest for reply handler: {error}");
-                return true;
+                return (true, None);
             }
         };
 
@@ -3099,22 +3964,22 @@ fn run_reply_handlers(
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
                             error!("async Python reply handler error: {error}");
-                            return true;
+                            return (true, None);
                         }
                     }
                 }
                 Err(error) => {
                     error!("Python reply handler error: {error}");
-                    return true; // forward on error to avoid silent drops
+                    return (true, None); // forward on error to avoid silent drops
                 }
             }
         }
 
-        let result = py_reply.borrow(python).was_forwarded();
-        result
+        let reply_ref = py_reply.borrow(python);
+        (reply_ref.was_forwarded(), reply_ref.reject_action())
     });
 
-    if !forwarded {
+    if reject_action.is_none() && !forwarded {
         debug!(
             status = status_code,
             branch = %branch,
@@ -3147,7 +4012,72 @@ fn run_reply_handlers(
         }
     };
 
-    (extracted, forwarded)
+    (extracted, forwarded, reject_action)
+}
+
+/// Fire `@proxy.on_cancel` handlers for a relayed INVITE that was CANCELled
+/// before any final response (RFC 3261 §9).
+///
+/// Fire-and-forget cleanup: the 487 to the UAC has already been sent at the
+/// transaction layer and is not gated by the script — there is no
+/// `relay()`/`reply()` decision. This is the only teardown signal a script
+/// gets for a cancelled-before-answer call (neither `on_reply` nor
+/// `on_failure` ever fires — the session is torn down with the CANCEL), so it
+/// exists to release per-call resources that no BYE will ever clear (Diameter
+/// Rx/N5 QoS, rtpengine media).
+///
+/// Mirrors `run_reply_handlers`' PyRequest construction — including the
+/// inbound-flow replay — so the handler sees the same listener context the
+/// `on_request` handler did (`registrar.lookup_by_token`, `request.flow`).
+fn run_proxy_cancel_handlers(
+    original_request: SipMessage,
+    transport: crate::transport::Transport,
+    source_addr: SocketAddr,
+    inbound_local_addr: SocketAddr,
+    inbound_connection_id: ConnectionId,
+    state: &DispatcherState,
+) {
+    let engine_state = state.engine.state();
+    let handlers = engine_state.handlers_for(&HandlerKind::ProxyCancel);
+    if handlers.is_empty() {
+        return;
+    }
+
+    let request_arc = Arc::new(std::sync::Mutex::new(original_request));
+    let mut py_request_obj = PyRequest::new(
+        request_arc,
+        transport.to_string(),
+        source_addr.ip().to_string(),
+        source_addr.port(),
+    );
+    py_request_obj.set_local_port(inbound_local_addr.port());
+    py_request_obj.set_inbound_flow(inbound_local_addr, inbound_connection_id.0);
+
+    Python::attach(|python| {
+        let py_request = match Py::new(python, py_request_obj) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyRequest for on_cancel handler: {error}");
+                return;
+            }
+        };
+
+        for handler in &handlers {
+            let callable = handler.callable.bind(python);
+            match callable.call1((py_request.bind(python),)) {
+                Ok(ret) => {
+                    if handler.is_async {
+                        if let Err(error) = run_coroutine(python, &ret) {
+                            error!("async Python on_cancel handler error: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    error!("Python on_cancel handler error: {error}");
+                }
+            }
+        }
+    });
 }
 
 /// Rewrite the Contact URI in a response with the observed source address.
@@ -3187,10 +4117,19 @@ struct RelayTarget {
     transport: Option<Transport>,
 }
 
-fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<RelayTarget> {
+/// Resolve a SIP target URI to its full ordered candidate set (RFC 3263).
+///
+/// A bare `IP:port` short-circuits to a single candidate. A SIP URI is resolved
+/// via DNS (SRV → A/AAAA); the order is the resolver's RFC 3263 §4.2 /
+/// RFC 2782 selection (A/AAAA Fisher-Yates shuffled per call, SRV
+/// weighted-random), so a caller that wants a single target takes
+/// `.into_iter().next()` — see [`resolve_target`]. In-dialog connection reuse
+/// ([`resolve_in_dialog_flow_uri`]) needs the *whole* set to test whether the
+/// dialog's established peer is still among the next hop's members.
+fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarget> {
     // Try as bare IP:port first (cheapest check)
     if let Ok(addr) = uri_string.parse::<SocketAddr>() {
-        return Some(RelayTarget { address: addr, transport: None });
+        return vec![RelayTarget { address: addr, transport: None }];
     }
 
     // Try parsing as a full SIP URI
@@ -3207,22 +4146,36 @@ fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<RelayTarge
             ))
         });
 
-        return results.into_iter().next().map(|r| {
-            let transport = r.transport.as_deref()
-                .or(transport_hint.as_deref())
-                .and_then(|t| match t.to_lowercase().as_str() {
-                    "tcp" => Some(Transport::Tcp),
-                    "tls" => Some(Transport::Tls),
-                    "udp" => Some(Transport::Udp),
-                    "ws" => Some(Transport::WebSocket),
-                    "wss" => Some(Transport::WebSocketSecure),
-                    _ => None,
-                });
-            RelayTarget { address: r.address, transport }
-        });
+        return results
+            .into_iter()
+            .map(|r| {
+                let transport = r
+                    .transport
+                    .as_deref()
+                    .or(transport_hint.as_deref())
+                    .and_then(|t| match t.to_lowercase().as_str() {
+                        "tcp" => Some(Transport::Tcp),
+                        "tls" => Some(Transport::Tls),
+                        "udp" => Some(Transport::Udp),
+                        "ws" => Some(Transport::WebSocket),
+                        "wss" => Some(Transport::WebSocketSecure),
+                        _ => None,
+                    });
+                RelayTarget { address: r.address, transport }
+            })
+            .collect();
     }
 
-    None
+    Vec::new()
+}
+
+/// Resolve a SIP target URI to a single send destination (RFC 3263).
+///
+/// Returns the first candidate from [`resolve_candidates`] — the resolver has
+/// already applied RFC 3263 §4.2 / RFC 2782 ordering, so "first" is a fresh
+/// weighted-random / shuffled pick on every call.
+fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<RelayTarget> {
+    resolve_candidates(uri_string, resolver).into_iter().next()
 }
 
 /// Send a relayed request to a resolved target, using the connection pool for
@@ -3292,18 +4245,12 @@ fn send_to_target(
             }
         }
         Transport::Tls => {
-            // TLS connection reuse: find an existing inbound TLS connection
-            // to the destination (like OpenSIPS connection reuse).
-            // First try exact SocketAddr match, then fall back to IP-only match
-            // (handles NAT where Contact URI port differs from source port).
-            let connection_id = state.tls_addr_map.get(&destination).map(|r| *r.value())
-                .or_else(|| {
-                    // IP-only fallback: find any TLS connection from the same IP
-                    let target_ip = destination.ip();
-                    state.tls_addr_map.iter()
-                        .find(|entry| entry.key().ip() == target_ip)
-                        .map(|entry| *entry.value())
-                });
+            // TLS connection reuse: find an existing inbound (or pool-created
+            // outbound) TLS connection to the destination (like OpenSIPS
+            // connection reuse).  `reuse` tries an exact SocketAddr match, then
+            // an IP-only fallback (handles NAT where the Contact-URI port
+            // differs from the source port), filtered to TLS.
+            let connection_id = state.stream_connections.reuse(destination, Transport::Tls);
 
             if let Some(connection_id) = connection_id {
                 let outbound_message = OutboundMessage {
@@ -3348,6 +4295,53 @@ fn send_to_target(
                 }
             }
         }
+        Transport::WebSocket | Transport::WebSocketSecure => {
+            // WebSocket connection reuse is *mandatory*: the connection is
+            // client-initiated and can never be re-opened by the server
+            // (RFC 7118 §5 / RFC 5626 §5.3).  Look up the live connection for
+            // this UE (exact, then IP-only fallback, filtered to this WS/WSS
+            // transport).
+            //
+            // This URI-relay path only fires when the target resolved to the
+            // UE's real address — the primary WS MT path is the captured-flow
+            // path (`relay(flow=...)` / forked flow), which bypasses
+            // `send_to_target` entirely.  On a miss we DROP (return the
+            // sentinel `ConnectionId::default()`) instead of falling back to
+            // `fallback_connection_id` (the inbound caller's connection): the
+            // UE is simply unreachable, and echoing the request back to the
+            // sender — the pre-fix behaviour of the `_` arm — is exactly the
+            // bug being closed.
+            match state.stream_connections.reuse(destination, transport) {
+                Some(connection_id) => {
+                    let outbound_message = OutboundMessage {
+                        connection_id,
+                        transport,
+                        destination,
+                        data,
+                        source_local_addr: None,
+                    };
+                    if let Err(error) = state.outbound.send(outbound_message) {
+                        error!(destination = %destination, %transport, "WS/WSS connection reuse send failed: {error}");
+                    } else {
+                        debug!(
+                            destination = %destination,
+                            connection_id = ?connection_id,
+                            %transport,
+                            "relayed via WS/WSS connection reuse"
+                        );
+                    }
+                    connection_id
+                }
+                None => {
+                    warn!(
+                        destination = %destination,
+                        %transport,
+                        "no live WS/WSS connection to reuse — dropping (client-initiated transport cannot be dialed; use relay(flow=...) for MT routing)"
+                    );
+                    ConnectionId::default()
+                }
+            }
+        }
         _ => {
             // UDP and other transports: use the existing outbound channel.
             //
@@ -3387,13 +4381,7 @@ fn send_to_target(
 ///
 /// Returns `(None, None)` when `media.rtpengine` is not configured.
 /// Also registers the Python `siphon.rtpengine` singleton for script use.
-pub fn init_rtpengine(
-    config: &Config,
-) -> (
-    Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
-    Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
-    Option<Arc<crate::rtpengine::ProfileRegistry>>,
-) {
+pub fn init_rtpengine(config: &Config) -> RtpEngineComponents {
     let media_config = match &config.media {
         Some(c) => c,
         None => return (None, None, None),
@@ -3743,48 +4731,76 @@ fn first_route_uri(route_set: &[String]) -> Option<String> {
         .map(|entry| entry.uri.to_string())
 }
 
-/// Resolve the destination for an in-dialog request per RFC 3261 §12.2.1.1
-/// and §16.12. When `route_set` is non-empty, the first Route URI is the next
-/// hop (after DNS resolution per RFC 3263) — NOT the Request-URI and NOT the
-/// cached destination of the original INVITE. Falls back to the cached
-/// `(addr, transport)` only when the route set is empty or resolution fails.
+/// Resolve the destination for a B2BUA in-dialog request per RFC 3261
+/// §12.2.1.1 / §16.12, preferring the dialog's established connection
+/// (RFC 5923) — see [`resolve_in_dialog_flow_uri`] for the full reasoning.
 ///
-/// This matters whenever Record-Route adds intermediaries on the response path
-/// that aren't the original next-hop — for IMS calls the 200 OK comes back
-/// through I-CSCF (which doesn't Record-Route per TS 24.229 §5.3.2), so the
-/// cached INVITE destination is I-CSCF while the route-set first hop is
-/// S-CSCF. Sending in-dialog requests to the cached destination produces 404
-/// from the wrong node.
+/// The next hop is the first `Route` URI of the dialog route set (or the cached
+/// remote target when the route set is empty). When that next hop still
+/// resolves to the peer the dialog was established with (`fallback_addr`'s IP),
+/// the cached address/transport are returned so the existing send reuses the
+/// established connection rather than re-resolving — which, since the RFC 3263
+/// §4.2 A/AAAA shuffle, can land on a different member of a load-balanced trunk
+/// that holds no dialog state. It still follows the route set to a genuinely
+/// different next hop (e.g. an IMS S-CSCF reached via the route set while the
+/// INVITE traversed a non-Record-Routing I-CSCF — TS 24.229 §5.3.2).
+///
+/// The B2BUA send sites already supply the leg's `connection_id` to
+/// [`send_message`] (A-leg, where an inbound connection can only be reached by
+/// reuse) or reuse the outbound pool connection by address via
+/// [`send_b2bua_to_bleg`] (B-leg), so this returns just `(addr, transport)`.
 fn resolve_in_dialog_destination(
     route_set: &[String],
     state: &DispatcherState,
     fallback_addr: SocketAddr,
     fallback_transport: Transport,
 ) -> (SocketAddr, Transport) {
-    let (destination, mut transport) = if let Some(uri_str) = first_route_uri(route_set) {
-        if let Some(target) = resolve_target(&uri_str, &state.dns_resolver) {
-            (target.address, target.transport.unwrap_or(fallback_transport))
-        } else {
-            warn!(
-                route = %route_set[0],
-                "B2BUA: failed to resolve in-dialog Route — falling back to cached destination",
-            );
-            (fallback_addr, fallback_transport)
-        }
-    } else {
-        (fallback_addr, fallback_transport)
-    };
+    let next_hop = first_route_uri(route_set);
+    let (destination, transport, _connection_id) = resolve_in_dialog_flow_uri(
+        next_hop.as_deref(),
+        &state.dns_resolver,
+        fallback_addr,
+        fallback_transport,
+        ConnectionId::default(),
+    );
+    (destination, transport)
+}
 
-    // IPsec SA transport pin (3GPP TS 33.203 §7.2).  When the
-    // destination matches a registered UE binding, the SA's pinned
-    // protocol (UDP vs TCP) overrides whatever the dialog route set
-    // or cached transport selected.  In-dialog requests (BYE, UPDATE,
-    // in-dialog re-INVITE) often arrive with a Route URI / cached
-    // Contact that lacks `;transport=`, and the kernel XFRM selector
-    // silently drops every protected frame whose upper-layer protocol
-    // doesn't match.  Returns `None` for non-IPsec deployments and
-    // ordinary destinations — zero impact when no IpsecManager is
-    // wired.
+/// For an in-dialog request whose next hop did not resolve — e.g. a WebSocket
+/// UE registered a `<uuid>.invalid` Contact (RFC 7118), so the R-URI can't be
+/// DNS-resolved — recover the destination from the connection the dialog was
+/// established on (RFC 5923 / RFC 5626 §5.3 connection reuse).
+///
+/// Returns the established far-end `(destination, transport)`.  The destination
+/// is the peer's source address, which the stream-connection registry is keyed
+/// on, so [`send_to_target`]'s per-transport reuse (TCP/TLS/WS/WSS arms) then
+/// routes the request over the live connection — the only way back to a WS/WSS
+/// UE.  Looked up by the dialog key `(Call-ID, From-tag)`; finds the session for
+/// any in-dialog request originated by the dialog's creator (the common case:
+/// a UAC sending BYE/re-INVITE/UPDATE for its own call).
+fn in_dialog_reuse_destination(
+    message: &SipMessage,
+    state: &DispatcherState,
+) -> Option<(SocketAddr, Transport)> {
+    let call_id = message.headers.get("Call-ID")?;
+    let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag)?;
+    let session_arc = state.session_store.get_by_dialog_key(call_id, &from_tag)?;
+    let session = session_arc.read().ok()?;
+    let client_key = session.client_keys.first()?;
+    let branch = session.get_client_branch(client_key)?;
+    Some((branch.destination, branch.transport))
+}
+
+/// Pin the outbound transport to a matching IPsec SA's protocol
+/// (3GPP TS 33.203 §7.2).  When `destination` matches a registered UE binding,
+/// the SA's pinned protocol (UDP vs TCP) overrides whatever the dialog route
+/// set or cached transport selected.  In-dialog requests (BYE, UPDATE,
+/// in-dialog re-INVITE, end-to-end 2xx ACK) often arrive with a Route URI /
+/// cached Contact that lacks `;transport=`, and the kernel XFRM selector
+/// silently drops every protected frame whose upper-layer protocol doesn't
+/// match.  No-op for non-IPsec deployments and ordinary destinations — zero
+/// impact when no IpsecManager is wired.
+fn ipsec_pin_transport(destination: SocketAddr, transport: Transport) -> Transport {
     if matches!(transport, Transport::Udp | Transport::Tcp) {
         if let Some((_, sa_transport)) =
             crate::script::api::ipsec::outbound_for(destination, transport)
@@ -3794,14 +4810,133 @@ fn resolve_in_dialog_destination(
                     %destination,
                     from = %transport,
                     to = %sa_transport,
-                    "IPsec: pinning B2BUA in-dialog transport to SA protocol",
+                    "IPsec: pinning in-dialog transport to SA protocol",
                 );
-                transport = sa_transport;
+                return sa_transport;
             }
         }
     }
+    transport
+}
 
-    (destination, transport)
+/// Test whether an in-dialog request should reuse the dialog's established
+/// connection (RFC 5923) instead of opening one to a freshly-resolved next hop.
+///
+/// Reuse when the established peer's IP is among the next hop's resolved
+/// candidates — IP-only, because the cached address carries the peer's *source*
+/// port (an ephemeral port for an inbound connection, or the pooled outbound
+/// socket's peer), not its SIP listening port — or when nothing resolved (the
+/// established peer is then the best available target). Returns `false` only
+/// when the next hop points at a genuinely different peer (e.g. an IMS S-CSCF
+/// reached via the dialog route set while the INVITE was forwarded to a
+/// non-Record-Routing I-CSCF).
+fn established_peer_in_candidates(cached_ip: std::net::IpAddr, candidates: &[RelayTarget]) -> bool {
+    candidates.is_empty() || candidates.iter().any(|target| target.address.ip() == cached_ip)
+}
+
+/// Resolve the destination for an in-dialog request, preferring the dialog's
+/// established connection (RFC 5923) when the next hop still resolves to the
+/// peer the dialog was established with.
+///
+/// On a connection-oriented transport to a multi-member peer behind one DNS
+/// name (a load-balanced Record-Route), the next hop resolves to several
+/// siblings; since the RFC 3263 §4.2 A/AAAA shuffle picks one at random per
+/// call, a fresh resolution can land on a member that holds no dialog state, so
+/// an in-dialog BYE/re-INVITE/UPDATE hits the wrong node and the far leg is
+/// never released / the request is never applied. RFC 5923 says to send
+/// in-dialog traffic over the connection the dialog was established on; we do
+/// exactly that whenever the established peer is still one of the next hop's
+/// resolved members.
+///
+/// Returns `(destination, transport, connection_id)`. On the reuse path the
+/// connection_id is the cached one, so [`send_message_from`] routes over the
+/// live connection (and the per-transport outbound distributor falls back to
+/// the pool against the *same member's* address if it has since closed). On the
+/// fresh-resolution path it is [`ConnectionId::default`] (open / pool a new
+/// connection). The IPsec transport pin is applied to the final destination in
+/// both cases.
+fn resolve_in_dialog_flow_uri(
+    next_hop_uri: Option<&str>,
+    resolver: &SipResolver,
+    cached_addr: SocketAddr,
+    cached_transport: Transport,
+    cached_connection_id: ConnectionId,
+) -> (SocketAddr, Transport, ConnectionId) {
+    let (destination, transport, connection_id) = match next_hop_uri {
+        // No next hop (empty route set) → the cached peer IS the remote target
+        // (RFC 3261 §12.2.1.1); reuse its connection.
+        None => (cached_addr, cached_transport, cached_connection_id),
+        Some(uri) => {
+            let candidates = resolve_candidates(uri, resolver);
+            if established_peer_in_candidates(cached_addr.ip(), &candidates) {
+                (cached_addr, cached_transport, cached_connection_id)
+            } else {
+                // Genuinely different next hop (IMS route-set divergence) —
+                // resolve fresh and open/pool a new connection.
+                let target = &candidates[0];
+                (
+                    target.address,
+                    target.transport.unwrap_or(cached_transport),
+                    ConnectionId::default(),
+                )
+            }
+        }
+    };
+
+    (destination, ipsec_pin_transport(destination, transport), connection_id)
+}
+
+/// Choose the wire destination for a B2BUA retry INVITE that supersedes a failed
+/// outbound leg in place — the 401/407 credentialed re-INVITE and the RFC 4028
+/// 422 higher-Session-Expires re-INVITE both take this path (RFC 5923 connection
+/// reuse).
+///
+/// The CSeq-1 INVITE, its non-2xx final response, and any server nonce all
+/// traversed one specific trunk member. The retry is a *fresh* pre-dialog
+/// transaction (new Via branch, new CSeq, no To-tag yet), so the in-dialog
+/// connection-reuse path doesn't apply to it. Re-resolving the trunk hostname
+/// here would re-run the RFC 3263 §4.2 A/AAAA shuffle and can pick a *different*
+/// member than the one that issued the challenge — on a strict trunk a 401 retry
+/// draws another 401 (auth loop), and even on a lenient trunk it splits one
+/// INVITE transaction across two members (fragile CANCEL/BYE/session-timer
+/// correlation, per-member state divergence).
+///
+/// So when the failed leg has a recorded destination, reuse it verbatim
+/// (address + transport + connection_id): for TCP/TLS [`send_to_target`] then
+/// reuses the pooled connection to that member (keyed by address); for UDP it
+/// pins the datagram to the same member. Only when the leg has no recorded
+/// destination (defensive — in the live path `b_leg_dest` is derived from the
+/// same matched leg as the target URI) do we resolve `target_uri` afresh and
+/// open/pool a new connection.
+///
+/// Returns `(destination, transport, connection_id, relay_target)`, or `None`
+/// when there is no leg destination and `target_uri` does not resolve.
+fn select_b2bua_retry_destination(
+    b_leg_dest: Option<(SocketAddr, Transport)>,
+    b_leg_connection_id: ConnectionId,
+    target_uri: &str,
+    resolver: &SipResolver,
+) -> Option<(SocketAddr, Transport, ConnectionId, RelayTarget)> {
+    match b_leg_dest {
+        Some((member_addr, member_transport)) => Some((
+            member_addr,
+            member_transport,
+            b_leg_connection_id,
+            RelayTarget {
+                address: member_addr,
+                transport: Some(member_transport),
+            },
+        )),
+        None => resolve_target(target_uri, resolver).map(|relay_target| {
+            let transport = relay_target.transport.unwrap_or(Transport::Udp);
+            (
+                relay_target.address,
+                transport,
+                ConnectionId::default(),
+                relay_target,
+            )
+        }),
+    }
 }
 
 /// Flatten Record-Route header lines into one URI per entry.
@@ -3824,14 +4959,17 @@ fn flatten_record_route_headers(headers: &[String]) -> Vec<String> {
     routes
 }
 
-/// Sanitize a B2BUA response before forwarding it to the A-leg.
-///
-/// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
-/// headers must not leak to the A-leg. This function:
-/// - Replaces Contact with siphon's own address (critical for dialog routing)
-/// - Strips User-Agent (UAC header — not for responses), sets Server
-/// - Removes Allow, Allow-Events, Supported, Require
-/// - Strips B-leg-specific P-Asserted-Identity, P-Charging-Vector
+/// Compute the UAC-side dialog route set (RFC 3261 §12.1.2) from a response's
+/// Record-Route header lines: flatten multi-URI lines (RFC 3261 §7.3.1) into one
+/// URI per entry, then reverse (the UAC route set is the responder's Record-Route
+/// in reverse order). Used for the early dialog (reliable 1xx, RFC 3262 §4) and
+/// the confirmed dialog (2xx).
+fn uac_route_set_from_record_routes(record_routes: &[String]) -> Vec<String> {
+    let mut routes = flatten_record_route_headers(record_routes);
+    routes.reverse();
+    routes
+}
+
 /// Resolve a script-supplied translate-op name (from `call.dial(translate=[(…, "rfc7044")])`)
 /// to a [`crate::b2bua::header_policy::TranslateOp`].  Returns `None` for
 /// unknown names; the caller is expected to log and skip.
@@ -3844,10 +4982,19 @@ fn parse_translate_op_name(name: &str) -> Option<crate::b2bua::header_policy::Tr
     }
 }
 
+/// Sanitize a B2BUA response before forwarding it to the A-leg.
+///
+/// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
+/// headers must not leak to the A-leg. This function:
+/// - Replaces Contact with siphon's own address (critical for dialog routing)
+/// - Strips User-Agent (UAC header — not for responses), sets Server
+/// - Removes Allow, Allow-Events, Supported, Require
+/// - Strips B-leg-specific P-Asserted-Identity, P-Charging-Vector
 fn sanitize_b2bua_response(
     response: &mut SipMessage,
     state: &DispatcherState,
     a_leg_transport: Transport,
+    a_leg_supports_100rel: bool,
     call_id: &str,
 ) {
     // Contact: must point to siphon so in-dialog requests (ACK, BYE, re-INVITE)
@@ -3875,6 +5022,22 @@ fn sanitize_b2bua_response(
     // framework-auto so transparent-proxy B2BUAs can opt back in via
     // `call.dial(copy=["Proxy-Authenticate"])` for the rare case.
     response.headers.remove("Record-Route");
+
+    // Framework-auto strip — never present a `100rel` reliability contract to
+    // an A-leg that didn't advertise it.  The B-leg's reliable provisional is
+    // PRACKed locally (RFC 3262 auto-PRACK, handle_b2bua_response); leaking
+    // `Require: 100rel` / `RSeq` to a non-100rel A-leg (e.g. a plain PSTN
+    // trunk) makes it CANCEL the call rather than PRACK.  This is a
+    // correctness invariant, not topology hygiene, so it runs preset-independent
+    // here rather than as a preset override.  Done before `apply_to_response`:
+    // a `Copy`/`Rewrite` preset can't resurrect the removed `RSeq`, and the
+    // `Require` edit leaves any surviving option-tags for `Copy` to preserve.
+    // A 100rel-capable A-leg (gate true) still gets the reliable provisional
+    // end-to-end (RFC 3262 §3).
+    crate::sip::headers::rseq::strip_100rel_for_unsupported_peer(
+        &mut response.headers,
+        a_leg_supports_100rel,
+    );
 
     // Apply per-call header policy.  Resolves to the per-call preset (when
     // the script attached one via `call.dial(header_policy=…)`), otherwise
@@ -3950,7 +5113,7 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
                     // Optionally rewrite the address (last field)
                     if let Some(sdp_addr) = addr {
                         // Find the last space before the trailing \r\n
-                        let trimmed = after_username.trim_end_matches(|c| c == '\r' || c == '\n');
+                        let trimmed = after_username.trim_end_matches(['\r', '\n']);
                         if let Some(last_space) = trimmed.rfind(' ') {
                             let line_ending = &after_username[trimmed.len()..];
                             result.push_str("o=");
@@ -3982,7 +5145,7 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
             } else if line.ends_with('\n') {
                 result.push_str("s=");
                 result.push_str(name);
-                result.push_str("\n");
+                result.push('\n');
             } else {
                 result.push_str("s=");
                 result.push_str(name);
@@ -4013,7 +5176,7 @@ fn fix_srs_answer_sdp_direction(body: &mut Vec<u8>) {
     }
     let mut result = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(|c: char| c == '\r' || c == '\n');
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed == "a=sendonly" {
             result.push_str("a=recvonly");
             result.push_str(&line[trimmed.len()..]);
@@ -4032,7 +5195,8 @@ fn build_b2bua_ack_for_non2xx(
     branch: &str,
     target_uri: Option<&str>,
     downstream_transport: Transport,
-    local_addr: SocketAddr,
+    via_host: &str,
+    via_port: u16,
 ) -> SipMessage {
     let request_uri = target_uri
         .and_then(|uri| parse_uri_standalone(uri).ok())
@@ -4041,12 +5205,21 @@ fn build_b2bua_ack_for_non2xx(
     let mut builder = SipMessageBuilder::new()
         .request(Method::Ack, request_uri);
 
-    // Via: only our own hop with the client transaction branch
+    // Via: only our own hop with the client transaction branch.
+    //
+    // The sent-by host:port MUST equal the top Via of the INVITE this ACK
+    // acknowledges (RFC 3261 §17.1.1.3).  The trunk's server transaction keys
+    // its ACK match on (branch, sent-by host:port, method) per §17.2.3, so the
+    // host:port has to be the *advertised* address the INVITE went out with
+    // (state.via_host/via_port) — NOT the raw bind address.  When this used
+    // `local_addr`, an ACK with an internal sent-by reached a trunk that had
+    // only ever seen the advertised one; the ACK never matched, so the trunk
+    // kept retransmitting its 401/4xx on Timer G until the credentialed retry
+    // happened to succeed.
     let transport_str = format!("{}", downstream_transport).to_uppercase();
-    let host = format_sip_host(&local_addr.ip().to_string());
     builder = builder.via(format!(
         "SIP/2.0/{} {}:{};branch={}",
-        transport_str, host, local_addr.port(), branch
+        transport_str, via_host, via_port, branch
     ));
 
     // From: same as in the response (which echoes the B-leg INVITE's From)
@@ -4175,7 +5348,7 @@ fn send_message_from(
 /// Drain deferred messages queued by presence.notify() etc. during the handler
 /// and send each one via the UacSender.  Called after the reply/relay has been
 /// dispatched so ordering is preserved (RFC 3265 §3.1.6.2).
-fn flush_deferred_sends(state: &DispatcherState) {
+fn flush_deferred_sends(_state: &DispatcherState) {
     let deferred = crate::script::api::proxy_utils::drain_deferred_sends();
     if deferred.is_empty() {
         return;
@@ -4396,6 +5569,7 @@ pub fn inject_python_singletons(config: &Config) {
         max_expires: config.registrar.max_expires,
         min_expires: config.registrar.min_expires.unwrap_or(60),
         max_contacts: config.registrar.max_contacts.unwrap_or(10) as usize,
+        enforce_auth_aor_match: config.registrar.enforce_auth_aor_match,
     };
     let registrar = Arc::new(Registrar::new(registrar_config));
     let py_registrar = PyRegistrar::new(registrar);
@@ -4405,6 +5579,23 @@ pub fn inject_python_singletons(config: &Config) {
     realm_users.insert(config.auth.realm.clone(), config.auth.users.clone());
     let mut py_auth = PyAuth::new(realm_users, config.auth.realm.clone());
     py_auth.set_backend_type(config.auth.backend.clone());
+
+    // Digest-nonce anti-replay policy (RFC 7616 §3.3). The shared secret, when
+    // set, MUST be identical across instances behind the same SIP domain.
+    py_auth.set_nonce_policy(
+        config
+            .auth
+            .nonce_secret
+            .as_ref()
+            .map(|secret| secret.as_bytes().to_vec()),
+        config.auth.nonce_ttl_secs.unwrap_or(0),
+    );
+    if config.auth.nonce_secret.is_none() {
+        tracing::info!(
+            "digest nonce: timestamp-only (no auth.nonce_secret set); set a shared \
+             secret on all instances to reject foreign nonces"
+        );
+    }
 
     // Wire HTTP auth backend if configured
     if let Some(http_config) = &config.auth.http {
@@ -4663,6 +5854,7 @@ fn spawn_rf_proxy_start_if_invite(
                         ims_data: ims_term,
                         user_name: Some(term_user_for_record),
                         storage_keys: term_keys_for_spawn.clone(),
+                        created_at: std::time::Instant::now(),
                     });
                     for key in term_keys_for_spawn {
                         rf_sessions_term.insert(key, Arc::clone(&entry));
@@ -4704,6 +5896,7 @@ fn spawn_rf_proxy_start_if_invite(
             ims_data: ims_primary,
             user_name: primary_user_name,
             storage_keys: primary_keys.clone(),
+            created_at: std::time::Instant::now(),
         });
         for key in primary_keys {
             rf_sessions.insert(key, Arc::clone(&entry));
@@ -4916,6 +6109,7 @@ fn spawn_rf_b2bua_start(
                 ims_data,
                 user_name,
                 storage_keys: vec![key],
+                created_at: std::time::Instant::now(),
             }),
         );
     });
@@ -4990,6 +6184,25 @@ fn cancel_other_fork_branches(
     server_key: &TransactionKey,
     state: &DispatcherState,
 ) {
+    cancel_fork_branches(server_key, Some(winning_key), state);
+}
+
+/// CANCEL the pending downstream branches of a proxy session.
+///
+/// `exclude` skips one branch — the branch that won (`Some(winning_key)`, used
+/// by fork aggregation when a 2xx/6xx settles the fork).  Pass `None` to CANCEL
+/// every branch, which is what a reply-time `reply.reject(code, reason)` needs:
+/// it aborts the whole in-progress INVITE, including the branch whose
+/// provisional triggered the reject.
+///
+/// RFC 3261 §9.1: each branch's CANCEL MUST carry the same topmost Via branch
+/// (and CSeq number) siphon used for that branch's INVITE, so we rebuild the
+/// per-branch outbound-INVITE view and run it through `build_cancel_from_invite`.
+fn cancel_fork_branches(
+    server_key: &TransactionKey,
+    exclude: Option<&TransactionKey>,
+    state: &DispatcherState,
+) {
     let session_arc = match state.session_store.get_by_server_key(server_key) {
         Some(arc) => arc,
         None => return,
@@ -5000,7 +6213,7 @@ fn cancel_other_fork_branches(
     };
 
     for client_key in &session.client_keys {
-        if client_key == winning_key {
+        if Some(client_key) == exclude {
             continue;
         }
         if let Some(client_branch) = session.get_client_branch(client_key) {
@@ -5047,6 +6260,95 @@ fn cancel_other_fork_branches(
     }
 }
 
+/// Fail an in-progress proxied INVITE from the reply context.
+///
+/// Driven by `reply.reject(code, reason)` in a `@proxy.on_reply` handler (the
+/// IMS P-CSCF media-authorization reject — N5/Rx fails at answer time, so the
+/// leg must be rejected with a SIP error rather than proceed medialess).
+///
+/// Two halves, in order:
+/// 1. Mark the session finalized *first* so any branch response that races in
+///    (the `487` the CANCEL draws back, or a late provisional) is absorbed by
+///    the straggler guard in `handle_response` rather than forwarded upstream.
+/// 2. CANCEL every pending downstream branch (RFC 3261 §9 — we have received a
+///    provisional, so CANCEL is well-formed), then send `code reason` upstream
+///    to the UAC through the server transaction so retransmission and ACK
+///    absorption are handled by the transaction layer.
+///
+/// The session is deliberately left in the store: the in-flight `487`(s) from
+/// the CANCEL still need to resolve to it (to be ACKed downstream and absorbed).
+/// Per-branch final cleanup (`remove_client_key`) and the session TTL sweep
+/// tear it down afterwards.
+fn reject_pending_invite(
+    server_key: &TransactionKey,
+    session_arc: &Arc<RwLock<ProxySession>>,
+    code: u16,
+    reason: &str,
+    original_request: &SipMessage,
+    transport: crate::transport::Transport,
+    source_addr: SocketAddr,
+    connection_id: ConnectionId,
+    inbound_local_addr: SocketAddr,
+    state: &DispatcherState,
+) {
+    // 1. Latch the finalized flag before anything goes on the wire.
+    match session_arc.write() {
+        Ok(mut session) => session.final_response_sent = true,
+        Err(error) => {
+            error!("proxy session lock poisoned during reject: {error}");
+            return;
+        }
+    }
+
+    // Hygiene: a rejected INVITE establishes no dialog, so its `by_dialog_key`
+    // entry (which exists only to route the end-to-end 2xx ACK) is now dead.
+    // Drop it so a stray/non-compliant ACK can't match this rejected call's
+    // dialog and reach the ACK relay path.  The client-key indices stay intact
+    // so the CANCEL's `487` straggler is still matched and absorbed.
+    state.session_store.remove_dialog_key(original_request);
+
+    info!(
+        server_key = %server_key,
+        code = code,
+        "reply-time reject: failing in-progress INVITE and cancelling downstream"
+    );
+
+    // 2a. CANCEL all pending downstream branches (no winner to exclude).
+    cancel_fork_branches(server_key, None, state);
+
+    // 2b. Build and send the error response upstream via the server
+    // transaction (handles retransmission + UAC-ACK absorption for INVITE).
+    let response = build_response(
+        original_request,
+        code,
+        reason,
+        state.server_header.as_deref(),
+        &[],
+    );
+
+    let event = ServerEvent::Ist(IstEvent::TuNon2xxFinal(response.clone()));
+    let mut sent_by_transaction = false;
+    if let Ok(actions) = state.transaction_manager.process_server_event(server_key, event) {
+        sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
+        process_timer_actions(
+            &actions,
+            server_key,
+            Some(source_addr),
+            Some(transport),
+            Some(connection_id),
+            Some(inbound_local_addr),
+            state,
+        );
+    }
+
+    if !sent_by_transaction {
+        // No live server transaction (or it emitted no SendMessage) — send the
+        // error directly, pinning the inbound listener's local address so an
+        // IPsec-protected response egresses on the right SA (TS 33.203 §7.4).
+        send_message_from(response, transport, source_addr, connection_id, Some(inbound_local_addr), state);
+    }
+}
+
 /// Start the next branch in a sequential fork.
 fn start_next_fork_branch(
     next_index: usize,
@@ -5054,7 +6356,7 @@ fn start_next_fork_branch(
     server_key: &TransactionKey,
     state: &DispatcherState,
 ) {
-    let (original_request, record_routed, source_addr, connection_id, transport, agg) = {
+    let (original_request, record_routed, source_addr, connection_id, transport, agg, branch_flow) = {
         let session = match session_arc.read() {
             Ok(s) => s,
             Err(_) => return,
@@ -5066,6 +6368,7 @@ fn start_next_fork_branch(
             session.connection_id,
             session.transport,
             session.fork_aggregator.clone(),
+            session.fork_flows.get(next_index).cloned().flatten(),
         )
     };
 
@@ -5097,8 +6400,9 @@ fn start_next_fork_branch(
             record_routed,
             &inbound_info,
             server_key,
-            &session_arc,
+            session_arc,
             &agg,
+            branch_flow.as_ref(),
             state,
         );
     }
@@ -5179,6 +6483,20 @@ fn handle_cancel(
 // ProxySession-based ACK (2xx) handling
 // ---------------------------------------------------------------------------
 
+/// Determine the next-hop URI for an end-to-end 2xx ACK after the proxy has
+/// popped its own Route (RFC 3261 §16.12): the top remaining Route URI, or the
+/// Request-URI when the route set is empty.
+///
+/// This is what makes the ACK follow the dialog route set rather than the
+/// cached INVITE forward path. Returns `None` only for a non-request message
+/// (an ACK is always a request, so this is a defensive guard).
+fn ack_next_hop_uri(headers: &SipHeaders, start_line: &StartLine) -> Option<String> {
+    core::next_hop_from_route(headers).or_else(|| match start_line {
+        StartLine::Request(request_line) => Some(request_line.request_uri.to_string()),
+        _ => None,
+    })
+}
+
 /// Handle ACK for 2xx responses by relaying it downstream via the ProxySession.
 ///
 /// ACK for 2xx is end-to-end (RFC 3261 §13.2.2.4): the proxy must relay it
@@ -5204,28 +6522,101 @@ fn handle_ack_via_session(
         if let Some(client_branch) = session.get_client_branch(client_key) {
             let mut ack_downstream = message.clone();
 
-            // Pop our own Route entry (loose routing — RFC 3261 §16.12)
+            // Consume our own Route entries (loose routing — RFC 3261 §16.4 /
+            // §16.12), mirroring the script-side loose_route() that the
+            // in-dialog BYE/UPDATE path uses. Pop the top Route, then any
+            // additional Routes that also point to us — a doubly-Record-Routed
+            // dialog (transport bridging, e.g. an IMS P-CSCF/S-CSCF spanning
+            // UDP and TCP) leaves two consecutive self-Routes, and consuming
+            // only the top would leave our own second Route as the apparent
+            // next hop (a routing loop). `pop_local_routes` matches the same
+            // `local_domains` loose_route() does, so the ACK consumes exactly
+            // the self-Routes the BYE on this dialog already consumes.
             if core::check_loose_route(&ack_downstream.headers) {
                 core::pop_top_route(&mut ack_downstream.headers);
+                if !state.local_domains.is_empty() {
+                    core::pop_local_routes(&mut ack_downstream.headers, &state.local_domains);
+                }
             }
 
-            // Add our Via on top (preserving existing Vias)
-            let transport_str = format!("{}", client_branch.transport);
+            // The 2xx ACK is end-to-end (RFC 3261 §13.2.2.4 / §17.1.1.3): it is
+            // a new request routed by the *dialog route set*, NOT retraced along
+            // the INVITE's forward path. After popping our own Route, the next
+            // hop is the top remaining Route URI, or the Request-URI when the
+            // route set is empty (RFC 3261 §16.12). For an INVITE forwarded
+            // through a hop that did not Record-Route (a transparent iFC AS, an
+            // IMS I-CSCF), the cached branch destination and the dialog route set
+            // diverge; sending to the cached destination retraces the INVITE
+            // path and the ACK never reaches the UAS. This is the proxy-mode
+            // sibling of the B2BUA in-dialog route-set fix.
+            //
+            // `resolve_in_dialog_flow_uri` keeps the established connection
+            // (RFC 5923) whenever the route-set next hop still resolves to the
+            // member the INVITE was relayed to (`client_branch`): re-resolving a
+            // load-balanced trunk domain would, since the RFC 3263 §4.2 shuffle,
+            // pick a sibling member at random and `send_to_target` would then ACK
+            // the wrong node (or reuse an unrelated keepalive connection to it).
+            // It falls back to the cached branch on resolution failure, so
+            // non-routed dialogs (loopback baseline) are unaffected.
+            let next_hop_uri =
+                ack_next_hop_uri(&ack_downstream.headers, &ack_downstream.start_line);
+            let (destination, out_transport, ack_connection_id) = resolve_in_dialog_flow_uri(
+                next_hop_uri.as_deref(),
+                &state.dns_resolver,
+                client_branch.destination,
+                client_branch.transport,
+                client_branch.connection_id,
+            );
+
+            // Loop guard (RFC 3261 §16.3): never forward an ACK back to one of
+            // our own listen addresses.  A stray/misrouted 2xx ACK whose route
+            // set or R-URI resolves to us (e.g. a non-compliant UAC ACKing a
+            // final whose R-URI is the proxy, matched here by `by_dialog_key`)
+            // would otherwise be re-received and re-relayed, stacking a Via each
+            // hop until the datagram exceeds the UDP recv buffer and is dropped
+            // on a parse error.  ACK gets no response (RFC 3261 §17.1.1.3), so
+            // drop silently — mirroring the relay-path guard in `relay_request`.
+            if state.is_own_address(&destination) {
+                debug!(
+                    client_key = %client_key,
+                    %destination,
+                    "ACK to self via dialog route set — dropping (loop guard)"
+                );
+                continue;
+            }
+
+            // Add our Via on top (preserving existing Vias), reflecting the
+            // transport we will actually send over.
+            let transport_str = format!("{out_transport}");
             core::add_via(
                 &mut ack_downstream.headers,
                 &transport_str,
-                &state.via_host(&client_branch.transport),
-                Some(state.via_port(&client_branch.transport)),
+                &state.via_host(&out_transport),
+                Some(state.via_port(&out_transport)),
             );
 
             let data = Bytes::from(ack_downstream.to_bytes());
             debug!(
                 client_key = %client_key,
-                destination = %client_branch.destination,
-                "relaying ACK for 2xx downstream via session"
+                %destination,
+                transport = %out_transport,
+                "relaying ACK for 2xx downstream via dialog route set"
             );
 
-            send_outbound(data, client_branch.transport, client_branch.destination, client_branch.connection_id, state);
+            // Send to the resolved dialog next hop. `send_to_target` picks the
+            // right connection per transport (TCP/TLS pool, UDP outbound + IPsec
+            // source), using the established connection as the UDP fallback.
+            let target = RelayTarget {
+                address: destination,
+                transport: Some(out_transport),
+            };
+            send_to_target(
+                data,
+                &target,
+                client_branch.transport,
+                ack_connection_id,
+                state,
+            );
         }
     }
 }
@@ -5233,6 +6624,34 @@ fn handle_ack_via_session(
 // ---------------------------------------------------------------------------
 // ProxySession-based CANCEL handling
 // ---------------------------------------------------------------------------
+
+/// Build the topmost `Via` value for a CANCEL forwarded on a proxy client
+/// branch.
+///
+/// RFC 3261 §9.1 makes CANCEL the one request that MUST share the topmost
+/// `Via` branch of the request it cancels; §16.10 has a stateful proxy
+/// generate, for each pending branch, a CANCEL whose single `Via` equals the
+/// top `Via` of the INVITE it forwarded on that branch.  The downstream
+/// UAS/proxy matches CANCEL→INVITE on that branch + sent-by (RFC 3261 §9.2 /
+/// §17.2.3) to find the in-progress INVITE server transaction.
+///
+/// The proxy's client transaction key already holds exactly the branch and
+/// sent-by siphon stamped on that INVITE's topmost `Via` (see
+/// [`TransactionManager::key_from_message`]), so we reuse them verbatim —
+/// reusing `sent_by` also keeps the CANCEL aligned with the INVITE in the
+/// IPsec / flow / `force_send_via` cases where the advertised sent-by differs
+/// from the default per-transport `via_host`.  Minting a fresh branch here
+/// (as siphon did before) makes the forwarded CANCEL unmatchable downstream:
+/// it is dropped, the INVITE leg below is never torn down, and the callee
+/// keeps ringing after the caller abandons during alerting.
+fn cancel_via_for_client_branch(client_key: &TransactionKey, transport: Transport) -> String {
+    format!(
+        "SIP/2.0/{} {};branch={}",
+        format!("{transport}").to_uppercase(),
+        client_key.sent_by,
+        client_key.branch,
+    )
+}
 
 /// Handle CANCEL using ProxySession — forwards CANCEL to all client branches
 /// and sends 487 Request Terminated upstream.
@@ -5267,17 +6686,16 @@ fn handle_cancel_via_session(
     for client_key in &session.client_keys {
         if let Some(client_branch) = session.get_client_branch(client_key) {
             let mut cancel_downstream = message.clone();
-            // CANCEL gets its own branch (different transaction) but we derive it
-            // from the client branch so it's traceable.
-            let cancel_branch = TransactionKey::generate_branch();
-            let transport_str = format!("{}", client_branch.transport);
-            let via_value = format!(
-                "SIP/2.0/{} {}:{};branch={}",
-                transport_str.to_uppercase(),
-                state.via_host(&client_branch.transport),
-                state.via_port(&client_branch.transport),
-                cancel_branch,
-            );
+            // RFC 3261 §9.1 / §16.10: the forwarded CANCEL MUST carry the SAME
+            // topmost Via branch (and sent-by) as the INVITE siphon sent on
+            // this branch, so the downstream matches CANCEL→INVITE (RFC 3261
+            // §9.2 / §17.2.3) and tears the alerting branch down.  Minting a
+            // fresh branch makes the CANCEL unmatchable: it's dropped, the
+            // INVITE leg below is never cancelled, and the callee keeps
+            // ringing after the caller abandons.  `headers.set` collapses the
+            // inbound CANCEL's Via stack to this single Via (§9.1 — a proxy
+            // CANCEL carries exactly one Via).
+            let via_value = cancel_via_for_client_branch(client_key, client_branch.transport);
             cancel_downstream.headers.set("Via", via_value);
 
             let data = Bytes::from(cancel_downstream.to_bytes());
@@ -5309,9 +6727,36 @@ fn handle_cancel_via_session(
         state,
     );
 
-    // Clean up session
+    // Fire @proxy.on_cancel before the session is evicted so scripts can
+    // release per-call resources (Diameter Rx/N5 QoS, rtpengine media) that
+    // no BYE will ever clear — the only teardown signal for a
+    // CANCELled-before-answer INVITE (RFC 3261 §9). Guard the clone: the
+    // common no-handler path stays allocation-free.
     let server_key = invite_server_key.clone();
-    drop(session);
+    let has_cancel_handlers = !state
+        .engine
+        .state()
+        .handlers_for(&HandlerKind::ProxyCancel)
+        .is_empty();
+    if has_cancel_handlers {
+        let cancel_request = session.original_request.clone();
+        let cancel_transport = session.transport;
+        let cancel_source_addr = session.source_addr;
+        let cancel_inbound_local_addr = session.inbound_local_addr;
+        let cancel_connection_id = session.connection_id;
+        drop(session);
+        run_proxy_cancel_handlers(
+            cancel_request,
+            cancel_transport,
+            cancel_source_addr,
+            cancel_inbound_local_addr,
+            cancel_connection_id,
+            state,
+        );
+    } else {
+        drop(session);
+    }
+
     state.session_store.remove_by_server_key(&server_key);
 }
 
@@ -5501,8 +6946,12 @@ fn handle_b2bua_cancel(
         let _ = handle.tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
     }
 
-    // Send 487 Request Terminated to A-leg for the original INVITE
+    // Send 487 Request Terminated to A-leg for the original INVITE.
+    // Capture the stored A-leg INVITE + source before dropping the call ref so
+    // @b2bua.on_cancel can run after the lock is released (no DashMap reentry).
     let a_leg = call.a_leg.clone();
+    let cancel_a_leg_invite = call.a_leg_invite.clone();
+    let cancel_a_leg_source_ip = call.a_leg.transport.remote_addr.ip().to_string();
     drop(call);
 
     // Emit the prepared CANCELs after dropping the call lock so the
@@ -5520,10 +6969,241 @@ fn handle_b2bua_cancel(
         state,
     );
 
+    // Fire @b2bua.on_cancel before tearing the call out of the registry so a
+    // script can release per-call resources (rtpengine media, QoS) that no BYE
+    // will ever clear — the only teardown signal for a cancelled-before-answer
+    // B2BUA call (RFC 3261 §9). A 2xx that races this CANCEL is independently
+    // ACK+BYE'd by handle_zombie_cancelled_2xx and never delivered on_answer,
+    // so this only ever fires for a genuinely abandoned call.
+    run_b2bua_cancel_handlers(&call_id, cancel_a_leg_invite, cancel_a_leg_source_ip, state);
+
     state.call_actors.set_state(&call_id, CallState::Terminated);
-    // remove_call sends Shutdown to any remaining actors and cleans up registry
-    state.call_actors.remove_call(&call_id);
+    // remove_call_after_cancel sends Shutdown to remaining actors, cleans the
+    // registry, and preserves still-pending B-legs as zombie-cancelled entries
+    // so a 2xx that raced this CANCEL (RFC 3261 §9.1) can still be ACKed + BYEd
+    // by handle_response → handle_zombie_cancelled_2xx instead of being dropped
+    // as an unknown branch (which leaves the callee retransmitting 200 OK then
+    // BYEing the half-open dialog).
+    if state.call_actors.remove_call_after_cancel(&call_id) {
+        schedule_zombie_cancelled_cleanup(state.call_actors.clone());
+    }
     state.call_event_receivers.remove(&call_id);
+}
+
+/// Fire `@b2bua.on_cancel` handlers for an unanswered call (Calling/Ringing)
+/// that was CANCELled.
+///
+/// Fire-and-forget cleanup — the 487 to the A-leg has already been sent and
+/// the call is being torn down regardless. This is the B2BUA teardown signal
+/// that `on_failure` (B-leg error) and `on_bye` (answered call) never cover,
+/// so a script can release per-call resources that no BYE will clear
+/// (rtpengine media, QoS). Mirrors the `on_bye` PyCall construction.
+fn run_b2bua_cancel_handlers(
+    call_id: &str,
+    a_leg_invite: Option<Arc<std::sync::Mutex<SipMessage>>>,
+    a_leg_source_ip: String,
+    state: &DispatcherState,
+) {
+    let engine_state = state.engine.state();
+    let handlers = engine_state.handlers_for(&HandlerKind::B2buaCancel);
+    if handlers.is_empty() {
+        return;
+    }
+
+    let invite_arc = match &a_leg_invite {
+        Some(arc) => Arc::clone(arc),
+        None => {
+            warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_cancel");
+            return;
+        }
+    };
+
+    let py_call = PyCall::new(call_id.to_string(), invite_arc, a_leg_source_ip);
+
+    Python::attach(|python| {
+        let call_obj = match Py::new(python, py_call) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyCall for on_cancel: {error}");
+                return;
+            }
+        };
+
+        for handler in &handlers {
+            let callable = handler.callable.bind(python);
+            match callable.call1((call_obj.bind(python),)) {
+                Ok(ret) => {
+                    if handler.is_async {
+                        if let Err(error) = run_coroutine(python, &ret) {
+                            error!("async B2BUA on_cancel handler error: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    error!("B2BUA on_cancel handler error: {error}");
+                }
+            }
+        }
+    });
+}
+
+/// Arm the answer-timeout for a B2BUA call from a `call.fork`/`call.dial`
+/// `timeout=` (seconds).
+///
+/// `timeout == 0` disables the application timeout (the 24h orphan sweep stays
+/// the only backstop). Otherwise the orphan sweep fails the call if it is still
+/// un-answered `timeout` seconds from now — see [`fail_b2bua_call_on_timeout`].
+fn set_b2bua_answer_deadline(call_id: &str, timeout_secs: u32, state: &DispatcherState) {
+    if timeout_secs == 0 {
+        return;
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+    state.call_actors.set_answer_deadline(call_id, deadline);
+}
+
+/// Fail a B2BUA call whose answer deadline passed while it was still
+/// un-answered — the B-leg never produced a final 2xx (dead/partitioned trunk,
+/// or a B-leg that silently went away).
+///
+/// Mirrors the B-leg error teardown in [`handle_b2bua_response`]: CANCEL every
+/// pending B-leg (RFC 3261 §9.1), fire `@b2bua.on_failure(call, 408, …)`, send
+/// `408 Request Timeout` to the A-leg, then tear the call down via
+/// [`CallActorStore::remove_call_after_cancel`] (so a 2xx that raced our CANCEL
+/// is still ACK+BYEd). Driven from [`sweep_stale_entries`].
+fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
+    // Snapshot everything needed, then drop the DashMap ref before the CANCEL
+    // sends, Python, and the A-leg response.
+    let (a_leg, a_leg_invite, cancel_targets, handle_txs) =
+        match state.call_actors.get_call(call_id) {
+            Some(call) => {
+                // Re-check under the lock: the call may have answered or started
+                // tearing down between take_timed_out_calls and here.
+                if !matches!(call.state, CallState::Calling | CallState::Ringing) {
+                    return;
+                }
+                let mut targets: Vec<(SipMessage, Transport, SocketAddr)> = Vec::new();
+                for b_leg in &call.b_legs {
+                    if let Some(invite_arc) = b_leg.b_leg_invite.as_ref() {
+                        if let Ok(invite) = invite_arc.lock() {
+                            if let Some(cancel_msg) = build_cancel_from_invite(&invite) {
+                                targets.push((
+                                    cancel_msg,
+                                    b_leg.transport.transport,
+                                    b_leg.transport.remote_addr,
+                                ));
+                            }
+                        }
+                    }
+                }
+                let handle_txs: Vec<_> = call
+                    .b_leg_handles
+                    .iter()
+                    .flatten()
+                    .map(|handle| handle.tx.clone())
+                    .collect();
+                (
+                    call.a_leg.clone(),
+                    call.a_leg_invite.clone(),
+                    targets,
+                    handle_txs,
+                )
+            }
+            None => return,
+        };
+
+    warn!(
+        call_id = %call_id,
+        "B2BUA: answer timeout — no final response from B-leg, failing call with 408",
+    );
+
+    // CANCEL each pending B-leg transaction (RFC 3261 §9.1).
+    for (cancel_msg, transport, dest) in cancel_targets {
+        send_b2bua_to_bleg(cancel_msg, transport, dest, state);
+    }
+    for tx in &handle_txs {
+        let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
+    }
+
+    // Fire @b2bua.on_failure(call, 408, "Request Timeout").
+    if let Some(invite_arc) = &a_leg_invite {
+        let engine_state = state.engine.state();
+        let handlers = engine_state.handlers_for(&HandlerKind::B2buaFailure);
+        if !handlers.is_empty() {
+            let py_call = PyCall::new(
+                call_id.to_string(),
+                Arc::clone(invite_arc),
+                a_leg.transport.remote_addr.ip().to_string(),
+            );
+            Python::attach(|python| {
+                let call_obj = match Py::new(python, py_call) {
+                    Ok(obj) => obj,
+                    Err(error) => {
+                        error!("failed to create PyCall for timeout on_failure: {error}");
+                        return;
+                    }
+                };
+                for handler in &handlers {
+                    let callable = handler.callable.bind(python);
+                    match callable.call1((call_obj.bind(python), 408u16, "Request Timeout")) {
+                        Ok(ret) => {
+                            if handler.is_async {
+                                if let Err(error) = run_coroutine(python, &ret) {
+                                    error!("async B2BUA timeout on_failure handler error: {error}");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            error!("B2BUA timeout on_failure handler error: {error}");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // Send 408 Request Timeout to the A-leg (final response to its INVITE).
+    if let Some(invite_arc) = &a_leg_invite {
+        if let Ok(invite) = invite_arc.lock() {
+            let mut response =
+                build_response(&invite, 408, "Request Timeout", state.server_header.as_deref(), &[]);
+            // Carry the UAS To-tag we assigned the A-leg dialog (the A-leg saw it
+            // on our 1xx) so the final response terminates the same dialog.
+            if let Some(to) = response.headers.to() {
+                let to_with_tag =
+                    crate::b2bua::actor::ensure_tag(to, Some(&a_leg.dialog.local_tag));
+                response.headers.set("To", to_with_tag);
+            }
+            send_message(
+                response,
+                a_leg.transport.transport,
+                a_leg.transport.remote_addr,
+                a_leg.transport.connection_id,
+                state,
+            );
+        }
+    }
+
+    // RTPEngine safety-net cleanup (mirrors the B-leg failure path).
+    let a_sip_call_id = a_leg.dialog.call_id.clone();
+    if let (Some(rtpengine_set), Some(media_sessions)) =
+        (&state.rtpengine_set, &state.rtpengine_sessions)
+    {
+        if let Some(session) = media_sessions.remove(&a_sip_call_id) {
+            let set = Arc::clone(rtpengine_set);
+            tokio::spawn(async move {
+                if let Err(error) = set.delete(&session.call_id, &session.from_tag).await {
+                    warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed (timeout): {error}");
+                }
+            });
+        }
+    }
+
+    // Tear down, preserving still-pending legs for a 2xx that races the CANCEL.
+    if state.call_actors.remove_call_after_cancel(call_id) {
+        schedule_zombie_cancelled_cleanup(state.call_actors.clone());
+    }
+    state.call_event_receivers.remove(call_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -5555,6 +7235,14 @@ fn handle_b2bua_invite(
         .and_then(|v| v.branch)
         .unwrap_or_default();
 
+    // Snapshot the A-leg peer's reliable-provisional capability from the
+    // on-wire INVITE, BEFORE the `@b2bua.on_invite` handler runs.  The script
+    // may add `Supported: 100rel` to the shared INVITE to advertise reliable
+    // provisionals toward the B-leg (IR.92 UEs need it to alert) — that must
+    // not poison the gate that decides whether to strip `Require:100rel`/`RSeq`
+    // from provisionals relayed back to this A-leg.  See CallActor.a_leg_supports_100rel.
+    let a_leg_supports_100rel = crate::sip::headers::rseq::supports_100rel(&message.headers);
+
     // Guard against INVITE retransmissions: if we already have a call for this
     // SIP Call-ID, this is a retransmission — absorb it silently.
     // Without this check, each UDP retransmission would create a new call and
@@ -5573,7 +7261,7 @@ fn handle_b2bua_invite(
     // the attended-transfer semantics (the referrer expects the old dialog
     // to go away once this INVITE succeeds).
     if let Some(replaces_raw) = message.headers.get("Replaces") {
-        match crate::sip::headers::refer::parse_replaces(&replaces_raw) {
+        match crate::sip::headers::refer::parse_replaces(replaces_raw) {
             Ok(replaces) => {
                 match state.call_actors.find_call_by_replaces_dialog(
                     &replaces.call_id,
@@ -5667,12 +7355,12 @@ fn handle_b2bua_invite(
     if let Some(contact) = message.headers.get("Contact")
         .or_else(|| message.headers.get("m"))
     {
-        a_leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(&contact));
+        a_leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(contact));
     }
 
     // Store A-leg's remote AoR host (caller's From URI host) for in-dialog To headers.
     if let Some(from) = message.headers.from() {
-        let from_str = crate::b2bua::actor::extract_contact_uri(&from);
+        let from_str = crate::b2bua::actor::extract_contact_uri(from);
         if let Ok(parsed) = parse_uri_standalone(&from_str) {
             a_leg.dialog.remote_aor_host = Some(if let Some(port) = parsed.port {
                 format!("{}:{}", parsed.host, port)
@@ -5700,6 +7388,10 @@ fn handle_b2bua_invite(
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<CallEvent>(64);
     if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
         call.event_tx = Some(event_tx);
+        // Persist the pre-handler on-wire 100rel capability (immutable for the
+        // call's life) so the reliable-1xx strip gate can't be defeated by the
+        // script mutating the shared INVITE for B-leg header shaping.
+        call.a_leg_supports_100rel = a_leg_supports_100rel;
     }
     state.call_event_receivers.insert(call_id.clone(), event_rx);
 
@@ -5842,34 +7534,42 @@ fn handle_b2bua_invite(
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
         }
-        CallAction::Dial { target, next_hop, timeout: _ } => {
+        CallAction::Dial { target, next_hop, flow, route, timeout } => {
             debug!(
                 call_id = %call_id,
                 target = %target,
                 next_hop = ?next_hop,
+                flow = flow.is_some(),
+                routes = route.len(),
                 "B2BUA: dialling B-leg",
             );
             b2bua_send_b_leg_invite(
                 &call_id,
                 &target,
                 next_hop.as_deref(),
+                flow.as_ref(),
+                &route,
                 &message_guard,
                 &inbound,
                 state,
             );
+            set_b2bua_answer_deadline(&call_id, timeout, state);
         }
-        CallAction::Fork { targets, strategy: _, timeout: _ } => {
+        CallAction::Fork { targets, flows, strategy: _, timeout } => {
             debug!(call_id = %call_id, targets = ?targets, "B2BUA: forking B-legs");
-            for target in &targets {
+            for (index, target) in targets.iter().enumerate() {
                 b2bua_send_b_leg_invite(
                     &call_id,
                     target,
                     None,
+                    flows.get(index).and_then(|f| f.as_ref()),
+                    &[],
                     &message_guard,
                     &inbound,
                     state,
                 );
             }
+            set_b2bua_answer_deadline(&call_id, timeout, state);
         }
         CallAction::Terminate => {
             debug!(call_id = %call_id, "B2BUA: terminate on invite (unusual)");
@@ -5912,28 +7612,46 @@ fn b2bua_send_b_leg_invite(
     call_id: &str,
     target_uri: &str,
     next_hop: Option<&str>,
+    flow: Option<&crate::script::api::registrar::PyFlow>,
+    b_leg_route: &[String],
     original_request: &SipMessage,
     _inbound: &InboundMessage,
     state: &DispatcherState,
 ) {
-    // Resolve the wire destination from next_hop when set, else from target.
-    // R-URI construction below still uses target_uri unconditionally — this
-    // is the whole point of the split.
-    let routing_uri = next_hop.unwrap_or(target_uri);
-    let relay_target = match resolve_target(routing_uri, &state.dns_resolver) {
-        Some(t) => t,
-        None => {
-            warn!(
-                call_id = %call_id,
-                target = %target_uri,
-                next_hop = ?next_hop,
-                "B2BUA: cannot resolve destination",
-            );
-            return;
-        }
+    // Resolve the wire destination: over the captured inbound flow (RFC 5626
+    // §5.3 connection reuse — the only way to reach a WebSocket callee, RFC
+    // 7118 §5) when one is attached, else from next_hop when set, else from
+    // target.  R-URI construction below still uses target_uri unconditionally —
+    // that split is the whole point of next_hop.
+    let (destination, outbound_transport) = if let Some(flow) = flow {
+        let transport = match flow.transport.as_str() {
+            "udp" => Transport::Udp,
+            "tcp" => Transport::Tcp,
+            "tls" => Transport::Tls,
+            "ws" => Transport::WebSocket,
+            "wss" => Transport::WebSocketSecure,
+            other => {
+                warn!(call_id = %call_id, transport = %other, "B2BUA: unknown flow transport");
+                return;
+            }
+        };
+        (flow.source_addr, transport)
+    } else {
+        let routing_uri = next_hop.unwrap_or(target_uri);
+        let relay_target = match resolve_target(routing_uri, &state.dns_resolver) {
+            Some(t) => t,
+            None => {
+                warn!(
+                    call_id = %call_id,
+                    target = %target_uri,
+                    next_hop = ?next_hop,
+                    "B2BUA: cannot resolve destination",
+                );
+                return;
+            }
+        };
+        (relay_target.address, relay_target.transport.unwrap_or(Transport::Udp))
     };
-    let destination = relay_target.address;
-    let outbound_transport = relay_target.transport.unwrap_or(Transport::Udp);
 
     // Build a new INVITE for the B-leg
     let branch = TransactionKey::generate_branch();
@@ -5959,6 +7677,13 @@ fn b2bua_send_b_leg_invite(
     // the Digest hash).
     b_leg_invite.headers.remove("Record-Route");
     b_leg_invite.headers.remove("Route");
+
+    // Script-supplied Route set (`call.dial(route=[…])`) — the captured IMS
+    // Service-Route on MO calls, prepended here *after* the A-leg Route strip so
+    // the B-leg traverses the originating S-CSCF (RFC 3608 / TS 24.229).
+    if !b_leg_route.is_empty() {
+        b_leg_invite.headers.set_all("Route", b_leg_route.to_vec());
+    }
 
     // Replace Via with our own (set preserves header position)
     b_leg_invite.headers.set("Via", via_value);
@@ -6019,7 +7744,7 @@ fn b2bua_send_b_leg_invite(
         if let Some(at_pos) = new_from.find('@') {
             // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
             let after_at = &new_from[at_pos + 1..];
-            let host_end = after_at.find(|c: char| c == '>' || c == ';' || c == ':')
+            let host_end = after_at.find(['>', ';', ':'])
                 .unwrap_or(after_at.len());
             let end_pos = at_pos + 1 + host_end;
             new_from = format!("{}{}{}", &new_from[..at_pos + 1], b2bua_host, &new_from[end_pos..]);
@@ -6057,7 +7782,7 @@ fn b2bua_send_b_leg_invite(
         if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
             if let Some(at_pos) = new_to.find('@') {
                 let after_at = &new_to[at_pos + 1..];
-                let host_end = after_at.find(|c: char| c == '>' || c == ';' || c == ':')
+                let host_end = after_at.find(['>', ';', ':'])
                     .unwrap_or(after_at.len());
                 let end_pos = at_pos + 1 + host_end;
                 let target_host = &target_parsed.host;
@@ -6138,7 +7863,7 @@ fn b2bua_send_b_leg_invite(
         branch.clone(),
         LegTransport {
             remote_addr: destination,
-            connection_id: ConnectionId::default(),
+            connection_id: flow.map(|f| ConnectionId(f.connection_id)).unwrap_or_default(),
             transport: outbound_transport,
         },
     );
@@ -6167,8 +7892,24 @@ fn b2bua_send_b_leg_invite(
 
     let data = Bytes::from(b_leg_invite.to_bytes());
 
-    // Send via pool for TCP/TLS, direct channel for UDP
-    send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
+    // Send: over the captured flow (direct OutboundMessage, bypassing DNS/pool —
+    // mirrors the proxy relay(flow=...) path) when one is attached, else via the
+    // resolver/pool path.
+    if let Some(flow) = flow {
+        let outbound_message = OutboundMessage {
+            connection_id: ConnectionId(flow.connection_id),
+            transport: outbound_transport,
+            destination,
+            data,
+            source_local_addr: Some(flow.local_addr),
+        };
+        if let Err(error) = state.outbound.send(outbound_message) {
+            error!(call_id = %call_id, destination = %destination, transport = %outbound_transport, "B2BUA: flow send failed: {error}");
+        }
+    } else {
+        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport) };
+        send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
+    }
 
     // Persist the fully hygiene-processed B-leg INVITE on the leg.
     // The 401/407 auto-retry path rebuilds the retry from this — rebuilding
@@ -6269,6 +8010,60 @@ fn spawn_b_leg_actor(call_id: &str, b_leg: &Leg, state: &DispatcherState) {
     }
 }
 
+/// Spawn a [`LegActor`] for a B-leg whose slot is at an explicit `index`.
+///
+/// Like [`spawn_b_leg_actor`] but stores the handle at `index` rather than the
+/// last B-leg. Used by the 401/407 and 422 retry paths, which *supersede* the
+/// failed leg in place (via `CallActorStore::replace_b_leg`) instead of
+/// appending — so the retry's actor handle must land on the same slot the
+/// retry leg occupies.
+fn spawn_b_leg_actor_at(call_id: &str, b_leg: &Leg, index: usize, state: &DispatcherState) {
+    if let Some(call) = state.call_actors.get_call(call_id) {
+        if let Some(event_tx) = &call.event_tx {
+            let (actor, handle) = LegActor::new(b_leg.clone(), event_tx.clone());
+            drop(call);
+            tokio::spawn(actor.run());
+            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                call.set_b_leg_handle(index, handle);
+            }
+        }
+    }
+}
+
+/// Receive the next B-leg response classification from the shared per-call
+/// event channel, discarding stale `CallEvent::Terminated` notifications.
+///
+/// Every [`LegActor`] emits `CallEvent::Terminated` as it falls out of its run
+/// loop. A 401/407/422 outbound retry supersedes the failed B-leg in place
+/// (`CallActorStore::replace_b_leg`), which drops the old leg's actor handle;
+/// that actor then exits and pushes a `Terminated` onto the SHARED per-call
+/// channel — the very channel the dispatcher block-recvs for each response's
+/// classification.
+///
+/// `Terminated` is a lifecycle notification, never a response classification,
+/// and nothing else consumes this channel. Taking one here as though it
+/// classified the response just handed to the live actor desyncs the stream by
+/// one: the next 200 OK then reads the previous 18x's `Provisional` event, so
+/// the 2xx is misclassified as provisional — `set_winner` and the deferred
+/// B-leg ACK are skipped, the trunk's 200 OK is never ACKed, and it retransmits
+/// until the dialog collapses (BYE storm ~5 s after answer). Filtering
+/// `Terminated` out restores the strict one-response/one-classification
+/// invariant the caller relies on.
+///
+/// The caller block-recvs only after a successful `try_send` of the response to
+/// the live actor, so exactly one non-`Terminated` classification event is
+/// always forthcoming and this loop terminates.
+fn recv_b_leg_classification_event(
+    rx: &mut tokio::sync::mpsc::Receiver<CallEvent>,
+) -> Option<CallEvent> {
+    loop {
+        match rx.blocking_recv() {
+            Some(CallEvent::Terminated { .. }) => continue,
+            other => return other,
+        }
+    }
+}
+
 /// Extract the `expires=` parameter value from a Contact header value.
 ///
 /// Skips URI parameters inside angle brackets so that only Contact-level
@@ -6314,6 +8109,9 @@ fn handle_registrant_response(
         }
     };
 
+    let is_aka =
+        registrant.auth_mode(&aor) == Some(crate::registrant::AuthMode::Aka);
+
     match status_code {
         200 => {
             // Parse granted expires: top-level Expires header first,
@@ -6326,6 +8124,41 @@ fn handle_registrant_response(
                         .and_then(|contact| parse_contact_expires(contact))
                 })
                 .unwrap_or(registrant.default_interval);
+
+            // IMS: capture the Service-Route / P-Associated-URI / Path the
+            // S-CSCF granted, for MO call routing and implicit-set resolution
+            // (Phase 3). Only for AKA entries so the carrier-trunk path is
+            // byte-identical.
+            if is_aka {
+                registrant.store_registration_routes(
+                    &aor,
+                    collect_route_set(message, "Service-Route"),
+                    collect_route_set(message, "P-Associated-URI"),
+                    collect_route_set(message, "Path"),
+                );
+            }
+
+            // IPsec: tighten the kernel SA hard-lifetime from the placeholder
+            // installed on the 401 path down to the registrar's granted Expires
+            // (+ RFC 3261 Timer F grace), so the SAs track the registration
+            // lifetime (TS 33.203 §7.4).
+            if is_aka && registrant.is_ipsec_entry(&aor) {
+                if let (Some(ipsec_manager), Some(ue_port_c)) =
+                    (state.ipsec_manager.clone(), registrant.ue_protected_client_port(&aor))
+                {
+                    let ue_addr = state.local_addr.ip();
+                    let hard_lifetime = (expires as u64) + 32;
+                    tokio::spawn(async move {
+                        if let Err(error) = ipsec_manager
+                            .update_sa_pair_lifetime(&ue_addr, ue_port_c, Some(hard_lifetime))
+                            .await
+                        {
+                            warn!(%error, "IPsec UE: failed to tighten SA lifetime");
+                        }
+                    });
+                }
+            }
+
             registrant.handle_success(&aor, expires);
         }
         401 | 407 => {
@@ -6346,17 +8179,40 @@ fn handle_registrant_response(
             };
 
             if let Some(challenge) = crate::auth::parse_challenge(&challenge_raw) {
-                let is_proxy_auth = status_code == 407;
-                if let Some((retry_message, _retry_branch, destination, transport)) =
+                // IMS AKA + IPsec sec-agree: parse the P-CSCF's Security-Server,
+                // build the protected re-REGISTER (which stashes CK/IK), install
+                // the UE SAs, then send over the SA. The install MUST precede the
+                // send so the kernel encrypts the protected REGISTER — both run
+                // ordered inside one spawned task (TS 33.203 §7.4).
+                if is_aka && registrant.is_ipsec_entry(&aor) {
+                    handle_registrant_ipsec_challenge(registrant, message, &aor, &challenge, status_code, state);
+                    return;
+                }
+
+                // IMS AKA entries run Milenage over the RAND/AUTN in the nonce;
+                // carrier-trunk entries use password digest. The IMS challenge
+                // always arrives as a 401 (WWW-Authenticate).
+                let built = if is_aka {
+                    registrant.build_register_aka(
+                        &aor,
+                        state.local_addr,
+                        &state.listen_addrs,
+                        &challenge,
+                        registrant.default_interval,
+                        None,
+                    )
+                } else {
                     registrant.build_register_with_auth(
                         &aor,
                         state.local_addr,
                         &state.listen_addrs,
                         &challenge,
-                        is_proxy_auth,
+                        status_code == 407,
                         registrant.default_interval,
                     )
-                {
+                };
+
+                if let Some((retry_message, _retry_branch, destination, transport)) = built {
                     let data = bytes::Bytes::from(retry_message.to_bytes());
                     send_outbound(data, transport, destination, crate::transport::ConnectionId::default(), state);
                 } else {
@@ -6372,6 +8228,160 @@ fn handle_registrant_response(
         }
     }
 }
+
+/// Handle a 401 challenge for an IPsec sec-agree (UE) registration.
+///
+/// Records the P-CSCF's Security-Server answer, builds the protected
+/// re-REGISTER (which stashes CK/IK on the entry), then installs the four UE
+/// SAs and sends the REGISTER over them. The SA install and the send run
+/// ordered inside one spawned task so the kernel encrypts the protected
+/// REGISTER (3GPP TS 33.203 §7.4) — sourced from the UE protected client port
+/// so the outbound XFRM selector matches.
+fn handle_registrant_ipsec_challenge(
+    registrant: &Arc<crate::registrant::RegistrantManager>,
+    message: &SipMessage,
+    aor: &str,
+    challenge: &crate::auth::DigestChallenge,
+    status_code: u16,
+    state: &DispatcherState,
+) {
+    match message.headers.get("Security-Server").cloned() {
+        Some(server_raw) => match crate::ipsec::parse_security_client(&server_raw) {
+            Some(server) => registrant.store_security_server(aor, &server, &server_raw),
+            None => {
+                warn!(aor = %aor, "IPsec UE: unparseable Security-Server, failing registration");
+                registrant.handle_failure(aor, status_code);
+                return;
+            }
+        },
+        None => {
+            warn!(aor = %aor, "IPsec UE: 401 without Security-Server, failing registration");
+            registrant.handle_failure(aor, status_code);
+            return;
+        }
+    }
+
+    // build_register_aka stashes CK/IK and targets the P-CSCF protected server
+    // port; the Security-Verify echoes the Security-Server recorded above.
+    let verify = registrant.security_server_value(aor);
+    let built = registrant.build_register_aka(
+        aor,
+        state.local_addr,
+        &state.listen_addrs,
+        challenge,
+        registrant.default_interval,
+        verify.as_deref(),
+    );
+    let (retry_message, destination, transport) = match built {
+        Some((retry_message, _branch, destination, transport)) => (retry_message, destination, transport),
+        None => {
+            registrant.handle_failure(aor, status_code);
+            return;
+        }
+    };
+
+    let ue_addr = state.local_addr.ip();
+    let pcscf_addr = destination.ip();
+    let ue_port_c = registrant.ue_protected_client_port(aor).unwrap_or(0);
+    // Placeholder lifetime; tightened to the granted Expires on the 200 OK.
+    let sa = registrant.ue_sa_pair(
+        aor,
+        ue_addr,
+        pcscf_addr,
+        Some(registrant.default_interval as u64),
+        crate::ipsec::SaProtocol::Any,
+    );
+
+    let ipsec_manager = match state.ipsec_manager.clone() {
+        Some(manager) => manager,
+        None => {
+            warn!(aor = %aor, "IPsec UE: no IpsecManager configured, failing registration");
+            registrant.handle_failure(aor, status_code);
+            return;
+        }
+    };
+
+    let source = std::net::SocketAddr::new(ue_addr, ue_port_c);
+    let data = bytes::Bytes::from(retry_message.to_bytes());
+    let outbound = state.outbound.clone();
+    let registrant_task = Arc::clone(registrant);
+    let aor_task = aor.to_string();
+
+    tokio::spawn(async move {
+        let sa = match sa {
+            Some(sa) => sa,
+            None => {
+                warn!(aor = %aor_task, "IPsec UE: missing CK/IK or Security-Server, protected REGISTER not sent");
+                registrant_task.handle_failure(&aor_task, 0);
+                return;
+            }
+        };
+        // Re-REGISTER rekey: tear down any prior SA pair on the same UE
+        // protected client port before installing the new one. The UE keeps
+        // fixed protected ports, so old and new cannot overlap (their XFRM
+        // policy selectors would collide) — delete-before-install avoids the
+        // collision and the leak; no-op on the first registration. (Full
+        // TS 33.203 §6.3 old/new overlap would need fresh ports per
+        // registration, i.e. runtime listener binding.)
+        let _ = ipsec_manager.delete_sa_pair(&ue_addr, ue_port_c).await;
+        if let Err(error) = ipsec_manager.create_ue_sa_pair(sa).await {
+            warn!(aor = %aor_task, %error, "IPsec UE: SA install failed, protected REGISTER not sent");
+            registrant_task.handle_failure(&aor_task, 0);
+            return;
+        }
+        let outbound_message = crate::transport::OutboundMessage {
+            connection_id: crate::transport::ConnectionId::default(),
+            transport,
+            destination,
+            data,
+            source_local_addr: Some(source),
+        };
+        if let Err(error) = outbound.send(outbound_message) {
+            warn!(aor = %aor_task, %error, "IPsec UE: failed to send protected REGISTER");
+        }
+    });
+}
+
+/// Expand a route-set header (Service-Route, P-Associated-URI, Path) into its
+/// individual values: each header line plus any comma-folded values within it,
+/// splitting only on top-level commas (not inside `<...>` or quotes).
+fn collect_route_set(message: &SipMessage, header_name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(lines) = message.headers.get_all(header_name) {
+        for line in lines {
+            let mut start = 0;
+            let mut depth = 0i32;
+            let mut in_quotes = false;
+            for (index, byte) in line.bytes().enumerate() {
+                match byte {
+                    b'"' => in_quotes = !in_quotes,
+                    b'<' if !in_quotes => depth += 1,
+                    b'>' if !in_quotes => depth -= 1,
+                    b',' if !in_quotes && depth == 0 => {
+                        let part = line[start..index].trim();
+                        if !part.is_empty() {
+                            values.push(part.to_string());
+                        }
+                        start = index + 1;
+                    }
+                    _ => {}
+                }
+            }
+            let tail = line[start..].trim();
+            if !tail.is_empty() {
+                values.push(tail.to_string());
+            }
+        }
+    }
+    values
+}
+
+/// Maximum credentialed outbound INVITEs the B2BUA will send on the 401/407
+/// digest auto-retry path per call before treating further challenges as a
+/// persistent auth failure and surfacing the response upstream. RFC has no
+/// fixed number; 2 covers the normal single-challenge (and one stale-nonce
+/// re-challenge) case while bounding a misconfigured-credentials loop.
+const MAX_B2BUA_AUTH_RETRIES: u32 = 2;
 
 /// Handle a response to a B2BUA B-leg INVITE.
 fn handle_b2bua_response(
@@ -6390,7 +8400,7 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, call_state, outbound_credentials, li_record, b_leg_handle_tx, b_leg_stored_invite, b_leg_local_cseq) = match state.call_actors.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_connection_id, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, call_state, outbound_credentials, li_record, b_leg_handle_tx, b_leg_stored_invite, b_leg_local_cseq, a_leg_supports_100rel) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
@@ -6399,6 +8409,10 @@ fn handle_b2bua_response(
             let local_contact = matching_b.and_then(|b| b.dialog.local_contact.clone());
             let dialog = matching_b.map(|b| (b.dialog.call_id.clone(), b.dialog.local_tag.clone()));
             let dest = matching_b.map(|b| (b.transport.remote_addr, b.transport.transport));
+            // The connection_id the original B-leg INVITE was sent on — reused
+            // by the 401/407 retry path so the credentialed re-INVITE stays on
+            // the same trunk member that issued the nonce (RFC 5923).
+            let connection_id = matching_b.map(|b| b.transport.connection_id).unwrap_or_default();
             let stored_vias = matching_b.map(|b| b.stored_vias.clone()).unwrap_or_default();
             let stored_cseq = matching_b.and_then(|b| b.stored_cseq.clone());
             let handle_tx = matching_b_idx
@@ -6407,7 +8421,7 @@ fn handle_b2bua_response(
                 .map(|h| h.tx.clone());
             let stored_invite = matching_b.and_then(|b| b.b_leg_invite.clone());
             let local_cseq = matching_b.map(|b| b.dialog.local_cseq).unwrap_or(2);
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, matching_b_idx, stored_vias, stored_cseq, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx, stored_invite, local_cseq)
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, connection_id, matching_b_idx, stored_vias, stored_cseq, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx, stored_invite, local_cseq, call.a_leg_supports_100rel)
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -6415,11 +8429,23 @@ fn handle_b2bua_response(
         }
     };
 
+    // The A-leg peer's advertised reliable-provisional capability (RFC 3262 §3),
+    // snapshotted from the on-wire INVITE at receipt (CallActor.a_leg_supports_100rel)
+    // — NOT re-derived from `a_leg_invite`, which the `@b2bua.on_invite` script
+    // can mutate via `call.set_header` to advertise 100rel toward the B-leg.
+    // Drives the framework-auto `100rel` strip in `sanitize_b2bua_response` so we
+    // never forward a reliable provisional to an A-leg (e.g. a PSTN trunk) that
+    // can't PRACK it.  Passed to every sanitize call: the responses sanitized
+    // below all flow to the A-leg (or, for the B→A re-INVITE/UPDATE direction,
+    // are produced by the A-leg — so a non-100rel A-leg never emits the markers
+    // and the strip is a no-op there anyway).
+
     // RFC 3262 auto-PRACK for the B-leg side: when the B-leg sends a
     // reliable provisional response (`Require: 100rel` + `RSeq: <n>`),
     // the B2BUA must answer with a PRACK. We do that locally here using
-    // the B-leg dialog state so the A-leg sees an ordinary 1xx (the
-    // `Require`/`RSeq` headers are stripped in `sanitize_b2bua_response`).
+    // the B-leg dialog state so a non-100rel A-leg sees an ordinary 1xx (the
+    // `Require`/`RSeq` headers are stripped in `sanitize_b2bua_response` when
+    // the A-leg didn't advertise 100rel — preset-independent).
     // We don't track a client transaction for the PRACK — the B-leg's
     // 200 OK PRACK that comes back will hit the response handler with no
     // matching session and be dropped, which is the correct behavior here.
@@ -6446,6 +8472,28 @@ fn handle_b2bua_response(
                 // We DO want to fall through to the rest of the function so
                 // the 1xx still reaches the A-leg.
             } else {
+            // RFC 3262 §4 + RFC 3261 §12.1.2: a reliable provisional response
+            // establishes the early dialog, whose route set is THIS response's
+            // Record-Route reversed (UAC side). The confirmed-dialog route set
+            // isn't captured until the 200 OK, so without this the PRACK is built
+            // with no Route header and sent to the cached INVITE next-hop (e.g. an
+            // IMS I-CSCF that doesn't Record-Route and rejects the in-dialog PRACK
+            // with 406). Establish it once (§12.1.2 — not updated by later
+            // responses), so build_b2bua_prack and resolve_in_dialog_destination
+            // both pick the route-set first hop (the S-CSCF).
+            let early_routes = uac_route_set_from_record_routes(
+                &message.headers.get_all("Record-Route").cloned().unwrap_or_default(),
+            );
+            if !early_routes.is_empty() {
+                if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                    if let Some(leg) = call.b_legs.get_mut(idx) {
+                        if leg.dialog.route_set.is_empty() {
+                            leg.dialog.route_set = early_routes;
+                        }
+                    }
+                }
+            }
+
             // Pull CSeq num + method from the 1xx (it echoes the INVITE's).
             let response_cseq_num: u32 = message.headers.cseq()
                 .and_then(|c| c.split_whitespace().next())
@@ -6472,10 +8520,11 @@ fn handle_b2bua_response(
                 if let Some(prack) = prack {
                     if let Some((dest, transport)) = b_leg_dest {
                         // PRACK follows the early-dialog route set (RFC 3262 §4
-                        // + RFC 3261 §12.2.1.1). At reliable-1xx time the
-                        // confirmed-dialog route set (set on 200 OK) is
-                        // typically still empty; resolve_in_dialog_destination
-                        // falls back to the cached destination in that case.
+                        // + RFC 3261 §12.2.1.1), captured from this reliable
+                        // 1xx's Record-Route just above. When the 1xx carried no
+                        // Record-Route (direct B-leg, no proxies) the set is
+                        // empty and resolve_in_dialog_destination falls back to
+                        // the cached destination, which is correct there.
                         let leg_route_set = state.call_actors.get_call(call_id)
                             .and_then(|call| {
                                 call.b_legs.get(idx).map(|leg| leg.dialog.route_set.clone())
@@ -6538,7 +8587,7 @@ fn handle_b2bua_response(
                     // (RFC 3261 §12.2.1.1), with fallback to stored remote_contact.
                     let ack_uri = message.headers.get("Contact")
                         .or_else(|| message.headers.get("m"))
-                        .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
+                        .map(|c| crate::b2bua::actor::extract_contact_uri(c))
                         .and_then(|u| parse_uri_standalone(&u).ok())
                         .or_else(|| if is_a2b {
                             b_leg_remote_contact.as_deref()
@@ -6640,7 +8689,7 @@ fn handle_b2bua_response(
                     message,
                     &a_leg.dialog.call_id,
                     b_ftag,
-                    &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                    a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                     Some(&a_leg.dialog.local_tag),
                 );
             }
@@ -6676,7 +8725,7 @@ fn handle_b2bua_response(
             message.headers.set("CSeq", cseq.clone());
         }
 
-        sanitize_b2bua_response(message, state, resp_transport, call_id);
+        sanitize_b2bua_response(message, state, resp_transport, a_leg_supports_100rel, call_id);
 
         // RTPEngine: rewrite re-INVITE 2xx response SDP through answer.
         // Mirrors the offer processing done on the request side.
@@ -6734,7 +8783,7 @@ fn handle_b2bua_response(
                     // (RFC 3261 §12.2.1.1), with fallback to stored remote_contact.
                     let ack_uri = message.headers.get("Contact")
                         .or_else(|| message.headers.get("m"))
-                        .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
+                        .map(|c| crate::b2bua::actor::extract_contact_uri(c))
                         .and_then(|u| parse_uri_standalone(&u).ok())
                         .or_else(|| if is_a2b {
                             b_leg_remote_contact.as_deref()
@@ -6870,21 +8919,19 @@ fn handle_b2bua_response(
                     message,
                     &a_leg.dialog.call_id,
                     b_ftag,
-                    &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                    a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                     Some(&a_leg.dialog.local_tag),
                 );
             }
-        } else {
-            if let Some(call) = state.call_actors.get_call(call_id) {
-                if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
-                    crate::b2bua::actor::Dialog::rewrite_headers(
-                        message,
-                        &winner.dialog.call_id,
-                        a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
-                        &winner.dialog.local_tag,
-                        winner.dialog.remote_tag.as_deref(),
-                    );
-                }
+        } else if let Some(call) = state.call_actors.get_call(call_id) {
+            if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
+                crate::b2bua::actor::Dialog::rewrite_headers(
+                    message,
+                    &winner.dialog.call_id,
+                    a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                    &winner.dialog.local_tag,
+                    winner.dialog.remote_tag.as_deref(),
+                );
             }
         }
 
@@ -6894,7 +8941,7 @@ fn handle_b2bua_response(
             message.headers.set("CSeq", cseq.clone());
         }
 
-        sanitize_b2bua_response(message, state, resp_transport, call_id);
+        sanitize_b2bua_response(message, state, resp_transport, a_leg_supports_100rel, call_id);
 
         // RTPEngine answer for UPDATE 2xx with SDP body (codec/precondition
         // re-negotiation). Empty-body 2xx (session-timer refresh) bypasses.
@@ -6986,8 +9033,12 @@ fn handle_b2bua_response(
             Ok(()) => {
                 // Temporarily extract receiver to block on it.
                 // Safe: dispatcher processes messages sequentially.
+                // Skip stale CallEvent::Terminated from a superseded leg's
+                // actor (401/407/422 retry → replace_b_leg) — see
+                // recv_b_leg_classification_event for why consuming one here
+                // would misclassify the B-leg 200 OK as provisional.
                 if let Some((_, mut rx)) = state.call_event_receivers.remove(call_id) {
-                    let event = rx.blocking_recv();
+                    let event = recv_b_leg_classification_event(&mut rx);
                     state.call_event_receivers.insert(call_id.to_string(), rx);
                     event
                 } else {
@@ -7029,7 +9080,7 @@ fn handle_b2bua_response(
                         .or_else(|| message.headers.get("m"))
                     {
                         b_leg.dialog.remote_contact = Some(
-                            crate::b2bua::actor::extract_contact_uri(&contact),
+                            crate::b2bua::actor::extract_contact_uri(contact),
                         );
                     }
                 }
@@ -7083,13 +9134,13 @@ fn handle_b2bua_response(
             );
             // Re-send ACK to B-leg to stop retransmissions
             if let Some((b_dest, b_transport)) = b_leg_dest {
-                if let Some((ref b_cid, ref b_ftag)) = b_leg_dialog {
+                if let Some((ref b_cid, _b_ftag)) = b_leg_dialog {
                     // Build a clean ACK from scratch — do NOT clone the 200 OK
                     // (cloning leaks response headers like User-Agent, Contact,
                     // Allow, Supported, etc. from the remote UA).
                     let request_uri = message.headers.get("Contact")
                         .or_else(|| message.headers.get("m"))
-                        .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
+                        .map(|c| crate::b2bua::actor::extract_contact_uri(c))
                         .and_then(|u| parse_uri_standalone(&u).ok())
                         .or_else(|| b_leg_remote_contact.as_deref()
                             .and_then(|u| parse_uri_standalone(u).ok()))
@@ -7275,7 +9326,7 @@ fn handle_b2bua_response(
                 &mut response,
                 &a_leg.dialog.call_id,
                 b_ftag,
-                &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 Some(&a_leg.dialog.local_tag),
             );
             let _ = (b_cid,); // Call-ID already set by rewrite_dialog_headers
@@ -7304,7 +9355,7 @@ fn handle_b2bua_response(
             .unwrap_or_default();
 
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(&mut response, state, a_leg.transport.transport, call_id);
+        sanitize_b2bua_response(&mut response, state, a_leg.transport.transport, a_leg_supports_100rel, call_id);
 
         // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).
         // sanitize_b2bua_response strips all Record-Route (B-leg path). The A-leg
@@ -7323,8 +9374,7 @@ fn handle_b2bua_response(
             // B-leg route set from B-leg 200 OK Record-Route, reversed per RFC 3261
             // §12.1.1. Reversal MUST happen after flattening — multiple URIs sharing one
             // header line stay in wire order until then.
-            let mut b_routes = flatten_record_route_headers(&b_leg_record_routes);
-            b_routes.reverse();
+            let b_routes = uac_route_set_from_record_routes(&b_leg_record_routes);
             // A-leg route set from stored INVITE's Record-Route (in order for UAS)
             let a_routes = a_leg_invite.as_ref()
                 .and_then(|arc| arc.lock().ok())
@@ -7362,7 +9412,7 @@ fn handle_b2bua_response(
             if let Some((ref b_cid, ref _b_ftag)) = b_leg_dialog {
                 let ack_uri = message.headers.get("Contact")
                     .or_else(|| message.headers.get("m"))
-                    .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
+                    .map(|c| crate::b2bua::actor::extract_contact_uri(c))
                     .and_then(|u| parse_uri_standalone(&u).ok())
                     .or_else(|| b_leg_remote_contact.as_deref()
                         .and_then(|u| parse_uri_standalone(u).ok()))
@@ -7378,8 +9428,7 @@ fn handle_b2bua_response(
 
                 // Build B-leg Route set from Record-Route (reversed per RFC 3261 §12.2.1.1).
                 // Flatten BEFORE reversing — see flatten_record_route_headers comment.
-                let mut b_leg_routes = flatten_record_route_headers(&b_leg_record_routes);
-                b_leg_routes.reverse();
+                let b_leg_routes = uac_route_set_from_record_routes(&b_leg_record_routes);
 
                 let mut ack_builder = SipMessageBuilder::new()
                     .request(Method::Ack, ack_uri)
@@ -7622,7 +9671,7 @@ fn handle_b2bua_response(
                 message,
                 &a_leg.dialog.call_id,
                 b_ftag,
-                &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 Some(&a_leg.dialog.local_tag),
             );
         }
@@ -7639,7 +9688,7 @@ fn handle_b2bua_response(
             }
         }
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(message, state, a_leg.transport.transport, call_id);
+        sanitize_b2bua_response(message, state, a_leg.transport.transport, a_leg_supports_100rel, call_id);
         send_message(
             message.clone(),
             a_leg.transport.transport,
@@ -7670,11 +9719,22 @@ fn handle_b2bua_response(
                                 "B2BUA: 422 received, retrying with Session-Expires={min_se}"
                             );
 
-                            // Resolve target
-                            if let Some(relay_target) = resolve_target(target_uri, &state.dns_resolver) {
-                                let destination = relay_target.address;
-                                let b_leg_transport = b_leg_dest.map(|(_, t)| t).unwrap_or(Transport::Udp);
-                                let transport = relay_target.transport.unwrap_or(b_leg_transport);
+                            // RFC 5923 connection reuse: keep the higher-
+                            // Session-Expires retry on the SAME trunk member the
+                            // 422'd INVITE traversed, instead of re-resolving the
+                            // trunk hostname and round-robining onto a sibling
+                            // member (see select_b2bua_retry_destination).
+                            {
+                                let (destination, transport, reuse_connection_id, relay_target) =
+                                    match select_b2bua_retry_destination(
+                                        b_leg_dest,
+                                        b_leg_connection_id,
+                                        target_uri,
+                                        &state.dns_resolver,
+                                    ) {
+                                        Some(resolved) => resolved,
+                                        None => return,
+                                    };
 
                                 // Build retry INVITE from stored A-leg INVITE
                                 let Ok(original) = invite_arc.lock() else {
@@ -7723,27 +9783,48 @@ fn handle_b2bua_response(
                                 crate::b2bua::actor::Dialog::rewrite_headers(
                                     &mut retry,
                                     &retry_call_id,
-                                    &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                                    a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                                     &retry_from_tag,
                                     None,
                                 );
 
-                                let b_leg = Leg::new_b_leg(
+                                let mut b_leg = Leg::new_b_leg(
                                     retry_call_id,
                                     retry_from_tag,
                                     target_uri.clone(),
                                     new_branch,
                                     LegTransport {
                                         remote_addr: destination,
-                                        connection_id: ConnectionId::default(),
+                                        connection_id: reuse_connection_id,
                                         transport,
                                     },
                                 );
-                                state.call_actors.add_b_leg(call_id, b_leg.clone());
-                                spawn_b_leg_actor(call_id, &b_leg, state);
+                                // Stash the retry INVITE so a caller CANCEL during
+                                // alerting can rebuild the CANCEL from it (RFC 3261
+                                // §9.1 — same Via branch + CSeq). The original 422'd
+                                // leg's stash is discarded by the in-place supersede
+                                // below; without re-stashing here the live retry
+                                // transaction would be left un-cancellable.
+                                b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
+
+                                // RFC 4028: the 422'd INVITE transaction is complete,
+                                // so the higher-Session-Expires retry continues the
+                                // same logical B-leg — supersede in place rather than
+                                // append (see the 401/407 path for why appending
+                                // strands a dead leg that a later CANCEL hits).
+                                match b_leg_index {
+                                    Some(idx) => {
+                                        state.call_actors.replace_b_leg(call_id, idx, b_leg.clone());
+                                        spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
+                                    }
+                                    None => {
+                                        state.call_actors.add_b_leg(call_id, b_leg.clone());
+                                        spawn_b_leg_actor(call_id, &b_leg, state);
+                                    }
+                                }
 
                                 let data = Bytes::from(retry.to_bytes());
-                                send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
+                                send_to_target(data, &relay_target, transport, reuse_connection_id, state);
                             }
                             return; // don't forward 422 to A-leg or fire on_failure
                         }
@@ -7764,7 +9845,46 @@ fn handle_b2bua_response(
         // and only patching Via / RURI / Authorization (the old behaviour)
         // leaks every other A-leg header back to the B-leg.
         if status_code == 401 || status_code == 407 {
-            if let Some((username, password)) = &outbound_credentials {
+            // Cap credentialed retries per call. The per-leg dedup below stops a
+            // *retransmitted* challenge from spawning a duplicate INVITE, but a
+            // trunk that rejects every *fresh* credentialed attempt (wrong
+            // password, or a new nonce each time) would otherwise re-auth
+            // forever — each retry lands on a new branch, so there's no 482 to
+            // self-terminate the loop (that was the pre-dedup failure mode).
+            // Once MAX_B2BUA_AUTH_RETRIES credentialed INVITEs have gone out,
+            // treat a further challenge as a persistent auth failure: ACK it and
+            // surface the response upstream (fall through to @b2bua.on_failure +
+            // forward to the A-leg) instead of looping. The per-leg dedup makes
+            // this one-shot — retransmits of the surfaced challenge are absorbed.
+            if outbound_credentials.is_some()
+                && state.call_actors.auth_retry_count(call_id) >= MAX_B2BUA_AUTH_RETRIES
+            {
+                if let Some((b_dest, b_transport)) = b_leg_dest {
+                    let ack = build_b2bua_ack_for_non2xx(
+                        message,
+                        branch,
+                        b_leg_target.as_deref(),
+                        b_transport,
+                        &state.via_host(&b_transport),
+                        state.via_port(&b_transport),
+                    );
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                }
+                let first = b_leg_index
+                    .map(|idx| state.call_actors.try_mark_auth_challenged(call_id, idx))
+                    .unwrap_or(true);
+                if !first {
+                    // Retransmit of an already-surfaced challenge — absorb.
+                    return;
+                }
+                warn!(
+                    call_id = %call_id,
+                    status = status_code,
+                    limit = MAX_B2BUA_AUTH_RETRIES,
+                    "B2BUA: outbound auth retry limit reached — surfacing {status_code} upstream instead of re-authing"
+                );
+                // fall through to the failure path (on_failure + forward to A-leg)
+            } else if let Some((username, password)) = &outbound_credentials {
                 let challenge_header = if status_code == 401 {
                     message.headers.get("WWW-Authenticate")
                 } else {
@@ -7774,6 +9894,59 @@ fn handle_b2bua_response(
                 if let Some(challenge_value) = challenge_header {
                     if let Some(challenge) = crate::auth::parse_challenge(challenge_value) {
                         if let (Some(target_uri), Some(stored_invite_arc)) = (&b_leg_target, &b_leg_stored_invite) {
+                            // RFC 3261 §17.1.1.3: the INVITE client transaction
+                            // MUST ACK every non-2xx final response on the branch
+                            // it arrived on — the first 401/407 AND every
+                            // retransmit. The trunk's server transaction keeps
+                            // retransmitting the challenge until this ACK lands;
+                            // skipping it (the old behaviour — this path returned
+                            // before the non-2xx ACK below) leaves the trunk
+                            // retransmitting until Timer B and feeds the re-retry
+                            // bug guarded against next.
+                            if let Some((b_dest, b_transport)) = b_leg_dest {
+                                let ack = build_b2bua_ack_for_non2xx(
+                                    message,
+                                    branch,
+                                    b_leg_target.as_deref(),
+                                    b_transport,
+                                    &state.via_host(&b_transport),
+                                    state.via_port(&b_transport),
+                                );
+                                send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                            }
+
+                            // Only the FIRST challenge on this leg drives a retry.
+                            // A retransmitted 401/407 on the same branch is the
+                            // trunk re-sending its non-2xx (we just re-ACKed it),
+                            // NOT a fresh challenge. Re-challenging would emit a
+                            // second authenticated INVITE at the same CSeq on a
+                            // new branch; the trunk sees a merged request
+                            // (RFC 3261 §8.2.2.2) and replies 482, and we end up
+                            // with two outstanding UAC branches where the real
+                            // 2xx lands on the first while our state tracks the
+                            // second — the 2xx then never gets ACKed and the
+                            // trunk BYEs the call. A chained re-challenge (stale
+                            // nonce) lands on the *retry* leg's branch, a distinct
+                            // B-leg, so legitimate re-auth still proceeds.
+                            let first_challenge = b_leg_index
+                                .map(|idx| state.call_actors.try_mark_auth_challenged(call_id, idx))
+                                .unwrap_or(true);
+                            if !first_challenge {
+                                debug!(
+                                    call_id = %call_id,
+                                    branch = %branch,
+                                    status = status_code,
+                                    "B2BUA: absorbing retransmitted challenge (auth retry already sent on this leg)"
+                                );
+                                return;
+                            }
+
+                            // Count this committed credentialed retry against the
+                            // per-call cap checked at the top of the 401/407
+                            // block. Placed after the per-leg dedup so retransmits
+                            // (which returned above) never inflate the count.
+                            state.call_actors.incr_auth_retry_count(call_id);
+
                             // RFC 7616 §3.3: nc starts at 1 for a fresh server
                             // nonce and increments on every reuse. The
                                 // per-call NonceCounter resets internally when
@@ -7814,11 +9987,25 @@ fn handle_b2bua_response(
                                 None,
                             );
 
-                            // Resolve target
-                            if let Some(relay_target) = resolve_target(target_uri, &state.dns_resolver) {
-                                let destination = relay_target.address;
-                                let b_leg_transport = b_leg_dest.map(|(_, t)| t).unwrap_or(Transport::Udp);
-                                let transport = relay_target.transport.unwrap_or(b_leg_transport);
+                            // RFC 5923 connection reuse: keep the authenticated
+                            // retry on the SAME trunk member the CSeq-1 INVITE
+                            // (and its 401 + nonce) traversed, instead of
+                            // re-resolving the trunk hostname and round-robining
+                            // onto a sibling member that never issued the nonce.
+                            // See select_b2bua_retry_destination for the full
+                            // rationale; it falls back to a fresh DNS resolution
+                            // only when the leg has no recorded destination.
+                            {
+                                let (destination, transport, reuse_connection_id, relay_target) =
+                                    match select_b2bua_retry_destination(
+                                        b_leg_dest,
+                                        b_leg_connection_id,
+                                        target_uri,
+                                        &state.dns_resolver,
+                                    ) {
+                                        Some(resolved) => resolved,
+                                        None => return,
+                                    };
 
                                 // Build retry from the stored, hygiene-processed B-leg INVITE.
                                 // Call-ID, From-tag, From-host, To, RURI, Contact, User-Agent,
@@ -7861,7 +10048,7 @@ fn handle_b2bua_response(
                                     new_branch,
                                     LegTransport {
                                         remote_addr: destination,
-                                        connection_id: ConnectionId::default(),
+                                        connection_id: reuse_connection_id,
                                         transport,
                                     },
                                 );
@@ -7884,11 +10071,30 @@ fn handle_b2bua_response(
                                 // (e.g. nonce stale) rebuilds from the right snapshot.
                                 b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
 
-                                state.call_actors.add_b_leg(call_id, b_leg.clone());
-                                spawn_b_leg_actor(call_id, &b_leg, state);
+                                // RFC 3261 §9.1: the CSeq-1 INVITE transaction is
+                                // complete after its 401/407 + ACK, so the retry is
+                                // the *same* logical B-leg continuing with credentials
+                                // — supersede the failed leg in place rather than
+                                // appending. Appending leaves the dead leg in
+                                // `b_legs`, so a later CANCEL fans out to its
+                                // already-final-responded transaction too (→ a
+                                // spurious 481). `b_leg_index` is the slot the
+                                // challenged response matched; it is always Some here
+                                // (a B-leg response only reaches this path with a
+                                // matched leg), but fall back to append defensively.
+                                match b_leg_index {
+                                    Some(idx) => {
+                                        state.call_actors.replace_b_leg(call_id, idx, b_leg.clone());
+                                        spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
+                                    }
+                                    None => {
+                                        state.call_actors.add_b_leg(call_id, b_leg.clone());
+                                        spawn_b_leg_actor(call_id, &b_leg, state);
+                                    }
+                                }
 
                                 let data = Bytes::from(retry.to_bytes());
-                                send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
+                                send_to_target(data, &relay_target, transport, reuse_connection_id, state);
                             }
                             return; // don't forward 401/407 to A-leg or fire on_failure
                         }
@@ -7956,7 +10162,8 @@ fn handle_b2bua_response(
                 branch,
                 b_leg_target.as_deref(),
                 b_transport,
-                state.local_addr,
+                &state.via_host(&b_transport),
+                state.via_port(&b_transport),
             );
             send_b2bua_to_bleg(ack, b_transport, b_dest, state);
         }
@@ -7967,7 +10174,7 @@ fn handle_b2bua_response(
                 message,
                 &a_leg.dialog.call_id,
                 b_ftag,
-                &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 Some(&a_leg.dialog.local_tag),
             );
         }
@@ -7985,7 +10192,7 @@ fn handle_b2bua_response(
             }
         }
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(message, state, a_leg.transport.transport, call_id);
+        sanitize_b2bua_response(message, state, a_leg.transport.transport, a_leg_supports_100rel, call_id);
         send_message(
             message.clone(),
             a_leg.transport.transport,
@@ -8038,6 +10245,133 @@ fn schedule_zombie_reinvite_cleanup(call_actors: &crate::b2bua::actor::CallActor
                 zombie_map.remove(&key);
             }
         });
+    }
+}
+
+/// Expire post-CANCEL glare entries after 32 s (Timer H / 64·T1).
+///
+/// Unlike [`schedule_zombie_reinvite_cleanup`], this removes from the *shared*
+/// store via the `Arc` rather than from a `DashMap` clone, so entries that
+/// never see a racing 2xx (the CANCEL won the race) are still reaped.
+fn schedule_zombie_cancelled_cleanup(call_actors: Arc<crate::b2bua::actor::CallActorStore>) {
+    let keys: Vec<String> = call_actors
+        .zombie_cancelled
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    if keys.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+        for key in keys {
+            call_actors.zombie_cancelled.remove(&key);
+        }
+    });
+}
+
+/// Build an ACK for a 2xx INVITE response on a B2BUA B-leg (RFC 3261 §13.2.2.4).
+///
+/// The ACK for a 2xx is its own transaction: a fresh Via branch, R-URI set to
+/// the response's Contact (the remote target), and the INVITE's CSeq number
+/// with method ACK. From / To / Call-ID are echoed from the 2xx (its To already
+/// carries the remote tag).
+///
+/// Pure w.r.t. dispatcher state — the caller supplies the local `via_host` /
+/// `via_port` (from `DispatcherState::via_host`/`via_port`) so this is directly
+/// unit-testable.
+fn build_b2bua_ack_for_2xx(
+    response: &SipMessage,
+    transport: Transport,
+    via_host: &str,
+    via_port: u16,
+) -> Option<SipMessage> {
+    let request_uri = response.headers.get("Contact")
+        .map(|c| crate::b2bua::actor::extract_contact_uri(c))
+        .and_then(|u| parse_uri_standalone(&u).ok())
+        .unwrap_or_else(|| SipUri::new("invalid".to_string()));
+    let transport_str = format!("{}", transport).to_uppercase();
+    let cseq_num = response.headers.cseq()
+        .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
+        .unwrap_or_else(|| "1".to_string());
+    let from = response.headers.from().cloned().unwrap_or_default();
+    let to = response.headers.to().cloned().unwrap_or_default();
+    let call_id = response.headers.call_id().map(|s| s.to_string()).unwrap_or_default();
+    match SipMessageBuilder::new()
+        .request(Method::Ack, request_uri)
+        .via(format!(
+            "SIP/2.0/{} {}:{};branch={}",
+            transport_str,
+            via_host,
+            via_port,
+            TransactionKey::generate_branch(),
+        ))
+        .from(from.to_string())
+        .to(to.to_string())
+        .call_id(call_id)
+        .cseq(format!("{} ACK", cseq_num))
+        .header("Max-Forwards", "70".to_string())
+        .content_length(0)
+        .build()
+    {
+        Ok(ack) => Some(ack),
+        Err(error) => {
+            warn!("B2BUA: failed to build ACK for raced 2xx: {error}");
+            None
+        }
+    }
+}
+
+/// Handle a 2xx that raced an outbound CANCEL (RFC 3261 §9.1 glare).
+///
+/// The callee answered the B-leg INVITE before our CANCEL landed, so the 2xx
+/// established a dialog even though the call is gone. ACK it (§13.2.2.4) to stop
+/// the 200 OK retransmissions, then — on the first 2xx only — BYE it (§15) to
+/// release the session. All dialog state comes from the captured leg plus this
+/// response (the remote tag / Contact were unknown when the INVITE was CANCELled).
+fn handle_zombie_cancelled_2xx(
+    mut leg: crate::b2bua::actor::Leg,
+    first_2xx: bool,
+    response: &SipMessage,
+    state: &DispatcherState,
+) {
+    let transport = leg.transport.transport;
+    let destination = leg.transport.remote_addr;
+
+    // ACK the 2xx on every match — a lost ACK leaves the callee retransmitting.
+    if let Some(ack) = build_b2bua_ack_for_2xx(
+        response,
+        transport,
+        &state.via_host(&transport),
+        state.via_port(&transport),
+    ) {
+        send_b2bua_to_bleg(ack, transport, destination, state);
+    }
+
+    if !first_2xx {
+        return; // retransmit — re-ACK only; the BYE already went out.
+    }
+
+    // Fill the remote dialog identity from the 2xx (unknown at CANCEL time).
+    if let Some(tag) = crate::b2bua::actor::extract_to_tag(response) {
+        leg.dialog.remote_tag = Some(tag);
+    }
+    if let Some(contact) = response.headers.get("Contact") {
+        leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(contact));
+    }
+    // The BYE CSeq must exceed the INVITE's; derive it from the 2xx's CSeq.
+    let invite_cseq = response.headers.cseq()
+        .and_then(|c| c.split_whitespace().next())
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(leg.dialog.local_cseq);
+    leg.dialog.local_cseq = invite_cseq.saturating_add(1);
+
+    if let Some(bye) = build_b2bua_bye(&leg, state) {
+        send_b2bua_to_bleg(bye, transport, destination, state);
+        debug!(
+            sip_call_id = %leg.dialog.call_id,
+            "B2BUA: ACK+BYE for a 2xx that raced our CANCEL (RFC 3261 §9.1 glare)"
+        );
     }
 }
 
@@ -8358,7 +10692,7 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     // Rewrite From URI host to our advertised address (topology hiding)
     let b2bua_host = state.via_host(&b_leg.transport.transport);
     if let Some(from) = reinvite.headers.get("From").or_else(|| reinvite.headers.get("f")) {
-        reinvite.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
+        reinvite.headers.set("From", crate::b2bua::actor::rewrite_uri_host(from, &b2bua_host));
     }
 
     // Regenerate CSeq for B-leg dialog
@@ -8611,7 +10945,7 @@ fn handle_b2bua_reinvite(
     };
 
     // Per-leg Contact URIs for RURI and Contact rewriting (RFC 3261 §12.2.1.1)
-    let (target_remote_contact, target_local_contact, target_remote_aor_host) = if from_a_leg {
+    let (target_remote_contact, target_local_contact, _target_remote_aor_host) = if from_a_leg {
         // A→B: target is B-leg
         winner_b_leg.as_ref().map(|b| (b.dialog.remote_contact.clone(), b.dialog.local_contact.clone(), b.dialog.remote_aor_host.clone()))
             .unwrap_or((None, None, None))
@@ -8865,6 +11199,15 @@ fn handle_b2bua_reinvite(
             forwarded.headers.set("Contact", contact.clone());
         }
 
+        // In-dialog requests follow the dialog route set (RFC 3261 §12.2.1.1):
+        // send to the route-set first hop, not the cached INVITE next-hop. In an
+        // IMS topology the INVITE was sent to a non-Record-Routing I-CSCF while
+        // the dialog routes via the S-CSCF, so the cached leg destination is the
+        // wrong target for an in-dialog re-INVITE (mirrors the PRACK/ACK/BYE
+        // paths). Falls back to the cached destination when there is no route set.
+        let (send_dest, send_transport) =
+            resolve_in_dialog_destination(&target_route_set, state, destination, transport);
+
         // Track the re-INVITE branch → call_id for response routing.
         // Encode the direction so the response handler knows where to relay.
         // Store the originator's Via(s) so we can restore them on the response.
@@ -8878,16 +11221,16 @@ fn handle_b2bua_reinvite(
             direction.to_string(),
             branch.clone(),
             LegTransport {
-                remote_addr: destination,
+                remote_addr: send_dest,
                 connection_id: ConnectionId::default(),
-                transport,
+                transport: send_transport,
             },
         );
         reinvite_leg.stored_vias = originator_vias;
         reinvite_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
         state.call_actors.add_b_leg(&call_id, reinvite_leg);
 
-        send_b2bua_to_bleg(forwarded, transport, destination, state);
+        send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
 
         // Increment the target leg's local CSeq after sending the re-INVITE
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
@@ -9145,6 +11488,15 @@ fn handle_b2bua_update(
             forwarded.headers.set("Contact", contact.clone());
         }
 
+        // In-dialog requests follow the dialog route set (RFC 3261 §12.2.1.1):
+        // send to the route-set first hop, not the cached INVITE next-hop. In an
+        // IMS topology the INVITE was sent to a non-Record-Routing I-CSCF while
+        // the dialog routes via the S-CSCF, so the cached leg destination is the
+        // wrong target for an in-dialog UPDATE (mirrors the PRACK/ACK/BYE paths).
+        // Falls back to the cached destination when there is no route set.
+        let (send_dest, send_transport) =
+            resolve_in_dialog_destination(&target_route_set, state, destination, transport);
+
         // Track the UPDATE branch under "update:" so the response handler
         // routes the cross-leg response correctly without colliding with a
         // concurrent re-INVITE on the same dialog.
@@ -9158,16 +11510,16 @@ fn handle_b2bua_update(
             direction.to_string(),
             branch.clone(),
             LegTransport {
-                remote_addr: destination,
+                remote_addr: send_dest,
                 connection_id: ConnectionId::default(),
-                transport,
+                transport: send_transport,
             },
         );
         update_leg.stored_vias = originator_vias;
         update_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
         state.call_actors.add_b_leg(&call_id, update_leg);
 
-        send_b2bua_to_bleg(forwarded, transport, destination, state);
+        send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
 
         // Bump local CSeq on the target leg after sending.
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
@@ -9617,8 +11969,119 @@ fn handle_srs_bye(
 mod tests {
     use super::*;
     use crate::sip::message::Method;
+    use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    #[test]
+    fn collect_route_set_splits_lines_and_top_level_commas() {
+        let mut message = SipMessageBuilder::new()
+            .request(Method::Register, SipUri::new("example.com".to_string()))
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-reg-x".to_string())
+            .to("<sip:alice@example.com>".to_string())
+            .from("<sip:alice@example.com>;tag=t".to_string())
+            .call_id("c".to_string())
+            .cseq("1 REGISTER".to_string())
+            .content_length(0)
+            .build()
+            .expect("builds");
+
+        // One plain header line and one comma-folded line → three route values,
+        // with the comma inside <...> of a uri-param left untouched.
+        message.headers.set_all(
+            "Service-Route",
+            vec![
+                "<sip:scscf1.example.com;lr>".to_string(),
+                "<sip:scscf2.example.com;lr>, <sip:scscf3.example.com;lr>".to_string(),
+            ],
+        );
+
+        let routes = collect_route_set(&message, "Service-Route");
+        assert_eq!(
+            routes,
+            vec![
+                "<sip:scscf1.example.com;lr>".to_string(),
+                "<sip:scscf2.example.com;lr>".to_string(),
+                "<sip:scscf3.example.com;lr>".to_string(),
+            ]
+        );
+
+        // Missing header → empty.
+        assert!(collect_route_set(&message, "P-Associated-URI").is_empty());
+    }
+
+    #[test]
+    fn build_dereg_register_has_expires_zero_routes_and_aor() {
+        let destination = "192.0.2.5:6060".parse().unwrap();
+        let routes = vec!["<sip:scscf.example.com:6060;lr>".to_string()];
+        let message = build_dereg_register(
+            "sip:alice@example.com",
+            "sip:alice@10.0.0.1:5060",
+            &routes,
+            destination,
+        )
+        .expect("de-REGISTER builds");
+        let wire = String::from_utf8(message.to_bytes()).unwrap();
+
+        // R-URI is the registrar domain (AoR host), not the contact.
+        assert!(
+            wire.starts_with("REGISTER sip:example.com SIP/2.0\r\n"),
+            "request line wrong:\n{wire}"
+        );
+        assert!(wire.contains("Expires: 0\r\n"), "missing Expires: 0:\n{wire}");
+        assert!(
+            wire.contains("Contact: <sip:alice@10.0.0.1:5060>;expires=0"),
+            "missing deregistering Contact:\n{wire}"
+        );
+        assert!(
+            wire.contains("Route: <sip:scscf.example.com:6060;lr>"),
+            "missing Service-Route:\n{wire}"
+        );
+        assert!(wire.contains("To: <sip:alice@example.com>"), "missing To:\n{wire}");
+        assert!(
+            wire.contains("From: <sip:alice@example.com>;tag=liveness-"),
+            "missing From with liveness tag:\n{wire}"
+        );
+        assert!(wire.contains("CSeq: 1 REGISTER"), "missing CSeq:\n{wire}");
+        // Must carry the integrity-protected marker so the S-CSCF skips the
+        // IMS-AKA re-challenge (TS 24.229 §5.4.1.2.2) and actually completes
+        // the de-registration.
+        assert!(
+            wire.contains("integrity-protected=\"ip-assoc-yes\""),
+            "missing integrity-protected marker in Authorization:\n{wire}"
+        );
+        assert!(
+            wire.contains("Authorization: Digest username=\"alice@example.com\""),
+            "Authorization username should be the IMPI-shaped public id:\n{wire}"
+        );
+    }
+
+    #[test]
+    fn transport_from_name_maps_known_transports_else_udp() {
+        assert!(matches!(transport_from_name(Some("tcp")), Transport::Tcp));
+        assert!(matches!(transport_from_name(Some("TLS")), Transport::Tls));
+        assert!(matches!(transport_from_name(Some("ws")), Transport::WebSocket));
+        assert!(matches!(
+            transport_from_name(Some("WSS")),
+            Transport::WebSocketSecure
+        ));
+        assert!(matches!(transport_from_name(Some("udp")), Transport::Udp));
+        // Unknown / absent transport falls back to UDP.
+        assert!(matches!(transport_from_name(None), Transport::Udp));
+        assert!(matches!(transport_from_name(Some("sctp")), Transport::Udp));
+    }
+
+    #[test]
+    fn parse_route_uri_strips_brackets_and_keeps_hostport() {
+        let uri = parse_route_uri("<sip:scscf.example.com:6060;lr>").expect("parses");
+        assert_eq!(uri.host, "scscf.example.com");
+        assert_eq!(uri.port, Some(6060));
+
+        let secure = parse_route_uri("  <sips:scscf2.example.com;lr>  ").expect("parses");
+        assert_eq!(secure.scheme, "sips");
+        assert_eq!(secure.host, "scscf2.example.com");
+        assert_eq!(secure.port, None);
+    }
 
     #[test]
     fn drain_state_default_counts_zero_when_managers_unset() {
@@ -9666,6 +12129,48 @@ mod tests {
     }
 
     #[test]
+    fn uac_route_set_from_record_routes_flattens_and_reverses() {
+        // Mix of one-URI-per-line and a comma-joined multi-URI line (RFC 3261
+        // §7.3.1). The UAC route set is the responder's Record-Route in reverse
+        // wire order (RFC 3261 §12.1.2), computed after flattening.
+        let record_routes = vec![
+            "<sip:p1.example.com;lr>, <sip:p2.example.com;lr>".to_string(),
+            "<sip:p3.example.com;lr>".to_string(),
+        ];
+        let route_set = uac_route_set_from_record_routes(&record_routes);
+        assert_eq!(
+            route_set,
+            vec![
+                "<sip:p3.example.com;lr>".to_string(),
+                "<sip:p2.example.com;lr>".to_string(),
+                "<sip:p1.example.com;lr>".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn uac_route_set_from_record_routes_empty() {
+        assert!(uac_route_set_from_record_routes(&[]).is_empty());
+    }
+
+    #[test]
+    fn early_dialog_route_set_first_hop_is_proxy_not_cached_next_hop() {
+        // Regression for the B2BUA auto-PRACK 406: a reliable 183 arrives via the
+        // S-CSCF, which Record-Routes. The early-dialog route set must be derived
+        // from THIS response's Record-Route so the PRACK's Route header and
+        // resolve_in_dialog_destination both target the S-CSCF — not the cached
+        // INVITE next-hop (an IMS I-CSCF that doesn't Record-Route and rejects the
+        // in-dialog PRACK with 406, killing the 100rel handshake).
+        let record_routes = vec!["<sip:scscf.ims.example.com:6060;lr;transport=udp>".to_string()];
+        let route_set = uac_route_set_from_record_routes(&record_routes);
+        assert_eq!(
+            first_route_uri(&route_set).as_deref(),
+            Some("sip:scscf.ims.example.com:6060;lr;transport=udp"),
+            "PRACK must follow the early-dialog route set to the S-CSCF",
+        );
+    }
+
+    #[test]
     fn first_route_uri_empty_route_set() {
         assert!(first_route_uri(&[]).is_none());
     }
@@ -9689,6 +12194,109 @@ mod tests {
         ];
         let uri = first_route_uri(&route_set);
         assert_eq!(uri.as_deref(), Some("sip:first.example.com;lr"));
+    }
+
+    fn ack_request_with_route(route: Option<&str>) -> SipMessage {
+        let ruri = parse_uri_standalone("sip:5111@100.65.0.2:7000").unwrap();
+        let mut builder = SipMessageBuilder::new()
+            .request(Method::Ack, ruri)
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-e2e-ack".to_string())
+            .to("<sip:5111@ims.example.com>;tag=uas-tag".to_string())
+            .from("<sip:trunk@example.com>;tag=uac-tag".to_string())
+            .call_id("ack-e2e-route-set".to_string())
+            .cseq("1 ACK".to_string())
+            .content_length(0);
+        if let Some(route) = route {
+            builder = builder.header("Route", route.to_string());
+        }
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn ack_next_hop_prefers_remaining_route_over_ruri() {
+        // The end-to-end 2xx ACK must follow the dialog route set: when a Route
+        // remains (after the proxy popped its own), that Route is the next hop —
+        // NOT the Request-URI (the UE Contact) and NOT the cached INVITE branch.
+        let ack = ack_request_with_route(Some(
+            "<sip:172.16.0.101:5060;transport=udp;lr>, <sip:172.16.0.101:5060;transport=tcp;lr>",
+        ));
+        let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("ACK has a next hop");
+        let parsed = parse_uri_standalone(&next_hop).unwrap();
+        assert_eq!(parsed.host, "172.16.0.101");
+        assert_eq!(parsed.port, Some(5060));
+        assert_ne!(
+            parsed.host, "100.65.0.2",
+            "must not short-circuit the ACK to the Request-URI when a Route remains",
+        );
+    }
+
+    #[test]
+    fn ack_next_hop_falls_back_to_ruri_when_route_set_empty() {
+        // No Route header → the next hop is the Request-URI (the remote target),
+        // resolved per RFC 3261 §16.12 — still derived from the message, never
+        // the cached INVITE branch destination.
+        let ack = ack_request_with_route(None);
+        let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line);
+        let ruri = parse_uri_standalone("sip:5111@100.65.0.2:7000").unwrap();
+        assert_eq!(next_hop, Some(ruri.to_string()));
+    }
+
+    #[test]
+    fn ack_2xx_follows_route_set_after_popping_self() {
+        // Field regression (siphon as S-CSCF): the 2xx ACK arrives with a route
+        // set of [S-CSCF (self), P-CSCF]. After loose-routing pops our own top
+        // Route, the next hop is the P-CSCF — not the cached INVITE branch (which
+        // pointed at a non-Record-Routing MMTel-AS) and not the UE Contact in the
+        // Request-URI. The cached-branch path mis-delivered the ACK so the UAS
+        // never confirmed the dialog.
+        let mut ack = ack_request_with_route(Some(
+            "<sip:172.16.0.121:6060;lr>, <sip:172.16.0.101:5060;transport=udp;lr>",
+        ));
+
+        // Mirror handle_ack_via_session: pop our own (top) Route entry.
+        assert!(core::check_loose_route(&ack.headers));
+        core::pop_top_route(&mut ack.headers);
+
+        let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
+        let parsed = parse_uri_standalone(&next_hop).unwrap();
+        assert_eq!(
+            parsed.host, "172.16.0.101",
+            "ACK must follow the dialog route set to the P-CSCF",
+        );
+        assert_eq!(parsed.port, Some(5060));
+        assert_ne!(
+            parsed.host, "100.65.0.2",
+            "ACK must not short-circuit to the UE Contact in the Request-URI",
+        );
+    }
+
+    #[test]
+    fn ack_2xx_consumes_double_self_record_route_then_follows_route_set() {
+        // Transport-bridging double Record-Route: siphon appears twice at the
+        // top of the dialog route set, followed by the real next hop (P-CSCF).
+        // Consuming only the top self-Route would leave our own second Route as
+        // the apparent next hop — a routing loop. The ACK must consume both
+        // self-Routes (via pop_local_routes) and forward to the P-CSCF, exactly
+        // as loose_route() does for the in-dialog BYE on this dialog.
+        let local_domains = vec!["172.16.0.121".to_string()];
+        let mut ack = ack_request_with_route(Some(
+            "<sip:172.16.0.121:6060;transport=tcp;lr>, \
+             <sip:172.16.0.121:6060;transport=udp;lr>, \
+             <sip:172.16.0.101:5060;transport=udp;lr>",
+        ));
+
+        // Mirror handle_ack_via_session's route consumption.
+        assert!(core::check_loose_route(&ack.headers));
+        core::pop_top_route(&mut ack.headers);
+        core::pop_local_routes(&mut ack.headers, &local_domains);
+
+        let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
+        let parsed = parse_uri_standalone(&next_hop).unwrap();
+        assert_eq!(
+            parsed.host, "172.16.0.101",
+            "ACK must skip our own double Record-Route and follow the route set",
+        );
+        assert_eq!(parsed.port, Some(5060));
     }
 
     #[test]
@@ -10160,6 +12768,165 @@ a=rtpmap:8 PCMA/8000\r\n";
         assert_eq!(retry.body, original.body);
     }
 
+    /// The B2BUA must ACK a 401/407 on the outbound leg before (and while)
+    /// retrying with credentials — RFC 3261 §17.1.1.3. Prior to the fix the
+    /// 401-retry path returned without ever building this ACK, so the trunk
+    /// kept retransmitting the challenge. The ACK must reuse the original
+    /// INVITE's Via branch (hop-by-hop) and carry the UAS To-tag from the 401.
+    ///
+    /// Critically, the ACK's Via sent-by host:port must be the *advertised*
+    /// address the INVITE went out with — not the internal bind address — or
+    /// the trunk's server transaction can't match the ACK (RFC 3261 §17.2.3)
+    /// and keeps retransmitting its 401 on Timer G.  The caller passes
+    /// `state.via_host`/`via_port` (advertised); behind NAT/edge that differs
+    /// from the bind address.
+    #[test]
+    fn build_b2bua_ack_for_401_uses_invite_branch_and_response_to_tag() {
+        let response = SipMessageBuilder::new()
+            .response(401, "Unauthorized".to_string())
+            .via("SIP/2.0/UDP 203.0.113.7:5060;branch=z9hG4bK-orig".to_string())
+            .from("<sip:alice@siphon.example.org>;tag=b-leg-from".to_string())
+            .to("<sip:bob@trunk.example.net>;tag=uas-12345".to_string())
+            .call_id("b2b-aaaa-bbbb".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        // Advertised (public) address the B-leg INVITE used in its Via.  An
+        // internal bind address (e.g. 10.x) would be a *different* value — the
+        // regression was that the ACK leaked the internal one.
+        let advertised_host = "203.0.113.7";
+        let advertised_port = 5060;
+        let ack = build_b2bua_ack_for_non2xx(
+            &response,
+            "z9hG4bK-orig",
+            Some("sip:bob@trunk.example.net"),
+            Transport::Udp,
+            advertised_host,
+            advertised_port,
+        );
+
+        // Method line is ACK to the dial target.
+        match &ack.start_line {
+            StartLine::Request(rl) => {
+                assert_eq!(rl.method, Method::Ack);
+                assert_eq!(rl.request_uri.host, "trunk.example.net");
+            }
+            _ => panic!("expected an ACK request line"),
+        }
+
+        // Same Via branch as the INVITE it acknowledges, and the advertised
+        // sent-by host:port (RFC 3261 §17.1.1.3 / §17.2.3).
+        assert_eq!(
+            ack.headers.via().unwrap(),
+            "SIP/2.0/UDP 203.0.113.7:5060;branch=z9hG4bK-orig"
+        );
+        // To header carries the UAS tag from the 401 — without it the trunk's
+        // server transaction would not match the ACK.
+        assert!(ack.headers.to().unwrap().contains("tag=uas-12345"));
+        // CSeq number echoes the INVITE; method becomes ACK.
+        assert_eq!(ack.headers.cseq().unwrap(), "1 ACK");
+        assert_eq!(ack.headers.call_id().unwrap(), "b2b-aaaa-bbbb");
+    }
+
+    /// Regression: an outbound INVITE to an authenticating trunk draws a 401,
+    /// is ACKed, and re-sent with credentials on a new branch + CSeq. The retry
+    /// supersedes the failed B-leg in place (`replace_b_leg`), dropping the old
+    /// leg's actor handle — so that actor exits and emits `CallEvent::Terminated`
+    /// onto the SHARED per-call event channel. The dispatcher block-recvs that
+    /// channel to classify each response; consuming the stale `Terminated` as a
+    /// classification desynced the stream so the live retry leg's 200 OK was
+    /// read as the previous 18x's `Provisional` event. That skipped
+    /// `set_winner` + the deferred B-leg ACK, leaving the trunk's 200 OK unacked
+    /// until the dialog collapsed (BYE storm ~5 s after answer).
+    ///
+    /// `recv_b_leg_classification_event` must skip the stale `Terminated` and
+    /// return the live leg's `Answered` for the 200 OK.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b_leg_200_classifies_as_answered_after_auth_retry_supersede() {
+        use crate::b2bua::actor::{Leg, LegActor, LegMessage, TransportInfo as LegTransport};
+        use crate::transport::{ConnectionId, Transport};
+
+        // The shared per-call channel, mirroring CallActor.event_tx and the
+        // dispatcher's call_event_receivers entry.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<CallEvent>(64);
+
+        let transport = LegTransport {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        };
+
+        // CSeq-1 B-leg: drew the 401 and is now superseded. Dropping its handle
+        // closes the actor's mailbox, so the actor exits and pushes a
+        // CallEvent::Terminated onto the shared channel — the stale event that
+        // used to desync the classifier.
+        let cseq1 = Leg::new_b_leg(
+            "b2b-supersede-desync@test".to_string(),
+            "from-tag-1".to_string(),
+            "sip:bob@10.0.0.2:5060".to_string(),
+            "z9hG4bK-cseq1-desync".to_string(),
+            transport.clone(),
+        );
+        let (actor1, handle1) = LegActor::new(cseq1, event_tx.clone());
+        let actor1_task = tokio::spawn(actor1.run());
+        drop(handle1);
+        // Await the old actor so its Terminated is on the channel ahead of the
+        // live leg's Answered — the ordering that triggered the bug.
+        actor1_task.await.unwrap();
+
+        // CSeq-2 B-leg (the live retry). Its 200 OK must classify as Answered.
+        let cseq2 = Leg::new_b_leg(
+            "b2b-supersede-desync@test".to_string(),
+            "from-tag-2".to_string(),
+            "sip:bob@10.0.0.2:5060".to_string(),
+            "z9hG4bK-cseq2-desync".to_string(),
+            transport.clone(),
+        );
+        let (actor2, handle2) = LegActor::new(cseq2, event_tx.clone());
+        let actor2_task = tokio::spawn(actor2.run());
+
+        let ok_200 = parse_sip_message(concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-cseq2-desync\r\n",
+            "From: <sip:alice@10.0.0.1>;tag=from-tag-2\r\n",
+            "To: <sip:bob@10.0.0.2>;tag=uas-2\r\n",
+            "Call-ID: b2b-supersede-desync@test\r\n",
+            "CSeq: 2 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ))
+        .expect("200 OK fixture parses")
+        .1;
+        handle2
+            .tx
+            .send(LegMessage::SipInbound {
+                message: ok_200,
+                source: transport,
+            })
+            .await
+            .unwrap();
+
+        // The channel now holds [Terminated (stale), Answered]. The classifier
+        // must skip Terminated and return Answered; the pre-fix code returned
+        // Terminated, which the dispatcher misreads as a non-answer.
+        let event = tokio::task::spawn_blocking(move || {
+            recv_b_leg_classification_event(&mut event_rx)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(event, Some(CallEvent::Answered { .. })),
+            "200 OK on the live retry leg must classify as Answered, not the \
+             stale Terminated from the superseded leg; got {event:?}"
+        );
+
+        handle2.tx.send(LegMessage::Shutdown).await.ok();
+        let _ = actor2_task.await;
+    }
+
     fn test_resolver() -> SipResolver {
         SipResolver::from_system().unwrap()
     }
@@ -10206,6 +12973,182 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn resolve_target_unresolvable_domain() {
         let resolver = test_resolver();
         assert!(resolve_target("sip:alice@this-domain-should-not-exist-xyzzy.invalid", &resolver).is_none());
+    }
+
+    // --- In-dialog connection reuse (RFC 5923) ---
+
+    fn candidate(addr: &str) -> RelayTarget {
+        RelayTarget { address: addr.parse().unwrap(), transport: None }
+    }
+
+    #[test]
+    fn established_peer_in_candidates_ip_match() {
+        // Load-balanced trunk: the established peer's IP is one of the members
+        // the route-set domain resolves to → reuse the established connection.
+        let candidates = [candidate("198.51.100.26:5061"), candidate("198.51.100.34:5061")];
+        let cached = "198.51.100.26:5061".parse::<SocketAddr>().unwrap();
+        assert!(established_peer_in_candidates(cached.ip(), &candidates));
+    }
+
+    #[test]
+    fn established_peer_in_candidates_ip_match_ignores_port() {
+        // The cached address carries the peer's source / ephemeral port while a
+        // candidate carries the SIP listening port — the match must be IP-only.
+        let candidates = [candidate("198.51.100.26:5061")];
+        let cached = "198.51.100.26:41897".parse::<SocketAddr>().unwrap();
+        assert!(established_peer_in_candidates(cached.ip(), &candidates));
+    }
+
+    #[test]
+    fn established_peer_not_in_candidates() {
+        // IMS divergence: the route set points at the S-CSCF while the
+        // established peer is the I-CSCF the INVITE traversed → resolve fresh.
+        let candidates = [candidate("203.0.113.20:5060")]; // S-CSCF
+        let icscf = "203.0.113.10:5060".parse::<SocketAddr>().unwrap();
+        assert!(!established_peer_in_candidates(icscf.ip(), &candidates));
+    }
+
+    #[test]
+    fn established_peer_in_empty_candidates() {
+        // Resolution failure: nothing to compare against, so the established
+        // peer is the best available target → reuse.
+        let cached = "203.0.113.7:5060".parse::<SocketAddr>().unwrap();
+        assert!(established_peer_in_candidates(cached.ip(), &[]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_dialog_flow_none_next_hop_reuses_cached() {
+        // Empty route set → the cached peer is the remote target; reuse it
+        // verbatim, including the connection_id.
+        let resolver = test_resolver();
+        let cached = "10.1.2.3:6000".parse::<SocketAddr>().unwrap();
+        let connection_id = ConnectionId(42);
+        let (destination, transport, out_connection_id) =
+            resolve_in_dialog_flow_uri(None, &resolver, cached, Transport::Tls, connection_id);
+        assert_eq!(destination, cached);
+        assert_eq!(transport, Transport::Tls);
+        assert_eq!(out_connection_id, connection_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_dialog_flow_reuses_established_member_over_resolved_port() {
+        // Next hop is a literal IP equal to the established peer but on its SIP
+        // listening port, while the cached address is the same peer on its
+        // source port. RFC 5923: keep the established connection (cached address
+        // + connection_id), not the re-resolved listening-port address. This is
+        // the load-balanced-trunk fix in miniature.
+        let resolver = test_resolver();
+        let cached = "192.0.2.50:33333".parse::<SocketAddr>().unwrap();
+        let connection_id = ConnectionId(7);
+        let (destination, transport, out_connection_id) = resolve_in_dialog_flow_uri(
+            Some("sip:192.0.2.50:5061;transport=tls"),
+            &resolver,
+            cached,
+            Transport::Tls,
+            connection_id,
+        );
+        assert_eq!(destination, cached, "must keep the established peer's connection address");
+        assert_eq!(transport, Transport::Tls);
+        assert_eq!(out_connection_id, connection_id, "must reuse the established connection_id");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_dialog_flow_resolves_fresh_for_divergent_next_hop() {
+        // Next hop is a genuinely different peer than the established one (IMS
+        // S-CSCF via the route set vs the I-CSCF the INVITE traversed): resolve
+        // fresh and drop the established connection_id so a new connection is
+        // opened/pooled.
+        let resolver = test_resolver();
+        let cached = "203.0.113.10:5060".parse::<SocketAddr>().unwrap(); // I-CSCF (established)
+        let connection_id = ConnectionId(7);
+        let (destination, _transport, out_connection_id) = resolve_in_dialog_flow_uri(
+            Some("sip:203.0.113.20:5060"), // S-CSCF (route set)
+            &resolver,
+            cached,
+            Transport::Udp,
+            connection_id,
+        );
+        assert_eq!(destination, "203.0.113.20:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            out_connection_id,
+            ConnectionId::default(),
+            "fresh resolution must not reuse the established connection_id",
+        );
+    }
+
+    // --- B2BUA 401/407/422 retry connection reuse (RFC 5923) ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b2bua_retry_reuses_established_member_not_resolved_sibling() {
+        // The 401'd CSeq-1 INVITE (and the nonce) went to trunk member A.  The
+        // dial target resolves to a *different* member B (the RFC 3263 A/AAAA
+        // shuffle on a multi-member trunk behind one DNS name).  The retry MUST
+        // stay on member A — the member that issued the nonce — so a strict
+        // trunk doesn't 401 again and the INVITE isn't split across members.
+        let resolver = test_resolver();
+        let member_a = "198.51.100.10:5061".parse::<SocketAddr>().unwrap();
+        let member_b_uri = "sip:trunk@198.51.100.20:5061;transport=tls";
+        let leg_connection_id = ConnectionId(99);
+
+        let (destination, transport, connection_id, relay_target) =
+            select_b2bua_retry_destination(
+                Some((member_a, Transport::Tls)),
+                leg_connection_id,
+                member_b_uri,
+                &resolver,
+            )
+            .expect("established leg destination is always selectable");
+
+        assert_eq!(
+            destination, member_a,
+            "retry must reuse the nonce-issuing member, not re-resolve onto a sibling",
+        );
+        assert_eq!(transport, Transport::Tls);
+        assert_eq!(
+            relay_target.address, member_a,
+            "send target must point at the established member so the TLS pool reuses its connection",
+        );
+        assert_eq!(relay_target.transport, Some(Transport::Tls));
+        // RFC 5923: the retry rides the connection the original INVITE was sent on.
+        assert_eq!(connection_id, leg_connection_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b2bua_retry_resolves_fresh_when_leg_has_no_destination() {
+        // Defensive fallback: with no recorded leg destination, resolve the
+        // target afresh and open/pool a new connection (default connection_id).
+        let resolver = test_resolver();
+        let (destination, transport, connection_id, relay_target) =
+            select_b2bua_retry_destination(
+                None,
+                ConnectionId(99),
+                "sip:bob@192.0.2.50:5061;transport=tls",
+                &resolver,
+            )
+            .expect("a resolvable literal-IP target yields a destination");
+
+        assert_eq!(destination, "192.0.2.50:5061".parse::<SocketAddr>().unwrap());
+        assert_eq!(transport, Transport::Tls);
+        assert_eq!(relay_target.address, destination);
+        assert_eq!(
+            connection_id,
+            ConnectionId::default(),
+            "fresh resolution must not claim a reused connection_id",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b2bua_retry_none_when_no_dest_and_unresolvable_target() {
+        // No leg destination and an unresolvable target → None, so the caller
+        // drops the retry rather than sending to a bogus address.
+        let resolver = test_resolver();
+        let result = select_b2bua_retry_destination(
+            None,
+            ConnectionId::default(),
+            "sip:bob@this-domain-should-not-exist-xyzzy.invalid",
+            &resolver,
+        );
+        assert!(result.is_none());
     }
 
     // --- CANCEL tests ---
@@ -10383,6 +13326,134 @@ a=rtpmap:8 PCMA/8000\r\n";
         assert!(build_cancel_from_invite(&response).is_none());
     }
 
+    // --- 2xx-after-CANCEL glare: ACK builder (RFC 3261 §13.2.2.4) ---
+
+    #[test]
+    fn build_ack_for_2xx_echoes_dialog_and_targets_contact() {
+        // The ACK siphon sends when a 2xx races our CANCEL must be its own
+        // transaction: R-URI = the 2xx Contact, CSeq = the INVITE's number with
+        // method ACK, From/To/Call-ID echoed (To carries the remote tag), and a
+        // fresh Via on our supplied host:port.
+        let response = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-bleg".to_string())
+            .from("<sip:alice@10.0.0.50>;tag=our-tag".to_string())
+            .to("<sip:bob@10.0.0.2>;tag=their-tag".to_string())
+            .call_id("glare-call@10.0.0.50".to_string())
+            .cseq("5 INVITE".to_string())
+            .header("Contact", "<sip:bob@10.0.0.2:5070>".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let ack = build_b2bua_ack_for_2xx(&response, Transport::Udp, "10.0.0.9", 5060)
+            .expect("ACK builds");
+        let wire = String::from_utf8(ack.to_bytes()).unwrap();
+
+        // R-URI is the 2xx Contact (the remote target), method ACK.
+        assert!(
+            wire.starts_with("ACK sip:bob@10.0.0.2:5070 SIP/2.0\r\n"),
+            "request line wrong:\n{wire}"
+        );
+        // Same CSeq number as the INVITE, method ACK (RFC 3261 §13.2.2.4).
+        assert!(wire.contains("CSeq: 5 ACK\r\n"), "CSeq wrong:\n{wire}");
+        // Dialog identifiers echoed from the 2xx, including the remote To-tag.
+        assert!(wire.contains("Call-ID: glare-call@10.0.0.50\r\n"), "Call-ID:\n{wire}");
+        assert!(wire.contains(";tag=their-tag"), "To-tag must survive:\n{wire}");
+        assert!(wire.contains(";tag=our-tag"), "From-tag must survive:\n{wire}");
+        // Fresh Via on the supplied local host:port.
+        assert!(
+            wire.contains("Via: SIP/2.0/UDP 10.0.0.9:5060;branch="),
+            "Via host:port wrong:\n{wire}"
+        );
+    }
+
+    #[test]
+    fn build_ack_for_2xx_falls_back_when_contact_absent() {
+        // No Contact on the 2xx → R-URI degrades to a placeholder rather than
+        // panicking; CSeq number is still preserved from the response.
+        let response = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-x".to_string())
+            .from("<sip:alice@10.0.0.50>;tag=a".to_string())
+            .to("<sip:bob@10.0.0.2>;tag=b".to_string())
+            .call_id("no-contact@10.0.0.50".to_string())
+            .cseq("9 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let ack = build_b2bua_ack_for_2xx(&response, Transport::Udp, "10.0.0.9", 5060)
+            .expect("ACK builds even without Contact");
+        let wire = String::from_utf8(ack.to_bytes()).unwrap();
+        assert!(wire.starts_with("ACK "), "must still be an ACK:\n{wire}");
+        assert!(wire.contains("CSeq: 9 ACK\r\n"), "CSeq preserved:\n{wire}");
+    }
+
+    // --- Proxy-forwarded CANCEL Via (RFC 3261 §9.1 / §16.10) ---
+    //
+    // Regression: handle_cancel_via_session used to mint a fresh branch
+    // (TransactionKey::generate_branch()) for the forwarded CANCEL, so the
+    // downstream proxy/UAS could not match CANCEL→INVITE and dropped it — the
+    // INVITE leg below was never torn down and the callee kept ringing after
+    // the caller abandoned during alerting.
+
+    #[test]
+    fn proxy_cancel_via_reuses_invite_branch_and_sent_by() {
+        // The proxy forwarded an INVITE on this client branch; its transaction
+        // key holds exactly the branch + sent-by siphon stamped on that
+        // INVITE's topmost Via.
+        let client_key = TransactionKey::new(
+            "z9hG4bK-invite-branch-B".to_string(),
+            Method::Invite,
+            "172.16.0.111:4060".to_string(),
+        );
+        let via = cancel_via_for_client_branch(&client_key, Transport::Udp);
+        assert_eq!(
+            via, "SIP/2.0/UDP 172.16.0.111:4060;branch=z9hG4bK-invite-branch-B",
+            "forwarded CANCEL must reuse the INVITE's top Via branch + sent-by (RFC 3261 §9.1)",
+        );
+    }
+
+    #[test]
+    fn proxy_cancel_via_branch_is_deterministic_not_fresh() {
+        // Guards the exact regression: TransactionKey::generate_branch() would
+        // yield a different (and non-matching) branch on every call.
+        let client_key = TransactionKey::new(
+            "z9hG4bK-stored-branch".to_string(),
+            Method::Invite,
+            "10.0.0.1:5060".to_string(),
+        );
+        let via_first = cancel_via_for_client_branch(&client_key, Transport::Tcp);
+        let via_second = cancel_via_for_client_branch(&client_key, Transport::Tcp);
+        assert_eq!(
+            via_first, via_second,
+            "forwarded CANCEL Via must derive from the stored client branch, \
+             never a freshly generated one",
+        );
+        assert!(
+            via_first.ends_with(";branch=z9hG4bK-stored-branch"),
+            "CANCEL branch must equal the stored INVITE branch: {via_first}",
+        );
+    }
+
+    #[test]
+    fn proxy_cancel_via_preserves_transport_and_ipv6_sent_by() {
+        // sent_by is reused verbatim from the client key — this covers the
+        // IPsec / flow / force_send_via cases where the advertised sent-by
+        // (here an IPv6 literal with a non-default protected port) differs
+        // from the default per-transport via_host.
+        let client_key = TransactionKey::new(
+            "z9hG4bK-tls-branch".to_string(),
+            Method::Invite,
+            "[2001:db8::1]:5061".to_string(),
+        );
+        let via = cancel_via_for_client_branch(&client_key, Transport::Tls);
+        assert_eq!(
+            via, "SIP/2.0/TLS [2001:db8::1]:5061;branch=z9hG4bK-tls-branch",
+        );
+    }
+
     // --- Transaction integration tests ---
 
     #[test]
@@ -10397,6 +13468,72 @@ a=rtpmap:8 PCMA/8000\r\n";
         assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
         assert!(actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::B, _))));
         assert!(actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::A, _))));
+    }
+
+    /// Regression for the spurious-INVITE-retransmit bug: a forwarded INVITE
+    /// arms Timer A, and the downstream 100 Trying MUST cancel it (RFC 3261
+    /// §17.1.1.2). The historical bug was the dispatcher `return`ing on
+    /// status==100 (RFC 3261 §16.7 "don't forward 100 upstream") *before*
+    /// feeding the client transaction, so Timer A stayed armed and the proxy
+    /// retransmitted the INVITE ~T1 (~500 ms) despite holding a provisional.
+    ///
+    /// Two properties must hold for the dispatcher's absorb-the-100 path
+    /// (which now feeds the FSM) to actually stop the retransmit:
+    ///   1. the key derived from the echoed 100 matches the key the client
+    ///      transaction was registered under (RFC 3261 §17.1.3), and
+    ///   2. feeding that 100 as a Provisional emits CancelTimer(A).
+    #[test]
+    fn provisional_100_cancels_invite_client_timer_a() {
+        let manager = TransactionManager::default();
+        let invite = SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("biloxi.com".to_string()).with_user("bob".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-timera".to_string())
+            .to("Bob <sip:bob@biloxi.com>".to_string())
+            .from("Alice <sip:alice@atlanta.com>;tag=99".to_string())
+            .call_id("timera-call@10.0.0.1".to_string())
+            .cseq("1 INVITE".to_string())
+            .max_forwards(70)
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let (key, start_actions) = manager
+            .new_client_transaction(invite, crate::transaction::state::Transport::Udp)
+            .unwrap();
+        assert!(
+            start_actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::A, _))),
+            "UDP INVITE client transaction must arm Timer A"
+        );
+
+        // Downstream 100 Trying echoing the forwarded INVITE's top Via verbatim.
+        let trying = SipMessageBuilder::new()
+            .response(100, "Trying".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-timera".to_string())
+            .to("Bob <sip:bob@biloxi.com>".to_string())
+            .from("Alice <sip:alice@atlanta.com>;tag=99".to_string())
+            .call_id("timera-call@10.0.0.1".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        // (1) The 100 must map to the same transaction key the ICT was
+        //     registered under — else the dispatcher's process_client_event
+        //     lookup misses and Timer A is never cancelled.
+        let response_key = TransactionManager::key_from_message(&trying).unwrap();
+        assert_eq!(response_key, key, "100 response key must match the ICT key");
+
+        // (2) Feeding the 100 as a provisional cancels Timer A.
+        let actions = manager
+            .process_client_event(&response_key, ClientEvent::Ict(IctEvent::Provisional(trying)))
+            .unwrap();
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::CancelTimer(TimerName::A))),
+            "100 Trying must cancel the INVITE retransmit Timer A"
+        );
     }
 
     #[test]
@@ -10574,23 +13711,25 @@ a=rtpmap:8 PCMA/8000\r\n";
             .build()
             .unwrap();
 
-        let local_addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
         let ack = build_b2bua_ack_for_non2xx(
             &response,
             "z9hG4bK-b2b-branch",
             Some("sip:bob@10.0.0.2:5060"),
             Transport::Udp,
-            local_addr,
+            "198.51.100.20",
+            5060,
         );
 
         assert!(ack.is_request());
         let bytes = String::from_utf8(ack.to_bytes()).unwrap();
         assert!(bytes.starts_with("ACK sip:bob@10.0.0.2:5060 SIP/2.0\r\n"));
 
-        // Via uses our branch (same as client transaction)
+        // Via uses our branch (same as client transaction) and the advertised
+        // sent-by host:port supplied by the caller (state.via_host/via_port).
         let via = ack.headers.via().unwrap();
         assert!(via.contains("z9hG4bK-b2b-branch"));
         assert!(via.contains("UDP"));
+        assert!(via.contains("198.51.100.20:5060"));
 
         // From/To/Call-ID from the response
         assert!(ack.headers.from().unwrap().contains("b-leg-ftag"));

@@ -4,7 +4,6 @@
 //! config → registrar wiring, and end-to-end message flows through the proxy pipeline.
 
 use siphon::sip::{SipMessageBuilder, SipUri, Method, parse_sip_message};
-use siphon::sip::headers::SipHeaders;
 use siphon::transaction::key::TransactionKey;
 use siphon::registrar::{Registrar, RegistrarConfig};
 use siphon::dialog::{Dialog, DialogStore, DialogState};
@@ -281,6 +280,7 @@ registrar:
         max_expires: config.registrar.max_expires,
         min_expires: config.registrar.min_expires.unwrap_or(60),
         max_contacts: config.registrar.max_contacts.unwrap_or(10) as usize,
+        ..Default::default()
     };
     let registrar = Registrar::new(registrar_config);
 

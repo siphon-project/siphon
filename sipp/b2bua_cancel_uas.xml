@@ -7,36 +7,29 @@
 
   Simulates a slow-ringing endpoint that gets cancelled.
 
-  RFC 3261 §9.1 correlation assertions:
-    * The CANCEL's topmost Via branch MUST equal the INVITE's topmost Via
-      branch (so the UAS can match the CANCEL to the in-progress server
-      transaction of the INVITE).
-    * The CANCEL's CSeq sequence number MUST equal the INVITE's CSeq
-      sequence number (method swapped to CANCEL).
-  Without these, every proxy hop returns 481 Call/Transaction Does Not
-  Exist and the UAS never knows to stop ringing.
+  Kept deliberately free of <ereg>/<action> capture blocks. An earlier version
+  captured the INVITE's Via branch / CSeq and re-asserted them on the CANCEL via
+  `check_it` regexps (`branch=[$invite_branch]`). That syntax injects a captured
+  variable into a match regexp, which this SIPp build rejects with a FATAL error
+  (exit 255) at scenario load — so the UAS crashed before it ever bound its
+  socket, siphon's B-leg INVITE went unanswered, and the whole test hung.
 
-  These assertions exist because earlier B2BUA CANCEL code emitted a
-  fresh branch and copied the A-leg CANCEL's CSeq number — both wrong
-  per RFC 3261 §9.1.
+  The RFC 3261 §9.1 CANCEL→INVITE correlation (same topmost Via branch + CSeq
+  sequence number) is instead verified in Rust unit tests
+  (`dispatcher::tests::proxy_cancel_via_*` and the B2BUA
+  `b2bua_auth_retry_supersedes_failed_leg_for_single_cancel`), which is where
+  that invariant actually lives. This scenario just drives the end-to-end flow.
+
+  The matching UAC (b2bua_cancel_uac.xml) sends the INVITE at CSeq 1, so the
+  487's CSeq is hardcoded `1 INVITE` (a 487 after a CANCEL must echo the
+  INVITE's CSeq, not the CANCEL's — `[last_CSeq:]` would wrongly be `1 CANCEL`).
 -->
 <scenario name="B2BUA CANCEL UAS">
 
-  <!-- Receive INVITE from B2BUA (B-leg).  Capture the topmost Via
-       branch and the CSeq sequence number so we can assert that the
-       follow-up CANCEL is correlated correctly per RFC 3261 §9.1. -->
-  <recv request="INVITE" crlf="true">
-    <action>
-      <ereg regexp="branch=([^;&gt;\r\n ]+)"
-            search_in="hdr" header="Via:"
-            assign_to="junk,invite_branch" />
-      <ereg regexp="^([0-9]+)"
-            search_in="hdr" header="CSeq:"
-            assign_to="junk,invite_cseq_num" />
-    </action>
-  </recv>
+  <!-- Receive INVITE from B2BUA (B-leg). -->
+  <recv request="INVITE" crlf="true" />
 
-  <!-- Send 180 Ringing (keep ringing so the UAC has time to CANCEL) -->
+  <!-- Send 180 Ringing (keep ringing so the UAC has time to CANCEL). -->
   <send>
     <![CDATA[
 
@@ -52,20 +45,10 @@ Content-Length: 0
 ]]>
   </send>
 
-  <!-- Expect CANCEL from B2BUA.  Assert the correlation invariants:
-       same Via branch as the INVITE, same CSeq sequence number. -->
-  <recv request="CANCEL">
-    <action>
-      <ereg regexp="branch=\[$invite_branch\]"
-            search_in="hdr" header="Via:"
-            check_it="true" assign_to="junk" />
-      <ereg regexp="^\[$invite_cseq_num\] CANCEL"
-            search_in="hdr" header="CSeq:"
-            check_it="true" assign_to="junk" />
-    </action>
-  </recv>
+  <!-- Expect the CANCEL from the B2BUA. -->
+  <recv request="CANCEL" />
 
-  <!-- Respond 200 OK to CANCEL -->
+  <!-- Respond 200 OK to the CANCEL. -->
   <send>
     <![CDATA[
 
@@ -80,9 +63,8 @@ Content-Length: 0
 ]]>
   </send>
 
-  <!-- Respond 487 Request Terminated for the original INVITE.  Use the
-       captured INVITE CSeq number so we don't echo the CANCEL's CSeq
-       (which would be N CANCEL, not N INVITE). -->
+  <!-- Respond 487 Request Terminated for the original INVITE. The CSeq must be
+       the INVITE's (1 INVITE), not the CANCEL's. -->
   <send>
     <![CDATA[
 
@@ -91,13 +73,13 @@ SIP/2.0 487 Request Terminated
 [last_From:]
 [last_To:];tag=[pid]SIPpTag01[call_number]
 [last_Call-ID:]
-CSeq: [$invite_cseq_num] INVITE
+CSeq: 1 INVITE
 Content-Length: 0
 
 ]]>
   </send>
 
-  <!-- Receive ACK for the 487 -->
+  <!-- Receive ACK for the 487. -->
   <recv request="ACK" optional="true" timeout="5000" />
 
 </scenario>

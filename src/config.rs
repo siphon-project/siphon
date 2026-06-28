@@ -1,4 +1,4 @@
-//! YAML configuration — `siphon.yaml` deserialization via serde_yml.
+//! YAML configuration — `siphon.yaml` deserialization via serde_yaml_ng.
 
 use indexmap::IndexMap;
 use regex::Regex;
@@ -109,6 +109,10 @@ pub struct Config {
     /// IPsec SA management for P-CSCF (3GPP TS 33.203).
     pub ipsec: Option<IpsecConfig>,
 
+    /// STIR/SHAKEN caller-ID attestation (RFC 8224/8225/8226, ATIS-1000074).
+    /// Drives the `stir` Python namespace (`stir.sign()` / `stir.verify()`).
+    pub stir: Option<StirConfig>,
+
     /// Initial Filter Criteria (3GPP TS 29.228) — S-CSCF iFC evaluation.
     pub isc: Option<IscConfig>,
 
@@ -150,7 +154,7 @@ pub struct Config {
     /// they expect an external file) or [`Config::extension_config`]
     /// (when they consume the value directly).
     #[serde(default)]
-    pub extensions: Option<IndexMap<String, serde_yml::Value>>,
+    pub extensions: Option<IndexMap<String, serde_yaml_ng::Value>>,
 }
 
 /// B2BUA-wide configuration knobs.
@@ -401,10 +405,49 @@ pub struct ScriptConfig {
     /// throughput ceiling.  Lower it on memory-constrained, low-traffic NFs.
     #[serde(default)]
     pub sync_pool_size: Option<usize>,
+    /// Hard ceiling on synchronous Python executor worker threads. The pool is
+    /// elastic — it starts at `sync_pool_size` (the always-on core) and grows
+    /// on demand up to this when every worker is busy, then never shrinks. This
+    /// restores the burst headroom blocking-I/O handlers need (a handful of
+    /// concurrent blocking REGISTERs no longer wedge the engine) without the
+    /// free-threaded-CPython heap leak that reaping caused. Each grown worker
+    /// costs ~2 MB of persistent Python heap, so the pool's memory ceiling is
+    /// roughly `sync_pool_max × 2 MB` — lower it on memory-constrained NFs.
+    /// Defaults to `max(32, 4 × sync_pool_size)`; clamped to at least
+    /// `sync_pool_size`.
+    #[serde(default)]
+    pub sync_pool_max: Option<usize>,
+    /// Seconds the synchronous Python executor pool may show *zero forward
+    /// progress while fully saturated* before SIPhon aborts the process so a
+    /// supervisor (`restart: always`, systemd) restarts it.  Guards against a
+    /// handler that blocks every worker indefinitely (a thread-unsafe HTTP
+    /// client wedging, a backend that never returns, a lock held forever):
+    /// without it the process stays alive but serves no SIP, and a
+    /// restart-on-exit policy never fires because the process never exits.
+    /// Defaults to 30 (6× the default 5 s HTTP-auth timeout, so transient
+    /// backend slowness never trips it); `0` disables the watchdog.  See
+    /// `script::py_executor`.
+    #[serde(default = "default_handler_stall_abort_secs")]
+    pub handler_stall_abort_secs: u64,
+    /// Maximum number of handler jobs that may queue for the synchronous
+    /// Python executor pool before new inbound work is shed (dropped — the SIP
+    /// client retransmits).  Bounds memory under overload so a stuck pool can
+    /// no longer grow the queue without limit.  Defaults to 1024; raise it on
+    /// high-throughput NFs so normal bursts never shed.  Clamped to at least 1.
+    #[serde(default = "default_executor_queue_capacity")]
+    pub executor_queue_capacity: usize,
 }
 
 fn default_script_path() -> String {
     String::new()
+}
+
+fn default_handler_stall_abort_secs() -> u64 {
+    30
+}
+
+fn default_executor_queue_capacity() -> usize {
+    1024
 }
 
 impl Default for ScriptConfig {
@@ -414,6 +457,9 @@ impl Default for ScriptConfig {
             reload: default_reload(),
             async_pool_size: None,
             sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: default_handler_stall_abort_secs(),
+            executor_queue_capacity: default_executor_queue_capacity(),
         }
     }
 }
@@ -445,8 +491,20 @@ pub struct RegistrarConfig {
     pub min_expires: Option<u32>,
     /// Maximum contacts per AoR (None = unlimited). Use 1 for single-device deployments.
     pub max_contacts: Option<u32>,
+    /// Require the REGISTER's AoR (To-URI user) to match the authenticated
+    /// digest user, rejecting attempts to bind a contact under another
+    /// subscriber's AoR. Default false (backward-compatible; IMS deployments
+    /// where the public identity differs from the private auth identity must
+    /// leave this off and authorize via the implicit registration set).
+    #[serde(default)]
+    pub enforce_auth_aor_match: bool,
     pub redis: Option<RedisBackendConfig>,
     pub postgres: Option<PostgresBackendConfig>,
+    /// Registration liveness — network-initiated deregistration when a UE
+    /// vanishes without a SIP de-REGISTER (flow failure on TCP/TLS, idle
+    /// IPsec SA on UDP).  Default off.
+    #[serde(default)]
+    pub liveness: RegistrarLivenessConfig,
 }
 
 impl Default for RegistrarConfig {
@@ -457,10 +515,74 @@ impl Default for RegistrarConfig {
             max_expires: 7200,
             min_expires: None,
             max_contacts: None,
+            enforce_auth_aor_match: false,
             redis: None,
             postgres: None,
+            liveness: RegistrarLivenessConfig::default(),
         }
     }
+}
+
+/// Registration-liveness configuration (network-initiated deregistration).
+///
+/// When `enabled`, siphon clears a registration on its own initiative once it
+/// detects the UE is gone, instead of waiting for the SIP `Expires` timer
+/// (often hours):
+///   - **TCP/TLS/WS/WSS**: the binding is removed when its inbound connection
+///     closes (peer FIN/RST, read error, idle timeout, or CRLF-keepalive
+///     failure) — RFC 5626 §4.2.2 flow failure.
+///   - **UDP+IPsec**: an idle binding is detected by polling the kernel XFRM
+///     SA inbound use-time; the UE's RFC 6223 keepalive (~every 30 s) keeps
+///     the SA warm, so silence beyond `idle_multiplier × keepalive_interval`
+///     marks the binding suspect.  A single OPTIONS probe confirms before the
+///     binding is deregistered.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct RegistrarLivenessConfig {
+    /// Master switch.  Default `false` until the feature is proven in the
+    /// field; with it off, siphon behaves exactly as before (Expires-only).
+    pub enabled: bool,
+    /// Negotiated UE keepalive cadence in seconds (RFC 6223 Flow-Timer / NAT
+    /// keepalive).  Used as the base unit for the UDP+IPsec idle window.
+    pub keepalive_interval_secs: u32,
+    /// Grace multiplier: a UDP+IPsec binding is suspect after
+    /// `idle_multiplier × keepalive_interval_secs` of SA silence.  Default 3
+    /// (~90 s against a 30 s keepalive) survives a brief radio blip or a
+    /// single dropped keepalive without false-deregistering a live UE.
+    pub idle_multiplier: u32,
+    /// Per-attempt timeout (milliseconds) for the one-shot OPTIONS liveness
+    /// probe sent to a suspect UDP+IPsec binding before deregistration.
+    pub probe_timeout_ms: u64,
+    /// What to do once a binding is declared dead.
+    pub dereg_mode: LivenessDeregMode,
+}
+
+impl Default for RegistrarLivenessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keepalive_interval_secs: 30,
+            idle_multiplier: 3,
+            probe_timeout_ms: 2000,
+            dereg_mode: LivenessDeregMode::NetworkDereg,
+        }
+    }
+}
+
+/// How siphon clears a binding once liveness detection declares the UE dead.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LivenessDeregMode {
+    /// Authoritative registrar (S-CSCF / single box): drop the binding locally
+    /// and emit the `@registrar.on_change` cascade.  P-CSCF cache: additionally
+    /// synthesize a de-REGISTER (`Expires: 0`) on the UE's behalf toward the
+    /// S-CSCF so the registrar of record also clears the binding.
+    NetworkDereg,
+    /// Drop local state only (binding + IPsec SA) and emit the local
+    /// `on_change` event; never synthesize an upstream de-REGISTER.  Use on a
+    /// box that is the registrar of record, where the reg-event NOTIFY already
+    /// propagates the teardown.
+    LocalOnly,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -522,6 +644,16 @@ pub struct AuthConfig {
     pub aka_credentials: std::collections::HashMap<String, AkaCredential>,
     pub http: Option<HttpAuthConfig>,
     pub diameter: Option<DiameterCxConfig>,
+    /// Shared secret for stateless digest-nonce HMAC integrity (RFC 7616 §3.3).
+    /// When set, a digest response carrying a nonce the cluster never issued is
+    /// rejected. MUST be identical on every instance behind the same SIP domain
+    /// (round-robin DNS). When unset, nonces are timestamp-only — still bounding
+    /// replay to `nonce_ttl_secs`, and safe across instances with no shared state.
+    #[serde(default)]
+    pub nonce_secret: Option<String>,
+    /// Digest-nonce lifetime in seconds (replay window). Default 3600.
+    #[serde(default)]
+    pub nonce_ttl_secs: Option<u64>,
 }
 
 /// AKA credential for a single subscriber (3GPP TS 35.206 Milenage).
@@ -549,6 +681,8 @@ impl Default for AuthConfig {
             aka_credentials: Default::default(),
             http: None,
             diameter: None,
+            nonce_secret: None,
+            nonce_ttl_secs: None,
         }
     }
 }
@@ -897,6 +1031,16 @@ pub struct HttpAuthConfig {
     /// If false, it is a plaintext password (SIPhon hashes it internally).
     #[serde(default)]
     pub ha1: bool,
+    /// TTL (seconds) for caching a successful credential lookup keyed by
+    /// username. `0` (the default) disables caching — every digest
+    /// verification performs a blocking HTTP fetch, so a registration storm
+    /// translates 1:1 into blocking calls on the fixed Python executor pool.
+    /// Set this (e.g. `300`) so repeated REGISTERs for the same subscriber
+    /// reuse the cached HA1/password instead of re-hitting the backend.
+    /// Credentials rarely change, so a non-zero TTL is the recommended
+    /// production setting; a change propagates after at most `cache_ttl_secs`.
+    #[serde(default)]
+    pub cache_ttl_secs: u64,
 }
 
 fn default_http_timeout_ms() -> u64 {
@@ -916,9 +1060,14 @@ pub struct TlsServerConfig {
     pub private_key: String,
     #[serde(default = "default_tls_method")]
     pub method: String,
-    /// If true, client certificates are required and verified.
+    /// If true, client certificates are required and verified against
+    /// `client_ca`. Requires `client_ca` to be set, else startup fails.
     #[serde(default)]
     pub verify_client: bool,
+    /// PEM bundle of CA certificates that client certificates must chain to,
+    /// used only when `verify_client` is true (mutual TLS).
+    #[serde(default)]
+    pub client_ca: Option<String>,
 }
 
 fn default_tls_method() -> String {
@@ -975,8 +1124,33 @@ pub struct ScannerBlockConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct FailedAuthBanConfig {
+    /// Number of failures (auth challenges without a subsequent success, or
+    /// non-ACK INVITE server-transaction timeouts) within `window_secs` from a
+    /// single source IP before it is banned.
     pub threshold: u32,
+    /// Sliding window (seconds) over which failures are counted. A source that
+    /// authenticates successfully has its failure count reset, so a legit client
+    /// that challenges-then-succeeds never accumulates. Default: 600 (10 min).
+    #[serde(default = "default_failed_auth_window_secs")]
+    pub window_secs: u32,
+    /// How long a ban lasts (seconds) before the source IP is allowed again.
     pub ban_duration_secs: u32,
+    /// Weight applied to a single high-confidence abuse signal — present-but-
+    /// invalid credentials (wrong password), a forged/stale/replayed digest
+    /// nonce, non-SIP garbage on a stream transport, or a scanner User-Agent —
+    /// toward `threshold`. A weight > 1 bans these unambiguous signals faster
+    /// than a bare scanning probe (which counts as 1) while sharing the same
+    /// per-IP window. Clamped to ≥ 1. Default: 3.
+    #[serde(default = "default_strong_signal_weight")]
+    pub strong_signal_weight: u32,
+}
+
+fn default_failed_auth_window_secs() -> u32 {
+    600
+}
+
+fn default_strong_signal_weight() -> u32 {
+    3
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,7 +1645,7 @@ impl GatewayDestConfig {
         if let Some(pos) = uri_lower.find(";transport=") {
             let after = &uri_lower[pos + 11..];
             let end = after
-                .find(|c: char| c == ';' || c == '>' || c == ' ')
+                .find([';', '>', ' '])
                 .unwrap_or(after.len());
             return after[..end].to_string();
         }
@@ -1786,15 +1960,19 @@ pub struct RegistrantYamlConfig {
 /// A single static registrant entry.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RegistrantEntryConfig {
-    /// Address-of-Record (e.g. "sip:alice@carrier.com").
+    /// Address-of-Record (e.g. "sip:alice@carrier.com"). For IMS AKA this is
+    /// the IMPU.
     pub aor: String,
-    /// Registrar URI (e.g. "sip:registrar.carrier.com:5060").
+    /// Registrar URI (e.g. "sip:registrar.carrier.com:5060"). For IMS this is
+    /// the P-CSCF.
     pub registrar: String,
-    /// Authentication username.
+    /// Authentication username. For IMS AKA this is the IMPI.
     pub user: String,
-    /// Authentication password.
+    /// Authentication password (digest only; unused for AKA).
+    #[serde(default)]
     pub password: String,
-    /// Optional realm hint — derived from 401 challenge if omitted.
+    /// Optional realm hint — derived from 401 challenge if omitted (the home
+    /// domain for IMS).
     pub realm: Option<String>,
     /// Registration interval override in seconds.
     pub interval: Option<u32>,
@@ -1803,6 +1981,75 @@ pub struct RegistrantEntryConfig {
     /// Transport: "udp" (default), "tcp", "tls".
     #[serde(default = "default_registrant_transport")]
     pub transport: String,
+    /// Authentication mode: "digest" (default) or "aka" for IMS AKAv1-MD5
+    /// (RFC 3310 / 3GPP TS 33.203).
+    pub auth: Option<String>,
+    /// IMS AKA credentials — required when `auth: aka`.
+    pub aka: Option<RegistrantAkaConfig>,
+    /// IPsec sec-agree (UE side) — only valid with `auth: aka`.
+    pub ipsec: Option<RegistrantIpsecConfig>,
+    /// IMS Contact feature tags (instance ID + MMTel/video/SMS) so the S-CSCF
+    /// registers the implied services.
+    pub ims: Option<RegistrantImsConfig>,
+}
+
+/// IMS Contact feature tags for a registrant entry (TS 24.229 / GSMA IR.92).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantImsConfig {
+    /// IMEI for `+sip.instance="<urn:gsma:imei:…>"` (RFC 5626 instance ID).
+    pub imei: Option<String>,
+    /// Feature tags to advertise: any of "mmtel", "video", "smsip".
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+/// IMS AKA credentials for a registrant entry (3GPP TS 33.203).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantAkaConfig {
+    /// Subscriber key K as 32 hex chars.
+    pub k: String,
+    /// Operator variant OP as 32 hex chars (supply `op` OR `opc`).
+    pub op: Option<String>,
+    /// Pre-computed OPc as 32 hex chars (supply `op` OR `opc`).
+    pub opc: Option<String>,
+    /// Authentication Management Field as 4 hex chars.
+    #[serde(default = "default_aka_amf")]
+    pub amf: String,
+    /// Initial stored sequence number SQN_MS as 12 hex chars.
+    #[serde(default = "default_aka_sqn")]
+    pub sqn: String,
+}
+
+/// IPsec sec-agree parameters for a registrant entry (UE side, TS 33.203).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantIpsecConfig {
+    /// UE protected client port (must also be a `listen.udp` entry).
+    pub ue_port_c: u16,
+    /// UE protected server port (must also be a `listen.udp` entry).
+    pub ue_port_s: u16,
+    /// Offered integrity algorithm: "hmac-sha-1-96" (default), "hmac-md5-96",
+    /// or "hmac-sha-256-128".
+    #[serde(default = "default_ipsec_alg")]
+    pub alg: String,
+    /// Offered encryption algorithm: "null" (default) or "aes-cbc".
+    #[serde(default = "default_ipsec_ealg")]
+    pub ealg: String,
+}
+
+fn default_aka_amf() -> String {
+    "8000".to_string()
+}
+
+fn default_aka_sqn() -> String {
+    "000000000000".to_string()
+}
+
+fn default_ipsec_alg() -> String {
+    "hmac-sha-1-96".to_string()
+}
+
+fn default_ipsec_ealg() -> String {
+    "null".to_string()
 }
 
 fn default_registrant_interval() -> u32 {
@@ -2090,7 +2337,7 @@ impl Config {
 
     /// Parse YAML without env-var expansion (used after expansion is already done).
     fn from_str_raw(yaml: &str) -> Result<Self> {
-        serde_yml::from_str(yaml)
+        serde_yaml_ng::from_str(yaml)
             .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))
     }
 
@@ -2106,7 +2353,7 @@ impl Config {
     /// file"). Returns `None` when the entry is absent or its value is an
     /// inline mapping/sequence — extensions that accept inline config
     /// should call [`Config::extension_config`] instead and walk the
-    /// `serde_yml::Value` themselves.
+    /// `serde_yaml_ng::Value` themselves.
     pub fn extension_path(&self, name: &str) -> Option<&Path> {
         self.extensions
             .as_ref()?
@@ -2118,7 +2365,7 @@ impl Config {
     /// Raw-value accessor for an extension entry. Returns the entry's
     /// YAML value (any shape) for the extension to interpret. Returns
     /// `None` when the entry is absent.
-    pub fn extension_config(&self, name: &str) -> Option<&serde_yml::Value> {
+    pub fn extension_config(&self, name: &str) -> Option<&serde_yaml_ng::Value> {
         self.extensions.as_ref()?.get(name)
     }
 }
@@ -2195,6 +2442,96 @@ fn default_spi_range_count() -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// STIR/SHAKEN (RFC 8224/8225/8226, ATIS-1000074)
+// ---------------------------------------------------------------------------
+
+/// Top-level `stir:` configuration. Either or both of `signing` (the
+/// Authentication Service) and `verification` (the Verification Service)
+/// may be present; omitting one disables that side.
+#[derive(Debug, Deserialize, Clone)]
+pub struct StirConfig {
+    /// Master on/off switch. Defaults to `true` when the `stir:` block is
+    /// present, so adding the block enables it without an extra flag.
+    #[serde(default = "default_stir_enabled")]
+    pub enabled: bool,
+    /// Outbound signing parameters (Authentication Service). When absent,
+    /// `stir.sign()` / `stir.sign_div()` raise.
+    pub signing: Option<StirSigningConfig>,
+    /// Inbound verification parameters (Verification Service). When absent,
+    /// `stir.verify()` raises.
+    pub verification: Option<StirVerificationConfig>,
+}
+
+/// `stir.signing` — Authentication Service parameters.
+#[derive(Debug, Deserialize, Clone)]
+pub struct StirSigningConfig {
+    /// Path to the PEM EC P-256 private key used to sign PASSporTs.
+    pub private_key: String,
+    /// Public certificate URL embedded as the Identity `info=` parameter and
+    /// the PASSporT `x5u` header (RFC 8224 §4).
+    pub x5u: String,
+    /// Default attestation level (`A`, `B`, or `C`) when the script does not
+    /// pass one to `stir.sign()`.
+    #[serde(default = "default_stir_attestation")]
+    pub default_attestation: String,
+    /// Fixed `origid` (UUID) to stamp on every PASSporT. When unset, a fresh
+    /// v4 UUID is generated per call.
+    #[serde(default)]
+    pub origid: Option<String>,
+}
+
+/// `stir.verification` — Verification Service parameters.
+#[derive(Debug, Deserialize, Clone)]
+pub struct StirVerificationConfig {
+    /// STI-CA trust-anchor (root) certificate files (PEM).
+    #[serde(default)]
+    pub trust_anchors: Vec<String>,
+    /// Optional directory of PEM trust anchors — every `*.pem`/`*.crt` file
+    /// in it is loaded in addition to `trust_anchors`.
+    #[serde(default)]
+    pub trust_anchor_dir: Option<String>,
+    /// PASSporT `iat` freshness window in seconds (ATIS-1000074).
+    #[serde(default = "default_stir_freshness_secs")]
+    pub freshness_secs: u64,
+    /// Log-only rollout mode: x5u/infra failures degrade to
+    /// `No-TN-Validation` instead of `TN-Validation-Failed`. Genuine bad
+    /// signatures / expired certs / stale PASSporTs always fail.
+    #[serde(default)]
+    pub permissive: bool,
+    /// Default x5u certificate cache TTL in seconds (overridden by a
+    /// response `Cache-Control: max-age`).
+    #[serde(default = "default_stir_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// Maximum accepted size of an x5u certificate response, in bytes.
+    #[serde(default = "default_stir_max_cert_bytes")]
+    pub max_cert_bytes: usize,
+    /// Require the leaf certificate to carry the RFC 8226 TNAuthList
+    /// extension.
+    #[serde(default)]
+    pub require_tnauthlist: bool,
+}
+
+fn default_stir_enabled() -> bool {
+    true
+}
+
+fn default_stir_attestation() -> String {
+    "A".to_string()
+}
+
+fn default_stir_freshness_secs() -> u64 {
+    60
+}
+
+fn default_stir_cache_ttl_secs() -> u64 {
+    3600
+}
+
+fn default_stir_max_cert_bytes() -> usize {
+    65536
+}
+
+// ---------------------------------------------------------------------------
 // Initial Filter Criteria (3GPP TS 29.228)
 // ---------------------------------------------------------------------------
 
@@ -2236,6 +2573,24 @@ pub struct SbiYamlConfig {
     pub npcf_url: Option<String>,
     /// Nchf base URL (if not using NRF discovery).
     pub nchf_url: Option<String>,
+    /// Nbsf_Management (BSF) base URL for `sbi.discover_pcf_binding()`.
+    /// May equal the SCP/Npcf URL. When unset, `discover_pcf_binding` raises
+    /// a clear "BSF not configured" error rather than silently defaulting.
+    pub bsf_url: Option<String>,
+    /// Per-discovery timeout for BSF lookups in milliseconds. Falls back to
+    /// `timeout_secs` when unset.
+    pub bsf_timeout_ms: Option<u64>,
+    /// URL scheme ("http" | "https", default "http") used when deriving a PCF
+    /// base URL from a `pcfFqdn` returned by the BSF.
+    pub pcf_scheme: Option<String>,
+    /// SBI communication model: "direct" (default — straight to the NF) or
+    /// "indirect" (via the SCP, with `3gpp-Sbi-*` routing headers; TS 29.500
+    /// §6.10). When "indirect", `npcf_url`/`bsf_url` point at the SCP.
+    pub communication: Option<String>,
+    /// Requester NF type advertised in Nbsf delegated discovery
+    /// (`3gpp-Sbi-Discovery-requester-nf-type`) when communication is indirect.
+    /// Default "AF" (a P-CSCF acts as an AF).
+    pub requester_nf_type: Option<String>,
     /// Listen address for incoming PCF event notifications (e.g. "0.0.0.0:8080").
     pub notif_listen: Option<String>,
 }
@@ -2429,6 +2784,78 @@ auth:
         assert!(http.url.contains("{username}"));
         assert_eq!(http.timeout_ms, 2000);
         assert!(http.ha1);
+        // HA1 caching is opt-in: absent `cache_ttl_secs` defaults to 0 (disabled),
+        // preserving the per-request blocking-fetch behaviour.
+        assert_eq!(http.cache_ttl_secs, 0);
+    }
+
+    #[test]
+    fn parses_auth_http_cache_ttl() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+auth:
+  realm: "example.com"
+  backend: http
+  http:
+    url: "http://127.0.0.1:8000/sip/auth/{username}"
+    cache_ttl_secs: 300
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let http = config.auth.http.unwrap();
+        assert_eq!(http.cache_ttl_secs, 300);
+    }
+
+    #[test]
+    fn script_executor_defaults_and_overrides() {
+        // Defaults: watchdog at 30 s, bounded queue at 1024, pool sizes auto.
+        let default_script = ScriptConfig::default();
+        assert_eq!(default_script.handler_stall_abort_secs, 30);
+        assert_eq!(default_script.executor_queue_capacity, 1024);
+        assert_eq!(default_script.sync_pool_size, None);
+        assert_eq!(default_script.sync_pool_max, None);
+
+        // Defaults survive a YAML that omits the executor knobs.
+        let minimal = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(minimal).unwrap();
+        assert_eq!(config.script.handler_stall_abort_secs, 30);
+        assert_eq!(config.script.executor_queue_capacity, 1024);
+
+        // Explicit overrides parse, including disabling the watchdog (0).
+        let overridden = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+  sync_pool_size: 16
+  sync_pool_max: 128
+  handler_stall_abort_secs: 0
+  executor_queue_capacity: 4096
+"#;
+        let config = Config::from_str(overridden).unwrap();
+        assert_eq!(config.script.sync_pool_size, Some(16));
+        assert_eq!(config.script.sync_pool_max, Some(128));
+        assert_eq!(config.script.handler_stall_abort_secs, 0);
+        assert_eq!(config.script.executor_queue_capacity, 4096);
     }
 
     #[test]
@@ -2508,6 +2935,83 @@ registrant:
         assert_eq!(bob.interval, None);
         assert_eq!(bob.contact, None);
         assert_eq!(bob.transport, "udp"); // default
+
+        // Digest entries carry no AKA / IPsec blocks.
+        assert!(alice.auth.is_none());
+        assert!(alice.aka.is_none());
+        assert!(alice.ipsec.is_none());
+    }
+
+    #[test]
+    fn parses_registrant_aka_ipsec_config() {
+        // 3GPP test range (MCC 001 / MNC 01) + TS 35.208 Test Set 1 secrets.
+        let yaml = r#"
+listen:
+  udp:
+    - "10.0.0.20:5060"
+    - "10.0.0.20:6100"
+    - "10.0.0.20:6101"
+domain:
+  local:
+    - "10.0.0.20"
+script:
+  path: "examples/ims_ue_b2bua.py"
+ipsec:
+  backend: netlink
+registrant:
+  entries:
+    - aor: "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org"
+      registrar: "sip:pcscf.ims.mnc01.mcc001.3gppnetwork.org:5060"
+      user: "001010000000001@ims.mnc01.mcc001.3gppnetwork.org"
+      auth: "aka"
+      aka:
+        k: "465b5ce8b199b49faa5f0a2ee238a6bc"
+        opc: "cd63cb71954a9f4e48a5994e37a02baf"
+        amf: "b9b9"
+      ipsec:
+        ue_port_c: 6100
+        ue_port_s: 6101
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let registrant = config.registrant.unwrap();
+        let ue = &registrant.entries[0];
+        assert_eq!(ue.auth.as_deref(), Some("aka"));
+        // password omitted (unused for AKA) defaults to empty.
+        assert_eq!(ue.password, "");
+
+        let aka = ue.aka.as_ref().expect("aka block");
+        assert_eq!(aka.k, "465b5ce8b199b49faa5f0a2ee238a6bc");
+        assert_eq!(aka.opc.as_deref(), Some("cd63cb71954a9f4e48a5994e37a02baf"));
+        assert_eq!(aka.op, None);
+        assert_eq!(aka.amf, "b9b9");
+        assert_eq!(aka.sqn, "000000000000"); // default
+
+        let ipsec = ue.ipsec.as_ref().expect("ipsec block");
+        assert_eq!(ipsec.ue_port_c, 6100);
+        assert_eq!(ipsec.ue_port_s, 6101);
+        assert_eq!(ipsec.alg, "hmac-sha-1-96"); // default
+        assert_eq!(ipsec.ealg, "null"); // default
+    }
+
+    /// The shipped IMS UE B2BUA example config must actually parse (env vars
+    /// fall back to their `${VAR:-default}` defaults here). Guards against the
+    /// example silently rotting.
+    #[test]
+    fn example_ims_ue_b2bua_yaml_parses() {
+        let yaml = include_str!("../examples/ims_ue_b2bua.yaml");
+        let config = Config::from_str(yaml).expect("example yaml must parse");
+        let registrant = config.registrant.expect("registrant block");
+        assert_eq!(registrant.entries.len(), 1);
+        let ue = &registrant.entries[0];
+        assert_eq!(ue.auth.as_deref(), Some("aka"));
+        let aka = ue.aka.as_ref().expect("aka block");
+        assert_eq!(aka.k.len(), 32); // 128-bit K as hex
+        let ipsec = ue.ipsec.as_ref().expect("ipsec block");
+        assert_eq!(ipsec.ue_port_c, 6100);
+        assert_eq!(ipsec.ue_port_s, 6101);
+        let ims = ue.ims.as_ref().expect("ims block");
+        assert!(ims.imei.is_some());
+        assert!(ims.features.iter().any(|f| f == "mmtel"));
     }
 
     #[test]
@@ -2547,6 +3051,8 @@ security:
         assert_eq!(sec.trusted_cidrs, vec!["10.0.0.0/8"]);
         let fab = sec.failed_auth_ban.unwrap();
         assert_eq!(fab.threshold, 10);
+        assert_eq!(fab.ban_duration_secs, 300);
+        assert_eq!(fab.window_secs, 600); // serde default when omitted
     }
 
     #[test]
@@ -3833,12 +4339,12 @@ log:
             .expect("bar extension should resolve to a value");
         let mapping = value.as_mapping().expect("bar should be a mapping");
         let listen = mapping
-            .get(serde_yml::Value::String("listen".to_owned()))
+            .get(serde_yaml_ng::Value::String("listen".to_owned()))
             .and_then(|v| v.as_str())
             .expect("listen key");
         assert_eq!(listen, "0.0.0.0:8080");
         let workers = mapping
-            .get(serde_yml::Value::String("workers".to_owned()))
+            .get(serde_yaml_ng::Value::String("workers".to_owned()))
             .and_then(|v| v.as_u64())
             .expect("workers key");
         assert_eq!(workers, 4);

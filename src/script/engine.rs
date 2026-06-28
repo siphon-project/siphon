@@ -46,6 +46,11 @@ pub enum HandlerKind {
     ProxyReply,
     /// `@proxy.on_failure` — all branches failed.
     ProxyFailure,
+    /// `@proxy.on_cancel` — relayed INVITE was CANCELled before a final
+    /// response (RFC 3261 §9). Fires once per cancelled call with the
+    /// original INVITE so a script can release per-call resources
+    /// (Diameter Rx/N5 QoS, rtpengine media) that no BYE will ever clear.
+    ProxyCancel,
     /// `@proxy.on_register_reply` — REGISTER-specific reply handler.
     ProxyRegisterReply,
     /// `@b2bua.on_invite`
@@ -60,6 +65,11 @@ pub enum HandlerKind {
     B2buaBye,
     /// `@b2bua.on_refer` — call transfer (RFC 3515).
     B2buaRefer,
+    /// `@b2bua.on_cancel` — an unanswered call (Calling/Ringing) was
+    /// CANCELled. Fires once per call with the Call object so a B2BUA
+    /// script can release per-call resources (rtpengine media, QoS) that
+    /// no BYE will ever clear.
+    B2buaCancel,
     /// `@registrar.on_change` — registration state change callback.
     RegistrarOnChange,
     /// `@registration.on_change` — outbound registration state change callback.
@@ -742,6 +752,7 @@ fn extract_handlers(
             "proxy.on_request" => HandlerKind::ProxyRequest(filter),
             "proxy.on_reply" => HandlerKind::ProxyReply,
             "proxy.on_failure" => HandlerKind::ProxyFailure,
+            "proxy.on_cancel" => HandlerKind::ProxyCancel,
             "proxy.on_register_reply" => HandlerKind::ProxyRegisterReply,
             "b2bua.on_invite" => HandlerKind::B2buaInvite,
             "b2bua.on_early_media" => HandlerKind::B2buaEarlyMedia,
@@ -749,6 +760,7 @@ fn extract_handlers(
             "b2bua.on_failure" => HandlerKind::B2buaFailure,
             "b2bua.on_bye" => HandlerKind::B2buaBye,
             "b2bua.on_refer" => HandlerKind::B2buaRefer,
+            "b2bua.on_cancel" => HandlerKind::B2buaCancel,
             "registrar.on_change" => HandlerKind::RegistrarOnChange,
             "registration.on_change" => HandlerKind::RegistrantOnChange,
             "srs.on_invite" => HandlerKind::SrsOnInvite,
@@ -798,7 +810,7 @@ fn extract_handlers(
         let options = match &kind {
             HandlerKind::Custom { .. } => metadata
                 .as_ref()
-                .and_then(|m| m.downcast::<PyDict>().ok())
+                .and_then(|m| m.cast::<PyDict>().ok())
                 .map(|d| d.clone().unbind()),
             _ => None,
         };
@@ -845,7 +857,13 @@ async fn timer_loop(
         tokio::time::sleep(wait).await;
 
         let timer_name = name.clone();
-        let callback = callable.clone();
+        // Attach before cloning the Py callback — `timer_loop` runs as a
+        // spawned Tokio task whose worker is detached from the interpreter
+        // (pyo3 `ATTACH_COUNT == 0`), and on free-threaded Python cloning a
+        // `Py<>` while detached panics ("Cannot clone pointer into Python heap
+        // without the thread being attached"). Mirrors the clone at the timer
+        // registration site (`restart_timers`).
+        let callback = Python::attach(|python| callable.clone_ref(python));
         let result = crate::script::py_executor::try_run(move || {
             Python::attach(|python| {
                 let bound = callback.bind(python);
@@ -894,6 +912,38 @@ thread_local! {
     static PYTHON_LOOP: RefCell<Option<Py<PyAny>>> = const { RefCell::new(None) };
 }
 
+/// Acquire — creating it on first use — this thread's persistent fallback
+/// asyncio loop (the legacy path used when no global async pool is installed).
+/// Reused across calls so `call_soon_threadsafe` targets stay valid for the
+/// lifetime of the thread (see [`PYTHON_LOOP`]).
+///
+/// Pulled out as a named helper so the per-thread caching can be unit-tested
+/// directly: the public [`run_coroutine`] entry point short-circuits to the
+/// global async pool when one is installed (a process-wide `OnceLock`), which
+/// would otherwise route around — and thus never populate — this fallback loop
+/// whenever a sibling test installs the pool.
+fn fallback_thread_loop(python: Python<'_>) -> PyResult<Py<PyAny>> {
+    PYTHON_LOOP.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        match slot.as_ref() {
+            Some(handle) => Ok(handle.clone_ref(python)),
+            None => {
+                let asyncio = python.import("asyncio")?;
+                let new_loop = asyncio.call_method0("new_event_loop")?;
+                // Bind this loop to the thread for any code path that still
+                // calls the (deprecated) `asyncio.get_event_loop()`.  The
+                // running-loop lookup used by `pyo3_async_runtimes` is set
+                // automatically by `run_until_complete`.
+                asyncio.call_method1("set_event_loop", (&new_loop,))?;
+                let unbound = new_loop.unbind();
+                let handle = unbound.clone_ref(python);
+                *slot = Some(unbound);
+                Ok(handle)
+            }
+        }
+    })
+}
+
 /// Run a Python coroutine to completion on this thread's persistent asyncio
 /// event loop.
 ///
@@ -933,26 +983,7 @@ pub(crate) fn run_coroutine_value(
     {
         return Ok(value);
     }
-    let loop_handle = PYTHON_LOOP.with(|cell| -> PyResult<Py<PyAny>> {
-        let mut slot = cell.borrow_mut();
-        let handle = match slot.as_ref() {
-            Some(handle) => handle.clone_ref(python),
-            None => {
-                let asyncio = python.import("asyncio")?;
-                let new_loop = asyncio.call_method0("new_event_loop")?;
-                // Bind this loop to the thread for any code path that still
-                // calls the (deprecated) `asyncio.get_event_loop()`.  The
-                // running-loop lookup used by `pyo3_async_runtimes` is set
-                // automatically by `run_until_complete`.
-                asyncio.call_method1("set_event_loop", (&new_loop,))?;
-                let unbound = new_loop.unbind();
-                let handle = unbound.clone_ref(python);
-                *slot = Some(unbound);
-                handle
-            }
-        };
-        Ok(handle)
-    })?;
+    let loop_handle = fallback_thread_loop(python)?;
 
     let bound_loop = loop_handle.bind(python);
     let result = tokio::task::block_in_place(|| {
@@ -985,6 +1016,48 @@ mod tests {
     fn empty_script_yields_no_handlers() {
         let state = compile_temp_script("# empty script\npass\n").unwrap();
         assert!(state.handlers.is_empty());
+    }
+
+    /// Regression: `timer_loop` re-clones the timer's Python callable on every
+    /// fire to hand it to the executor. It runs as a spawned Tokio task whose
+    /// worker is detached from the interpreter (pyo3 `ATTACH_COUNT == 0`), so a
+    /// bare `Py::clone` there panics ("Cannot clone pointer into Python heap
+    /// without the thread being attached") on free-threaded CPython — the same
+    /// family of bug as the dispatcher relay callbacks. The clone must go
+    /// through `Python::attach` / `clone_ref` (mirrors `restart_timers`).
+    #[test]
+    fn timer_loop_fires_without_detached_clone_panic() {
+        Python::initialize();
+
+        // The periodic timer loop calls the handler with no arguments.
+        let callable: Py<PyAny> = Python::attach(|python| {
+            python
+                .eval(c"lambda: None", None, None)
+                .expect("compile timer lambda")
+                .unbind()
+        });
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // interval = 1s, so exactly one fire lands inside the 1200ms window.
+        // With a bare clone the worker panics at the first fire (~1s) and the
+        // panic unwinds `block_on`, failing the test. With the fix the loop
+        // keeps running and the timeout elapses.
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1200),
+                timer_loop(callable, false, 1, 0, "regression-timer".to_string()),
+            )
+            .await
+        });
+
+        assert!(
+            outcome.is_err(),
+            "timer_loop returned early — it should loop forever after firing"
+        );
     }
 
     #[test]
@@ -1062,6 +1135,38 @@ def ended(call, initiator):
     }
 
     #[test]
+    fn proxy_on_cancel_decorator_registers_handler() {
+        let source = r#"
+from siphon import proxy
+
+@proxy.on_cancel
+async def on_cancel(request):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert_eq!(state.handlers[0].kind, HandlerKind::ProxyCancel);
+        assert!(state.handlers[0].is_async);
+        assert_eq!(state.handlers_for(&HandlerKind::ProxyCancel).len(), 1);
+    }
+
+    #[test]
+    fn b2bua_on_cancel_decorator_registers_handler() {
+        let source = r#"
+from siphon import b2bua
+
+@b2bua.on_cancel
+def on_cancel(call):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert_eq!(state.handlers[0].kind, HandlerKind::B2buaCancel);
+        assert!(!state.handlers[0].is_async);
+        assert_eq!(state.handlers_for(&HandlerKind::B2buaCancel).len(), 1);
+    }
+
+    #[test]
     fn registrar_on_change_decorator_registers_handler() {
         let source = r#"
 from siphon import registrar
@@ -1118,6 +1223,9 @@ async def route(request):
             reload: ReloadMode::Auto,
             async_pool_size: None,
             sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: 30,
+            executor_queue_capacity: 1024,
         };
         let result = ScriptEngine::new(&config);
         assert!(result.is_err());
@@ -1144,6 +1252,9 @@ def route(request):
             reload: ReloadMode::Auto,
             async_pool_size: None,
             sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: 30,
+            executor_queue_capacity: 1024,
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -1192,6 +1303,9 @@ def route(request):
             reload: ReloadMode::Auto,
             async_pool_size: None,
             sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: 30,
+            executor_queue_capacity: 1024,
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -1313,6 +1427,8 @@ def new_call(call):
                 &crate::script::api::call::CallAction::Dial {
                     target: "sip:bob@10.0.0.2:5060".to_string(),
                     next_hop: None,
+                    flow: None,
+                    route: vec![],
                     timeout: 30,
                 }
             );
@@ -1800,7 +1916,7 @@ def route(request):
     // Host-registered user namespaces
     // -----------------------------------------------------------------
 
-    use pyo3::prelude::*;
+    
 
     #[pyclass]
     struct UserNamespaceProbe {
@@ -1911,7 +2027,7 @@ mod async_runner_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use pyo3::prelude::*;
+    
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods};
 
     /// Tokio-backed coroutine bridged to Python via
@@ -1993,46 +2109,27 @@ mod async_runner_tests {
         assert_eq!(success.load(Ordering::Relaxed), total);
     }
 
-    /// A second `run_coroutine` call from the same thread must reuse the
-    /// already-cached event loop; tearing the loop down between calls is
-    /// exactly what creates the closed-loop race.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_coroutine_reuses_thread_local_loop() {
+    /// The fallback (no-pool) path must reuse the same per-thread asyncio
+    /// loop across calls; tearing the loop down between calls is exactly what
+    /// creates the closed-loop race.
+    ///
+    /// Exercises `fallback_thread_loop` directly rather than going through
+    /// `run_coroutine`: the public entry point short-circuits to the global
+    /// async pool when a sibling test has installed it (a process-wide
+    /// `OnceLock`), which would route around — and thus never populate — the
+    /// per-thread fallback loop this test verifies.  Both calls run on the
+    /// same thread inside one `Python::attach`, so they share the thread-local.
+    #[test]
+    fn fallback_loop_is_reused_across_calls() {
         Python::initialize();
-        Python::attach(install_test_module);
-        let factory: Arc<Py<PyAny>> = Arc::new(Python::attach(build_factory));
-
-        // Pin both invocations to the same Tokio blocking-pool thread so we
-        // are exercising the per-thread loop cache, not two distinct ones.
-        tokio::task::spawn_blocking(move || {
-            let first_loop_id = Python::attach(|python| {
-                let coro = factory.bind(python).call0().unwrap();
-                run_coroutine(python, &coro).expect("first run");
-                PYTHON_LOOP.with(|cell| {
-                    cell.borrow()
-                        .as_ref()
-                        .map(|handle| handle.bind(python).as_ptr() as usize)
-                        .expect("loop cached after first run")
-                })
-            });
-
-            let second_loop_id = Python::attach(|python| {
-                let coro = factory.bind(python).call0().unwrap();
-                run_coroutine(python, &coro).expect("second run");
-                PYTHON_LOOP.with(|cell| {
-                    cell.borrow()
-                        .as_ref()
-                        .map(|handle| handle.bind(python).as_ptr() as usize)
-                        .expect("loop still cached after second run")
-                })
-            });
-
+        Python::attach(|python| {
+            let first = fallback_thread_loop(python).expect("first fallback loop");
+            let second = fallback_thread_loop(python).expect("second fallback loop");
             assert_eq!(
-                first_loop_id, second_loop_id,
-                "the same per-thread asyncio loop must be reused across calls"
+                first.bind(python).as_ptr() as usize,
+                second.bind(python).as_ptr() as usize,
+                "the same per-thread fallback asyncio loop must be reused across calls"
             );
-        })
-        .await
-        .unwrap();
+        });
     }
 }

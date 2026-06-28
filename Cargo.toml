@@ -1,13 +1,13 @@
 [package]
 name = "siphon-sip"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
 description = "SIPhon — high-performance SIP proxy, B2BUA and IMS platform with free-threaded Python scripting"
 readme = "README.md"
-homepage = "https://github.com/siphon-project/siphon"
-repository = "https://github.com/siphon-project/siphon"
+homepage = "https://github.com/siphon-project/siphon-sip"
+repository = "https://github.com/siphon-project/siphon-sip"
 keywords = ["sip", "voip", "proxy", "b2bua", "ims"]
 categories = ["network-programming"]
 exclude = [
@@ -50,16 +50,19 @@ arc-swap = "1"
 # Python scripting
 # Free-threaded support is auto-detected by PyO3 0.28 when building against Python 3.14t.
 # No feature flag needed — just: pyenv shell 3.14t && cargo build
-pyo3 = { version = "0.28", features = ["py-clone"] }
-pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+pyo3 = { version = "0.29", features = ["py-clone"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 
 # DNS
-hickory-resolver = "0.25"
+hickory-resolver = "0.26"
 
 # Transport
 socket2 = "0.6"
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
+# PEM parsing (CertificateDer/PrivateKeyDer::*_pem_*) is built into
+# rustls-pki-types and gated only by `std` — there is no separate `pem`
+# feature in the 1.x line we resolve here.
+rustls-pki-types = { version = "1", features = ["std"] }
 webpki-roots = "1"
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
@@ -71,7 +74,7 @@ serde_json = "1"
 
 # Config
 serde = { version = "1", features = ["derive"] }
-serde_yml = "0.0.12"
+serde_yaml_ng = "0.10"
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client (APIBAN, HTTP auth backend)
@@ -79,6 +82,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 
 # Crypto (Milenage AKA key derivation for IMS IPsec)
 aes = "0.8"
+
+# STIR/SHAKEN — ES256 PASSporT signing/verification (RFC 8224/8225/8226,
+# ATIS-1000074). RustCrypto, pure-Rust, no OpenSSL — fits the rustls posture.
+# ECDSA signing uses RFC 6979 deterministic nonces, so no RNG plumbing on the
+# sign path.
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }  # ES256 sign/verify + key load
+x509-cert = { version = "0.2", features = ["pem"] }               # cert parse, SPKI, extensions, validity
+base64 = "0.22"                                                    # base64url (URL_SAFE_NO_PAD) for JWS
 
 # Utilities
 md5 = "0.7"
@@ -97,7 +108,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Registrar persistence backends (optional, feature-flagged)
 redis = { version = "1", features = ["tokio-comp"], optional = true }
 tokio-postgres = { version = "0.7", optional = true }
-prometheus = { version = "0.13.4", features = ["process"] }
+prometheus = { version = "0.14", features = ["process"] }
 axum = { version = "0.8.8", features = ["tokio"] }
 tower = { version = "0.5.3", features = ["util"] }
 
@@ -139,6 +150,18 @@ rcgen = "0.14"
 default = ["redis-backend", "postgres-backend"]
 redis-backend = ["dep:redis"]
 postgres-backend = ["dep:tokio-postgres"]
+
+# --- Lint policy ---
+# The codebase is clippy-clean (see `clippy.toml` for the one tuned threshold).
+# Locally these warn; CI runs `cargo clippy --all-targets -- -D warnings` to
+# turn any warning — clippy lint or rustc (unused, dead_code) — into a hard
+# failure, so the clean state can't regress. Deny is kept out of the manifest
+# so local `cargo build`/`test` stays ergonomic during iteration.
+[lints.rust]
+unused = "warn"
+
+[lints.clippy]
+all = "warn"
 
 [profile.release]
 strip = true

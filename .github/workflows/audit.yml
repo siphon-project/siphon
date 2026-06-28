@@ -1,0 +1,29 @@
+name: Security audit
+
+# RustSec advisories are time-varying: a new advisory can land against an
+# unchanged dependency, so this runs on a schedule (and whenever the dependency
+# set changes) instead of gating every PR — a new advisory never turns a green
+# PR red on unchanged code, but it still surfaces here within a week.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: cargo-deny advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

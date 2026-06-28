@@ -68,6 +68,12 @@ pub enum LegSide {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LegId(pub String);
 
+impl Default for LegId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LegId {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
@@ -199,7 +205,7 @@ impl Dialog {
 
         if let Some(new_tag) = new_to_tag {
             if let Some(to) = message.headers.get("To").or_else(|| message.headers.get("t")) {
-                if let Ok(mut name_addr) = crate::sip::headers::nameaddr::NameAddr::parse(&to) {
+                if let Ok(mut name_addr) = crate::sip::headers::nameaddr::NameAddr::parse(to) {
                     if name_addr.tag.is_some() {
                         name_addr.tag = if new_tag.is_empty() {
                             None
@@ -262,7 +268,7 @@ pub fn rewrite_uri_host(header_value: &str, new_host: &str) -> String {
     if let Some(at_pos) = header_value.find('@') {
         let after_at = &header_value[at_pos + 1..];
         let host_end = after_at
-            .find(|c: char| c == '>' || c == ';' || c == ':')
+            .find(['>', ';', ':'])
             .unwrap_or(after_at.len());
         let end_pos = at_pos + 1 + host_end;
         format!(
@@ -354,6 +360,15 @@ pub struct Leg {
     /// CANCEL is emitted immediately so RFC 3261 §9.1 correlation
     /// (same Via branch + CSeq seq as the INVITE being cancelled) holds.
     pub pending_cancel: bool,
+    /// Whether a 401/407 digest challenge on this leg has already driven an
+    /// auth retry (B-leg only). The trunk's INVITE server transaction
+    /// retransmits the challenge until it is ACKed (RFC 3261 §17.1.1.3); each
+    /// retransmit re-enters the response handler on this same branch. Without
+    /// this guard every retransmit would emit a fresh authenticated INVITE at
+    /// the same CSeq on a new branch, which the trunk sees as a merged request
+    /// (RFC 3261 §8.2.2.2) and rejects 482. Set once on the first challenge;
+    /// subsequent challenges on this branch are absorbed (re-ACKed only).
+    pub auth_challenged: bool,
 }
 
 impl Leg {
@@ -377,6 +392,7 @@ impl Leg {
             prack_acked_rseq: None,
             b_leg_invite: None,
             pending_cancel: false,
+            auth_challenged: false,
         }
     }
 
@@ -401,6 +417,7 @@ impl Leg {
             prack_acked_rseq: None,
             b_leg_invite: None,
             pending_cancel: false,
+            auth_challenged: false,
         }
     }
 }
@@ -588,6 +605,30 @@ pub struct CallActor {
     /// when the script calls `call.dial(header_policy=…)`.  When `None`, the
     /// dispatcher falls back to the configured `b2bua.default_header_policy`.
     pub resolved_header_policy: Option<std::sync::Arc<super::header_policy::ResolvedPolicy>>,
+    /// Whether the A-leg *peer* advertised `100rel` on the wire (RFC 3262 §3),
+    /// snapshotted at INVITE receipt **before** the `@b2bua.on_invite` handler
+    /// runs.  Drives the reliable-1xx strip in `sanitize_b2bua_response`.  This
+    /// MUST NOT be re-derived from `a_leg_invite`: the script can mutate that
+    /// shared message via `call.set_header("Supported", "…100rel")` to advertise
+    /// reliable provisionals toward the B-leg (IR.92 UEs need it to alert), and
+    /// reading it back would falsely conclude the A-leg trunk supports `100rel`,
+    /// leaking the reliable provisional to a peer that CANCELs it.
+    pub a_leg_supports_100rel: bool,
+    /// Number of credentialed outbound INVITEs already sent on the 401/407
+    /// auto-retry path for this call. Capped (see `MAX_B2BUA_AUTH_RETRIES` in
+    /// the dispatcher): once the cap is hit, a further challenge is treated as a
+    /// persistent auth failure and surfaced upstream rather than re-authed.
+    /// Counts committed retries only (one per retry leg) — retransmitted
+    /// challenges are absorbed by the per-leg [`Leg::auth_challenged`] guard
+    /// before they reach the counter, so the cap reflects real attempts.
+    pub auth_retry_count: u32,
+    /// Wall-clock deadline by which this call must be answered, set from the
+    /// script's `call.fork(timeout=…)` / `call.dial(timeout=…)` when the B-leg
+    /// INVITE(s) go out. The orphan sweep fails the call (CANCEL pending legs,
+    /// `@b2bua.on_failure`, `408` to the A-leg, teardown) once this passes while
+    /// the call is still un-answered. `None` = no application timeout (the 24h
+    /// orphan backstop still applies).
+    pub answer_deadline: Option<std::time::Instant>,
 }
 
 impl CallActor {
@@ -613,6 +654,9 @@ impl CallActor {
             preserve_call_id: false,
             pending_b_leg_ack: None,
             resolved_header_policy: None,
+            a_leg_supports_100rel: false,
+            auth_retry_count: 0,
+            answer_deadline: None,
         }
     }
 
@@ -639,6 +683,37 @@ impl CallActor {
                 }
             }
             Some(self.b_legs.remove(index))
+        } else {
+            None
+        }
+    }
+
+    /// Supersede a B-leg in place (e.g. a 401/407 digest or RFC 4028 422
+    /// session-timer retry resends the INVITE on a fresh branch).
+    ///
+    /// RFC 3261 §9.1: the failed attempt's INVITE client transaction is
+    /// complete once it has received a final response and been ACKed, so the
+    /// retry is the *same* logical B-leg continuing with new credentials /
+    /// Session-Expires — NOT a new fork branch. Appending instead (the old
+    /// behaviour) leaves the dead leg in `b_legs`, so a later CANCEL fans out
+    /// to its already-final-responded transaction as well as the live one
+    /// (→ a spurious 481 Call/Transaction Does Not Exist).
+    ///
+    /// Replaces the leg at `index`, resets its status to `Trying`, and clears
+    /// the actor handle — dropping the old [`LegHandle`] closes the previous
+    /// [`LegActor`]'s channel so it exits on its own (the same implicit
+    /// cleanup [`remove_b_leg`](Self::remove_b_leg) relies on). Keeps the
+    /// `b_legs` / `b_leg_status` / `b_leg_handles` parallel vectors aligned.
+    ///
+    /// Returns the superseded leg's Via branch (so the caller can re-point the
+    /// routing registry from the old branch to the new one), or `None` if
+    /// `index` is out of range.
+    pub fn replace_b_leg(&mut self, index: usize, leg: Leg) -> Option<String> {
+        if index < self.b_legs.len() {
+            let old_branch = std::mem::replace(&mut self.b_legs[index], leg).branch;
+            self.b_leg_status[index] = BLegStatus::Trying;
+            self.b_leg_handles[index] = None;
+            Some(old_branch)
         } else {
             None
         }
@@ -809,6 +884,27 @@ pub struct ZombieReInviteEntry {
     pub transport: Transport,
 }
 
+/// Post-teardown state for a B-leg whose INVITE was CANCELled but might still
+/// be answered (RFC 3261 §9.1 glare): the callee put a 2xx on the wire before
+/// our CANCEL arrived. That 2xx still establishes a dialog, which the B2BUA
+/// MUST ACK (§13.2.2.4) and then BYE (§15) to release. `handle_b2bua_cancel`
+/// removes the call — unregistering the B-leg branch — so the racing 2xx would
+/// otherwise be dropped as "unknown branch"; this entry lets `handle_response`
+/// catch it and clean the dialog up.
+///
+/// Keyed by B-leg SIP Call-ID. Auto-expires after 32 seconds (Timer H).
+#[derive(Debug, Clone)]
+pub struct ZombieCancelledLeg {
+    /// The cancelled B-leg's dialog + transport, used to build the ACK and BYE.
+    /// `remote_tag` / `remote_contact` are filled from the racing 2xx at
+    /// handling time (they were unknown when the INVITE was CANCELled).
+    pub leg: Leg,
+    /// Whether the BYE has already been sent. The first racing 2xx triggers
+    /// ACK + BYE; later 200 OK retransmits re-ACK only (so a lost ACK still
+    /// gets retried) without emitting a second BYE.
+    pub byed: bool,
+}
+
 /// Manages all active B2BUA calls.
 ///
 /// Stores `CallActor` instances in a concurrent map, indexed by internal
@@ -821,6 +917,9 @@ pub struct CallActorStore {
     pub registry: LegRegistry,
     /// Post-teardown re-INVITE ACK absorber, keyed by B-leg SIP Call-ID.
     pub zombie_reinvites: DashMap<String, ZombieReInviteEntry>,
+    /// Post-CANCEL glare absorber (RFC 3261 §9.1): a 2xx that raced our CANCEL
+    /// is ACKed + BYEd here, keyed by B-leg SIP Call-ID.
+    pub zombie_cancelled: DashMap<String, ZombieCancelledLeg>,
 }
 
 impl CallActorStore {
@@ -829,6 +928,7 @@ impl CallActorStore {
             calls: DashMap::new(),
             registry: LegRegistry::new(),
             zombie_reinvites: DashMap::new(),
+            zombie_cancelled: DashMap::new(),
         }
     }
 
@@ -868,6 +968,33 @@ impl CallActorStore {
             true
         } else {
             false
+        }
+    }
+
+    /// Supersede a B-leg in place and re-point the routing registry from the
+    /// old branch to the new one.
+    ///
+    /// Used by the 401/407 (RFC 3261 §9.1) and 422 (RFC 4028) retry paths: the
+    /// retry continues the same logical B-leg rather than forking a new one, so
+    /// a later CANCEL fans out to the live transaction only. See
+    /// [`CallActor::replace_b_leg`]. The dialog Call-ID is unchanged (the retry
+    /// reuses it), so the Call-ID registration is left untouched. Returns true
+    /// on success, false if the call or `index` is unknown.
+    pub fn replace_b_leg(&self, call_id: &str, index: usize, leg: Leg) -> bool {
+        let new_branch = leg.branch.clone();
+        let old_branch = match self.calls.get_mut(call_id) {
+            Some(mut call) => call.replace_b_leg(index, leg),
+            None => return false,
+        };
+        match old_branch {
+            Some(old) => {
+                if old != new_branch {
+                    self.registry.remove_branch(&old);
+                }
+                self.registry.register_branch(&new_branch, call_id);
+                true
+            }
+            None => false,
         }
     }
 
@@ -918,11 +1045,10 @@ impl CallActorStore {
             let leg_matches = |leg: &Leg| {
                 leg.dialog.call_id == call_id
                     && leg.dialog.local_tag == to_tag
-                    && leg
+                    && (leg
                         .dialog
                         .remote_tag
-                        .as_deref()
-                        .map_or(false, |tag| tag == from_tag)
+                        .as_deref() == Some(from_tag))
             };
             if leg_matches(&call.a_leg) || call.b_legs.iter().any(leg_matches) {
                 return Some(entry.key().clone());
@@ -978,11 +1104,55 @@ impl CallActorStore {
         let Some(leg) = call.b_legs.get_mut(b_leg_index) else {
             return false;
         };
-        if leg.prack_acked_rseq.map_or(false, |v| v >= rseq) {
+        if leg.prack_acked_rseq.is_some_and(|v| v >= rseq) {
             return false;
         }
         leg.prack_acked_rseq = Some(rseq);
         true
+    }
+
+    /// 401/407 auth-retry dedup: returns `true` exactly once for the first
+    /// digest challenge seen on the given B-leg, and `false` for retransmits
+    /// of that challenge on the same branch. The trunk retransmits the 401/407
+    /// until it is ACKed (RFC 3261 §17.1.1.3); without this guard each
+    /// retransmit would emit a second authenticated INVITE at the same CSeq on
+    /// a new branch, which the trunk rejects as a merged request (§8.2.2.2 →
+    /// 482). A chained re-challenge (e.g. stale nonce) lands on the *retry*
+    /// leg's branch, which is a distinct B-leg with its own flag, so legitimate
+    /// re-authentication still proceeds.
+    pub fn try_mark_auth_challenged(&self, call_id: &str, b_leg_index: usize) -> bool {
+        let Some(mut call) = self.calls.get_mut(call_id) else {
+            return false;
+        };
+        let Some(leg) = call.b_legs.get_mut(b_leg_index) else {
+            return false;
+        };
+        if leg.auth_challenged {
+            return false;
+        }
+        leg.auth_challenged = true;
+        true
+    }
+
+    /// Current count of credentialed outbound INVITEs sent on the 401/407
+    /// auto-retry path for this call (0 if the call is unknown). Read by the
+    /// dispatcher's retry cap before deciding whether to re-auth or surface the
+    /// failure.
+    pub fn auth_retry_count(&self, call_id: &str) -> u32 {
+        self.calls.get(call_id).map_or(0, |call| call.auth_retry_count)
+    }
+
+    /// Increment and return the per-call credentialed-retry counter. Called
+    /// once per committed retry (after the per-leg dedup), so retransmitted
+    /// challenges don't inflate it.
+    pub fn incr_auth_retry_count(&self, call_id: &str) -> u32 {
+        match self.calls.get_mut(call_id) {
+            Some(mut call) => {
+                call.auth_retry_count = call.auth_retry_count.saturating_add(1);
+                call.auth_retry_count
+            }
+            None => 0,
+        }
     }
 
     /// Set the `pending_reinvite` flag on the A-leg or the winning B-leg.
@@ -1120,6 +1290,54 @@ impl CallActorStore {
         self.zombie_reinvites.remove(sip_call_id);
     }
 
+    /// Tear down a CANCELled call, but first preserve every still-pending
+    /// B-leg (INVITE sent, no final response yet — status `Trying`/`Ringing`)
+    /// as a [`ZombieCancelledLeg`] so a 2xx that raced the CANCEL
+    /// (RFC 3261 §9.1) can still be ACKed (§13.2.2.4) and BYEd (§15) after the
+    /// call is gone. Used by `handle_b2bua_cancel` in place of `remove_call`.
+    ///
+    /// Returns true if any zombie-cancelled entries were captured (so the
+    /// caller can schedule their expiry).
+    pub fn remove_call_after_cancel(&self, call_id: &str) -> bool {
+        let mut captured = false;
+        if let Some(call) = self.calls.get(call_id) {
+            for (index, b_leg) in call.b_legs.iter().enumerate() {
+                let pending = matches!(
+                    call.b_leg_status.get(index),
+                    Some(BLegStatus::Trying) | Some(BLegStatus::Ringing)
+                );
+                // Only legs whose INVITE actually went on the wire can answer.
+                if pending && b_leg.b_leg_invite.is_some() {
+                    self.zombie_cancelled.insert(
+                        b_leg.dialog.call_id.clone(),
+                        ZombieCancelledLeg {
+                            leg: b_leg.clone(),
+                            byed: false,
+                        },
+                    );
+                    captured = true;
+                }
+            }
+        }
+        self.remove_call(call_id);
+        captured
+    }
+
+    /// Resolve a racing 2xx to a CANCELled B-leg by SIP Call-ID.
+    ///
+    /// Returns the captured leg plus a `first_2xx` flag: the first racing 2xx
+    /// for a Call-ID returns `(leg, true)` so the caller sends ACK + BYE; later
+    /// 200 OK retransmits return `(leg, false)` so the caller re-ACKs only (a
+    /// lost ACK still gets retried) without a second BYE. The entry stays until
+    /// the 32 s cleanup so retransmits keep matching.
+    pub fn zombie_cancelled_for_2xx(&self, sip_call_id: &str) -> Option<(Leg, bool)> {
+        self.zombie_cancelled.get_mut(sip_call_id).map(|mut entry| {
+            let first_2xx = !entry.byed;
+            entry.byed = true;
+            (entry.leg.clone(), first_2xx)
+        })
+    }
+
     /// Iterate over all active calls (for session timer sweep).
     pub fn iter_calls(&self) -> dashmap::iter::Iter<'_, String, CallActor> {
         self.calls.iter()
@@ -1141,7 +1359,7 @@ impl CallActorStore {
                     early_only: false,
                 },
                 &entry.a_leg.dialog.call_id,
-                &entry.a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                entry.a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 from_tag,
             ) {
                 return Some(entry.id.clone());
@@ -1163,6 +1381,31 @@ impl CallActorStore {
         }
         removed
     }
+
+    /// Set the answer deadline for a call (from `call.fork`/`dial` `timeout=`).
+    pub fn set_answer_deadline(&self, call_id: &str, deadline: std::time::Instant) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.answer_deadline = Some(deadline);
+        }
+    }
+
+    /// Internal call IDs of calls that have blown their answer deadline while
+    /// still un-answered (`Calling`/`Ringing`).
+    ///
+    /// Does NOT remove them — the dispatcher runs the full timeout teardown
+    /// (CANCEL pending legs, `@b2bua.on_failure`, `408` to the A-leg) which
+    /// needs the call state and the Python engine. Answered/terminated calls
+    /// and calls without a deadline are skipped, so a long answered call (whose
+    /// `created_at` is old but which is past `Answered`) is never touched.
+    pub fn take_timed_out_calls(&self, now: std::time::Instant) -> Vec<String> {
+        self.calls.iter()
+            .filter(|entry| {
+                matches!(entry.state, CallState::Calling | CallState::Ringing)
+                    && entry.answer_deadline.is_some_and(|deadline| now >= deadline)
+            })
+            .map(|entry| entry.id.clone())
+            .collect()
+    }
 }
 
 impl Default for CallActorStore {
@@ -1176,7 +1419,15 @@ impl Default for CallActorStore {
 // ---------------------------------------------------------------------------
 
 /// Messages sent to a leg actor's mailbox (for async mode).
+///
+/// `large_enum_variant` is intentionally allowed: `SipInbound` is the hot,
+/// overwhelmingly-common variant (one per inbound SIP message on the leg),
+/// while `Cancel`/`Shutdown` are rare one-shots. Boxing `SipInbound.message`
+/// to shrink the enum would add a heap allocation to the hot path purely to
+/// save stack space on the rare variants — the opposite of what this lint
+/// optimizes for.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum LegMessage {
     /// A SIP message arrived from the network.
     SipInbound {
@@ -1563,6 +1814,48 @@ mod tests {
     }
 
     #[test]
+    fn call_actor_replace_b_leg_supersedes_in_place() {
+        // 401/407/422 retry: the retry INVITE supersedes the failed leg at the
+        // same index rather than appending a second leg. The parallel vectors
+        // stay aligned, the slot's status resets to Trying, its actor handle is
+        // cleared, and the old branch is returned for registry re-pointing.
+        let mut call = CallActor::new(make_a_leg());
+        call.add_b_leg(make_b_leg(0)); // CSeq-1 leg, branch z9hG4bK-bleg0
+        call.add_b_leg(make_b_leg(1)); // an unrelated fork branch
+
+        // The failed CSeq-1 leg got a final response, and we parked a handle on it.
+        call.b_leg_status[0] = BLegStatus::Failed(401);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<LegMessage>(1);
+        call.b_leg_handles[0] = Some(LegHandle {
+            id: call.b_legs[0].id.clone(),
+            side: LegSide::B,
+            tx,
+        });
+
+        // Build the retry leg on a fresh branch and supersede index 0.
+        let retry = Leg::new_b_leg(
+            "b2b-bleg0".to_string(),
+            "sb-bleg0".to_string(),
+            "sip:bob0@10.0.0.2".to_string(),
+            "z9hG4bK-bleg0-retry".to_string(),
+            test_transport(),
+        );
+        let old_branch = call.replace_b_leg(0, retry);
+
+        assert_eq!(old_branch.as_deref(), Some("z9hG4bK-bleg0"));
+        assert_eq!(call.b_legs.len(), 2); // superseded, not appended
+        assert_eq!(call.b_legs[0].branch, "z9hG4bK-bleg0-retry"); // live branch
+        assert_eq!(call.b_leg_status[0], BLegStatus::Trying); // status reset
+        assert!(call.b_leg_handles[0].is_none()); // old actor handle cleared
+        // The unrelated fork branch at index 1 is untouched.
+        assert_eq!(call.b_legs[1].branch, "z9hG4bK-bleg1");
+
+        // Out-of-range supersede is a no-op returning None.
+        assert_eq!(call.replace_b_leg(99, make_b_leg(7)), None);
+        assert_eq!(call.b_legs.len(), 2);
+    }
+
+    #[test]
     fn call_actor_losers() {
         let mut call = CallActor::new(make_a_leg());
         call.add_b_leg(make_b_leg(0));
@@ -1655,13 +1948,13 @@ mod tests {
         store.set_winner(&call_id, 0);
 
         // First re-INVITE toward B-leg: flag was false, is now true.
-        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true), false);
+        assert!(!store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true));
         // Second (glare): flag was already true.
-        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true), true);
+        assert!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true));
         // Clear on completion.
-        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, false), true);
+        assert!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, false));
         // Now a new re-INVITE can start.
-        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true), false);
+        assert!(!store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true));
     }
 
     /// RFC 3891 §3 dialog lookup: find a call where one of its legs has
@@ -1720,6 +2013,54 @@ mod tests {
         assert!(store.try_mark_prack_acked(&call_id, 0, 43));
     }
 
+    /// 401/407 auth-retry dedup: the first challenge on a B-leg returns true
+    /// (drive the retry); every retransmit of that challenge on the same
+    /// branch returns false (absorb — ACK only, no second authenticated
+    /// INVITE → no 482 merged request). A chained re-challenge arrives on the
+    /// retry leg's own branch, which is a distinct B-leg that has not yet been
+    /// challenged, so it returns true once on its own.
+    #[test]
+    fn try_mark_auth_challenged_dedupes_per_leg() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+
+        // First 401 on the original B-leg → retry.
+        assert!(store.try_mark_auth_challenged(&call_id, 0));
+        // Retransmitted 401 on the same branch → absorbed.
+        assert!(!store.try_mark_auth_challenged(&call_id, 0));
+        assert!(!store.try_mark_auth_challenged(&call_id, 0));
+
+        // The auth retry adds a new B-leg with a fresh branch. A chained
+        // re-challenge (stale nonce) on that leg is a legitimate new challenge.
+        store.add_b_leg(&call_id, make_b_leg(1));
+        assert!(store.try_mark_auth_challenged(&call_id, 1));
+        assert!(!store.try_mark_auth_challenged(&call_id, 1));
+
+        // Out-of-range index returns false (no leg to mark).
+        assert!(!store.try_mark_auth_challenged(&call_id, 99));
+    }
+
+    /// The per-call credentialed-retry counter backs the dispatcher's auth
+    /// retry cap: it starts at 0, increments once per committed retry, and is
+    /// readable without mutation. Unknown calls read 0 and increment to 0.
+    #[test]
+    fn auth_retry_count_increments_and_caps() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+
+        assert_eq!(store.auth_retry_count(&call_id), 0);
+        assert_eq!(store.incr_auth_retry_count(&call_id), 1);
+        assert_eq!(store.incr_auth_retry_count(&call_id), 2);
+        // Reading does not mutate.
+        assert_eq!(store.auth_retry_count(&call_id), 2);
+        assert_eq!(store.incr_auth_retry_count(&call_id), 3);
+
+        // Unknown call: read 0, increment is a no-op returning 0.
+        assert_eq!(store.auth_retry_count("nope"), 0);
+        assert_eq!(store.incr_auth_retry_count("nope"), 0);
+    }
+
     #[test]
     fn next_b_leg_local_cseq_increments_per_call() {
         let store = CallActorStore::new();
@@ -1744,9 +2085,9 @@ mod tests {
         store.add_b_leg(&call_id, make_b_leg(0));
         store.set_winner(&call_id, 0);
 
-        assert_eq!(store.set_pending_reinvite(&call_id, false, true), false);
+        assert!(!store.set_pending_reinvite(&call_id, false, true));
         // The A-leg flag should still be false.
-        assert_eq!(store.set_pending_reinvite(&call_id, true, true), false);
+        assert!(!store.set_pending_reinvite(&call_id, true, true));
     }
 
     #[test]
@@ -1767,12 +2108,138 @@ mod tests {
     }
 
     #[test]
+    fn store_replace_b_leg_repoints_registry() {
+        // Superseding a B-leg must move the routing registry from the old
+        // branch to the retry branch: responses to the retry INVITE route to
+        // this call, and the dead pre-auth branch no longer resolves (so a
+        // stray retransmit on it can't re-enter the call with a stale leg).
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        let original = make_b_leg(0);
+        let old_branch = original.branch.clone();
+        store.add_b_leg(&call_id, original);
+        assert_eq!(store.call_id_for_branch(&old_branch), Some(call_id.clone()));
+
+        let retry = Leg::new_b_leg(
+            "b2b-bleg0".to_string(),
+            "sb-bleg0".to_string(),
+            "sip:bob0@10.0.0.2".to_string(),
+            "z9hG4bK-bleg0-retry".to_string(),
+            test_transport(),
+        );
+        assert!(store.replace_b_leg(&call_id, 0, retry));
+
+        // Exactly one leg survives, on the retry branch.
+        let call = store.get_call(&call_id).expect("call exists");
+        assert_eq!(call.b_legs.len(), 1);
+        assert_eq!(call.b_legs[0].branch, "z9hG4bK-bleg0-retry");
+        drop(call);
+
+        // Registry now resolves the retry branch, not the dead one.
+        assert_eq!(
+            store.call_id_for_branch("z9hG4bK-bleg0-retry"),
+            Some(call_id.clone())
+        );
+        assert!(store.call_id_for_branch(&old_branch).is_none());
+
+        // Superseding an unknown call or out-of-range index is a no-op.
+        assert!(!store.replace_b_leg("nope", 0, make_b_leg(9)));
+        assert!(!store.replace_b_leg(&call_id, 99, make_b_leg(9)));
+    }
+
+    #[test]
+    fn store_remove_call_after_cancel_zombifies_pending_legs() {
+        // A CANCELled call's still-pending B-leg (INVITE on the wire, status
+        // Trying) must survive teardown as a zombie-cancelled entry so a 2xx
+        // that raced the CANCEL can be ACKed + BYEd. A leg whose INVITE never
+        // went out (no stash) must not.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+
+        let mut sent_leg = make_b_leg(0);
+        let sent_cid = sent_leg.dialog.call_id.clone();
+        let invite = crate::sip::builder::SipMessageBuilder::new()
+            .request(
+                crate::sip::message::Method::Invite,
+                crate::sip::uri::SipUri::new("10.0.0.2".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-b0".to_string())
+            .from("<sip:alice@10.0.0.1>;tag=a".to_string())
+            .to("<sip:bob@10.0.0.2>".to_string())
+            .call_id(sent_cid.clone())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        sent_leg.b_leg_invite = Some(Arc::new(Mutex::new(invite)));
+        store.add_b_leg(&call_id, sent_leg);
+
+        // A second B-leg whose INVITE never went on the wire (no stash).
+        let unsent_leg = make_b_leg(1);
+        let unsent_cid = unsent_leg.dialog.call_id.clone();
+        store.add_b_leg(&call_id, unsent_leg);
+
+        let captured = store.remove_call_after_cancel(&call_id);
+        assert!(captured, "the sent, still-pending leg should be zombified");
+        assert_eq!(store.count(), 0, "the call itself is removed");
+
+        // The sent leg resolves as a zombie; the unsent one does not.
+        let (leg, first) = store
+            .zombie_cancelled_for_2xx(&sent_cid)
+            .expect("zombie present for the sent leg");
+        assert!(first, "the first racing 2xx triggers ACK + BYE");
+        assert_eq!(leg.dialog.call_id, sent_cid);
+        assert!(store.zombie_cancelled_for_2xx(&unsent_cid).is_none());
+
+        // A retransmitted 2xx for the same Call-ID re-ACKs only (no second BYE).
+        let (_leg, second) = store
+            .zombie_cancelled_for_2xx(&sent_cid)
+            .expect("entry stays until the 32s cleanup");
+        assert!(!second, "a retransmit must not trigger a second BYE");
+    }
+
+    #[test]
     fn store_sweep_stale() {
         let store = CallActorStore::new();
         store.create_call(make_a_leg());
         assert_eq!(store.sweep_stale(std::time::Duration::from_secs(60)), 0);
         assert_eq!(store.sweep_stale(std::time::Duration::ZERO), 1);
         assert_eq!(store.count(), 0);
+    }
+
+    #[test]
+    fn take_timed_out_calls_only_unanswered_past_deadline() {
+        // The answer-timeout sweep must select only calls that are still
+        // un-answered AND past their deadline — never an answered call, a call
+        // whose deadline is in the future, or one with no deadline. And it must
+        // not remove anything (the dispatcher runs the teardown).
+        let store = CallActorStore::new();
+        let now = std::time::Instant::now();
+        let past = now - std::time::Duration::from_secs(1);
+        let future = now + std::time::Duration::from_secs(60);
+
+        // Un-answered (Calling), deadline already passed → timed out.
+        let stuck = store.create_call(make_a_leg());
+        store.set_answer_deadline(&stuck, past);
+
+        // Un-answered, deadline still in the future → not yet.
+        let waiting = store.create_call(make_a_leg());
+        store.set_answer_deadline(&waiting, future);
+
+        // Answered, deadline passed → never (it answered; lives until BYE).
+        let answered = store.create_call(make_a_leg());
+        store.set_answer_deadline(&answered, past);
+        store.add_b_leg(&answered, make_b_leg(0));
+        store.set_winner(&answered, 0);
+
+        // No deadline → only the 24h orphan backstop applies.
+        let no_deadline = store.create_call(make_a_leg());
+
+        let timed_out = store.take_timed_out_calls(now);
+        assert_eq!(timed_out, vec![stuck.clone()]);
+        // Nothing was removed.
+        assert_eq!(store.count(), 4);
+        let _ = (waiting, answered, no_deadline);
     }
 
     // --- LegRegistry tests ---

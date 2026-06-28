@@ -670,7 +670,7 @@ fn build_answer_via_handler(
             }
         }
     } else {
-        match resolved.downcast::<PyDiameterAnswer>() {
+        match resolved.cast::<PyDiameterAnswer>() {
             Ok(answer_bound) => answer_bound.clone().unbind(),
             Err(_) => {
                 warn!("DRA: on_request must return a DiameterAnswer or None");

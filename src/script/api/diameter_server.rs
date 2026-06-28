@@ -248,7 +248,7 @@ fn msg_iter_avps<'py>(py: Python<'py>, msg: &DiameterMsg) -> PyResult<Bound<'py,
 /// and each child `value` may itself be a list (a nested group). Any other
 /// value (str / int / bytes) is a leaf, encoded per the dictionary type.
 fn build_avp(code: u32, vendor: u32, value: &Bound<'_, PyAny>) -> PyResult<Avp> {
-    if let Ok(list) = value.downcast::<PyList>() {
+    if let Ok(list) = value.cast::<PyList>() {
         let mut children = Vec::with_capacity(list.len());
         for item in list.iter() {
             children.push(build_child_spec(&item)?);
@@ -271,7 +271,7 @@ fn build_avp(code: u32, vendor: u32, value: &Bound<'_, PyAny>) -> PyResult<Avp> 
 /// Parse one grouped child spec — a `(code_or_name, value)` or
 /// `(code_or_name, value, vendor)` tuple — into an [`Avp`].
 fn build_child_spec(spec: &Bound<'_, PyAny>) -> PyResult<Avp> {
-    let tuple = spec.downcast::<PyTuple>().map_err(|_| {
+    let tuple = spec.cast::<PyTuple>().map_err(|_| {
         pyo3::exceptions::PyTypeError::new_err(
             "grouped AVP children must be (code, value) or (code, value, vendor) tuples",
         )
@@ -819,7 +819,7 @@ mod tests {
                 .get_avp(py, dictionary::avp::AUTHENTICATION_INFO, dictionary::VENDOR_3GPP)
                 .unwrap()
                 .unwrap();
-            let list = read.downcast::<PyList>().unwrap();
+            let list = read.cast::<PyList>().unwrap();
             assert_eq!(list.len(), 1); // one E-UTRAN-Vector child
         });
     }

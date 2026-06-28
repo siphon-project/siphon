@@ -80,6 +80,10 @@ domain:
 #   private_key:  "/etc/siphon/tls/example.com.key"
 #   method: "TLSv1_3"     # TLSv1_2 | TLSv1_3
 #   verify_client: false  # true for mTLS (e.g. SIP trunks with mutual auth)
+#   client_ca: "/etc/siphon/tls/client-ca.pem"
+#     # PEM bundle of CA certs that client certs must chain to. REQUIRED when
+#     # verify_client is true (startup fails otherwise). Applies to listen.tls
+#     # and listen.wss (they share this block).
 
 # ---------------------------------------------------------------------------
 # Python script
@@ -90,6 +94,38 @@ script:
   # Timer routes: use @timer.every(seconds=N) in scripts for periodic callbacks.
   # No YAML config needed — all parameters are per-decorator in the script.
   # See examples/timer_example.py for usage patterns.
+  #
+  # --- Handler executor pool (see docs/handler-execution-model.md) ---
+  # Sync SIP handlers run on an ELASTIC pool of persistently-attached Python
+  # threads: it starts at sync_pool_size (always-on core) and grows on demand to
+  # sync_pool_max under load, then never shrinks. A handler that performs
+  # blocking I/O (HTTP/Diameter digest auth, an on_change notify) pins a worker
+  # for the whole call, so the pool grows to absorb concurrent blocking handlers
+  # instead of starving the engine.
+  #
+  # sync_pool_size: <int>          # core (always-on) threads. Default: max(8, 2 x CPUs).
+  # sync_pool_max: <int>           # elastic ceiling. Default: max(32, 4 x core).
+  #                                # Each grown worker costs ~2 MB of persistent
+  #                                # Python heap, so peak memory ~= sync_pool_max
+  #                                # x 2 MB. Lower it on memory-constrained NFs
+  #                                # (and prefer auth.http.cache_ttl_secs, which
+  #                                # keeps a storm from ever needing to grow).
+  # async_pool_size: <int>         # asyncio driver threads. Default: CPUs.
+  # executor_queue_capacity: 1024  # max queued handler jobs before load-shed
+  #                                # (drop + retransmit). Bounds memory under
+  #                                # overload. Raise on high-throughput NFs.
+  # handler_stall_abort_secs: 30   # liveness watchdog: abort the process (so a
+  #                                # supervisor restarts it) only if the pool is
+  #                                # at its thread cap with every worker busy and
+  #                                # zero completions for this long. 0 disables
+  #                                # it. The default 30 is 6x the 5 s HTTP-auth
+  #                                # timeout, so transient slowness never trips
+  #                                # it. A hung-but-alive SIP engine never
+  #                                # recovers on its own — this converts an
+  #                                # indefinite outage into a restart.
+  # Observability: siphon_pyexec_inflight / _queue_depth / _pool_size / _pool_max
+  # / _jobs_completed_total / _jobs_shed_total on /metrics. Alert on a sustained
+  # _jobs_shed_total rate or pool_size pinned at pool_max while saturated.
 
 # ---------------------------------------------------------------------------
 # Registrar
@@ -100,6 +136,12 @@ registrar:
   max_expires: 7200        # reject/clamp registrations above this
   # min_expires: 60        # reject with 423 Interval Too Brief if below this
   # max_contacts: 1        # evict existing contacts if above limit (omit = unlimited)
+  # enforce_auth_aor_match: true
+  #   Require the REGISTER's AoR (To-URI user) to equal the authenticated digest
+  #   user, so a subscriber authenticated as A cannot bind a Contact under B's
+  #   AoR (call hijack) or deregister B. Default false. Leave OFF for IMS
+  #   deployments where the public identity (AoR) differs from the private auth
+  #   identity — those authorize via the implicit registration set instead.
 
   # Redis persistence (backend: redis)
   # Survives restarts; required when RTPEngine or dialog state also uses Redis.
@@ -112,6 +154,28 @@ registrar:
   # postgres:
   #   url: "postgres://user:pass@localhost/siphon"
   #   table: "registrar"
+
+  # Registration liveness — network-initiated deregistration when a UE
+  # vanishes without a SIP de-REGISTER (default off until proven in the field).
+  # With it off, siphon behaves exactly as before (Expires-only).
+  #   - TCP/TLS/WS/WSS: the binding is removed when its inbound connection
+  #     closes (peer FIN/RST, read error, idle timeout, or CRLF-keepalive
+  #     failure) — RFC 5626 §4.2.2 flow failure.
+  #   - UDP+IPsec (Gm): an idle binding is detected by polling the kernel XFRM
+  #     SA inbound use-time (no per-packet cost; the UE's RFC 6223 keepalive
+  #     keeps the SA warm). Silence beyond idle_multiplier × keepalive_interval
+  #     triggers one OPTIONS probe; no answer → deregister.
+  # liveness:
+  #   enabled: false               # master switch
+  #   keepalive_interval_secs: 30  # RFC 6223 Flow-Timer / NAT keepalive cadence
+  #   idle_multiplier: 3           # grace = idle_multiplier × keepalive (~90 s)
+  #   probe_timeout_ms: 2000       # per-attempt OPTIONS probe timeout
+  #   dereg_mode: network_dereg    # network_dereg | local_only
+  #     # network_dereg: a P-CSCF cache binding also synthesizes a de-REGISTER
+  #     #   (Expires: 0) toward the S-CSCF via the stored Service-Route, so the
+  #     #   registrar of record clears the binding too.
+  #     # local_only: drop local state + emit on_change only (use on the box
+  #     #   that IS the registrar of record).
 
 # ---------------------------------------------------------------------------
 # Registrant — Outbound REGISTER Client (Carrier Trunk Registration)
@@ -179,6 +243,16 @@ auth:
   realm: "example.com"
   backend: static   # static | http | database | diameter_cx
 
+  # Digest-nonce anti-replay (RFC 7616 §3.3). Nonces embed a timestamp and are
+  # rejected once older than nonce_ttl_secs, so a captured Authorization can no
+  # longer be replayed indefinitely.
+  # nonce_ttl_secs: 3600
+  # nonce_secret: "${SIP_NONCE_SECRET}"
+  #   Optional shared secret enabling HMAC integrity (reject nonces this cluster
+  #   never issued). MUST be identical on every instance behind the same SIP
+  #   domain (round-robin DNS) or cross-instance challenges re-issue. Omit for a
+  #   single instance; timestamp-only replay bounding still applies.
+
   # Static credentials (dev / bring-up only)
   users:
     alice: "secret"
@@ -223,7 +297,15 @@ auth:
   #   url: "http://127.0.0.1:8000/sip/auth/{username}"
   #   timeout_ms: 2000
   #   connect_timeout_ms: 500
-  #   ha1: true   # true = response body is pre-hashed HA1 hex string
+  #   ha1: true            # true = response body is pre-hashed HA1 hex string
+  #   cache_ttl_secs: 300  # cache a successful lookup per-username for this long
+  #                        # (0 = disabled, the default). Each uncached digest
+  #                        # verification makes a BLOCKING HTTP fetch that pins a
+  #                        # handler-pool worker, so a registration storm without
+  #                        # caching can exhaust the pool. Credentials rarely
+  #                        # change, so a non-zero TTL is recommended in
+  #                        # production; a change propagates after <= cache_ttl_secs.
+  #                        # Hits are counted by siphon_auth_ha1_cache_hits_total.
 
 # ---------------------------------------------------------------------------
 # Security — rate limiting, scanner blocking, trust lists
@@ -241,12 +323,35 @@ auth:
 #       - "VaxSip"
 #       - "sipcli"
 #
-#   trusted_cidrs:              # bypass rate limiting (AS, monitoring)
-#     - "10.0.0.0/8"
+#   trusted_cidrs:              # never rate-limited and never auto-banned
+#     - "10.0.0.0/8"            # own infra: AS, BGCF, trunks, monitoring
 #
-#   failed_auth_ban:            # block IP after N failed auth attempts
-#     threshold: 10
-#     ban_duration_secs: 300
+#   failed_auth_ban:            # auto-ban scanners at accept (TCP/TLS/UDP/WS/SCTP)
+#     threshold: 10             # weighted failures within window_secs before a ban
+#     window_secs: 600          # sliding window for counting failures (default 600)
+#     ban_duration_secs: 3600   # how long the ban lasts (then auto-expires)
+#     strong_signal_weight: 3   # weight of a high-confidence abuse signal toward
+#                               # threshold (default 3); a plain probe counts as 1
+#     # Failures counted toward the ban, by weight:
+#     #   weight 1 (low-confidence — may fire for a benign peer):
+#     #     - an auth challenge (401/407) not followed by a successful auth
+#     #     - a non-ACK INVITE server-transaction timeout (toll-fraud pattern)
+#     #     - a failed/timed-out TLS / WSS / WS handshake
+#     #   weight = strong_signal_weight (high-confidence abuse — bans faster):
+#     #     - present-but-invalid digest credentials (wrong password), or a
+#     #       forged / stale / replayed nonce  [over UDP this stays weight 1,
+#     #       since a UDP source is spoofable and would amplify a reflected ban]
+#     #     - non-SIP / unparseable bytes on a TCP/TLS stream (HTTP probe, TLS
+#     #       record on the plaintext port, random bytes)
+#     #     - a request whose User-Agent matched scanner_block, over a
+#     #       connection-oriented transport (UDP scanner UAs are dropped, not banned)
+#     # A successful auth resets the source's counter, so a legit client that
+#     # challenges-then-succeeds (or retries a stale nonce) never accumulates.
+#     # trusted_cidrs are exempt — put load balancers / health-check probes
+#     # (e.g. AWS NLB) there; L4 (connect-only) checks send no data and are
+#     # never mistaken for garbage, but an L7/HTTP health check against a SIP
+#     # port would be, so its source belongs in trusted_cidrs.
+#     # Banned IPs are dropped at accept/recv, before any SIP parsing.
 #
 #   apiban:                     # APIBAN community blocklist (apiban.org)
 #     api_key: "your-api-key"   # get a free key at apiban.org
@@ -652,6 +757,34 @@ auth:
 #   ifc_xml_path: "/etc/siphon/ifc.xml"     # path to ServiceProfile XML
 #   # ifc_xml: "<ServiceProfile>...</ServiceProfile>"  # inline XML (alternative)
 #   ifc_key_prefix: "siphon:ifc:"            # Redis key prefix (default)
+
+# ---------------------------------------------------------------------------
+# STIR/SHAKEN — caller-ID attestation (RFC 8224/8225/8226, ATIS-1000074)
+# ---------------------------------------------------------------------------
+# Drives the `stir` Python namespace: stir.sign() / stir.sign_div() add the
+# Identity header to outbound INVITEs (Authentication Service); stir.verify()
+# validates inbound Identity headers (Verification Service).  Either side may
+# be omitted.  Script-driven — the script owns attestation logic and the
+# reject-on-fail policy.
+#
+# stir:
+#   enabled: true                  # default true when the block is present
+#   signing:                       # omit to disable the AS side
+#     private_key: "/etc/siphon/stir/sti.key"   # PEM EC P-256 private key
+#     x5u: "https://cert.example.com/sti.pem"    # public cert URL (Identity info=)
+#     default_attestation: "A"     # A (full) | B (partial) | C (gateway)
+#     # origid: "…"                # fixed UUID; per-call v4 if unset
+#   verification:                  # omit to disable the VS side
+#     trust_anchors:               # STI-CA root certificate files (PEM)
+#       - "/etc/siphon/stir/sti-ca-root.pem"
+#     # trust_anchor_dir: "/etc/siphon/stir/anchors"  # optional dir of PEM roots
+#     freshness_secs: 60           # PASSporT iat freshness window (ATIS-1000074)
+#     permissive: false            # log-only rollout: x5u/infra failures →
+#                                  #   No-TN-Validation instead of …-Failed
+#     cache_ttl_secs: 3600         # x5u cert cache TTL (Cache-Control overrides)
+#     max_cert_bytes: 65536        # x5u response size cap
+#     require_tnauthlist: false    # require RFC 8226 TNAuthList on the leaf
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------

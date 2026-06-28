@@ -19,7 +19,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::config::TlsServerConfig;
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
+use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 use crate::transport::pool::ConnectionPool;
@@ -28,9 +28,16 @@ use crate::transport::pool::ConnectionPool;
 /// atomically by the file watcher when the cert or key on disk changes.
 pub type SharedTlsAcceptor = Arc<ArcSwap<TlsAcceptor>>;
 
+/// Maximum time allowed for a TLS handshake to complete. tokio imposes no
+/// default, so without this a peer that connects and then stalls mid-handshake
+/// (slowloris) would pin a task + socket until the OS killed it. Generous
+/// enough for slow mobile clients, short enough to bound half-open handshakes.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Build a `TlsAcceptor` from the certificate and key paths in config.
 pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
-    use rustls_pemfile::{certs, private_key};
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
     use std::fs::File;
     use std::io::BufReader;
     use tokio_rustls::rustls;
@@ -42,14 +49,15 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
             format!("failed to open certificate file '{}': {}", tls_config.certificate, error),
         )
     })?;
-    let certificates: Vec<_> = certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to parse certificate PEM: {}", error),
-            )
-        })?;
+    let certificates: Vec<_> =
+        CertificateDer::pem_reader_iter(&mut BufReader::new(cert_file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to parse certificate PEM: {}", error),
+                )
+            })?;
 
     if certificates.is_empty() {
         return Err(io::Error::new(
@@ -65,29 +73,89 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
             format!("failed to open private key file '{}': {}", tls_config.private_key, error),
         )
     })?;
-    let key = private_key(&mut BufReader::new(key_file))
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to parse private key PEM: {}", error),
-            )
-        })?
-        .ok_or_else(|| {
-            io::Error::new(
+    let key = PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_file)).map_err(|error| {
+        // `from_pem_reader` returns `Err(NoItemsFound)` when the file held no
+        // private key — the case `rustls_pemfile::private_key` signalled with
+        // `Ok(None)`. Preserve the original "contains no private key" message
+        // for that case, and the "failed to parse" message for everything else.
+        match error {
+            rustls_pki_types::pem::Error::NoItemsFound => io::Error::new(
                 io::ErrorKind::InvalidData,
                 "private key file contains no private key",
-            )
-        })?;
-
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certificates, key)
-        .map_err(|error| {
-            io::Error::new(
+            ),
+            other => io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("failed to build TLS server config: {}", error),
+                format!("failed to parse private key PEM: {}", other),
+            ),
+        }
+    })?;
+
+    // Honor `verify_client` (mutual TLS). Previously this was hardcoded to
+    // `with_no_client_auth()`, so the config option was silently ignored —
+    // setting `verify_client: true` gave false assurance. When enabled we
+    // require a client certificate that chains to `client_ca`; a missing CA is
+    // a hard startup error (fail closed) rather than a silent downgrade.
+    let builder = rustls::ServerConfig::builder();
+    let server_config = if tls_config.verify_client {
+        let ca_path = tls_config.client_ca.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tls.verify_client is true but tls.client_ca (PEM CA bundle for \
+                 client certificates) is not set",
             )
         })?;
+        let ca_file = File::open(ca_path).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("failed to open client CA file '{ca_path}': {error}"),
+            )
+        })?;
+        let ca_certs: Vec<_> = CertificateDer::pem_reader_iter(&mut BufReader::new(ca_file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to parse client CA PEM: {error}"),
+                )
+            })?;
+        if ca_certs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "client CA file contains no certificates",
+            ));
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in ca_certs {
+            roots.add(ca).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to add client CA to root store: {error}"),
+                )
+            })?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to build client-certificate verifier: {error}"),
+                )
+            })?;
+        info!(client_ca = %ca_path, "mutual TLS enabled — client certificate required");
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certificates, key)
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+    }
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to build TLS server config: {}", error),
+        )
+    })?;
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
@@ -204,10 +272,11 @@ pub async fn listen(
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
-    addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
+    stream_connections: StreamConnections,
     tos: Option<u32>,
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
+    close_tx: Option<flume::Sender<u64>>,
 ) {
     let acceptor = build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
@@ -221,8 +290,21 @@ pub async fn listen(
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
             if let Some(sender) = connection_map_clone.get(&outbound.connection_id) {
-                if let Err(error) = sender.send(outbound.data).await {
-                    warn!("TLS outbound send failed for connection {:?}: {}", outbound.connection_id, error);
+                // Non-blocking: NEVER park in `send().await` here (see tcp.rs for
+                // the full rationale). This single outbound distributor holds the
+                // `connection_map` shard read guard across this `if let`; an
+                // awaiting send to a non-reading peer's full bounded channel would
+                // park here, stalling outbound for every connection and blocking
+                // accept's `insert` on the same shard — the wedge. `try_send`
+                // sheds for a backed-up (stuck) peer instead.
+                match sender.try_send(outbound.data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!("TLS outbound dropped: connection {:?} send buffer full (slow/stuck peer)", outbound.connection_id);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("TLS outbound dropped: connection {:?} closed", outbound.connection_id);
+                    }
                 }
             } else if let Some(ref pool) = pool {
                 // No existing connection — create outbound TLS via pool
@@ -294,17 +376,31 @@ pub async fn listen(
                     let acceptor = (**acceptor.load()).clone();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
-                    let addr_map = addr_map.clone();
+                    let stream_connections = stream_connections.clone();
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
+                    let close_tx = close_tx.clone();
 
                     configure_tcp_socket(&tcp_stream, tos);
 
                     tokio::spawn(async move {
-                        // Perform TLS handshake — timeout is inherited from tokio runtime.
-                        let tls_stream = match acceptor.accept(tcp_stream).await {
-                            Ok(stream) => stream,
-                            Err(error) => {
+                        // Perform TLS handshake under a bounded timeout so a peer
+                        // that connects and stalls mid-handshake (slowloris) cannot
+                        // pin a task + socket indefinitely.
+                        let tls_stream = match tokio::time::timeout(
+                            TLS_HANDSHAKE_TIMEOUT,
+                            acceptor.accept(tcp_stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => stream,
+                            Ok(Err(error)) => {
                                 warn!("TLS handshake failed from {}: {}", remote_addr, error);
+                                crate::security::record_handshake_failure(remote_addr.ip(), "TLS");
+                                return;
+                            }
+                            Err(_) => {
+                                warn!("TLS handshake timed out from {}", remote_addr);
+                                crate::security::record_handshake_failure(remote_addr.ip(), "TLS");
                                 return;
                             }
                         };
@@ -320,7 +416,7 @@ pub async fn listen(
                         // responses back over the same connection.
                         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
                         connection_map.insert(connection_id, outbound_tx.clone());
-                        addr_map.insert(remote_addr, connection_id);
+                        stream_connections.register(remote_addr, Transport::Tls, connection_id);
                         let keepalive_writer = outbound_tx;
 
                         // Read task with idle timeout and SIP stream framing (RFC 3261 §18.3)
@@ -352,7 +448,15 @@ pub async fn listen(
                                             }
                                             let message_len = match crate::transport::tcp::extract_sip_message_length(&accumulator) {
                                                 Some(len) if len <= accumulator.len() => len,
-                                                _ => break, // incomplete message, need more data
+                                                Some(_) => break, // header block complete, body still arriving — wait
+                                                None => match crate::transport::tcp::classify_incomplete_stream(&accumulator) {
+                                                    crate::transport::tcp::StreamVerdict::MaybeSip => break, // SIP still arriving — need more data
+                                                    crate::transport::tcp::StreamVerdict::Garbage => {
+                                                        warn!("non-SIP bytes from {} on TLS {:?}; dropping connection", remote_addr, connection_id);
+                                                        crate::security::record_malformed_message(remote_addr.ip(), "TLS");
+                                                        return; // close the connection
+                                                    }
+                                                },
                                             };
                                             let data = accumulator.split_to(message_len).freeze();
                                             let message = InboundMessage {
@@ -397,7 +501,13 @@ pub async fn listen(
                         }
 
                         connection_map.remove(&connection_id);
-                        addr_map.remove(&remote_addr);
+                        stream_connections.unregister(&remote_addr);
+                        // RFC 5626 §4.2.2 flow failure: notify the registrar so
+                        // it can deregister any binding that arrived on this
+                        // connection.  Best-effort.
+                        if let Some(close_tx) = &close_tx {
+                            let _ = close_tx.send(connection_id.0);
+                        }
                         debug!("TLS connection {:?} cleaned up", connection_id);
                     });
                 }
@@ -443,6 +553,7 @@ mod tests {
             private_key: key_path.to_str().unwrap().to_string(),
             method: "TLSv1_3".to_string(),
             verify_client: false,
+            client_ca: None,
         }
     }
 
@@ -463,6 +574,7 @@ mod tests {
             private_key: "/nonexistent/key.pem".to_string(),
             method: "TLSv1_3".to_string(),
             verify_client: false,
+            client_ca: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());
@@ -505,9 +617,26 @@ mod tests {
             private_key: key_path.to_str().unwrap().to_string(),
             method: "TLSv1_3".to_string(),
             verify_client: false,
+            client_ca: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_client_without_ca_fails_closed() {
+        // mTLS: verify_client must be honored. Enabling it without a client_ca
+        // is a hard error (fail closed), never a silent no-client-auth downgrade.
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        tls_config.verify_client = true;
+        tls_config.client_ca = None;
+        let result = build_tls_acceptor(&tls_config);
+        assert!(
+            result.is_err(),
+            "verify_client=true without client_ca must fail closed"
+        );
     }
 
     #[tokio::test]
@@ -532,7 +661,8 @@ mod tests {
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
-            Arc::new(DashMap::new()),
+            StreamConnections::new(),
+            None,
             None,
             None,
             None,
@@ -546,9 +676,11 @@ mod tests {
         // Read the cert back to build a client config that trusts it
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();
         let mut cursor = std::io::Cursor::new(cert_pem);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<_> =
+            rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
 
         let mut root_store = rustls::RootCertStore::empty();
         for cert in &certs {
@@ -582,7 +714,8 @@ mod tests {
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
-            Arc::new(DashMap::new()),
+            StreamConnections::new(),
+            None,
             None,
             None,
             None,
@@ -647,7 +780,7 @@ mod tests {
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
-        let addr_map: Arc<DashMap<SocketAddr, ConnectionId>> = Arc::new(DashMap::new());
+        let stream_connections = StreamConnections::new();
 
         listen(
             bound_addr,
@@ -656,7 +789,8 @@ mod tests {
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
-            Arc::clone(&addr_map),
+            stream_connections.clone(),
+            None,
             None,
             None,
             None,
@@ -668,9 +802,11 @@ mod tests {
         // Build TLS client
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();
         let mut cursor = std::io::Cursor::new(cert_pem);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<_> =
+            rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
         let mut root_store = rustls::RootCertStore::empty();
         for cert in &certs {
             root_store.add(cert.clone()).unwrap();
@@ -697,12 +833,16 @@ mod tests {
         let connection_id = message.connection_id;
         let remote_addr = message.remote_addr;
         assert!(connection_map.contains_key(&connection_id));
-        // Verify addr_map is populated for connection reuse
-        assert!(
-            addr_map.contains_key(&remote_addr),
-            "addr_map should track TLS connection by remote address"
+        // Verify the registry is populated for connection reuse (tagged TLS).
+        assert_eq!(
+            stream_connections.reuse(remote_addr, Transport::Tls),
+            Some(connection_id),
+            "stream registry should track the TLS connection by remote address"
         );
-        assert_eq!(*addr_map.get(&remote_addr).unwrap(), connection_id);
+        assert_eq!(
+            stream_connections.get(&remote_addr),
+            Some((Transport::Tls, connection_id)),
+        );
 
         // Drop the client
         drop(tls_stream);
@@ -714,9 +854,10 @@ mod tests {
             !connection_map.contains_key(&connection_id),
             "connection should have been cleaned up after client drop"
         );
-        assert!(
-            !addr_map.contains_key(&remote_addr),
-            "addr_map should be cleaned up after client drop"
+        assert_eq!(
+            stream_connections.reuse(remote_addr, Transport::Tls),
+            None,
+            "stream registry should be cleaned up after client drop"
         );
     }
 }
