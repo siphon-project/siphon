@@ -4,12 +4,11 @@
 //!
 //! These lock the cost of the work the proxy/B2BUA does on *every* SIP message —
 //! parse, header touch, transaction keying, serialize — so a regression on the
-//! datapath fails the release-cut gate (see CLAUDE.md → "Performance (criterion)"
-//! and `scripts/cut-release.sh`).  The end-to-end SIPp baseline in README.md
-//! measures aggregate CPS; these microbenches isolate the individual per-message
-//! costs that the perf-investigation log (CLAUDE.md) keeps tuning — string
-//! sharing, header clone, branch keying — so an improvement or regression in one
-//! is visible directly, not averaged into a CPS number.
+//! datapath fails the release-cut gate (`scripts/bench_regression.sh`, wired into
+//! `scripts/cut-release.sh`).  The end-to-end SIPp baseline in README.md measures
+//! aggregate CPS; these microbenches isolate the individual per-message costs —
+//! string sharing, header clone, branch keying — so an improvement or regression
+//! in one is visible directly, not averaged into a CPS number.
 //!
 //! Fixtures use only RFC 5737 documentation addresses (192.0.2.0/24) and generic
 //! example.com hosts — never real IPs or subscriber identities.

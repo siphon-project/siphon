@@ -5,8 +5,7 @@
 //! Every call that carries media touches SDP: the offer/answer is parsed,
 //! codec-filtered, and re-serialized on the INVITE/200 path. This is on the
 //! same per-call datapath as SIP parsing itself — string-heavy, siphon-owned,
-//! and run once (often twice) per call. See CLAUDE.md → "Performance
-//! (criterion)" and `scripts/bench_regression.sh`.
+//! and run once (often twice) per call. Gated by `scripts/bench_regression.sh`.
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use siphon::media::sdp::SdpBody;

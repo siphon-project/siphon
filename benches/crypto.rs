@@ -2,9 +2,8 @@
 //!
 //! Run with `PYO3_PYTHON=python3 cargo bench --bench crypto`.
 //!
-//! Scope note (CLAUDE.md → "test what makes sense"): these bench the
-//! constructions siphon implements itself, NOT the vendored hash/cipher
-//! primitives under them.
+//! Scope note: these bench the constructions siphon implements itself, NOT the
+//! vendored hash/cipher primitives under them.
 //!
 //! - Milenage f1–f5 / OPc derivation (3GPP TS 35.206) — siphon's own algorithm;
 //!   only the AES block op is vendored. Per IMS registration.
