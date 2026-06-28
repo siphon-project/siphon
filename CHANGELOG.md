@@ -7,9 +7,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Internal
-- Criterion microbenchmarks for the per-message SIP hot paths
-  (`benches/sip_hot_path.rs`): parse, serialize, roundtrip, header access/mutate,
-  and transaction-key extraction. They isolate the individual costs the SIPp
+- Criterion microbenchmarks for the per-message / per-call hot paths, one bench
+  file per path: `sip_hot_path` (parse/serialize/header/txn-key), `sdp_hot_path`
+  (parse/filter/serialize), `diameter_codec` (AVP encode + message decode),
+  `rtpengine_bencode` (NG offer encode/decode), and `crypto` (Milenage AKA +
+  digest response assembly). They isolate the individual costs the SIPp
   throughput baseline averages over.
 - Release-cut regression gate (`scripts/bench_regression.sh`, wired into
   `scripts/cut-release.sh`): fails on >10% slowdown vs the committed

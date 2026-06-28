@@ -41,9 +41,12 @@ if [ "$MODE" = "gate" ] && [ ! -f "$BENCH_BASELINE" ]; then
   die "no baseline at $BENCH_BASELINE — establish one first: scripts/bench_regression.sh --save"
 fi
 
-echo "==> running criterion benches (sip_hot_path)"
+echo "==> running criterion benches (all hot-path bench targets)"
+# --benches runs every [[bench]] target; the comparison below auto-discovers
+# all benchmark ids under target/criterion, so new bench files are covered with
+# no change here.
 # shellcheck disable=SC2086
-PYO3_PYTHON="${PYO3_PYTHON:-python3}" cargo bench --bench sip_hot_path -- ${BENCH_ARGS:-}
+PYO3_PYTHON="${PYO3_PYTHON:-python3}" cargo bench --benches -- ${BENCH_ARGS:-}
 
 echo "==> comparing against $BENCH_BASELINE (threshold ${BENCH_THRESHOLD_PCT}% slower = regression)"
 python3 - <<'PYEOF'
