@@ -263,8 +263,28 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 1050, vendor_id: TGPP, name: "AN-GW-Address",                      data_type: AvpType::Address },
     // SMS-Information envelope: Recipient-Address (TS 32.299 §7.2.155)
     AvpDef { code: 1201, vendor_id: TGPP, name: "Recipient-Address",                  data_type: AvpType::Grouped },
+    // S6a / S6d (TS 29.272) — MME/SGSN ↔ HSS for LTE attach + auth vectors
+    AvpDef { code: 1400, vendor_id: TGPP, name: "Subscription-Data",                  data_type: AvpType::Grouped },
+    AvpDef { code: 1401, vendor_id: TGPP, name: "Terminal-Information",               data_type: AvpType::Grouped },
+    AvpDef { code: 1402, vendor_id: TGPP, name: "IMEI",                               data_type: AvpType::UTF8String },
+    AvpDef { code: 1403, vendor_id: TGPP, name: "Software-Version",                   data_type: AvpType::UTF8String },
+    AvpDef { code: 1405, vendor_id: TGPP, name: "ULR-Flags",                          data_type: AvpType::Unsigned32 },
+    AvpDef { code: 1406, vendor_id: TGPP, name: "ULA-Flags",                          data_type: AvpType::Unsigned32 },
+    AvpDef { code: 1407, vendor_id: TGPP, name: "Visited-PLMN-Id",                    data_type: AvpType::OctetString },
+    AvpDef { code: 1408, vendor_id: TGPP, name: "Requested-EUTRAN-Authentication-Info", data_type: AvpType::Grouped },
+    AvpDef { code: 1410, vendor_id: TGPP, name: "Number-Of-Requested-Vectors",        data_type: AvpType::Unsigned32 },
+    AvpDef { code: 1411, vendor_id: TGPP, name: "Re-Synchronization-Info",            data_type: AvpType::OctetString },
+    AvpDef { code: 1412, vendor_id: TGPP, name: "Immediate-Response-Preferred",       data_type: AvpType::Unsigned32 },
+    AvpDef { code: 1413, vendor_id: TGPP, name: "Authentication-Info",                data_type: AvpType::Grouped },
+    AvpDef { code: 1414, vendor_id: TGPP, name: "E-UTRAN-Vector",                     data_type: AvpType::Grouped },
+    AvpDef { code: 1420, vendor_id: TGPP, name: "Cancellation-Type",                  data_type: AvpType::Enumerated },
+    AvpDef { code: 1447, vendor_id: TGPP, name: "RAND",                               data_type: AvpType::OctetString },
+    AvpDef { code: 1448, vendor_id: TGPP, name: "XRES",                               data_type: AvpType::OctetString },
+    AvpDef { code: 1449, vendor_id: TGPP, name: "AUTN",                               data_type: AvpType::OctetString },
+    AvpDef { code: 1450, vendor_id: TGPP, name: "KASME",                              data_type: AvpType::OctetString },
     // S6c served-node identifiers (TS 29.336 / 29.272)
     AvpDef { code: 1489, vendor_id: TGPP, name: "SGSN-Number",                        data_type: AvpType::OctetString },
+    AvpDef { code: 1635, vendor_id: TGPP, name: "PUR-Flags",                          data_type: AvpType::Unsigned32 },
     AvpDef { code: 1645, vendor_id: TGPP, name: "MME-Number-for-MT-SMS",              data_type: AvpType::OctetString },
     // SMS-Information block (TS 32.299 §7.2.79 / §7.2.158 / §7.2.171)
     AvpDef { code: 2000, vendor_id: TGPP, name: "SMS-Information",                    data_type: AvpType::Grouped },
@@ -374,6 +394,8 @@ pub const RF_APP_ID: u32 = 3;
 pub const S6C_APP_ID: u32 = 16777312;
 /// SGd Application-Id (TS 29.338) — SMS-over-Diameter, SMSC ↔ MME/SGSN
 pub const SGD_APP_ID: u32 = 16777313;
+/// S6a Application-Id (TS 29.272) — MME ↔ HSS for LTE attach/auth
+pub const S6A_APP_ID: u32 = 16777251;
 /// 3GPP Vendor-Id
 pub const VENDOR_3GPP: u32 = 10415;
 
@@ -390,6 +412,7 @@ pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
         "rf" => Some((0, RF_APP_ID)),
         "s6c" => Some((VENDOR_3GPP, S6C_APP_ID)),
         "sgd" => Some((VENDOR_3GPP, SGD_APP_ID)),
+        "s6a" => Some((VENDOR_3GPP, S6A_APP_ID)),
         _ => None,
     }
 }
@@ -406,6 +429,7 @@ pub fn app_name_by_id(app_id: u32) -> Option<&'static str> {
         RF_APP_ID => Some("Rf"),
         S6C_APP_ID => Some("S6c"),
         SGD_APP_ID => Some("SGd"),
+        S6A_APP_ID => Some("S6a"),
         _ => None,
     }
 }
@@ -452,6 +476,15 @@ pub fn command_code_by_name(name: &str) -> Option<u32> {
         // SGd
         "mo-forward-short-message" | "ofr" | "ofa" => Some(CMD_MO_FORWARD_SHORT_MESSAGE),
         "mt-forward-short-message" | "tfr" | "tfa" => Some(CMD_MT_FORWARD_SHORT_MESSAGE),
+        // S6a (TS 29.272). Note: "pur" stays mapped to Sh Profile-Update above;
+        // S6a Purge-UE is reached via "purge-ue" to avoid the acronym clash.
+        "update-location" | "ulr" | "ula" => Some(CMD_UPDATE_LOCATION),
+        "cancel-location" | "clr" | "cla" => Some(CMD_CANCEL_LOCATION),
+        "authentication-information" | "air" | "aia" => Some(CMD_AUTHENTICATION_INFORMATION),
+        "insert-subscriber-data" | "idr" | "ida" => Some(CMD_INSERT_SUBSCRIBER_DATA),
+        "delete-subscriber-data" | "dsr" | "dsa" => Some(CMD_DELETE_SUBSCRIBER_DATA),
+        "purge-ue" | "pua-s6a" => Some(CMD_PURGE_UE),
+        "notify" | "nor" | "noa" => Some(CMD_NOTIFY),
         // Base
         "capabilities-exchange" | "cer" | "cea" => Some(CMD_CAPABILITIES_EXCHANGE),
         "device-watchdog" | "dwr" | "dwa" => Some(CMD_DEVICE_WATCHDOG),
@@ -556,6 +589,23 @@ pub const CMD_ALERT_SERVICE_CENTRE: u32 = 8388648;
 /// Report-SM-Delivery-Status-Request/Answer (RSR/RSA) — SMSC → HSS.
 pub const CMD_REPORT_SM_DELIVERY_STATUS: u32 = 8388649;
 
+// ── S6a Command Codes (TS 29.272) ────────────────────────────────────────
+
+/// Update-Location-Request/Answer (ULR/ULA) — MME → HSS.
+pub const CMD_UPDATE_LOCATION: u32 = 316;
+/// Cancel-Location-Request/Answer (CLR/CLA) — HSS → MME.
+pub const CMD_CANCEL_LOCATION: u32 = 317;
+/// Authentication-Information-Request/Answer (AIR/AIA) — MME → HSS.
+pub const CMD_AUTHENTICATION_INFORMATION: u32 = 318;
+/// Insert-Subscriber-Data-Request/Answer (IDR/IDA) — HSS → MME.
+pub const CMD_INSERT_SUBSCRIBER_DATA: u32 = 319;
+/// Delete-Subscriber-Data-Request/Answer (DSR/DSA) — HSS → MME.
+pub const CMD_DELETE_SUBSCRIBER_DATA: u32 = 320;
+/// Purge-UE-Request/Answer (PUR/PUA) — MME → HSS.
+pub const CMD_PURGE_UE: u32 = 321;
+/// Notify-Request/Answer (NOR/NOA) — MME → HSS.
+pub const CMD_NOTIFY: u32 = 323;
+
 // ── Base Diameter Command Codes ──────────────────────────────────────────
 
 pub const CMD_CAPABILITIES_EXCHANGE: u32 = 257;
@@ -567,8 +617,14 @@ pub const CMD_DISCONNECT_PEER: u32 = 282;
 pub const DIAMETER_SUCCESS: u32 = 2001;
 pub const DIAMETER_LIMITED_SUCCESS: u32 = 2002;
 pub const DIAMETER_UNABLE_TO_DELIVER: u32 = 3002;
+pub const DIAMETER_TOO_BUSY: u32 = 3004;
 pub const DIAMETER_LOOP_DETECTED: u32 = 3005;
+/// CER from a peer whose asserted Origin-Host fails validation (RFC 6733
+/// §5.2 / §7.1.3.4) — answered in the CEA, then the connection is closed.
+pub const DIAMETER_UNKNOWN_PEER: u32 = 3010;
 pub const DIAMETER_UNABLE_TO_COMPLY: u32 = 5012;
+/// Malformed AVP length on an inbound message (RFC 6733 §7.1.5).
+pub const DIAMETER_INVALID_AVP_LENGTH: u32 = 5014;
 pub const DIAMETER_ERROR_USER_UNKNOWN: u32 = 5001;
 pub const DIAMETER_ERROR_ABSENT_USER: u32 = 4201;
 
@@ -598,8 +654,10 @@ pub mod avp {
     pub const FIRMWARE_REVISION: u32 = 267;
     pub const RESULT_CODE: u32 = 268;
     pub const PRODUCT_NAME: u32 = 269;
+    pub const DISCONNECT_CAUSE: u32 = 273;
     pub const AUTH_SESSION_STATE: u32 = 277;
     pub const ORIGIN_STATE_ID: u32 = 278;
+    pub const ERROR_MESSAGE: u32 = 281;
     pub const ROUTE_RECORD: u32 = 282;
     pub const DESTINATION_REALM: u32 = 283;
     pub const DESTINATION_HOST: u32 = 293;
@@ -797,6 +855,28 @@ pub mod avp {
     pub const SM_DEVICE_TRIGGER_INDICATOR: u32 = 3407;
     pub const SMS_RESULT: u32 = 3408;
     pub const MTC_IWF_ADDRESS: u32 = 3413;
+
+    // ── S6a / S6d (TS 29.272) ────────────────────────────────────────────
+    pub const RAT_TYPE: u32 = 1032;
+    pub const SUBSCRIPTION_DATA: u32 = 1400;
+    pub const TERMINAL_INFORMATION: u32 = 1401;
+    pub const IMEI: u32 = 1402;
+    pub const SOFTWARE_VERSION: u32 = 1403;
+    pub const ULR_FLAGS: u32 = 1405;
+    pub const ULA_FLAGS: u32 = 1406;
+    pub const VISITED_PLMN_ID: u32 = 1407;
+    pub const REQUESTED_EUTRAN_AUTHENTICATION_INFO: u32 = 1408;
+    pub const NUMBER_OF_REQUESTED_VECTORS: u32 = 1410;
+    pub const RE_SYNCHRONIZATION_INFO: u32 = 1411;
+    pub const IMMEDIATE_RESPONSE_PREFERRED: u32 = 1412;
+    pub const AUTHENTICATION_INFO: u32 = 1413;
+    pub const E_UTRAN_VECTOR: u32 = 1414;
+    pub const CANCELLATION_TYPE: u32 = 1420;
+    pub const RAND: u32 = 1447;
+    pub const XRES: u32 = 1448;
+    pub const AUTN: u32 = 1449;
+    pub const KASME: u32 = 1450;
+    pub const PUR_FLAGS: u32 = 1635;
 }
 
 #[cfg(test)]
