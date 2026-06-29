@@ -347,13 +347,15 @@ impl PyDiameterAnswer {
         Ok(self.lock()?.is_error())
     }
 
-    #[pyo3(signature = (code, vendor=0))]
+    #[pyo3(signature = (code_or_name, vendor=0))]
     fn get_avp<'py>(
         &self,
         py: Python<'py>,
-        code: u32,
+        code_or_name: &Bound<'_, PyAny>,
         vendor: u32,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let (code, name_vendor) = resolve_code(code_or_name)?;
+        let vendor = if vendor != 0 { vendor } else { name_vendor };
         let guard = self.lock()?;
         msg_get_avp(py, &guard, code, vendor)
     }
@@ -379,8 +381,10 @@ impl PyDiameterAnswer {
         Ok(())
     }
 
-    #[pyo3(signature = (code, vendor=0))]
-    fn remove_avp(&self, code: u32, vendor: u32) -> PyResult<usize> {
+    #[pyo3(signature = (code_or_name, vendor=0))]
+    fn remove_avp(&self, code_or_name: &Bound<'_, PyAny>, vendor: u32) -> PyResult<usize> {
+        let (code, name_vendor) = resolve_code(code_or_name)?;
+        let vendor = if vendor != 0 { vendor } else { name_vendor };
         Ok(self.lock_mut()?.remove(code, vendor))
     }
 }
@@ -502,13 +506,15 @@ impl PyDiameterRequest {
         self.peer.clone()
     }
 
-    #[pyo3(signature = (code, vendor=0))]
+    #[pyo3(signature = (code_or_name, vendor=0))]
     fn get_avp<'py>(
         &self,
         py: Python<'py>,
-        code: u32,
+        code_or_name: &Bound<'_, PyAny>,
         vendor: u32,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let (code, name_vendor) = resolve_code(code_or_name)?;
+        let vendor = if vendor != 0 { vendor } else { name_vendor };
         let guard = self.lock()?;
         msg_get_avp(py, &guard, code, vendor)
     }
@@ -548,8 +554,10 @@ impl PyDiameterRequest {
         Ok(())
     }
 
-    #[pyo3(signature = (code, vendor=0))]
-    fn remove_avp(&self, code: u32, vendor: u32) -> PyResult<usize> {
+    #[pyo3(signature = (code_or_name, vendor=0))]
+    fn remove_avp(&self, code_or_name: &Bound<'_, PyAny>, vendor: u32) -> PyResult<usize> {
+        let (code, name_vendor) = resolve_code(code_or_name)?;
+        let vendor = if vendor != 0 { vendor } else { name_vendor };
         Ok(self.lock()?.remove(code, vendor))
     }
 
@@ -733,9 +741,9 @@ mod tests {
         Python::attach(|py| {
             let request = py_request();
 
-            // get_avp on a text AVP → str
+            // get_avp on a text AVP by NAME → str (exercises the name overload)
             let origin = request
-                .get_avp(py, dictionary::avp::ORIGIN_HOST, 0)
+                .get_avp(py, &"Origin-Host".into_pyobject(py).unwrap().into_any(), 0)
                 .unwrap()
                 .unwrap();
             let origin_str: String = origin.extract().unwrap();
@@ -753,8 +761,13 @@ mod tests {
             let dest_host = request.dest_host().unwrap();
             assert_eq!(dest_host.as_deref(), Some("scscf.epc.example.org"));
 
-            // remove_avp
-            assert_eq!(request.remove_avp(dictionary::avp::DESTINATION_HOST, 0).unwrap(), 1);
+            // remove_avp by NAME (exercises the name overload)
+            assert_eq!(
+                request
+                    .remove_avp(&"Destination-Host".into_pyobject(py).unwrap().into_any(), 0)
+                    .unwrap(),
+                1
+            );
             assert!(request.dest_host().unwrap().is_none());
         });
     }
@@ -815,9 +828,14 @@ mod tests {
                 _ => panic!("E-UTRAN-Vector must be grouped"),
             }
 
-            // And read it back through the Python-facing API as a nested list.
+            // And read it back through the Python-facing API as a nested list,
+            // resolving the AVP by NAME (exercises the name overload).
             let read = answer
-                .get_avp(py, dictionary::avp::AUTHENTICATION_INFO, dictionary::VENDOR_3GPP)
+                .get_avp(
+                    py,
+                    &"Authentication-Info".into_pyobject(py).unwrap().into_any(),
+                    dictionary::VENDOR_3GPP,
+                )
                 .unwrap()
                 .unwrap();
             let list = read.cast::<PyList>().unwrap();

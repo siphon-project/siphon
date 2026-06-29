@@ -2132,14 +2132,23 @@ fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::DiameterManager
     // `diameter.config`, plus the event sink behind `diameter.event_sink`.
     // Only built when the deployment opts into Diameter server mode (listen/tenants set).
     let server_enabled =
-        diameter_config.listen.is_some() || !diameter_config.tenants.is_empty();
+        diameter_config.listen.is_some() || !diameter_config.effective_tenants().is_empty();
     let event_sink = diameter_config
         .event_sink
         .as_ref()
         .map(|cfg| Arc::new(crate::diameter::event_sink::EventSink::spawn(cfg)));
+    // Snapshot the fields scripts read via `diameter.config` — both the flat
+    // single-domain shape (origin/clients/servers/connect_to) and the explicit
+    // multi-tenant map, so a flat-config script's `diameter.config["origin_host"]`
+    // resolves.
     let config_json = if server_enabled {
         Some(
             serde_json::json!({
+                "origin_host": &diameter_config.origin_host,
+                "origin_realm": &diameter_config.origin_realm,
+                "clients": &diameter_config.clients,
+                "servers": &diameter_config.servers,
+                "connect_to": &diameter_config.connect_to,
                 "tenants": &diameter_config.tenants,
                 "listen": &diameter_config.listen,
             })

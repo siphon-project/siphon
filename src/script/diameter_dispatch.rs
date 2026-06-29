@@ -52,6 +52,11 @@ pub fn spawn(
     product_name: &str,
     product_version: &str,
 ) {
+    // Boot-time guard: if SCTP is referenced anywhere in the Diameter config
+    // but this build lacks the `sctp` feature, say so once and loudly instead
+    // of letting each connect attempt fail with an opaque error.
+    warn_if_sctp_without_feature(config);
+
     // Single-domain configs (flat clients/servers, no `tenants:` block) and
     // multi-tenant configs both resolve to the same tenant map here.
     let tenants = config.effective_tenants();
@@ -73,6 +78,7 @@ pub fn spawn(
         identities.insert(tenant_name.clone(), identity.clone());
         for server in &tenant.servers {
             spawn_backend_connection(
+                tenant_name,
                 tenant,
                 server,
                 Arc::clone(&manager),
@@ -166,9 +172,68 @@ pub fn spawn(
     }
 }
 
+/// Warn once at boot when SCTP is referenced anywhere in the Diameter config
+/// but this build wasn't compiled with the `sctp` feature. Without it those
+/// peers/listeners would silently fail to use SCTP (the listener is skipped;
+/// outbound connects fail with `ErrorKind::Unsupported` on every retry). No-op
+/// when the feature is enabled.
+#[cfg(not(feature = "sctp"))]
+fn warn_if_sctp_without_feature(config: &DiameterConfig) {
+    let is_sctp = |transport: &str| transport.eq_ignore_ascii_case("sctp");
+    let mut surfaces: Vec<String> = Vec::new();
+
+    if config.listen.as_ref().and_then(|listen| listen.sctp.as_ref()).is_some() {
+        surfaces.push("diameter.listen.sctp".to_string());
+    }
+    let default_is_sctp = is_sctp(&config.transport);
+    for peer in &config.peers {
+        let uses_sctp = peer.transport.as_deref().map(is_sctp).unwrap_or(default_is_sctp);
+        if uses_sctp {
+            surfaces.push(format!("diameter.peers[{}]", peer.name));
+        }
+    }
+    for server in &config.servers {
+        if is_sctp(&server.transport) {
+            surfaces.push(format!("diameter.servers[{}]", server.name));
+        }
+    }
+    for entry in &config.connect_to {
+        if is_sctp(&entry.transport) {
+            surfaces.push(format!("diameter.connect_to[{}]", entry.name));
+        }
+    }
+    for (tenant_name, tenant) in &config.tenants {
+        for server in &tenant.servers {
+            if is_sctp(&server.transport) {
+                surfaces.push(format!("diameter.tenants.{tenant_name}.servers[{}]", server.name));
+            }
+        }
+        for entry in &tenant.connect_to {
+            if is_sctp(&entry.transport) {
+                surfaces.push(format!(
+                    "diameter.tenants.{tenant_name}.connect_to[{}]",
+                    entry.name
+                ));
+            }
+        }
+    }
+
+    if !surfaces.is_empty() {
+        warn!(
+            surfaces = %surfaces.join(", "),
+            "Diameter: SCTP is configured but this build has no `sctp` feature — \
+             these surfaces will not use SCTP (rebuild with `--features sctp`)"
+        );
+    }
+}
+
+#[cfg(feature = "sctp")]
+fn warn_if_sctp_without_feature(_config: &DiameterConfig) {}
+
 /// Connect one backend server as an outbound client, reconnecting on drop.
 /// Supports both TCP and SCTP transports.
 fn spawn_backend_connection(
+    tenant_name: &str,
     tenant: &crate::config::DiameterTenant,
     server: &crate::config::DiameterServerEntry,
     manager: Arc<DiameterManager>,
@@ -191,13 +256,14 @@ fn spawn_backend_connection(
         firmware_revision: peer::version_to_firmware_revision(product_version),
     };
     let name = server.name.clone();
+    let tenant_name = tenant_name.to_string();
     tokio::spawn(async move {
         loop {
             match peer::connect_with_transport(config.clone(), &transport).await {
                 Ok((connected, mut incoming_rx)) => {
                     let client = Arc::new(DiameterClient::new(Arc::clone(&connected)));
-                    manager.register(name.clone(), client);
-                    info!(peer = %name, "Diameter server backend connected");
+                    manager.register_backend(&tenant_name, &name, client);
+                    info!(peer = %name, tenant = %tenant_name, "Diameter server backend connected");
                     // Drain backend-initiated requests (none expected for a
                     // pure relay target); answers correlate via send_request.
                     while incoming_rx.recv().await.is_some() {}

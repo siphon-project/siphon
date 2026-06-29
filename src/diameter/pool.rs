@@ -53,7 +53,7 @@ impl PeerPool {
     pub fn live_count(&self) -> usize {
         self.peers
             .iter()
-            .filter(|name| self.manager.live_client(name).is_some())
+            .filter(|name| self.manager.live_backend(&self.tenant, name).is_some())
             .count()
     }
 
@@ -72,7 +72,7 @@ impl PeerPool {
         for offset in 0..count {
             let idx = (start.wrapping_add(offset)) % count;
             let name = &self.peers[idx];
-            if let Some(client) = self.manager.live_client(name) {
+            if let Some(client) = self.manager.live_backend(&self.tenant, name) {
                 return Some((name.clone(), client));
             }
         }
@@ -93,7 +93,7 @@ impl PeerPool {
         let live: Vec<(&String, u32)> = self
             .peers
             .iter()
-            .filter(|name| self.manager.live_client(name).is_some())
+            .filter(|name| self.manager.live_backend(&self.tenant, name).is_some())
             .map(|name| (name, weights.get(name).copied().unwrap_or(1).max(1)))
             .collect();
         if live.is_empty() {
@@ -105,7 +105,7 @@ impl PeerPool {
         for (name, weight) in live {
             accumulated += weight;
             if tick < accumulated {
-                return self.manager.live_client(name).map(|client| (name.clone(), client));
+                return self.manager.live_backend(&self.tenant, name).map(|client| (name.clone(), client));
             }
         }
         None
@@ -129,7 +129,7 @@ impl PeerPool {
         if let Some(entry) = self.sticky.get(key) {
             let (name, expires) = entry.value();
             if *expires > now {
-                if let Some(client) = self.manager.live_client(name) {
+                if let Some(client) = self.manager.live_backend(&self.tenant, name) {
                     return Some((name.clone(), client));
                 }
             }
@@ -181,7 +181,7 @@ mod tests {
         let peer = DiameterPeer::new_for_test(config(name), write_tx);
         peer.set_state_for_test(state);
         let client = Arc::new(DiameterClient::new(Arc::new(peer)));
-        manager.register(name.to_string(), Arc::clone(&client));
+        manager.register_backend("t", name, Arc::clone(&client));
         client
     }
 
@@ -255,7 +255,7 @@ mod tests {
         // Kill the mapped peer → next sticky pick must re-pick a different,
         // still-live peer.
         manager
-            .live_client(&mapped_name)
+            .live_backend("t", &mapped_name)
             .unwrap()
             .peer()
             .set_state_for_test(PeerState::Closed);
@@ -313,9 +313,8 @@ mod tests {
         assert!(pool.pick_round_robin().is_some());
 
         // Simulate disconnect: old client goes Closed.
-        manager.live_client("a"); // (no-op read)
         manager
-            .client("a")
+            .live_backend("t", "a")
             .unwrap()
             .peer()
             .set_state_for_test(PeerState::Closed);

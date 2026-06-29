@@ -453,7 +453,14 @@ use dashmap::DashMap;
 ///
 /// Created at startup from config, holds connected clients indexed by peer name.
 pub struct DiameterManager {
+    /// Client-mode peers (`diameter.peers`), keyed by peer name. Used by
+    /// `send_request` / `send_air` / etc. — never tenant-scoped.
     clients: DashMap<String, Arc<DiameterClient>>,
+    /// Server-mode relay backends, keyed by `(tenant, peer name)`. Keeping the
+    /// tenant in the key means two tenants can each register a backend called
+    /// `hss` without one silently overwriting the other — no naming convention
+    /// required of operators.
+    backends: DashMap<(String, String), Arc<DiameterClient>>,
 }
 
 impl Default for DiameterManager {
@@ -466,6 +473,7 @@ impl DiameterManager {
     pub fn new() -> Self {
         Self {
             clients: DashMap::new(),
+            backends: DashMap::new(),
         }
     }
 
@@ -500,6 +508,31 @@ impl DiameterManager {
     /// on state-as-truth, not removal.
     pub fn deregister(&self, name: &str) -> Option<Arc<DiameterClient>> {
         self.clients.remove(name).map(|(_, client)| client)
+    }
+
+    /// Register a server-mode relay backend under `(tenant, name)`. A reconnect
+    /// swaps the `Arc` under the same key (state-as-truth), exactly like
+    /// [`register`](Self::register) does for client peers.
+    pub fn register_backend(&self, tenant: &str, name: &str, client: Arc<DiameterClient>) {
+        self.backends
+            .insert((tenant.to_string(), name.to_string()), client);
+    }
+
+    /// Get a server-mode backend by `(tenant, name)`, only if its connection is
+    /// `Open`. This is what [`PeerPool`](crate::diameter::pool::PeerPool) uses
+    /// to resolve a relay target — tenant-scoped so one tenant's backend can
+    /// never resolve another tenant's same-named entry.
+    pub fn live_backend(&self, tenant: &str, name: &str) -> Option<Arc<DiameterClient>> {
+        self.backends
+            .get(&(tenant.to_string(), name.to_string()))
+            .and_then(|entry| {
+                let client = entry.value();
+                if client.peer().is_open() {
+                    Some(Arc::clone(client))
+                } else {
+                    None
+                }
+            })
     }
 
     /// Get the first available client (for single-peer setups).
