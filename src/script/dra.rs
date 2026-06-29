@@ -300,6 +300,7 @@ fn spawn_listener(
 ) {
     tokio::spawn(async move {
         let listener = match transport {
+            #[cfg(feature = "sctp")]
             "sctp" => match addr.parse::<SocketAddr>() {
                 Ok(socket_addr) => DiameterListener::bind_sctp(socket_addr),
                 Err(error) => {
@@ -307,6 +308,15 @@ fn spawn_listener(
                     return;
                 }
             },
+            #[cfg(not(feature = "sctp"))]
+            "sctp" => {
+                warn!(
+                    %addr,
+                    "DRA: diameter.listen.sctp is set but this build has no `sctp` feature — \
+                     SCTP listener not started (rebuild with `--features sctp`)"
+                );
+                return;
+            }
             _ => DiameterListener::bind_tcp(&addr).await,
         };
         let listener = match listener {

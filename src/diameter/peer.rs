@@ -844,6 +844,7 @@ mod tests {
         assert!(peer.pending.lock().await.is_empty());
     }
 
+    #[cfg(feature = "sctp")]
     #[tokio::test]
     async fn sctp_client_server_cer_cea_roundtrip() {
         // Loopback SCTP CER/CEA over the real transport. Skips gracefully when
