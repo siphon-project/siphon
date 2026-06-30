@@ -40,6 +40,15 @@ theme:
 
 nav:
   - Home: README.md
+  - Cookbook:
+      - Overview: cookbook/index.md
+      - Registrar: cookbook/registrar.md
+      - Stateful proxy: cookbook/proxy.md
+      - Load balancer: cookbook/load-balancer.md
+      - SBC (B2BUA): cookbook/sbc.md
+      - Media & RTP profiles: cookbook/media-rtp.md
+      - Hardening & security: cookbook/security.md
+      - Monitoring & observability: cookbook/monitoring.md
   - Running in production:
       - Scaling, clustering & redundancy: scaling-and-redundancy.md
       - Deployment & operations: deployment.md
