@@ -20,6 +20,11 @@ pub enum AvpType {
     Address,
     Time,
     DiameterIdentity,
+    /// ISDN-AddressString (3GPP TS 29.002 §17.7.8): one ToN/NPI octet
+    /// followed by the TBCD-packed E.164 digit string. Surfaces to scripts
+    /// as a plain digit string, not raw bytes — see
+    /// [`crate::diameter::codec::decode_isdn_address_string`].
+    ISDNAddressString,
 }
 
 impl AvpType {
@@ -181,7 +186,7 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 633,  vendor_id: TGPP, name: "Originating-Request",                data_type: AvpType::Enumerated },
     // Sh (TS 29.329)
     AvpDef { code: 700,  vendor_id: TGPP, name: "User-Identity",                      data_type: AvpType::Grouped },
-    AvpDef { code: 701,  vendor_id: TGPP, name: "MSISDN",                             data_type: AvpType::OctetString },
+    AvpDef { code: 701,  vendor_id: TGPP, name: "MSISDN",                             data_type: AvpType::ISDNAddressString },
     AvpDef { code: 702,  vendor_id: TGPP, name: "User-Data-Sh",                       data_type: AvpType::OctetString },
     AvpDef { code: 703,  vendor_id: TGPP, name: "Data-Reference",                     data_type: AvpType::Enumerated },
     AvpDef { code: 704,  vendor_id: TGPP, name: "Service-Indication",                 data_type: AvpType::OctetString },
@@ -283,9 +288,9 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 1449, vendor_id: TGPP, name: "AUTN",                               data_type: AvpType::OctetString },
     AvpDef { code: 1450, vendor_id: TGPP, name: "KASME",                              data_type: AvpType::OctetString },
     // S6c served-node identifiers (TS 29.336 / 29.272)
-    AvpDef { code: 1489, vendor_id: TGPP, name: "SGSN-Number",                        data_type: AvpType::OctetString },
+    AvpDef { code: 1489, vendor_id: TGPP, name: "SGSN-Number",                        data_type: AvpType::ISDNAddressString },
     AvpDef { code: 1635, vendor_id: TGPP, name: "PUR-Flags",                          data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1645, vendor_id: TGPP, name: "MME-Number-for-MT-SMS",              data_type: AvpType::OctetString },
+    AvpDef { code: 1645, vendor_id: TGPP, name: "MME-Number-for-MT-SMS",              data_type: AvpType::ISDNAddressString },
     // SMS-Information block (TS 32.299 §7.2.79 / §7.2.158 / §7.2.171)
     AvpDef { code: 2000, vendor_id: TGPP, name: "SMS-Information",                    data_type: AvpType::Grouped },
     AvpDef { code: 2001, vendor_id: TGPP, name: "Data-Coding-Scheme",                 data_type: AvpType::Integer32 },
@@ -316,7 +321,7 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 3010, vendor_id: TGPP, name: "Application-Port-Identifier",        data_type: AvpType::Unsigned32 },
     AvpDef { code: 3111, vendor_id: TGPP, name: "External-Identifier",                data_type: AvpType::UTF8String },
     // S6c (TS 29.336) and SGd (TS 29.338) — SMS over Diameter
-    AvpDef { code: 3300, vendor_id: TGPP, name: "SC-Address",                         data_type: AvpType::OctetString },
+    AvpDef { code: 3300, vendor_id: TGPP, name: "SC-Address",                         data_type: AvpType::ISDNAddressString },
     AvpDef { code: 3301, vendor_id: TGPP, name: "SM-RP-UI",                           data_type: AvpType::OctetString },
     AvpDef { code: 3308, vendor_id: TGPP, name: "SM-RP-MTI",                          data_type: AvpType::Enumerated },
     AvpDef { code: 3316, vendor_id: TGPP, name: "SM-Delivery-Outcome",                data_type: AvpType::Grouped },

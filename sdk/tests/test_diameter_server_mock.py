@@ -166,6 +166,41 @@ def test_peer_pool_tenant_defaults_to_single_domain():
     assert pool.pick_round_robin().name == "backend"
 
 
+def test_isdn_address_helpers_roundtrip_and_idempotent():
+    _fresh_diameter()
+    from siphon import diameter as d
+
+    # encode → exact ISDN-AddressString (0x91 ToN/NPI + TBCD), decode → digits.
+    encoded = d.encode_isdn_address("31612345678")
+    assert encoded == bytes([0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8])
+    assert d.decode_isdn_address(encoded) == "31612345678"
+
+    # Bare TBCD (no ToN/NPI byte) is tolerated.
+    assert d.decode_isdn_address(bytes([0x13, 0x16, 0x32, 0x54, 0x76, 0xF8])) == "31612345678"
+
+    # Idempotent on an already-decoded str.
+    assert d.decode_isdn_address("31612345678") == "31612345678"
+
+    # A leading '+' is stripped (international form is the ToN/NPI byte).
+    assert d.encode_isdn_address("+31612345678") == encoded
+
+
+def test_get_avp_decodes_isdn_address_avps():
+    """get_avp on MSISDN (701/3GPP) surfaces the decoded E.164 string, like
+    the real server path — whether stored as raw bytes or already-decoded."""
+    raw = bytes([0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8])
+    req = mock_module.MockDiameterRequest(
+        application_name="S6c",
+        command_name="ALR",
+        avps={(701, 10415): raw},  # MSISDN
+    )
+    assert req.get_avp(701, 10415) == "31612345678"
+
+    # An already-decoded str passes through unchanged.
+    req2 = mock_module.MockDiameterRequest(avps={(3300, 10415): "31611111111"})
+    assert req2.get_avp(3300, 10415) == "31611111111"  # SC-Address
+
+
 def test_ip_in_cidr_and_fnmatch_helpers():
     from siphon import diameter as d
 

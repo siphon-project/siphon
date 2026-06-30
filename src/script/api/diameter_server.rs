@@ -50,6 +50,13 @@ fn avp_to_py<'py>(py: Python<'py>, code: u32, vendor: u32, avp: &Avp) -> PyResul
             Some(AvpType::UTF8String) | Some(AvpType::DiameterIdentity) => {
                 Ok(String::from_utf8_lossy(bytes).into_owned().into_pyobject(py)?.into_any())
             }
+            // ISDN-AddressString (MSISDN / SC-Address / SGSN-Number /
+            // MME-Number-for-MT-SMS) → decoded E.164 digit string, not raw
+            // TBCD bytes (TS 29.002 §17.7.8).
+            Some(AvpType::ISDNAddressString) => {
+                let digits = crate::diameter::codec::decode_isdn_address_string(bytes);
+                Ok(digits.into_pyobject(py)?.into_any())
+            }
             Some(AvpType::Unsigned32) | Some(AvpType::Enumerated) => {
                 let value = avp.as_u32().unwrap_or(0);
                 Ok(value.into_pyobject(py)?.into_any())
@@ -98,6 +105,21 @@ fn py_to_avp_raw(code: u32, vendor: u32, value: &Bound<'_, PyAny>) -> PyResult<V
         Some(AvpType::Unsigned64) => {
             let number: u64 = value.extract()?;
             Ok(number.to_be_bytes().to_vec())
+        }
+        Some(AvpType::ISDNAddressString) => {
+            // A str is an E.164 digit string → TBCD-encode with the
+            // international ToN/NPI byte (TS 29.002 §17.7.8); bytes are taken
+            // as already-encoded ISDN-AddressString wire octets (verbatim
+            // round-trip, e.g. relaying a value read off another message).
+            if let Ok(digits) = value.extract::<String>() {
+                Ok(crate::diameter::codec::encode_isdn_address_string(
+                    &digits,
+                    crate::diameter::codec::TON_NPI_INTERNATIONAL_E164,
+                ))
+            } else {
+                let bytes: Vec<u8> = value.extract()?;
+                Ok(bytes)
+            }
         }
         _ => {
             // OctetString / Address / unknown: accept bytes or str.
@@ -769,6 +791,69 @@ mod tests {
                 1
             );
             assert!(request.dest_host().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn isdn_address_avp_encodes_tbcd_and_reads_back_e164() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let request = py_request();
+
+            // set_avp by name with a plain E.164 digit string (the natural
+            // Python value) — MSISDN resolves to (701, 3GPP) by name.
+            let msisdn = "31612345678".into_pyobject(py).unwrap().into_any();
+            request
+                .set_avp(&"MSISDN".into_pyobject(py).unwrap().into_any(), &msisdn, 0)
+                .unwrap();
+
+            // get_avp returns the DECODED digit string (str), not raw bytes.
+            let read = request
+                .get_avp(py, &"MSISDN".into_pyobject(py).unwrap().into_any(), 0)
+                .unwrap()
+                .unwrap();
+            let digits: String = read.extract().unwrap();
+            assert_eq!(digits, "31612345678");
+
+            // On the wire it is ISDN-AddressString — 0x91 ToN/NPI + TBCD
+            // nibble-swapped pairs (7 octets), NOT 11 ASCII octets. Exercise
+            // the answer path too (same build_avp / py_to_avp_raw).
+            let answer = request.answer(2001, None).unwrap();
+            answer
+                .set_avp(&"MSISDN".into_pyobject(py).unwrap().into_any(), &msisdn, 0)
+                .unwrap();
+            let wire = answer.to_wire().unwrap();
+            let msg = DiameterMsg::from_wire(&wire).unwrap();
+            let avp = msg
+                .find(dictionary::avp::MSISDN, dictionary::VENDOR_3GPP)
+                .expect("MSISDN present on the answer");
+            assert_eq!(
+                avp.raw_bytes(),
+                Some(&[0x91u8, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8][..]),
+            );
+        });
+    }
+
+    #[test]
+    fn isdn_address_avp_accepts_raw_bytes_verbatim() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let request = py_request();
+
+            // A bytes value is taken as already-encoded ISDN-AddressString
+            // wire octets (e.g. relaying a value lifted off another message).
+            // Here: raw TBCD with no ToN/NPI byte — the lenient decoder still
+            // recovers the digits on read-back.
+            let raw = PyBytes::new(py, &[0x13u8, 0x16, 0x32, 0x54, 0x76, 0xF8]).into_any();
+            request
+                .set_avp(&"MSISDN".into_pyobject(py).unwrap().into_any(), &raw, 0)
+                .unwrap();
+            let read = request
+                .get_avp(py, &"MSISDN".into_pyobject(py).unwrap().into_any(), 0)
+                .unwrap()
+                .unwrap();
+            let digits: String = read.extract().unwrap();
+            assert_eq!(digits, "31612345678");
         });
     }
 
