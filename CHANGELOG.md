@@ -7,11 +7,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
-- **Native `siphon-rtp` media backend (JSON-over-TCP).** siphon can now drive
-  the in-house `siphon-rtp` media engine over its native control protocol — a
-  persistent TCP connection carrying length-prefixed JSON frames — as an
-  alternative to the rtpengine NG/bencode-over-UDP engine. Select it per
-  deployment:
+- **Native `siphon-rtp` media backend (JSON-over-TCP) — experimental.** siphon
+  can now drive the in-house `siphon-rtp` media engine over its native control
+  protocol — a persistent TCP connection carrying length-prefixed JSON frames —
+  as an alternative to the rtpengine NG/bencode-over-UDP engine. The siphon-rtp
+  engine is pre-release, so this backend is **experimental**; rtpengine remains
+  the recommended production backend. Select it per deployment:
   ```yaml
   media:
     backend: siphon-rtp            # default: rtpengine

@@ -419,7 +419,9 @@ auth:
 #   rtpengine  (default) — rtpengine NG protocol, bencode over UDP
 #   siphon-rtp           — native siphon-rtp engine, JSON over a persistent TCP
 #                          connection (reliable, optional auth, server-pushed
-#                          DTMF/media-timeout events on the same connection)
+#                          DTMF/media-timeout events on the same connection).
+#                          EXPERIMENTAL — the siphon-rtp engine is pre-release;
+#                          use rtpengine in production until it stabilises.
 # The Python `rtpengine` scripting API and all media profiles are identical for
 # both backends — only the transport underneath differs.
 #
@@ -447,7 +449,9 @@ auth:
 #         weight: 1
 #         timeout_ms: 2000
 #
-# --- native siphon-rtp backend ---
+# --- native siphon-rtp backend (EXPERIMENTAL) ---
+# The siphon-rtp media engine is pre-release; this backend is not yet
+# recommended for production. SIPREC/MPTY are not implemented on it yet.
 # Single instance:
 # media:
 #   backend: siphon-rtp
