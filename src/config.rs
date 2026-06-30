@@ -437,9 +437,12 @@ pub struct ScriptConfig {
     /// OS thread with a persistent Python attach — see `script::py_executor`
     /// for why this is needed (the free-threaded-CPython mimalloc heap leak
     /// on the elastic `spawn_blocking` pool).  Defaults to 2× the number of
-    /// available CPUs (clamped to at least 2): the hot inbound path runs here,
-    /// and 2× restores the burst headroom the elastic pool gave at the
-    /// throughput ceiling.  Lower it on memory-constrained, low-traffic NFs.
+    /// available CPUs (floored at 8), but **capped by the container memory
+    /// budget** so an un-cpu-limited NF on a many-core box doesn't *start* at 32
+    /// always-on workers (each carries ~8 MB of persistent free-threaded-CPython
+    /// heap).  The hot inbound path runs here, and 2× restores the burst headroom
+    /// the elastic pool gave at the throughput ceiling.  Lower it on
+    /// memory-constrained, low-traffic NFs.
     #[serde(default)]
     pub sync_pool_size: Option<usize>,
     /// Hard ceiling on synchronous Python executor worker threads. The pool is
@@ -448,10 +451,13 @@ pub struct ScriptConfig {
     /// restores the burst headroom blocking-I/O handlers need (a handful of
     /// concurrent blocking REGISTERs no longer wedge the engine) without the
     /// free-threaded-CPython heap leak that reaping caused. Each grown worker
-    /// costs ~2 MB of persistent Python heap, so the pool's memory ceiling is
-    /// roughly `sync_pool_max × 2 MB` — lower it on memory-constrained NFs.
-    /// Defaults to `max(32, 4 × sync_pool_size)`; clamped to at least
-    /// `sync_pool_size`.
+    /// costs ~8 MB of persistent free-threaded-CPython heap (measured on 3.14t;
+    /// the earlier ~2 MB estimate was ~4× low), so the pool's memory ceiling is
+    /// roughly `sync_pool_max × 8 MB`. The default is **memory-aware**: the
+    /// MINIMUM of the CPU-derived `max(32, 4 × sync_pool_size)` and a memory
+    /// budget (~30 % of the container's cgroup memory limit ÷ per-worker heap),
+    /// clamped to at least `sync_pool_size`. On a 512 MB NF that resolves to ~15
+    /// (not 32); set this explicitly to override the budget either way.
     #[serde(default)]
     pub sync_pool_max: Option<usize>,
     /// Seconds the synchronous Python executor pool may show *zero forward
