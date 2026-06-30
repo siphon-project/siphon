@@ -310,6 +310,59 @@ impl SiphonServer {
             init_logging(&config.log)
         };
 
+        // --- Allocator tuning (glibc arena cap + periodic trim) ---
+        // Applied as early as possible so the arena cap takes effect before the
+        // Python/script workload starts creating glibc arenas. The
+        // `siphon_glibc_*` gauges are always on regardless; this only bounds the
+        // pool. No-op off glibc.
+        if let Some(memory) = config.memory.as_ref() {
+            if let Some(arena_max) = memory.glibc.arena_max {
+                if crate::metrics::glibc::set_arena_max(arena_max) {
+                    tracing::info!(arena_max, "glibc M_ARENA_MAX cap applied");
+                } else {
+                    tracing::warn!(
+                        arena_max,
+                        "glibc M_ARENA_MAX cap not applied (non-glibc target or mallopt rejected it)"
+                    );
+                }
+            }
+            let trim_interval = memory.glibc.trim_interval_secs;
+            if trim_interval > 0 {
+                tokio::spawn(async move {
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_secs(trim_interval));
+                    ticker.tick().await; // consume the immediate first tick
+                    loop {
+                        ticker.tick().await;
+                        let released = crate::metrics::glibc::trim();
+                        tracing::debug!(released, "periodic glibc malloc_trim(0)");
+                    }
+                });
+            }
+        }
+
+        // SIGUSR2 → dump the full glibc `malloc_info` XML to the log for
+        // call-site attribution (which arena, how fragmented). A passive
+        // diagnostic, always installed on Unix; pair with heaptrack
+        // (`PYTHONMALLOC=malloc`) under load to name a true raw-domain leak.
+        #[cfg(unix)]
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut stream = match signal(SignalKind::user_defined2()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%error, "could not install SIGUSR2 glibc malloc_info handler");
+                    return;
+                }
+            };
+            while stream.recv().await.is_some() {
+                match crate::metrics::glibc::malloc_info_xml() {
+                    Some(xml) => tracing::info!("glibc malloc_info dump (SIGUSR2):\n{xml}"),
+                    None => tracing::info!("glibc malloc_info unavailable (non-glibc target)"),
+                }
+            }
+        });
+
         let script_desc = if self.embedded_script.is_some() || self.embedded_bytecode.is_some() {
             "<embedded>".to_owned()
         } else {
@@ -1420,6 +1473,22 @@ impl SiphonServer {
         // Do NOT drop diameter_incoming_tx here — the reconnect tasks hold clones
         // and the channel must stay open for the lifetime of the process.
 
+        // --- Diameter server (server mode) ---
+        // Opt-in via `diameter.listen`: connects tenant backends, binds the
+        // inbound listeners, and dispatches inbound requests to
+        // `@diameter.on_request`.
+        if let Some(ref diameter_config) = config.diameter {
+            if let Some(ref manager) = diameter_manager {
+                crate::script::diameter_dispatch::spawn(
+                    diameter_config,
+                    Arc::clone(manager),
+                    Arc::clone(&engine),
+                    product_name,
+                    product_version,
+                );
+            }
+        }
+
         // --- Outbound registration ---
         // `registrant_manager` was created (and its Python namespace installed)
         // before ScriptEngine::new; here we wire its config entries + loop.
@@ -1659,6 +1728,31 @@ impl SiphonServer {
 
         // --- Start dispatcher ---
         let drain = Arc::new(dispatcher::DrainState::new());
+
+        // --- HTTP admin API (health/readiness probes + registration inspection) ---
+        // Spawned here so it can share the drain signal: /admin/ready reports 503
+        // while draining. Independent of the Prometheus `metrics` listener above
+        // (the admin router also serves /metrics for convenience).
+        if let Some(ref admin_config) = config.admin {
+            match admin_config.listen.parse::<std::net::SocketAddr>() {
+                Ok(listen_addr) => {
+                    if let Some(registrar) = crate::script::api::registrar_arc() {
+                        let admin_state = crate::admin::AdminState {
+                            registrar: Arc::clone(registrar),
+                            start_time: std::time::Instant::now(),
+                            draining: Some(Arc::clone(&drain)),
+                        };
+                        tokio::spawn(crate::admin::serve(listen_addr, admin_state));
+                    } else {
+                        error!("admin API enabled but registrar is not initialized; not starting");
+                    }
+                }
+                Err(error) => {
+                    error!(listen = %admin_config.listen, "invalid admin.listen address: {error}");
+                }
+            }
+        }
+
         let dispatcher_handle = tokio::spawn(dispatcher::run(
             inbound_rx,
             outbound_senders,
@@ -2117,12 +2211,46 @@ fn init_li(config: &Config) -> Option<LiState> {
 }
 
 fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::DiameterManager>> {
-    config.diameter.as_ref()?;
+    let diameter_config = config.diameter.as_ref()?;
 
     let manager = Arc::new(crate::diameter::DiameterManager::new());
 
+    // Server mode runtime: a JSON snapshot of tenants/listen for
+    // `diameter.config`, plus the event sink behind `diameter.event_sink`.
+    // Only built when the deployment opts into Diameter server mode (listen/tenants set).
+    let server_enabled =
+        diameter_config.listen.is_some() || !diameter_config.effective_tenants().is_empty();
+    let event_sink = diameter_config
+        .event_sink
+        .as_ref()
+        .map(|cfg| Arc::new(crate::diameter::event_sink::EventSink::spawn(cfg)));
+    // Snapshot the fields scripts read via `diameter.config` — both the flat
+    // single-domain shape (origin/clients/servers/connect_to) and the explicit
+    // multi-tenant map, so a flat-config script's `diameter.config["origin_host"]`
+    // resolves.
+    let config_json = if server_enabled {
+        Some(
+            serde_json::json!({
+                "origin_host": &diameter_config.origin_host,
+                "origin_realm": &diameter_config.origin_realm,
+                "clients": &diameter_config.clients,
+                "servers": &diameter_config.servers,
+                "connect_to": &diameter_config.connect_to,
+                "tenants": &diameter_config.tenants,
+                "listen": &diameter_config.listen,
+            })
+            .to_string(),
+        )
+    } else {
+        None
+    };
+
     pyo3::Python::attach(|python| {
         let py_diameter = crate::script::api::diameter::PyDiameter::new(Arc::clone(&manager));
+        let py_diameter = match config_json {
+            Some(json) => py_diameter.with_server_runtime(json, event_sink),
+            None => py_diameter,
+        };
         if let Err(error) = crate::script::api::set_diameter_singleton(python, py_diameter) {
             warn!("failed to set Diameter Python singleton: {error}");
         } else {

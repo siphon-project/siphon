@@ -39,6 +39,81 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     `media.rtpengine` configs are untouched. SIPREC/MPTY subscriptions are not
     yet implemented on `siphon-rtp` and surface a clear engine error there.
   - Depends on the published `siphon-rtp-proto` crate (the shared wire contract).
+- **ISDN-AddressString AVPs decode to E.164 in scripts** — MSISDN (701),
+  SC-Address (3300), SGSN-Number (1489) and MME-Number-for-MT-SMS (1645) are
+  now dictionary-typed `ISDNAddressString` (3GPP TS 29.002 §17.7.8) instead of
+  raw `OctetString`. `req.get_avp("MSISDN")` now returns the decoded E.164
+  digit string (e.g. `"31612345678"`) rather than raw `0x91`+TBCD bytes, and
+  setting one of these AVPs from a digit string (`set_avp` / the generic
+  `diameter.send_request(msisdn=…)` kwargs) now TBCD-encodes it correctly on
+  the wire — previously the generic path shipped raw ASCII, which conformant
+  HSSes rejected. Two new script helpers cover raw/unknown AVPs and
+  hand-built messages: `diameter.decode_isdn_address(value)` (accepts bytes or
+  an already-decoded str — idempotent) and
+  `diameter.encode_isdn_address(digits, ton_npi=0x91)`.
+- **Generic Diameter server mode** — the Diameter stack was client-only
+  (originate toward HSS/PCRF); it now also accepts inbound Diameter from
+  authenticated peers, runs the CER/CEA handshake and the DWR/DWA watchdog, and
+  dispatches each inbound request to Python. Transport direction is independent
+  of request direction (RFC 6733 §2.1): incoming **and** outgoing connections,
+  TCP + SCTP, and a node that dials out (`diameter.connect_to`) can still serve
+  inbound requests over that connection. New Python server API:
+  `@diameter.on_inbound_cer` (advertise CEA identity), `@diameter.on_request`
+  with optional `"App:CMD"` filter (`req.answer(code)` / `req.reject(code)` /
+  `await req.forward_to(peer)`; unhandled → `3002`), `@diameter.on_reply`
+  (central answer-AVP rewrite — topology hiding, Origin / Result-Code mapping),
+  `@diameter.on_request_completed` (post-answer event hook), and
+  `diameter.peer_pool(target)` (round-robin / weighted / sticky with
+  Route-Record loop detection → `3005` and per-call timeout). Two Rust-only
+  admission gates run before any Python: source-IP CIDR ACL + Origin-Host
+  validation. A lossless AVP tree (`DiameterMsg` / `Avp`) sits alongside the
+  JSON decode path for byte-faithful relay that preserves unknown AVPs and flags
+  verbatim. Config is flat single-domain
+  (`diameter.{listen, origin_host, clients, servers, connect_to}`) or an
+  explicit per-domain map; `diameter.event_sink` writes per-transaction events
+  (file / none; clickhouse / kafka feature-gated). Ships an **S6a dictionary**
+  (TS 29.272: command codes 316–324, AVPs 1400–1450 / 1635, AIR / ULR / PUR
+  builders + parsers) and examples (`examples/diameter_server.{py,yaml}`,
+  `examples/hss_s6a.py`).
+- **glibc allocator instrumentation** — new `siphon_glibc_*` Prometheus gauges
+  (`system_bytes`, `in_use_bytes`, `free_bytes`, `mmap_bytes`, `arena_count`)
+  sourced from `malloc_info(3)`, aggregated across all arenas. This surfaces the
+  C-side / CPython-raw-domain memory pool (incl. `libsctp`) that jemalloc
+  (`siphon_memory_*`) and CPython's mimalloc (`siphon_python_allocated_blocks`)
+  cannot see; because Rust runs on jemalloc, glibc's arenas hold only the C
+  side, so the gauges isolate it cleanly. Deliberately uses `malloc_info` rather
+  than `mallinfo2`, which reports the main arena only. Sampled on the dispatcher
+  cleanup tick; no-op off glibc. `SIGUSR2` dumps the full `malloc_info` XML to
+  the log for call-site attribution.
+- **`memory:` config block** for allocator runtime tuning:
+  `memory.glibc.arena_max` (`mallopt(M_ARENA_MAX)`, caps the number of arenas)
+  and `memory.glibc.trim_interval_secs` (periodic `malloc_trim(0)`). The gauges
+  above are always-on; both knobs default off — measure first, bound only if the
+  pool proves to be arena retention rather than a leak.
+- **`siphon_sbi_npcf_app_sessions_active` gauge** — active N5/Npcf app-sessions
+  created by this NF and not yet deleted (a steady climb under flat call rate is
+  a stranded-session leak), backed by a new per-replica app-session registry on
+  `NpcfClient` that inserts on create and removes on delete.
+- **HTTP admin API is now served**, behind a new optional `admin.listen`. It was
+  implemented but never started, so only `/metrics` was exposed at runtime.
+  Endpoints: `/admin/health` (liveness), `/admin/ready` (readiness — returns 503
+  while the process is draining on SIGTERM, so a load balancer / Kubernetes
+  deschedules it before it stops accepting new INVITEs), `/admin/stats`,
+  `/admin/registrations[/{aor}]` (inspect / force-unregister), and `/metrics`.
+  Off by default (no `admin.listen` ⇒ unchanged behaviour).
+- **Operator documentation for scaling, redundancy and deployment** (`docs/`):
+  `scaling-and-redundancy.md` (what state is node-local vs. Redis-shared, what the
+  Redis backend actually provides, and why SIPhon ships no clusterer/DMQ-style
+  replication engine), `deployment.md` (single-node / redundant-pair / N-node
+  with a front LB + DNS SRV / IMS topologies, an operations runbook, and a light
+  Kubernetes shape), and `migrating-from-kamailio-opensips.md`.
+- **Reference deployments** (`deploy/`): a front-LB + 2-backend + Redis HA demo
+  (docker-compose + a host-binary `validate.sh` that proves restart recovery from
+  Redis), and Kubernetes manifests with a `kind` kill-a-pod failover drill
+  (`validate-kind.sh`).
+- **Release-cut HA failover gate** — `cut-release.sh` now runs the Redis-registrar
+  failover validation as a mandatory gate (skip with `FAILOVER_OK=1`), alongside
+  the existing perf/mem and criterion regression gates.
 
 ### Changed
 - **SCTP is now an opt-in build feature, off by default.** SIP-over-SCTP
@@ -68,6 +143,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   roundtrips unchanged).
 
 ### Internal
+- Per-module steady-state memory-leak guards for the control-plane paths the
+  SIP mem-leak test never exercised, each gating on the production store
+  draining back to baseline: rtpengine (`pending` correlation map on the success
+  and timeout paths), diameter (`pending` map through the real connection
+  reader, sequential and under concurrent in-flight load), and SBI/N5
+  (`NpcfClient` app-session store across create → delete).
 - Criterion microbenchmarks for the per-message / per-call hot paths, one bench
   file per path: `sip_hot_path` (parse/serialize/header/txn-key), `sdp_hot_path`
   (parse/filter/serialize), `diameter_codec` (AVP encode + message decode),

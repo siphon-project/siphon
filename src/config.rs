@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 use regex::Regex;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
 use crate::error::{Result, SiphonError};
@@ -33,6 +33,34 @@ fn expand_env_vars(input: &str) -> String {
             }
         })
         .into_owned()
+}
+
+/// Allocator runtime tuning — how the process *manages* memory, distinct from
+/// `metrics` (what it *measures*). The `siphon_glibc_*` gauges are always on
+/// regardless of this block; it carries only the optional bounding knobs.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct MemoryConfig {
+    /// glibc malloc tuning for the C-side / CPython raw-domain pool.
+    #[serde(default)]
+    pub glibc: GlibcMemoryConfig,
+}
+
+/// glibc `malloc` tuning. Both knobs default off — measure with the gauges
+/// first, then bound only if the pool proves to be arena *retention* rather
+/// than a true leak.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct GlibcMemoryConfig {
+    /// `mallopt(M_ARENA_MAX, n)` — cap the number of glibc arenas (each a
+    /// ~64 MB reservation). The primary lever against per-thread-arena
+    /// retention under free-threaded concurrency. `None` = leave glibc's
+    /// default (8 × CPUs). Applied once at startup, before the thread pools.
+    #[serde(default)]
+    pub arena_max: Option<usize>,
+
+    /// Period in seconds for a background `malloc_trim(0)` that returns free
+    /// arena memory to the OS. `0` = disabled.
+    #[serde(default)]
+    pub trim_interval_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -69,11 +97,20 @@ pub struct Config {
     /// Prometheus metrics endpoint.
     pub metrics: Option<MetricsConfig>,
 
+    /// HTTP admin API (health/readiness probes + registration inspection).
+    /// `None` = disabled.
+    pub admin: Option<AdminConfig>,
+
     /// Server and User-Agent header values injected into responses.
     pub server: Option<ServerIdentityConfig>,
 
     /// SIP transaction layer timer overrides.
     pub transaction: Option<TransactionConfig>,
+
+    /// Allocator runtime tuning (glibc arena cap + periodic trim). The
+    /// `siphon_glibc_*` gauges are always on; this block only adds the optional
+    /// bounding knobs. `None` = gauges only, no tuning.
+    pub memory: Option<MemoryConfig>,
 
     /// Dialog state tracking backend.
     pub dialog: Option<DialogConfig>,
@@ -731,9 +768,13 @@ fn default_diameter_route_algorithm() -> String { "failover".to_string() }
 /// each application interface.
 #[derive(Debug, Deserialize, Clone)]
 pub struct DiameterConfig {
-    /// Origin-Host identity for this SIPhon node (used in all CER messages).
+    /// Origin-Host identity for this SIPhon node (used in all client-mode CER
+    /// messages). Optional for pure Diameter server deployments, which carry identity
+    /// per-tenant under `tenants.<name>.identity` instead.
+    #[serde(default)]
     pub origin_host: String,
     /// Origin-Realm for this SIPhon node.
+    #[serde(default)]
     pub origin_realm: String,
     /// Product-Name advertised in CER/CEA. When unset, falls back to the
     /// product name resolved by `SiphonServer::product()` (default "SIPhon").
@@ -754,6 +795,155 @@ pub struct DiameterConfig {
     /// Application → peer routing table.
     #[serde(default)]
     pub routes: Vec<DiameterRouteEntry>,
+
+    // ── Server mode — all opt-in, additive ────────────────────────────
+    /// Inbound listener addresses. Presence enables server mode.
+    #[serde(default)]
+    pub listen: Option<DiameterListenConfig>,
+    /// Inbound peers (source-IP ACL + optional Origin-Host validation) for the
+    /// single-domain server. Folded into the implicit `"default"` tenant when
+    /// `tenants` is omitted. See [`DiameterConfig::effective_tenants`].
+    #[serde(default)]
+    pub clients: Vec<DiameterClientEntry>,
+    /// Backends this server connects out to and relays toward, for the
+    /// single-domain server. Folded into the implicit `"default"` tenant.
+    #[serde(default)]
+    pub servers: Vec<DiameterServerEntry>,
+    /// Outbound connections siphon initiates but serves inbound requests on
+    /// (e.g. this node dialling an upstream), for the single-domain server.
+    /// Folded into the implicit `"default"` tenant.
+    #[serde(default)]
+    pub connect_to: Vec<DiameterServerEntry>,
+    /// Per-tenant identity + peer tables. Optional — the common single-domain
+    /// case omits this and uses the flat `clients` / `servers` / `connect_to`
+    /// fields above instead.
+    #[serde(default)]
+    pub tenants: std::collections::HashMap<String, DiameterTenant>,
+    /// Generic event sink for Python-emitted signalling events.
+    #[serde(default)]
+    pub event_sink: Option<EventSinkConfig>,
+}
+
+impl DiameterConfig {
+    /// Resolve the tenant map the server bootstrap runs against.
+    ///
+    /// Multi-tenant deployments declare `diameter.tenants.<name>` explicitly.
+    /// The common single-domain case omits it and uses the flat
+    /// `diameter.{origin_host,origin_realm,clients,servers,connect_to}` fields;
+    /// those are folded into one implicit `"default"` tenant here, so the rest
+    /// of the server runs through exactly the same path either way. Pure
+    /// client-mode NFs (no identity, no peer lists) yield an empty map and
+    /// never reach the server bootstrap.
+    pub fn effective_tenants(&self) -> std::collections::HashMap<String, DiameterTenant> {
+        if !self.tenants.is_empty() {
+            return self.tenants.clone();
+        }
+        // Trigger synthesis on the server-specific fields only. `origin_host`
+        // alone is set by pure client-mode NFs too, so it must not by itself
+        // conjure a server tenant.
+        if self.clients.is_empty() && self.servers.is_empty() && self.connect_to.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let mut tenants = std::collections::HashMap::new();
+        tenants.insert(
+            "default".to_string(),
+            DiameterTenant {
+                identity: DiameterTenantIdentity {
+                    origin_host: self.origin_host.clone(),
+                    origin_realm: self.origin_realm.clone(),
+                },
+                clients: self.clients.clone(),
+                servers: self.servers.clone(),
+                connect_to: self.connect_to.clone(),
+            },
+        );
+        tenants
+    }
+}
+
+/// Inbound Diameter listener addresses for server mode.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterListenConfig {
+    /// TCP bind address, e.g. "0.0.0.0:3868".
+    #[serde(default)]
+    pub tcp: Option<String>,
+    /// SCTP bind address, e.g. "0.0.0.0:3868".
+    #[serde(default)]
+    pub sctp: Option<String>,
+}
+
+/// A Diameter server tenant: its advertised identity, inbound clients, and
+/// outbound servers. siphon does no routing — where a request goes is decided
+/// by the script (`@diameter.on_request` + `forward_to`), so there is no
+/// routing table here; the script sources its own (constants, a cache, an
+/// external store, …).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterTenant {
+    pub identity: DiameterTenantIdentity,
+    #[serde(default)]
+    pub clients: Vec<DiameterClientEntry>,
+    #[serde(default)]
+    pub servers: Vec<DiameterServerEntry>,
+    /// Outbound connections siphon **initiates** but **serves** inbound
+    /// requests on — e.g. an HSS dialling a Diameter server, then answering the AIR/ULR
+    /// the Diameter server relays back over that same connection. siphon sends the CER
+    /// (this tenant's identity) and routes inbound requests to
+    /// `@diameter.on_request`, exactly like the listener path. The transport
+    /// direction is independent of the request direction (RFC 6733 §2.1).
+    #[serde(default)]
+    pub connect_to: Vec<DiameterServerEntry>,
+}
+
+/// The (origin_host, origin_realm) a tenant advertises in its CEA.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterTenantIdentity {
+    #[serde(default)]
+    pub origin_host: String,
+    #[serde(default)]
+    pub origin_realm: String,
+}
+
+/// An inbound (client) peer the Diameter server accepts connections from.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterClientEntry {
+    pub name: String,
+    /// Source IPs / CIDRs allowed to connect as this peer (ACL gate).
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    /// Optional asserted-Origin-Host validator (exact match).
+    #[serde(default)]
+    pub expected_origin_host: Option<String>,
+}
+
+/// An outbound (server) peer the Diameter server relays to, using the tenant's identity.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterServerEntry {
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_diameter_port")]
+    pub port: u16,
+    #[serde(default = "default_diameter_transport")]
+    pub transport: String,
+}
+
+/// Generic batched event sink (Python-emitted signalling events).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct EventSinkConfig {
+    /// "file" | "none" (v1). "clickhouse" / "kafka" are feature-gated stubs.
+    #[serde(default = "default_event_sink_backend")]
+    pub backend: String,
+    #[serde(default)]
+    pub file: Option<EventSinkFileConfig>,
+}
+
+/// File backend for the event sink (newline-delimited JSON).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct EventSinkFileConfig {
+    pub path: String,
+}
+
+fn default_event_sink_backend() -> String {
+    "none".to_string()
 }
 
 /// A named Diameter peer endpoint.
@@ -805,6 +995,8 @@ pub enum DiameterApplication {
     S6c,
     /// SGd (TS 29.338) — SMSC ↔ MME/SGSN for SMS-over-NAS delivery.
     Sgd,
+    /// S6a (TS 29.272) — MME ↔ HSS for LTE attach/auth.
+    S6a,
 }
 
 impl DiameterApplication {
@@ -819,6 +1011,7 @@ impl DiameterApplication {
             Self::Rf => (0, dictionary::RF_APP_ID),
             Self::S6c => (dictionary::VENDOR_3GPP, dictionary::S6C_APP_ID),
             Self::Sgd => (dictionary::VENDOR_3GPP, dictionary::SGD_APP_ID),
+            Self::S6a => (dictionary::VENDOR_3GPP, dictionary::S6A_APP_ID),
         }
     }
 }
@@ -1183,6 +1376,25 @@ pub struct PrometheusConfig {
 
 fn default_metrics_path() -> String {
     "/metrics".to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// HTTP admin API
+// ---------------------------------------------------------------------------
+
+/// HTTP admin API listener. Exposes liveness/readiness probes and registration
+/// inspection on a dedicated port:
+///   `GET /admin/health`              liveness — 200 while the process is alive
+///   `GET /admin/ready`               readiness — 200, or 503 while draining
+///   `GET /admin/stats`               uptime + active registration count
+///   `GET /admin/registrations`       list all AoRs + contacts
+///   `GET /admin/registrations/{aor}` one AoR's contacts
+///   `DELETE /admin/registrations/{aor}` force-unregister an AoR
+///   `GET /metrics`                   Prometheus scrape (same body as the metrics port)
+#[derive(Debug, Deserialize, Clone)]
+pub struct AdminConfig {
+    /// Address to expose the admin API on (e.g. "0.0.0.0:9091").
+    pub listen: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -3169,6 +3381,55 @@ transaction:
     }
 
     #[test]
+    fn parses_memory_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+memory:
+  glibc:
+    arena_max: 2
+    trim_interval_secs: 30
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let memory = config.memory.expect("memory block present");
+        assert_eq!(memory.glibc.arena_max, Some(2));
+        assert_eq!(memory.glibc.trim_interval_secs, 30);
+    }
+
+    #[test]
+    fn memory_config_absent_and_partial_defaults() {
+        // Absent → None (gauges still always-on; only the knobs are gated).
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert!(config.memory.is_none());
+
+        // Partial → unspecified knobs take their defaults (arena_max None,
+        // trim disabled), so a bare `memory:` block is valid.
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+memory:
+  glibc:
+    arena_max: 4
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let glibc = config.memory.unwrap().glibc;
+        assert_eq!(glibc.arena_max, Some(4));
+        assert_eq!(glibc.trim_interval_secs, 0);
+    }
+
+    #[test]
     fn parses_tls_server_config() {
         let yaml = r#"
 listen:
@@ -4163,6 +4424,152 @@ script:
 "#;
         let config = Config::from_str(yaml).unwrap();
         assert_eq!(config.listen.dscp, Some(46));
+    }
+
+    #[test]
+    fn diameter_server_config_parses() {
+        let yaml = r#"
+listen:
+  udp:
+    - "127.0.0.1:5099"
+domain:
+  local:
+    - "epc.mnc001.mcc001.3gppnetwork.org"
+script:
+  path: "examples/diameter_server.py"
+diameter:
+  listen:
+    tcp: "0.0.0.0:3868"
+    sctp: "0.0.0.0:3868"
+  event_sink:
+    backend: file
+    file:
+      path: "/tmp/diameter.jsonl"
+  tenants:
+    default:
+      identity:
+        origin_host: "diam.epc.mnc001.mcc001.3gppnetwork.org"
+        origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
+      clients:
+        - name: mme
+          allowed_ips: ["172.16.0.0/24"]
+          expected_origin_host: "mme.epc.example.org"
+      servers:
+        - { name: hss, host: "172.16.0.61", port: 3868, transport: tcp }
+"#;
+        let config = Config::from_str(yaml).expect("Diameter server config should parse");
+        let diameter = config.diameter.expect("diameter section");
+        let listen = diameter.listen.expect("listen");
+        assert_eq!(listen.tcp.as_deref(), Some("0.0.0.0:3868"));
+        assert_eq!(listen.sctp.as_deref(), Some("0.0.0.0:3868"));
+        // Flat client-only fields default cleanly when omitted.
+        assert!(diameter.origin_host.is_empty());
+
+        let tenant = diameter.tenants.get("default").expect("default tenant");
+        assert_eq!(tenant.identity.origin_host, "diam.epc.mnc001.mcc001.3gppnetwork.org");
+        assert_eq!(tenant.clients[0].name, "mme");
+        assert_eq!(tenant.clients[0].allowed_ips, vec!["172.16.0.0/24"]);
+        assert_eq!(tenant.servers[0].name, "hss");
+        assert_eq!(tenant.servers[0].port, 3868);
+
+        let event_sink = diameter.event_sink.expect("event_sink");
+        assert_eq!(event_sink.backend, "file");
+    }
+
+    #[test]
+    fn hss_connect_to_server_config_parses() {
+        // An HSS that dials a Diameter server: no listener, a tenant with connect_to.
+        let yaml = r#"
+listen:
+  udp:
+    - "127.0.0.1:5099"
+domain:
+  local:
+    - "epc.mnc001.mcc001.3gppnetwork.org"
+script:
+  path: "examples/hss_s6a.py"
+diameter:
+  tenants:
+    default:
+      identity:
+        origin_host: "hss.epc.example.org"
+        origin_realm: "epc.example.org"
+      connect_to:
+        - { name: upstream, host: "172.16.0.10", port: 3868, transport: sctp }
+"#;
+        let config = Config::from_str(yaml).expect("HSS connect_to config should parse");
+        let diameter = config.diameter.expect("diameter section");
+        assert!(diameter.listen.is_none(), "HSS dials out, no listener");
+        let tenant = diameter.tenants.get("default").unwrap();
+        assert_eq!(tenant.connect_to.len(), 1);
+        assert_eq!(tenant.connect_to[0].name, "upstream");
+        assert_eq!(tenant.connect_to[0].transport, "sctp");
+    }
+
+    #[test]
+    fn example_diameter_server_yaml_loads() {
+        // The shipped example must always parse (acceptance artifact).
+        let config = Config::from_file("examples/diameter_server.yaml")
+            .expect("examples/diameter_server.yaml must parse");
+        let diameter = config.diameter.expect("diameter section");
+        assert!(diameter.listen.is_some());
+        // Flat single-domain shape: no `tenants:` block — the server runs
+        // against the implicit "default" tenant synthesized from the flat
+        // fields by effective_tenants().
+        assert!(diameter.tenants.is_empty());
+        assert!(!diameter.origin_host.is_empty());
+        assert_eq!(diameter.clients[0].name, "client-a");
+        assert_eq!(diameter.servers[0].name, "backend");
+
+        let effective = diameter.effective_tenants();
+        let default = effective.get("default").expect("synthesized default tenant");
+        assert_eq!(default.identity.origin_host, diameter.origin_host);
+        assert_eq!(default.identity.origin_realm, diameter.origin_realm);
+        assert_eq!(default.clients[0].name, "client-a");
+        assert_eq!(default.servers[0].name, "backend");
+    }
+
+    #[test]
+    fn effective_tenants_prefers_explicit_over_flat() {
+        // When `tenants:` is declared, the flat fields are ignored.
+        let yaml = r#"
+listen:
+  udp: ["127.0.0.1:5099"]
+domain:
+  local: ["example.org"]
+script:
+  path: "examples/diameter_server.py"
+diameter:
+  origin_host: "flat.example.org"
+  servers:
+    - { name: flatbackend, host: "10.0.0.1" }
+  tenants:
+    alpha:
+      identity: { origin_host: "alpha.example.org", origin_realm: "example.org" }
+"#;
+        let diameter = Config::from_str(yaml).unwrap().diameter.unwrap();
+        let effective = diameter.effective_tenants();
+        assert!(effective.contains_key("alpha"));
+        assert!(!effective.contains_key("default"));
+    }
+
+    #[test]
+    fn effective_tenants_empty_for_client_only() {
+        // Pure client-mode NFs set origin_host (for their CER) but no server
+        // fields (clients/servers/connect_to) — they synthesize no tenant.
+        let yaml = r#"
+listen:
+  udp: ["127.0.0.1:5099"]
+domain:
+  local: ["example.org"]
+script:
+  path: "examples/diameter_server.py"
+diameter:
+  origin_host: "client.example.org"
+  origin_realm: "example.org"
+"#;
+        let diameter = Config::from_str(yaml).unwrap().diameter.unwrap();
+        assert!(diameter.effective_tenants().is_empty());
     }
 
     #[test]
