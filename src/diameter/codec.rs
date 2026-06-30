@@ -215,6 +215,7 @@ fn decode_avp_value(avp_type: AvpType, data: &[u8]) -> Value {
             }
         }
         AvpType::OctetString => Value::String(hex::encode(data)),
+        AvpType::ISDNAddressString => Value::String(decode_isdn_address_string(data)),
         AvpType::Address => decode_address(data),
         AvpType::Time => {
             if data.len() >= 4 {

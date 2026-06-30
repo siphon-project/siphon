@@ -2842,6 +2842,62 @@ class MockDiameterAnswer:
         return [(code, vendor, value) for (code, vendor), value in self._avps.items()]
 
 
+# ── ISDN-AddressString / TBCD (3GPP TS 29.002 §17.7.8) ──────────────────────
+# Mirrors siphon's Rust codec so the mock decodes MSISDN / SC-Address /
+# SGSN-Number / MME-Number-for-MT-SMS exactly like the real server path.
+
+# (code, vendor) of the AVPs dictionary-typed ISDNAddressString — vendor 3GPP.
+_ISDN_ADDRESS_AVPS = {
+    (701, 10415),   # MSISDN
+    (1489, 10415),  # SGSN-Number
+    (1645, 10415),  # MME-Number-for-MT-SMS
+    (3300, 10415),  # SC-Address
+}
+
+# International, E.164 ToN/NPI octet (bit7=ext, ToN=001, NPI=0001).
+TON_NPI_INTERNATIONAL_E164 = 0x91
+
+
+def _encode_tbcd_digits(digits: str) -> bytes:
+    """Pack a digit string as TBCD — two digits per octet, low nibble first,
+    odd length padded with 0xF (TS 29.002 §17.7.8). Non-digits are dropped."""
+    nibbles = [ord(c) - ord("0") for c in digits if c.isdigit()]
+    out = bytearray()
+    for i in range(0, len(nibbles), 2):
+        lo = nibbles[i]
+        hi = nibbles[i + 1] if i + 1 < len(nibbles) else 0x0F
+        out.append((hi << 4) | lo)
+    return bytes(out)
+
+
+def _decode_tbcd_digits(data: bytes) -> str:
+    """Decode TBCD octets back to a digit string (low nibble first); nibbles
+    above 9 (filler/extended) are skipped, matching the Rust decoder."""
+    out = []
+    for byte in data:
+        lo = byte & 0x0F
+        hi = (byte >> 4) & 0x0F
+        if lo <= 9:
+            out.append(chr(ord("0") + lo))
+        if hi <= 9:
+            out.append(chr(ord("0") + hi))
+    return "".join(out)
+
+
+def encode_isdn_address_string(digits: str, ton_npi: int = TON_NPI_INTERNATIONAL_E164) -> bytes:
+    """Encode an E.164 digit string as ISDN-AddressString — one ToN/NPI octet
+    then the TBCD digits. A leading ``+`` is stripped."""
+    return bytes([ton_npi]) + _encode_tbcd_digits(digits)
+
+
+def decode_isdn_address_string(data: bytes) -> str:
+    """Decode ISDN-AddressString bytes to an E.164 digit string. Tolerates a
+    missing ToN/NPI byte (bit 7 clear → treat the whole buffer as TBCD)."""
+    if data and (data[0] & 0x80):
+        return _decode_tbcd_digits(data[1:])
+    return _decode_tbcd_digits(data)
+
+
 class MockDiameterRequest:
     """Mock ``DiameterRequest`` passed to ``@diameter.on_request`` in tests.
 
@@ -2869,7 +2925,13 @@ class MockDiameterRequest:
         self._avps = dict(avps or {})
 
     def get_avp(self, code: int, vendor: int = 0):
-        return self._avps.get((code, vendor))
+        value = self._avps.get((code, vendor))
+        # ISDNAddressString AVPs surface as a decoded E.164 digit string, like
+        # the real server path. Tolerate a test storing either raw bytes or an
+        # already-decoded str.
+        if value is not None and (code, vendor) in _ISDN_ADDRESS_AVPS and isinstance(value, (bytes, bytearray)):
+            return decode_isdn_address_string(bytes(value))
+        return value
 
     def set_avp(self, code_or_name, value, vendor: int = 0) -> None:
         self._avps[(code_or_name, vendor)] = value
@@ -2958,6 +3020,54 @@ class MockDiameter:
             Count of peers that are marked as connected.
         """
         return sum(1 for v in self._peers.values() if v)
+
+    # -- ISDN-AddressString helpers (3GPP TS 29.002 §17.7.8) --
+
+    def decode_isdn_address(self, value) -> str:
+        """Decode an ISDN-AddressString to its E.164 digit string.
+
+        Accepts the raw AVP bytes (``0x91`` ToN/NPI + TBCD digits) **or** an
+        already-decoded ``str`` — the latter is returned unchanged, so it is
+        safe to call on the result of ``req.get_avp("MSISDN")`` regardless of
+        the AVP's dictionary type. A missing ToN/NPI byte is tolerated.
+
+        Args:
+            value: ``bytes`` (raw ISDN-AddressString) or ``str`` (digits).
+
+        Returns:
+            The E.164 digit string (no leading ``+``).
+
+        Example:
+            >>> diameter.decode_isdn_address(req.get_avp("MSISDN"))
+            '31612345678'
+        """
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            return decode_isdn_address_string(bytes(value))
+        raise TypeError("decode_isdn_address expects bytes or str")
+
+    def encode_isdn_address(self, digits: str, ton_npi: int = TON_NPI_INTERNATIONAL_E164) -> bytes:
+        """Encode an E.164 digit string as an ISDN-AddressString — one ToN/NPI
+        octet followed by the TBCD digit string.
+
+        Use when building a raw OctetString AVP by hand for an unknown code;
+        dictionary-typed AVPs (MSISDN / SC-Address / SGSN-Number /
+        MME-Number-for-MT-SMS) encode digit strings automatically. A leading
+        ``+`` is stripped.
+
+        Args:
+            digits: The E.164 number as a digit string.
+            ton_npi: ToN/NPI byte (default ``0x91`` = international E.164).
+
+        Returns:
+            The encoded ISDN-AddressString ``bytes``.
+
+        Example:
+            >>> diameter.encode_isdn_address("31612345678")
+            b'\\x91\\x13\\x16\\x32\\x54\\x76\\xf8'
+        """
+        return encode_isdn_address_string(digits, ton_npi)
 
     # -- Cx: HSS integration (I-CSCF / S-CSCF) --
 

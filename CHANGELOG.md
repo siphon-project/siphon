@@ -7,6 +7,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **ISDN-AddressString AVPs decode to E.164 in scripts** — MSISDN (701),
+  SC-Address (3300), SGSN-Number (1489) and MME-Number-for-MT-SMS (1645) are
+  now dictionary-typed `ISDNAddressString` (3GPP TS 29.002 §17.7.8) instead of
+  raw `OctetString`. `req.get_avp("MSISDN")` now returns the decoded E.164
+  digit string (e.g. `"31612345678"`) rather than raw `0x91`+TBCD bytes, and
+  setting one of these AVPs from a digit string (`set_avp` / the generic
+  `diameter.send_request(msisdn=…)` kwargs) now TBCD-encodes it correctly on
+  the wire — previously the generic path shipped raw ASCII, which conformant
+  HSSes rejected. Two new script helpers cover raw/unknown AVPs and
+  hand-built messages: `diameter.decode_isdn_address(value)` (accepts bytes or
+  an already-decoded str — idempotent) and
+  `diameter.encode_isdn_address(digits, ton_npi=0x91)`.
 - **Generic Diameter server mode** — the Diameter stack was client-only
   (originate toward HSS/PCRF); it now also accepts inbound Diameter from
   authenticated peers, runs the CER/CEA handshake and the DWR/DWA watchdog, and
