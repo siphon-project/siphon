@@ -1436,12 +1436,17 @@ pub struct TransactionConfig {
     #[serde(default = "default_tx_invite_timeout")]
     pub invite_timeout_secs: u32,
     /// Auto-emit `100 Trying` on slow non-INVITE server transactions to
-    /// suppress UAC retransmits (RFC 3261 §17.1.2). Mirror of §17.2.1 for
-    /// INVITE applied to MESSAGE/SUBSCRIBE/OPTIONS relays. Default: true.
+    /// suppress UAC retransmits (MESSAGE/SUBSCRIBE/OPTIONS/BYE relays).
+    /// Default: true. Timing is governed by RFC 4320 §4.2 — see
+    /// `auto_emit_100_trying_delay_ms`.
     #[serde(default = "default_auto_emit_100_trying")]
     pub auto_emit_100_trying: bool,
-    /// Delay before the auto-100 Trying fires. Default: 200ms (mirrors
-    /// RFC 3261 §17.2.1's 200 ms IST timer).
+    /// Delay before the non-INVITE auto-100 fires **over a reliable transport**
+    /// (TCP/TLS), where RFC 4320 §4.2 permits a 100 at any time. Default: 200ms.
+    /// Over UDP this value is ignored: RFC 4320 §4.2 forbids a 100 to a
+    /// non-INVITE before the UAC's Timer E is reset to T2 (≈3.5s with default
+    /// timers), so the delay there is derived from T1/T2, not this field. This
+    /// is why an in-dialog BYE answered in milliseconds never draws a 100.
     #[serde(default = "default_auto_emit_100_trying_delay_ms")]
     pub auto_emit_100_trying_delay_ms: u64,
 }

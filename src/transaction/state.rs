@@ -169,7 +169,15 @@ impl Nist {
     ) -> (Self, Vec<Action>) {
         let mut actions = Vec::new();
         if timers.auto_100_trying {
-            actions.push(Action::StartTimer(TimerName::Trying100, timers.auto_100_delay));
+            // RFC 4320 §4.2: a 100 Trying for a non-INVITE MUST NOT be sent over
+            // an unreliable transport before the UAC's Timer E is reset to T2
+            // (≈3.5s with default timers), and MUST be sent by then if still
+            // unanswered; over a reliable transport it MAY be sent at any time.
+            // So the delay is transport-derived, NOT the short INVITE-style
+            // `auto_100_delay` — which fired ~200ms in and produced a premature
+            // 100 for e.g. an in-dialog BYE the peer answers in milliseconds.
+            let delay = timers.nist_auto_100_delay(transport == Transport::Reliable);
+            actions.push(Action::StartTimer(TimerName::Trying100, delay));
         }
         let nist = Self {
             state: NistState::Trying,
@@ -223,9 +231,12 @@ impl Nist {
                 actions
             }
             (NistState::Trying, NistEvent::Trying100Fired) => {
-                // TU was silent past `auto_100_delay` — synthesize the
-                // 100 Trying ourselves to suppress upstream UAC retransmits
-                // (RFC 3261 §17.1.2). Mirror of §17.2.1 for INVITE.
+                // TU was silent past the NIST auto-100 delay — synthesize the
+                // 100 Trying ourselves to suppress upstream UAC retransmits. The
+                // delay is bounded by RFC 4320 §4.2 (over UDP, not before the
+                // UAC's Timer E reaches T2; see `TimerConfig::nist_auto_100_delay`),
+                // so by the time this fires the UAC has ramped its retransmit
+                // interval to T2 and a 100 is warranted.
                 let trying = crate::sip::builder::build_response_skeleton(
                     &self.original_request,
                     100,
@@ -1070,8 +1081,22 @@ mod tests {
 
     #[test]
     fn nist_auto_100_initial_actions_include_timer() {
+        // RFC 4320 §4.2: over UDP the auto-100 is delayed until Timer E reaches
+        // T2 (3.5s with default timers) — NOT the short configured auto_100_delay.
         let (nist, actions) = nist_auto_100(Transport::Udp);
         assert_eq!(nist.state, NistState::Trying);
+        let started = actions.iter().find_map(|a| match a {
+            Action::StartTimer(TimerName::Trying100, d) => Some(*d),
+            _ => None,
+        });
+        assert_eq!(started, Some(std::time::Duration::from_millis(3500)));
+    }
+
+    #[test]
+    fn nist_auto_100_reliable_uses_configured_delay() {
+        // RFC 4320 §4.2: over a reliable transport a 100 MAY be sent at any
+        // time, so the configured auto_100_delay (50ms here) applies.
+        let (_nist, actions) = nist_auto_100(Transport::Reliable);
         let started = actions.iter().find_map(|a| match a {
             Action::StartTimer(TimerName::Trying100, d) => Some(*d),
             _ => None,
