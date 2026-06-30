@@ -133,6 +133,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     connect with `ErrorKind::Unsupported` (no silent fallback to TCP).
   - CI builds and tests both configurations (default and `--features sctp`).
 
+### Fixed
+- **Premature `100 Trying` on non-INVITE transactions over UDP (RFC 4320 §4.2).**
+  The non-INVITE auto-100 (MESSAGE/SUBSCRIBE/OPTIONS/BYE) fired after the short
+  INVITE-style delay (~200ms), violating RFC 4320 §4.2, which forbids a 100 to a
+  non-INVITE over an unreliable transport before the UAC's Timer E is reset to T2
+  (≈3.5s with default timers). The most visible symptom was a `100 Trying` for an
+  in-dialog BYE that the peer answers in milliseconds. The auto-100 delay over
+  UDP is now derived from T1/T2 (Timer E → T2); over a reliable transport, where
+  RFC 4320 permits a 100 at any time, the configured
+  `transaction.auto_emit_100_trying_delay_ms` still applies. INVITE 100 Trying
+  behavior is unchanged.
+
 ### Performance
 - `SipHeaders` now stores one `IndexMap<String, (String, Vec<String>)>` (lowercase
   key → original-cased name + values) instead of two parallel maps. This removes a
