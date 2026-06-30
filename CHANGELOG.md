@@ -7,6 +7,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`siphon::install_allocator!()` — one-line jemalloc + page-decay setup.** A
+  `#[global_allocator]` and jemalloc's `_rjem_malloc_conf` config symbol only
+  take effect in the final binary crate (the language honors `#[global_allocator]`
+  only in the binary root, and jemalloc's weak `_rjem_malloc_conf = NULL` default
+  means a library-provided definition isn't reliably linked), so both must be
+  emitted in `main.rs`. The new macro does exactly that in one line:
+  `siphon::install_allocator!();` installs jemalloc as the global allocator plus
+  siphon's page-decay tuning
+  (`background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0`), with siphon
+  owning the `tikv-jemallocator` version (re-exported, so there's no
+  `links = "jemalloc"` version skew and no separate dependency to add). Pass a
+  literal to override the decay config
+  (`siphon::install_allocator!("dirty_decay_ms:0")`). A read-only boot probe
+  (`siphon::metrics::jemalloc_is_active`) now logs a loud WARN at startup if
+  jemalloc isn't the active allocator — so the system allocator running
+  unexpectedly (RSS bloat, `siphon_memory_*` gauges reading jemalloc's idle
+  footprint) shows up in logs rather than a memory post-mortem. See
+  `examples/embed_with_allocator.rs`. siphon's own binary is unchanged.
 - **ISDN-AddressString AVPs decode to E.164 in scripts** — MSISDN (701),
   SC-Address (3300), SGSN-Number (1489) and MME-Number-for-MT-SMS (1645) are
   now dictionary-typed `ISDNAddressString` (3GPP TS 29.002 §17.7.8) instead of
@@ -84,6 +102,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the existing perf/mem and criterion regression gates.
 
 ### Changed
+- **Synchronous Python executor pool ceiling is now memory-aware by default.**
+  The pool's default `max`/`core` worker counts were derived only from the host
+  CPU count (`core = max(8, 2×CPUs)`, `max = max(32, 4×core)`), which scaled the
+  pool's memory ceiling with the *box's* core count rather than the NF's memory
+  budget. Combined with a per-worker heap that is ~8 MB on free-threaded CPython
+  3.14t (not the ~2 MB the comment assumed), an un-cpu-limited NF on a 16-core
+  host defaulted to `core=32/max=128` ≈ 1 GB of pool heap, so memory-constrained
+  IMS NFs hit their cgroup limit under churn. The default ceiling is now the
+  **minimum** of that CPU-derived cap and a memory budget (~30 % of the
+  container's cgroup memory limit — v2 `memory.max`, v1 `memory.limit_in_bytes`,
+  falling back to host RAM — divided by the ~10 MB conservative per-worker heap),
+  and `core` is capped the same way so the pool no longer *starts* at 32 workers
+  on a big box. On a 512 MB NF the ceiling resolves to ~15 (was 32/128); on
+  256 MB to ~7. The resolved `core`/`max` and which bound won (`cpu`/`memory`/
+  `override`) are logged at startup. The `script.sync_pool_size` /
+  `script.sync_pool_max` overrides still take precedence when set.
 - **SCTP is now an opt-in build feature, off by default.** SIP-over-SCTP
   (RFC 4168) and Diameter-over-SCTP link the `libsctp` system library, which
   only exists on Linux. Moving them behind the `sctp` Cargo feature lets the
