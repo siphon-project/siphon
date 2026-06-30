@@ -7,6 +7,38 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Native `siphon-rtp` media backend (JSON-over-TCP) — experimental.** siphon
+  can now drive the in-house `siphon-rtp` media engine over its native control
+  protocol — a persistent TCP connection carrying length-prefixed JSON frames —
+  as an alternative to the rtpengine NG/bencode-over-UDP engine. The siphon-rtp
+  engine is pre-release, so this backend is **experimental**; rtpengine remains
+  the recommended production backend. Select it per deployment:
+  ```yaml
+  media:
+    backend: siphon-rtp            # default: rtpengine
+    siphon_rtp:
+      address: "127.0.0.1:8080"
+      control_secret: "${SIPHON_RTP_CONTROL_SECRET}"   # optional
+      timeout_ms: 2000
+  ```
+  - Reliable transport with request/response correlation, an optional
+    shared-secret auth handshake, and automatic reconnect with backoff (siphon
+    boots even when the engine is down; commands issued before the connection is
+    up wait for it, up to their timeout).
+  - **Server-pushed events** (DTMF, media-timeout) arrive on the same control
+    connection and flow through the existing event path, so
+    `@rtpengine.on_dtmf` handlers work unchanged regardless of backend.
+  - The Python `rtpengine` scripting API and all media profiles are **unchanged**
+    — only the transport underneath differs.
+  - **Full HA / load-balancing parity with rtpengine:** `media.siphon_rtp`
+    accepts either a single `address` or an `instances:` list with weights, using
+    weighted round-robin plus per-call-id connection affinity (every command for
+    a call stays on one connection). Per-instance health is probed and exported
+    alongside the existing rtpengine health metrics.
+  - **Backward compatible:** the default backend remains `rtpengine`; existing
+    `media.rtpengine` configs are untouched. SIPREC/MPTY subscriptions are not
+    yet implemented on `siphon-rtp` and surface a clear engine error there.
+  - Depends on the published `siphon-rtp-proto` crate (the shared wire contract).
 - **ISDN-AddressString AVPs decode to E.164 in scripts** — MSISDN (701),
   SC-Address (3300), SGSN-Number (1489) and MME-Number-for-MT-SMS (1645) are
   now dictionary-typed `ISDNAddressString` (3GPP TS 29.002 §17.7.8) instead of
