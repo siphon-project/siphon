@@ -2905,14 +2905,13 @@ dependencies = [
  "clap",
  "siphon-sip",
  "siphon-smpp",
- "tikv-jemallocator",
  "tracing",
 ]
 
 [[package]]
 name = "siphon-sip"
 version = "1.0.0"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#cd22d1f4b797f98d55a52ff4515f4dad375e76b6"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#87855d44493f771dc329356047041b17a7e63c0e"
 dependencies = [
  "aes",
  "arc-swap",

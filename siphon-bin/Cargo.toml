@@ -43,12 +43,9 @@ siphon-smpp = { git = "https://github.com/siphon-project/siphon-smpp", tag = "v1
 
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
-
-# jemalloc as the global allocator is mandatory for the binary: siphon's own
-# #[global_allocator] lives in the siphon-sip binary and does NOT propagate
-# through the library dependency. Keep it in lockstep with siphon-sip.
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+# jemalloc is installed in main.rs via `siphon::install_allocator!()`, which
+# re-exports siphon's own tikv-jemallocator — so there is no jemalloc dependency
+# to declare here (avoids `links = "jemalloc"` version skew with siphon-sip).
 
 # Standalone workspace so this package is never swept into the siphon-sip
 # package and its dependency graph stays independent.

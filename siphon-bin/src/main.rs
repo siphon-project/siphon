@@ -20,13 +20,13 @@ use siphon::SiphonServer;
 
 mod ext;
 
-// jemalloc as the global allocator — eliminates glibc malloc arena contention
-// under high-concurrency tokio + embedded-Python workloads. siphon's own
-// #[global_allocator] lives in the siphon-sip binary and does NOT propagate
-// through the library dependency, so it must be set here too.
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// jemalloc as the global allocator + siphon's page-decay tuning, plus a boot
+// probe that WARNs if jemalloc isn't actually active. The allocator only takes
+// effect in the final binary crate (it does not propagate through the siphon-sip
+// library dep), so it must be installed here. This macro re-exports siphon's own
+// tikv-jemallocator, so there's no separate dependency to add and no
+// `links = "jemalloc"` version skew.
+siphon::install_allocator!();
 
 #[derive(Parser)]
 #[command(
