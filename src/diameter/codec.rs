@@ -39,6 +39,10 @@ pub struct DiameterMessage {
     pub end_to_end: u32,
     pub is_request: bool,
     pub avps: Value,
+    /// Original wire bytes. Carried so the Diameter server relay path can reconstruct the
+    /// lossless AVP tree from an answer (the JSON `avps` view is lossy). Empty
+    /// only for messages not produced by `decode_diameter`.
+    pub raw: Vec<u8>,
 }
 
 // ── Framing ────────────────────────────────────────────────────────────────
@@ -102,6 +106,7 @@ pub fn decode_diameter(msg: &[u8]) -> Option<DiameterMessage> {
         end_to_end,
         is_request,
         avps,
+        raw: msg.to_vec(),
     })
 }
 
@@ -210,6 +215,7 @@ fn decode_avp_value(avp_type: AvpType, data: &[u8]) -> Value {
             }
         }
         AvpType::OctetString => Value::String(hex::encode(data)),
+        AvpType::ISDNAddressString => Value::String(decode_isdn_address_string(data)),
         AvpType::Address => decode_address(data),
         AvpType::Time => {
             if data.len() >= 4 {
@@ -493,6 +499,321 @@ pub fn encode_diameter_message(
     buf.extend_from_slice(avps);
 
     buf
+}
+
+// ── Lossless AVP tree (Diameter server relay path) ──────────────────────────────────────
+//
+// The `serde_json::Value` decode path above is LOSSY (drops AVP flags, folds
+// vendor-id away, hex-encodes OctetStrings ambiguously, collapses duplicate
+// AVPs into arrays losing order). That is fine for the typed app modules that
+// read named fields, but a Diameter server must relay a message —
+// including AVPs it does not understand — byte-faithfully, append a
+// Route-Record, and re-serialize. This tree preserves every AVP's code,
+// vendor, flags, and raw value bytes in order, so `from_wire → to_wire`
+// reproduces a structurally identical message (padding normalized to zero).
+//
+// It is ADDITIVE: the JSON path is untouched and every existing caller keeps
+// working. Typed interpretation happens lazily (`Avp::as_str` / `as_u32`),
+// only at the boundary that needs it.
+
+/// Error decoding a Diameter message into the lossless AVP tree.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DecodeError {
+    #[error("message too short: {0} bytes (need >= 20)")]
+    HeaderTooShort(usize),
+    #[error("unsupported Diameter version: {0}")]
+    UnsupportedVersion(u8),
+    #[error("declared message length {declared} out of range for {actual}-byte buffer")]
+    LengthMismatch { declared: usize, actual: usize },
+    #[error("AVP truncated: need {need} bytes at offset {offset}, have {have}")]
+    Truncated {
+        offset: usize,
+        need: usize,
+        have: usize,
+    },
+    #[error("invalid AVP length {length} at offset {offset} (header is {header} bytes)")]
+    InvalidAvpLength {
+        offset: usize,
+        length: usize,
+        header: usize,
+    },
+}
+
+/// An AVP's value: either opaque bytes or a parsed list of child AVPs.
+///
+/// Whether an AVP is treated as `Grouped` is decided by the dictionary
+/// (`AvpType::Grouped`); unknown AVPs are always `Raw`, which keeps the tree
+/// lossless without requiring a dictionary entry for every relayed AVP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AvpData {
+    Raw(Vec<u8>),
+    Grouped(Vec<Avp>),
+}
+
+/// A single AVP in the lossless tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Avp {
+    pub code: u32,
+    pub vendor: u32,
+    /// Wire flags byte (V/M/P) — preserved verbatim on re-encode. Never
+    /// re-derived: relaying a peer's message must not silently flip the
+    /// M-bit, unlike the typed `encode_avp_*` helpers which force Mandatory.
+    pub flags: u8,
+    pub value: AvpData,
+}
+
+impl Avp {
+    /// Build a UTF8String / DiameterIdentity AVP, setting the Mandatory bit
+    /// (and the Vendor bit when `vendor != 0`).
+    pub fn utf8(code: u32, vendor: u32, value: &str) -> Avp {
+        Avp::raw(code, vendor, value.as_bytes().to_vec())
+    }
+
+    /// Build an Unsigned32 AVP.
+    pub fn u32(code: u32, vendor: u32, value: u32) -> Avp {
+        Avp::raw(code, vendor, value.to_be_bytes().to_vec())
+    }
+
+    /// Build a Raw-valued AVP with the Mandatory bit (and Vendor bit when
+    /// `vendor != 0`) set — the common case for AVPs siphon constructs.
+    pub fn raw(code: u32, vendor: u32, value: Vec<u8>) -> Avp {
+        let mut flags = AVP_FLAG_MANDATORY;
+        if vendor != 0 {
+            flags |= AVP_FLAG_VENDOR;
+        }
+        Avp {
+            code,
+            vendor,
+            flags,
+            value: AvpData::Raw(value),
+        }
+    }
+
+    /// Raw value bytes, if this AVP is not grouped.
+    pub fn raw_bytes(&self) -> Option<&[u8]> {
+        match &self.value {
+            AvpData::Raw(bytes) => Some(bytes),
+            AvpData::Grouped(_) => None,
+        }
+    }
+
+    /// Interpret the value as a UTF-8 string (lossy), if not grouped.
+    pub fn as_str(&self) -> Option<String> {
+        self.raw_bytes()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// Interpret the value as a big-endian Unsigned32, if not grouped.
+    pub fn as_u32(&self) -> Option<u32> {
+        match self.raw_bytes() {
+            Some(bytes) if bytes.len() >= 4 => {
+                Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Parse a sequence of AVPs from the AVP region of a message (or the value of
+/// a Grouped AVP). Returns an error on a malformed length so the caller can
+/// answer with `DIAMETER_INVALID_AVP_LENGTH` rather than silently truncating.
+pub fn parse_avps(data: &[u8]) -> Result<Vec<Avp>, DecodeError> {
+    let mut avps = Vec::new();
+    let mut pos = 0;
+
+    // Loop while a full AVP header (8 bytes minimum) remains. Trailing bytes
+    // shorter than a header are padding remnants and ignored.
+    while pos + 8 <= data.len() {
+        let code = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        let flags = data[pos + 4];
+        let length = ((data[pos + 5] as usize) << 16)
+            | ((data[pos + 6] as usize) << 8)
+            | (data[pos + 7] as usize);
+
+        let has_vendor = (flags & AVP_FLAG_VENDOR) != 0;
+        let header_size = if has_vendor { 12 } else { 8 };
+
+        if length < header_size {
+            return Err(DecodeError::InvalidAvpLength {
+                offset: pos,
+                length,
+                header: header_size,
+            });
+        }
+        if pos + length > data.len() {
+            return Err(DecodeError::Truncated {
+                offset: pos,
+                need: length,
+                have: data.len() - pos,
+            });
+        }
+
+        let vendor = if has_vendor {
+            u32::from_be_bytes([data[pos + 8], data[pos + 9], data[pos + 10], data[pos + 11]])
+        } else {
+            0
+        };
+
+        let value_bytes = &data[pos + header_size..pos + length];
+        let value = match dictionary::lookup_avp(code, vendor) {
+            Some(def) if def.data_type == AvpType::Grouped => {
+                AvpData::Grouped(parse_avps(value_bytes)?)
+            }
+            _ => AvpData::Raw(value_bytes.to_vec()),
+        };
+
+        avps.push(Avp {
+            code,
+            vendor,
+            flags,
+            value,
+        });
+
+        // Advance past the 4-byte-padded AVP. A peer may omit the final AVP's
+        // padding inside a Grouped value; clamping keeps us from looping.
+        pos += (length + 3) & !3;
+    }
+
+    Ok(avps)
+}
+
+/// Encode a sequence of AVPs back to wire bytes, each padded to a 4-byte
+/// boundary with zero bytes.
+pub fn encode_avps(avps: &[Avp]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for avp in avps {
+        encode_one_avp(avp, &mut out);
+    }
+    out
+}
+
+fn encode_one_avp(avp: &Avp, out: &mut Vec<u8>) {
+    let owned_group;
+    let value: &[u8] = match &avp.value {
+        AvpData::Raw(bytes) => bytes,
+        AvpData::Grouped(children) => {
+            owned_group = encode_avps(children);
+            &owned_group
+        }
+    };
+
+    let has_vendor = (avp.flags & AVP_FLAG_VENDOR) != 0;
+    let header_size = if has_vendor { 12 } else { 8 };
+    let length = header_size + value.len();
+    let padded = (length + 3) & !3;
+
+    let start = out.len();
+    out.extend_from_slice(&avp.code.to_be_bytes());
+    out.push(avp.flags);
+    out.push(((length >> 16) & 0xff) as u8);
+    out.push(((length >> 8) & 0xff) as u8);
+    out.push((length & 0xff) as u8);
+    if has_vendor {
+        out.extend_from_slice(&avp.vendor.to_be_bytes());
+    }
+    out.extend_from_slice(value);
+    while out.len() - start < padded {
+        out.push(0);
+    }
+}
+
+/// A Diameter message decoded into the lossless AVP tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiameterMsg {
+    pub flags: u8,
+    pub command_code: u32,
+    pub application_id: u32,
+    pub hop_by_hop: u32,
+    pub end_to_end: u32,
+    pub avps: Vec<Avp>,
+}
+
+impl DiameterMsg {
+    /// Decode a complete message (header + AVPs) into the tree.
+    pub fn from_wire(msg: &[u8]) -> Result<Self, DecodeError> {
+        if msg.len() < 20 {
+            return Err(DecodeError::HeaderTooShort(msg.len()));
+        }
+        let version = msg[0];
+        if version != 1 {
+            return Err(DecodeError::UnsupportedVersion(version));
+        }
+        let declared = ((msg[1] as usize) << 16) | ((msg[2] as usize) << 8) | (msg[3] as usize);
+        if declared < 20 || declared > msg.len() {
+            return Err(DecodeError::LengthMismatch {
+                declared,
+                actual: msg.len(),
+            });
+        }
+        let flags = msg[4];
+        let command_code = ((msg[5] as u32) << 16) | ((msg[6] as u32) << 8) | (msg[7] as u32);
+        let application_id = u32::from_be_bytes([msg[8], msg[9], msg[10], msg[11]]);
+        let hop_by_hop = u32::from_be_bytes([msg[12], msg[13], msg[14], msg[15]]);
+        let end_to_end = u32::from_be_bytes([msg[16], msg[17], msg[18], msg[19]]);
+        let avps = parse_avps(&msg[20..declared])?;
+
+        Ok(DiameterMsg {
+            flags,
+            command_code,
+            application_id,
+            hop_by_hop,
+            end_to_end,
+            avps,
+        })
+    }
+
+    /// Serialize the tree back to wire bytes, recomputing the message length.
+    pub fn to_wire(&self) -> Vec<u8> {
+        let avp_bytes = encode_avps(&self.avps);
+        encode_diameter_message(
+            self.flags,
+            self.command_code,
+            self.application_id,
+            self.hop_by_hop,
+            self.end_to_end,
+            &avp_bytes,
+        )
+    }
+
+    pub fn is_request(&self) -> bool {
+        (self.flags & FLAG_REQUEST) != 0
+    }
+
+    pub fn is_proxiable(&self) -> bool {
+        (self.flags & FLAG_PROXIABLE) != 0
+    }
+
+    pub fn is_error(&self) -> bool {
+        (self.flags & FLAG_ERROR) != 0
+    }
+
+    /// First top-level AVP matching (code, vendor).
+    pub fn find(&self, code: u32, vendor: u32) -> Option<&Avp> {
+        self.avps
+            .iter()
+            .find(|avp| avp.code == code && avp.vendor == vendor)
+    }
+
+    /// All top-level AVPs matching (code, vendor), in order.
+    pub fn find_all<'a>(&'a self, code: u32, vendor: u32) -> impl Iterator<Item = &'a Avp> + 'a {
+        self.avps
+            .iter()
+            .filter(move |avp| avp.code == code && avp.vendor == vendor)
+    }
+
+    /// Convenience: a base (vendor 0) AVP's value as a UTF-8 string.
+    pub fn get_str(&self, code: u32) -> Option<String> {
+        self.find(code, 0).and_then(|avp| avp.as_str())
+    }
+
+    /// Remove every top-level AVP matching (code, vendor); returns how many
+    /// were removed.
+    pub fn remove(&mut self, code: u32, vendor: u32) -> usize {
+        let before = self.avps.len();
+        self.avps
+            .retain(|avp| !(avp.code == code && avp.vendor == vendor));
+        before - self.avps.len()
+    }
 }
 
 // ── Command name mapping ───────────────────────────────────────────────────
@@ -869,5 +1190,272 @@ mod tests {
         let decoded = decode_diameter(&wire).unwrap();
         assert!(decoded.avps.get("Vendor-Specific-Application-Id").is_none());
         assert_eq!(decoded.application_id, dictionary::RF_APP_ID);
+    }
+}
+
+// ── Lossless AVP tree tests (Phase 0 — Diameter server relay) ───────────────────────────
+
+#[cfg(test)]
+mod avp_tree_tests {
+    use super::*;
+
+    #[test]
+    fn single_avp_no_vendor_roundtrip() {
+        let avp = Avp::utf8(dictionary::avp::ORIGIN_HOST, 0, "diam.epc.example.org");
+        let wire = encode_avps(std::slice::from_ref(&avp));
+        let parsed = parse_avps(&wire).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], avp);
+        assert_eq!(parsed[0].as_str().as_deref(), Some("diam.epc.example.org"));
+        // No vendor field on the wire (8-byte header).
+        assert_eq!(parsed[0].flags & AVP_FLAG_VENDOR, 0);
+    }
+
+    #[test]
+    fn single_avp_vendor_roundtrip() {
+        // 999_001 is outside the dictionary, so it stays Raw (not Grouped).
+        let avp = Avp::u32(999_001, dictionary::VENDOR_3GPP, 0xDEAD_BEEF);
+        let wire = encode_avps(std::slice::from_ref(&avp));
+        let parsed = parse_avps(&wire).unwrap();
+        assert_eq!(parsed[0], avp);
+        assert_eq!(parsed[0].vendor, dictionary::VENDOR_3GPP);
+        assert_ne!(parsed[0].flags & AVP_FLAG_VENDOR, 0);
+        assert_eq!(parsed[0].as_u32(), Some(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn flags_preserved_verbatim_not_rederived() {
+        // An AVP arriving WITHOUT the Mandatory bit must re-encode without it —
+        // relaying must never flip the M-bit (unlike encode_avp_* helpers).
+        let avp = Avp {
+            code: dictionary::avp::ORIGIN_HOST,
+            vendor: 0,
+            flags: 0, // neither M nor V
+            value: AvpData::Raw(b"peer.example.org".to_vec()),
+        };
+        let wire = encode_avps(std::slice::from_ref(&avp));
+        assert_eq!(wire[4], 0, "flags byte must be written verbatim");
+        let parsed = parse_avps(&wire).unwrap();
+        assert_eq!(parsed[0].flags, 0);
+    }
+
+    #[test]
+    fn three_byte_value_padded_to_four() {
+        let avp = Avp::raw(1, 0, vec![0xAA, 0xBB, 0xCC]);
+        let wire = encode_avps(std::slice::from_ref(&avp));
+        // 8-byte header + 3-byte value = 11, padded to 12.
+        assert_eq!(wire.len(), 12);
+        assert_eq!(&wire[11..12], &[0u8], "pad byte must be zero");
+        // Declared length is the UNPADDED length (11), per RFC 6733.
+        let declared = ((wire[5] as usize) << 16) | ((wire[6] as usize) << 8) | (wire[7] as usize);
+        assert_eq!(declared, 11);
+        let parsed = parse_avps(&wire).unwrap();
+        assert_eq!(parsed[0].raw_bytes(), Some(&[0xAA, 0xBB, 0xCC][..]));
+    }
+
+    #[test]
+    fn nested_grouped_three_levels_roundtrip() {
+        // Vendor-Specific-Application-Id (260) is Grouped in the dictionary;
+        // nest it inside two more grouped layers using known grouped codes.
+        // Use SIP-Auth-Data-Item (612, 3GPP, Grouped) and Subscription-Id-style
+        // nesting via Vendor-Specific-Application-Id children.
+        let inner = Avp {
+            code: dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID,
+            vendor: 0,
+            flags: AVP_FLAG_MANDATORY,
+            value: AvpData::Grouped(vec![
+                Avp::u32(dictionary::avp::VENDOR_ID, 0, dictionary::VENDOR_3GPP),
+                Avp::u32(dictionary::avp::AUTH_APPLICATION_ID, 0, dictionary::CX_APP_ID),
+            ]),
+        };
+        let wire = encode_avps(std::slice::from_ref(&inner));
+        let parsed = parse_avps(&wire).unwrap();
+        assert_eq!(parsed.len(), 1);
+        match &parsed[0].value {
+            AvpData::Grouped(children) => {
+                assert_eq!(children.len(), 2);
+                assert_eq!(children[0].as_u32(), Some(dictionary::VENDOR_3GPP));
+                assert_eq!(children[1].as_u32(), Some(dictionary::CX_APP_ID));
+            }
+            other => panic!("expected grouped, got {other:?}"),
+        }
+        assert_eq!(parsed[0], inner);
+    }
+
+    #[test]
+    fn malformed_avp_length_errors() {
+        // AVP code (4) + flags (0) + length = 4 (< 8-byte header) → InvalidAvpLength.
+        let bad = [0u8, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0];
+        let err = parse_avps(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidAvpLength { .. }));
+    }
+
+    #[test]
+    fn truncated_avp_errors() {
+        // Header claims length 100 but only 12 bytes present → Truncated.
+        let mut bad = vec![0u8, 0, 0, 1, 0];
+        bad.extend_from_slice(&[0, 0, 100]); // length = 100
+        bad.extend_from_slice(&[0, 0, 0, 0]);
+        let err = parse_avps(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Truncated { .. }));
+    }
+
+    #[test]
+    fn full_message_from_wire_to_wire() {
+        let mut avps = Vec::new();
+        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::SESSION_ID, "diam;1;1"));
+        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_HOST, "mme.example.org"));
+        avps.extend_from_slice(&encode_avp_u32(dictionary::avp::RESULT_CODE, 2001));
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_CAPABILITIES_EXCHANGE,
+            0,
+            0x1122_3344,
+            0x5566_7788,
+            &avps,
+        );
+
+        let msg = DiameterMsg::from_wire(&wire).unwrap();
+        assert!(msg.is_request());
+        assert!(msg.is_proxiable());
+        assert_eq!(msg.hop_by_hop, 0x1122_3344);
+        assert_eq!(msg.end_to_end, 0x5566_7788);
+        assert_eq!(msg.get_str(dictionary::avp::SESSION_ID).as_deref(), Some("diam;1;1"));
+
+        // Byte-exact round-trip for this well-formed (zero-padded) message.
+        assert_eq!(msg.to_wire(), wire);
+    }
+
+    #[test]
+    fn from_wire_rejects_bad_version_and_length() {
+        let mut wire = encode_diameter_message(0, 257, 0, 1, 1, &[]);
+        wire[0] = 2; // bad version
+        assert!(matches!(
+            DiameterMsg::from_wire(&wire),
+            Err(DecodeError::UnsupportedVersion(2))
+        ));
+        assert!(matches!(
+            DiameterMsg::from_wire(&[1, 0, 0, 5]),
+            Err(DecodeError::HeaderTooShort(4))
+        ));
+    }
+
+    #[test]
+    fn remove_and_find() {
+        let mut msg = DiameterMsg {
+            flags: FLAG_REQUEST,
+            command_code: 257,
+            application_id: 0,
+            hop_by_hop: 1,
+            end_to_end: 1,
+            avps: vec![
+                Avp::utf8(dictionary::avp::ORIGIN_HOST, 0, "a"),
+                Avp::utf8(dictionary::avp::ROUTE_RECORD, 0, "hop1"),
+                Avp::utf8(dictionary::avp::ROUTE_RECORD, 0, "hop2"),
+            ],
+        };
+        assert_eq!(msg.find_all(dictionary::avp::ROUTE_RECORD, 0).count(), 2);
+        assert_eq!(msg.remove(dictionary::avp::ROUTE_RECORD, 0), 2);
+        assert_eq!(msg.find_all(dictionary::avp::ROUTE_RECORD, 0).count(), 0);
+        assert!(msg.find(dictionary::avp::ORIGIN_HOST, 0).is_some());
+    }
+
+    #[test]
+    fn corpus_real_message_structural_roundtrip() {
+        // Feed a realistically-shaped message (mixed vendor + grouped) through
+        // from_wire → to_wire → from_wire and assert structural stability.
+        let mut avps = Vec::new();
+        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::SESSION_ID, "scscf;42;7"));
+        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_HOST, "scscf.ims.example.org"));
+        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_REALM, "ims.example.org"));
+        avps.extend_from_slice(&encode_vendor_specific_app_id(
+            dictionary::VENDOR_3GPP,
+            dictionary::CX_APP_ID,
+        ));
+        avps.extend_from_slice(&encode_avp_utf8_3gpp(dictionary::avp::PUBLIC_IDENTITY, "sip:alice@ims.example.org"));
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_MULTIMEDIA_AUTH,
+            dictionary::CX_APP_ID,
+            7,
+            8,
+            &avps,
+        );
+
+        let first = DiameterMsg::from_wire(&wire).unwrap();
+        let second = DiameterMsg::from_wire(&first.to_wire()).unwrap();
+        assert_eq!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod avp_tree_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // Generate an arbitrary leaf AVP (Raw value). Codes avoid the dictionary's
+    // Grouped entries so the parser keeps them Raw (matching how they were
+    // built), keeping the structural-equality invariant clean.
+    fn arb_leaf_avp() -> impl Strategy<Value = Avp> {
+        (
+            900_000u32..900_100, // codes well outside the dictionary
+            prop::option::of(Just(dictionary::VENDOR_3GPP)),
+            prop::collection::vec(any::<u8>(), 0..40),
+        )
+            .prop_map(|(code, vendor, bytes)| {
+                let vendor = vendor.unwrap_or(0);
+                Avp::raw(code, vendor, bytes)
+            })
+    }
+
+    fn arb_message() -> impl Strategy<Value = DiameterMsg> {
+        (
+            any::<u8>(),
+            0u32..0x00FF_FFFF,
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+            prop::collection::vec(arb_leaf_avp(), 0..12),
+        )
+            .prop_map(
+                |(flags, command_code, application_id, hop_by_hop, end_to_end, avps)| DiameterMsg {
+                    flags,
+                    command_code,
+                    application_id,
+                    hop_by_hop,
+                    end_to_end,
+                    avps,
+                },
+            )
+    }
+
+    proptest! {
+        #[test]
+        fn structural_roundtrip(msg in arb_message()) {
+            let wire = msg.to_wire();
+            let reparsed = DiameterMsg::from_wire(&wire).unwrap();
+            prop_assert_eq!(reparsed, msg);
+        }
+
+        #[test]
+        fn output_padding_is_zero(avps in prop::collection::vec(arb_leaf_avp(), 0..12)) {
+            // Re-encode and verify every pad byte is zero by re-walking the
+            // encoded buffer: each AVP's declared length, padded, must land on
+            // a 4-byte boundary with zero fill.
+            let wire = encode_avps(&avps);
+            let mut pos = 0;
+            while pos + 8 <= wire.len() {
+                let flags = wire[pos + 4];
+                let length = ((wire[pos + 5] as usize) << 16)
+                    | ((wire[pos + 6] as usize) << 8)
+                    | (wire[pos + 7] as usize);
+                let _ = flags;
+                let padded = (length + 3) & !3;
+                for pad_byte in &wire[pos + length..pos + padded] {
+                    prop_assert_eq!(*pad_byte, 0u8);
+                }
+                pos += padded;
+            }
+        }
     }
 }

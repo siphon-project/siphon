@@ -55,7 +55,7 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 use tracing::warn;
 
 use crate::diameter::codec::{
@@ -326,15 +326,165 @@ fn extract_subscription_id(obj: &Bound<'_, PyAny>) -> PyResult<(String, u32)> {
     Ok((data, type_num))
 }
 
+/// Shell-style glob matcher supporting `*` (any run) and `?` (one char).
+/// Iterative with backtracking — no allocation, no regex dependency.
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star_p, mut star_t): (Option<usize>, usize) = (None, 0);
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star_p = Some(p);
+            star_t = t;
+            p += 1;
+        } else if let Some(sp) = star_p {
+            // Backtrack: let the last `*` swallow one more char.
+            p = sp + 1;
+            star_t += 1;
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// Register a `@diameter.on_request` handler with an optional command filter
+/// (stored as the registry's filter field, mirroring `@proxy.on_request`).
+fn register_on_request(
+    python: Python<'_>,
+    func: &Bound<'_, PyAny>,
+    filter: Option<&str>,
+) -> PyResult<()> {
+    let asyncio = python.import("asyncio")?;
+    let is_async = asyncio
+        .call_method1("iscoroutinefunction", (func,))?
+        .is_truthy()?;
+    let registry = python.import("_siphon_registry")?;
+    let filter_obj: Bound<'_, PyAny> = match filter {
+        Some(value) => value.into_pyobject(python)?.into_any(),
+        None => python.None().into_bound(python),
+    };
+    registry.call_method1("register", ("diameter.on_request", filter_obj, func, is_async))?;
+    Ok(())
+}
+
+/// Build a decorator closure that registers its argument as a
+/// `@diameter.on_request` handler scoped by `filter`.
+fn make_on_request_decorator(
+    python: Python<'_>,
+    filter: Option<String>,
+) -> PyResult<Bound<'_, PyAny>> {
+    let closure = pyo3::types::PyCFunction::new_closure(
+        python,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>,
+              _kwargs: Option<&Bound<'_, PyDict>>|
+              -> PyResult<Py<PyAny>> {
+            let py = args.py();
+            let func = args.get_item(0)?;
+            register_on_request(py, &func, filter.as_deref())?;
+            Ok(func.unbind())
+        },
+    )?;
+    Ok(closure.into_any())
+}
+
+/// Validate a `@diameter.on_request` filter (`"App:CMD[|CMD…]"` or
+/// `"CMD[|CMD…]"`) at decoration time — unknown app/command names raise, so a
+/// typo fails loudly instead of registering a handler that never fires. Uses
+/// the same vocabulary (`command_code_by_name` / `app_id_by_name`) the dispatch
+/// resolves against.
+fn validate_request_filter(filter: &str) -> PyResult<()> {
+    let (app, commands) = match filter.split_once(':') {
+        Some((app, commands)) => (Some(app.trim()), commands),
+        None => (None, filter),
+    };
+    if let Some(app) = app {
+        if dictionary::app_id_by_name(app).is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown Diameter application in on_request filter: {app:?}"
+            )));
+        }
+    }
+    let mut saw_command = false;
+    for command in commands.split('|') {
+        let command = command.trim();
+        if command.is_empty() {
+            continue;
+        }
+        saw_command = true;
+        if dictionary::command_code_by_name(command).is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown Diameter command in on_request filter: {command:?}"
+            )));
+        }
+    }
+    if !saw_command {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "empty on_request filter",
+        ));
+    }
+    Ok(())
+}
+
+/// Python-visible event sink (`diameter.event_sink`). `emit(row: dict)`
+/// serializes via `json.dumps` and forwards to the Rust batch writer.
+#[pyclass(name = "DiameterEventSink", skip_from_py_object)]
+#[derive(Clone, Default)]
+pub struct PyEventSink {
+    sink: Option<Arc<crate::diameter::event_sink::EventSink>>,
+}
+
+#[pymethods]
+impl PyEventSink {
+    /// Emit a JSON-serializable row. No-op when no sink is configured.
+    fn emit(&self, python: Python<'_>, row: &Bound<'_, PyAny>) -> PyResult<()> {
+        let Some(sink) = &self.sink else {
+            return Ok(());
+        };
+        let json_module = python.import("json")?;
+        let serialized: String = json_module.call_method1("dumps", (row,))?.extract()?;
+        sink.emit(serialized);
+        Ok(())
+    }
+}
+
 /// Python-visible Diameter namespace.
 #[pyclass(name = "DiameterNamespace", skip_from_py_object)]
 pub struct PyDiameter {
     manager: Arc<DiameterManager>,
+    /// JSON snapshot of `diameter.{tenants,listen}` for `diameter.config`
+    /// (loaded once at startup — siphon has no YAML hot-reload).
+    config_json: Option<Arc<String>>,
+    event_sink: PyEventSink,
 }
 
 impl PyDiameter {
     pub fn new(manager: Arc<DiameterManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            config_json: None,
+            event_sink: PyEventSink::default(),
+        }
+    }
+
+    /// Attach server mode runtime: the config snapshot exposed as
+    /// `diameter.config`, and the event sink behind `diameter.event_sink`.
+    pub fn with_server_runtime(
+        mut self,
+        config_json: String,
+        event_sink: Option<Arc<crate::diameter::event_sink::EventSink>>,
+    ) -> Self {
+        self.config_json = Some(Arc::new(config_json));
+        self.event_sink = PyEventSink { sink: event_sink };
+        self
     }
 
     /// Pick a Diameter peer for an Rf ACR.
@@ -594,6 +744,68 @@ impl PyDiameter {
         self.manager.peer_count()
     }
 
+    /// Decode an ISDN-AddressString (3GPP TS 29.002 §17.7.8) to its E.164
+    /// digit string.
+    ///
+    /// Accepts the raw AVP bytes (``0x91`` ToN/NPI + TBCD digits) **or** an
+    /// already-decoded ``str`` — the latter is returned unchanged, so it is
+    /// safe to call on the result of ``req.get_avp("MSISDN")`` whether that
+    /// AVP is dictionary-typed (already a ``str``) or an unknown/raw AVP
+    /// (``bytes``). The ToN/NPI byte is optional: peers that ship bare TBCD
+    /// are tolerated.
+    ///
+    /// Args:
+    ///     value: ``bytes`` (raw ISDN-AddressString) or ``str`` (digits).
+    ///
+    /// Returns:
+    ///     The E.164 digit string (no leading ``+``).
+    ///
+    /// Example:
+    ///     >>> diameter.decode_isdn_address(req.get_avp("MSISDN"))
+    ///     '31612345678'
+    fn decode_isdn_address(&self, value: &Bound<'_, PyAny>) -> PyResult<String> {
+        // Already-decoded str (e.g. a dictionary-typed MSISDN read) →
+        // idempotent passthrough.
+        if let Ok(text) = value.extract::<String>() {
+            return Ok(text);
+        }
+        let bytes: Vec<u8> = value.extract().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err("decode_isdn_address expects bytes or str")
+        })?;
+        Ok(crate::diameter::codec::decode_isdn_address_string(&bytes))
+    }
+
+    /// Encode an E.164 digit string as an ISDN-AddressString (TS 29.002
+    /// §17.7.8) — one ToN/NPI octet followed by the TBCD digit string.
+    ///
+    /// Use when building a raw OctetString AVP by hand (``set_avp`` /
+    /// ``send_request`` for an unknown code). Dictionary-typed AVPs
+    /// (MSISDN / SC-Address / SGSN-Number / MME-Number-for-MT-SMS) already
+    /// encode digit strings automatically — you do not need this for those.
+    /// A leading ``+`` is stripped.
+    ///
+    /// Args:
+    ///     digits: The E.164 number as a digit string.
+    ///     ton_npi: ToN/NPI byte (default ``0x91`` = international E.164).
+    ///
+    /// Returns:
+    ///     The encoded ISDN-AddressString ``bytes``.
+    ///
+    /// Example:
+    ///     >>> diameter.encode_isdn_address("31612345678")
+    ///     b'\\x91\\x13\\x16\\x32\\x54\\x76\\xf8'
+    #[pyo3(signature = (digits, ton_npi=None))]
+    fn encode_isdn_address<'py>(
+        &self,
+        py: Python<'py>,
+        digits: &str,
+        ton_npi: Option<u8>,
+    ) -> Bound<'py, PyBytes> {
+        let ton_npi = ton_npi.unwrap_or(crate::diameter::codec::TON_NPI_INTERNATIONAL_E164);
+        let bytes = crate::diameter::codec::encode_isdn_address_string(digits, ton_npi);
+        PyBytes::new(py, &bytes)
+    }
+
     /// Send a Cx User-Authorization-Request to the HSS.
     ///
     /// Used by the I-CSCF to discover which S-CSCF should handle a REGISTER.
@@ -740,6 +952,164 @@ impl PyDiameter {
             }
             Err(error) => {
                 warn!(error = %error, "cx_lir failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send an S6a Authentication-Information-Request to the HSS (MME role).
+    ///
+    /// Args:
+    ///     imsi: Subscriber IMSI (User-Name).
+    ///     visited_plmn_id: 3-octet MCC/MNC (TS 23.003 §12.1), as ``bytes``.
+    ///     num_vectors: Number of E-UTRAN vectors to request (default 1).
+    ///     immediate_response_preferred: TS 29.272 §7.3.10 (default True).
+    ///     resync_info: Optional RAND‖AUTS ``bytes`` for SQN resync.
+    ///     peer: Optional peer name (defaults to the first connected peer).
+    ///
+    /// Returns:
+    ///     Dict ``{"result_code": int, "vectors": [{"rand","xres","autn","kasme"}]}``
+    ///     (vector fields are ``bytes``), or ``None`` if no peer is connected.
+    #[pyo3(signature = (imsi, visited_plmn_id, num_vectors=1, immediate_response_preferred=true, resync_info=None, peer=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn s6a_air<'py>(
+        &self,
+        python: Python<'py>,
+        imsi: &str,
+        visited_plmn_id: Vec<u8>,
+        num_vectors: u32,
+        immediate_response_preferred: bool,
+        resync_info: Option<Vec<u8>>,
+        peer: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.pick_rf_peer(peer) {
+            Some(client) => client,
+            None => {
+                warn!("s6a_air: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.send_air(
+                imsi,
+                &visited_plmn_id,
+                num_vectors,
+                immediate_response_preferred,
+                resync_info.as_deref(),
+            ))
+        });
+        match answer {
+            Ok(message) => {
+                let parsed = match crate::diameter::s6a::parse_aia(&message) {
+                    Some(parsed) => parsed,
+                    None => return Ok(None),
+                };
+                let dict = PyDict::new(python);
+                dict.set_item("result_code", parsed.result_code)?;
+                let vectors = pyo3::types::PyList::empty(python);
+                for vector in &parsed.vectors {
+                    let item = PyDict::new(python);
+                    item.set_item("rand", pyo3::types::PyBytes::new(python, &vector.rand))?;
+                    item.set_item("xres", pyo3::types::PyBytes::new(python, &vector.xres))?;
+                    item.set_item("autn", pyo3::types::PyBytes::new(python, &vector.autn))?;
+                    item.set_item("kasme", pyo3::types::PyBytes::new(python, &vector.kasme))?;
+                    vectors.append(item)?;
+                }
+                dict.set_item("vectors", vectors)?;
+                Ok(Some(dict))
+            }
+            Err(error) => {
+                warn!(error = %error, "s6a_air failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send an S6a Update-Location-Request to the HSS (MME role).
+    ///
+    /// Args:
+    ///     imsi: Subscriber IMSI.
+    ///     rat_type: TS 29.272 §7.3.13 (default 1004 = EUTRAN).
+    ///     ulr_flags: TS 29.272 §7.3.7 (default 0).
+    ///     visited_plmn_id: 3-octet MCC/MNC, as ``bytes``.
+    ///     peer: Optional peer name.
+    ///
+    /// Returns:
+    ///     Dict ``{"result_code": int, "ula_flags": int|None,
+    ///     "has_subscription_data": bool}`` or ``None``.
+    #[pyo3(signature = (imsi, visited_plmn_id, rat_type=1004, ulr_flags=0, peer=None))]
+    fn s6a_ulr<'py>(
+        &self,
+        python: Python<'py>,
+        imsi: &str,
+        visited_plmn_id: Vec<u8>,
+        rat_type: u32,
+        ulr_flags: u32,
+        peer: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.pick_rf_peer(peer) {
+            Some(client) => client,
+            None => {
+                warn!("s6a_ulr: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.send_ulr(
+                imsi,
+                rat_type,
+                ulr_flags,
+                &visited_plmn_id,
+            ))
+        });
+        match answer {
+            Ok(message) => {
+                let parsed = match crate::diameter::s6a::parse_ula(&message) {
+                    Some(parsed) => parsed,
+                    None => return Ok(None),
+                };
+                let dict = PyDict::new(python);
+                dict.set_item("result_code", parsed.result_code)?;
+                dict.set_item("ula_flags", parsed.ula_flags)?;
+                dict.set_item("has_subscription_data", parsed.has_subscription_data)?;
+                Ok(Some(dict))
+            }
+            Err(error) => {
+                warn!(error = %error, "s6a_ulr failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send an S6a Purge-UE-Request to the HSS (MME role).
+    ///
+    /// Returns ``{"result_code": int}`` or ``None`` if no peer is connected.
+    #[pyo3(signature = (imsi, pur_flags=None, peer=None))]
+    fn s6a_purge_ue<'py>(
+        &self,
+        python: Python<'py>,
+        imsi: &str,
+        pur_flags: Option<u32>,
+        peer: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let client = match self.pick_rf_peer(peer) {
+            Some(client) => client,
+            None => {
+                warn!("s6a_purge_ue: no Diameter peer connected");
+                return Ok(None);
+            }
+        };
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.send_purge_ue(imsi, pur_flags))
+        });
+        match answer {
+            Ok(message) => {
+                let dict = PyDict::new(python);
+                dict.set_item("result_code", extract_result_code(&message.avps))?;
+                Ok(Some(dict))
+            }
+            Err(error) => {
+                warn!(error = %error, "s6a_purge_ue failed");
                 Ok(None)
             }
         }
@@ -900,33 +1270,21 @@ impl PyDiameter {
         }
     }
 
-    /// Send an Rx Session-Termination-Request to the PCRF.
+
+    /// Register the server mode CER identity callback.
     ///
-    /// Used by the P-CSCF when a SIP session ends (BYE) to release
-    /// the dedicated bearer resources.
-    ///
-    /// Args:
-    ///     session_id: The Rx session ID from the original AAR.
-    ///
-    /// Returns:
-    ///     Result code (int), or ``None`` if no Rx peer is connected.
-    /// Register a handler for incoming Registration-Termination-Request (RTR).
-    ///
-    /// The HSS sends RTR (command 304) to force deregistration. Siphon
-    /// automatically sends the RTA (result 2001) after the handler returns.
-    ///
-    /// Args:
-    ///     func: Callback ``fn(public_identity, reason_code, reason_info)``.
-    ///
-    /// Usage:
+    /// Called for an already-authenticated peer (both Rust auth gates have
+    /// passed) to decide which identity to advertise in the CEA. Return
+    /// ``(origin_host, origin_realm)`` to accept, or ``None`` to reject the CER.
     ///
     /// ```python,ignore
-    /// @diameter.on_rtr
-    /// def handle_rtr(public_identity, reason_code, reason_info):
-    ///     registrar.remove(public_identity)
+    /// @diameter.on_inbound_cer
+    /// def cer_received(peer_addr, peer_name, asserted_origin_host):
+    ///     identity = diameter.config["tenants"][_tenant(peer_addr)]["identity"]
+    ///     return identity["origin_host"], identity["origin_realm"]
     /// ```
     #[staticmethod]
-    fn on_rtr(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    fn on_inbound_cer(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let asyncio = python.import("asyncio")?;
         let is_async = asyncio
             .call_method1("iscoroutinefunction", (func.bind(python),))?
@@ -934,30 +1292,80 @@ impl PyDiameter {
         let registry = python.import("_siphon_registry")?;
         registry.call_method1(
             "register",
-            ("diameter.on_rtr", python.None(), func.bind(python), is_async),
+            (
+                "diameter.on_inbound_cer",
+                python.None(),
+                func.bind(python),
+                is_async,
+            ),
         )?;
         Ok(func)
     }
 
-    /// Register a handler for incoming Re-Auth-Request (RAR) from the PCRF.
+    /// Register the server mode inbound-request dispatcher.
     ///
-    /// The PCRF sends RAR (command 258) when PCC rules change (e.g. bearer
-    /// loss, QoS modification). Siphon automatically sends RAA (result 2001)
-    /// after the handler returns.
+    /// Called for inbound requests (R-bit set) from an authenticated peer.
+    /// Return ``req.reject(code)``, ``await req.forward_to(peer, …)``,
+    /// ``req.answer(code)``, or ``None`` (→ DIAMETER_UNABLE_TO_DELIVER, 3002).
     ///
-    /// Args:
-    ///     func: Callback ``fn(session_id, abort_cause, specific_actions)``.
-    ///
-    /// Usage:
+    /// An optional filter scopes the handler to specific commands, mirroring
+    /// ``@proxy.on_request("INVITE")``:
+    ///   - bare ``@diameter.on_request`` — every command (the Diameter server relay catch-all)
+    ///   - ``@diameter.on_request("ULR")`` — that command, any application
+    ///   - ``@diameter.on_request("ULR|AIR")`` — several commands
+    ///   - ``@diameter.on_request("S6a:ULR")`` — app-qualified. The most specific
+    ///     matching handler wins (``App:CMD`` > ``CMD`` > catch-all).
+    /// App/command names are validated at decoration time (typos raise).
     ///
     /// ```python,ignore
-    /// @diameter.on_rar
-    /// def handle_rar(session_id, abort_cause, specific_actions):
-    ///     if 2 in specific_actions:  # INDICATION_OF_LOSS_OF_BEARER
-    ///         log.warn(f"Bearer lost for session {session_id}")
+    /// @diameter.on_request("S6a:ULR")
+    /// async def update_location(req):
+    ///     return req.answer(2001)
     /// ```
     #[staticmethod]
-    fn on_rar(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (arg=None))]
+    fn on_request<'py>(
+        python: Python<'py>,
+        arg: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match arg {
+            // Bare decorator: @diameter.on_request  (arg is the handler).
+            Some(value) if value.is_callable() => {
+                register_on_request(python, &value, None)?;
+                Ok(value)
+            }
+            // Filtered: @diameter.on_request("S6a:ULR") → returns a decorator.
+            Some(value) => {
+                let filter: String = value.extract().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "diameter.on_request expects a handler function or a filter string",
+                    )
+                })?;
+                validate_request_filter(&filter)?;
+                make_on_request_decorator(python, Some(filter))
+            }
+            // @diameter.on_request() with empty parens → catch-all decorator.
+            None => make_on_request_decorator(python, None),
+        }
+    }
+
+    /// Register the server mode answer-rewrite hook.
+    ///
+    /// Called with ``fn(req, answer)`` on the answer an ``on_request`` handler
+    /// produced — whether relayed via ``forward_to`` or built by
+    /// ``answer``/``reject`` — just before it goes back upstream. A central
+    /// place to rewrite answer AVPs for every reply (topology hiding,
+    /// Origin-Host/Result-Code mapping) instead of repeating it in each
+    /// ``on_request`` handler. Mutate ``answer`` in place; the return value is
+    /// ignored. Both sync and async handlers are supported.
+    ///
+    /// ```python,ignore
+    /// @diameter.on_reply
+    /// def hide_topology(req, answer):
+    ///     answer.set_avp("Origin-Host", b"diam.example.net")
+    /// ```
+    #[staticmethod]
+    fn on_reply(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let asyncio = python.import("asyncio")?;
         let is_async = asyncio
             .call_method1("iscoroutinefunction", (func.bind(python),))?
@@ -965,28 +1373,22 @@ impl PyDiameter {
         let registry = python.import("_siphon_registry")?;
         registry.call_method1(
             "register",
-            ("diameter.on_rar", python.None(), func.bind(python), is_async),
+            (
+                "diameter.on_reply",
+                python.None(),
+                func.bind(python),
+                is_async,
+            ),
         )?;
         Ok(func)
     }
 
-    /// Register a handler for incoming Abort-Session-Request (ASR) from the PCRF.
+    /// Register the server mode post-answer hook.
     ///
-    /// The PCRF sends ASR (command 274) to force Rx session teardown. Siphon
-    /// automatically sends ASA (result 2001) after the handler returns.
-    ///
-    /// Args:
-    ///     func: Callback ``fn(session_id, abort_cause, origin_host)``.
-    ///
-    /// Usage:
-    ///
-    /// ```python,ignore
-    /// @diameter.on_asr
-    /// def handle_asr(session_id, abort_cause, origin_host):
-    ///     log.info(f"Session abort from {origin_host}: {session_id}")
-    /// ```
+    /// Called after the answer has been sent upstream with
+    /// ``fn(req, answer, latency_us)`` — typically to emit an event.
     #[staticmethod]
-    fn on_asr(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    fn on_request_completed(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let asyncio = python.import("asyncio")?;
         let is_async = asyncio
             .call_method1("iscoroutinefunction", (func.bind(python),))?
@@ -994,40 +1396,93 @@ impl PyDiameter {
         let registry = python.import("_siphon_registry")?;
         registry.call_method1(
             "register",
-            ("diameter.on_asr", python.None(), func.bind(python), is_async),
+            (
+                "diameter.on_request_completed",
+                python.None(),
+                func.bind(python),
+                is_async,
+            ),
         )?;
         Ok(func)
     }
 
-    /// Register a handler for incoming Sh Push-Notification-Request (PNR) from the HSS.
-    ///
-    /// The HSS sends PNR (command 309, Sh) when a subscribed user's profile
-    /// changes (MMTEL config edit via XCAP, CFU activation, etc.). Siphon
-    /// automatically sends PNA (result 2001) after the handler returns.
-    ///
-    /// Args:
-    ///     func: Callback ``fn(public_identity, user_data_xml)``. ``user_data_xml``
-    ///         is the Sh-Data XML payload, or ``None`` if the PNR had no payload.
-    ///
-    /// Usage:
+    /// Build a backend peer pool for `target` (a peer name or list of names)
+    /// resolved through the connected peers (state-as-truth liveness).
     ///
     /// ```python,ignore
-    /// @diameter.on_pnr
-    /// def handle_pnr(public_identity, user_data_xml):
-    ///     cache.put("simservs", public_identity, user_data_xml)
+    /// pool = diameter.peer_pool(["hss-a", "hss-b"])
+    /// peer = pool.pick_sticky(req.session_id, ttl_secs=300)
     /// ```
+    ///
+    /// `tenant` is an optional label used only to scope the pool; it defaults
+    /// to `"default"` and can be left unset for single-domain servers.
+    #[pyo3(signature = (target, tenant=None))]
+    fn peer_pool(
+        &self,
+        target: &Bound<'_, PyAny>,
+        tenant: Option<String>,
+    ) -> PyResult<crate::script::api::diameter_server::PyPeerPool> {
+        let names: Vec<String> = if let Ok(single) = target.extract::<String>() {
+            vec![single]
+        } else {
+            target.extract::<Vec<String>>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "peer_pool target must be a peer name or list of names",
+                )
+            })?
+        };
+        let pool = std::sync::Arc::new(crate::diameter::pool::PeerPool::new(
+            tenant.unwrap_or_else(|| "default".to_string()),
+            std::sync::Arc::clone(&self.manager),
+            names,
+        ));
+        Ok(crate::script::api::diameter_server::PyPeerPool::new(pool))
+    }
+
+    /// Whether `addr` falls within `cidr` (helper for routing scripts).
     #[staticmethod]
-    fn on_pnr(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        let asyncio = python.import("asyncio")?;
-        let is_async = asyncio
-            .call_method1("iscoroutinefunction", (func.bind(python),))?
-            .is_truthy()?;
-        let registry = python.import("_siphon_registry")?;
-        registry.call_method1(
-            "register",
-            ("diameter.on_pnr", python.None(), func.bind(python), is_async),
-        )?;
-        Ok(func)
+    fn ip_in_cidr(addr: &str, cidr: &str) -> PyResult<bool> {
+        let ip: std::net::IpAddr = addr
+            .parse()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err(format!("bad IP: {addr}")))?;
+        let net = crate::diameter::auth::parse_cidr(cidr)
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+        Ok(net.contains(&ip))
+    }
+
+    /// Shell-style glob match (`*`, `?`) — for route-table matching in scripts.
+    #[staticmethod]
+    fn fnmatch(value: &str, pattern: &str) -> bool {
+        glob_match(pattern.as_bytes(), value.as_bytes())
+    }
+
+    /// Monotonic-ish wall-clock microseconds since the Unix epoch.
+    #[staticmethod]
+    fn now_us() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Read-only view of the parsed `diameter` config (`tenants`, `listen`),
+    /// loaded once at startup. Returns an empty dict when no Diameter server config is set.
+    ///
+    /// Note: siphon has no YAML hot-reload — a route-table change needs a
+    /// restart in v1.
+    #[getter]
+    fn config<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let json_module = python.import("json")?;
+        match &self.config_json {
+            Some(snapshot) => Ok(json_module.call_method1("loads", (snapshot.as_str(),))?),
+            None => Ok(python.import("builtins")?.call_method0("dict")?),
+        }
+    }
+
+    /// The generic event sink (`diameter.event_sink.emit(row)`).
+    #[getter]
+    fn event_sink(&self) -> PyEventSink {
+        self.event_sink.clone()
     }
 
     /// Send a Sh User-Data-Request to the HSS (AS role).
@@ -1398,56 +1853,6 @@ impl PyDiameter {
         }
     }
 
-    /// Register a handler for incoming S6c Alert-Service-Centre-Request
-    /// (ALR) from the HSS.
-    ///
-    /// The HSS sends ALR (command 8388648) when a previously-unreachable
-    /// UE has registered or moved into coverage — a signal to the SMSC
-    /// to drain any pending MT-SMS queue. Siphon automatically sends
-    /// ALA (result 2001) after the handler returns.
-    ///
-    /// Args:
-    ///     func: Callback ``fn(public_identity, msisdn)``.
-    ///         ``public_identity`` is the IMSI from User-Name; ``msisdn``
-    ///         is the UE's E.164 number when the ALR carried it
-    ///         (otherwise an empty string).
-    #[staticmethod]
-    fn on_alr(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        let asyncio = python.import("asyncio")?;
-        let is_async = asyncio
-            .call_method1("iscoroutinefunction", (func.bind(python),))?
-            .is_truthy()?;
-        let registry = python.import("_siphon_registry")?;
-        registry.call_method1(
-            "register",
-            ("diameter.on_alr", python.None(), func.bind(python), is_async),
-        )?;
-        Ok(func)
-    }
-
-    /// Register a handler for incoming SGd MO-Forward-Short-Message-Request
-    /// (OFR) from the MME (or SGSN/MSC).
-    ///
-    /// The MME sends OFR (command 8388645) carrying a UE-originated SMS
-    /// (SMS-SUBMIT TPDU). Siphon automatically sends OFA (result 2001)
-    /// after the handler returns.
-    ///
-    /// Args:
-    ///     func: Callback ``fn(user_name, sc_address, sm_rp_ui)``.
-    ///         ``sm_rp_ui`` is the raw SMS-SUBMIT TPDU bytes (`bytes`).
-    #[staticmethod]
-    fn on_ofr(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        let asyncio = python.import("asyncio")?;
-        let is_async = asyncio
-            .call_method1("iscoroutinefunction", (func.bind(python),))?
-            .is_truthy()?;
-        let registry = python.import("_siphon_registry")?;
-        registry.call_method1(
-            "register",
-            ("diameter.on_ofr", python.None(), func.bind(python), is_async),
-        )?;
-        Ok(func)
-    }
 
     /// Originate a Diameter request by spec name + application name +
     /// AVP kwargs. Generic counterpart of the typed helpers (`cx_uar`,
@@ -1593,92 +1998,6 @@ impl PyDiameter {
 
         let dict = decode_avps_to_pydict(python, &message.avps)?;
         Ok(Some(dict))
-    }
-
-    /// Register a generic handler for an incoming Diameter command.
-    ///
-    /// Companion to `send_request` — accepts the same flexible naming
-    /// for ``command`` and ``application``. Resolves both at decoration
-    /// time and stores the handler under a canonical key so that all
-    /// of ``"Alert-SC-Request"``, ``"Alert-Service-Centre-Request"``,
-    /// and ``"ALR"`` end up in the same handler list when the dispatcher
-    /// matches an incoming ALR.
-    ///
-    /// Siphon auto-sends a generic 2001-Success answer for the same
-    /// command code after the handler returns. Custom result codes are
-    /// not yet wired through — typed helpers (`@on_alr`, `@on_ofr`)
-    /// remain the path for those flows.
-    ///
-    /// Args:
-    ///     command: Diameter command name (long form, suffix-stripped,
-    ///         or 3-letter acronym).
-    ///     application: Application short name.
-    ///
-    /// Usage:
-    ///
-    /// ```python,ignore
-    /// @diameter.on_command("Alert-SC-Request", application="S6c")
-    /// def drain_pending(public_identity, msisdn, **other_avps):
-    ///     ...
-    /// ```
-    #[staticmethod]
-    #[pyo3(signature = (command, application))]
-    fn on_command<'py>(
-        python: Python<'py>,
-        command: &str,
-        application: &str,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let command_code = dictionary::command_code_by_name(command).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown Diameter command name: {command}"
-            ))
-        })?;
-        let (_vendor, app_id) = dictionary::app_id_by_name(application).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown Diameter application name: {application}"
-            ))
-        })?;
-        let canonical_command = dictionary::command_name_by_code(command_code)
-            .unwrap_or(command)
-            .to_owned();
-        let canonical_app = dictionary::app_name_by_id(app_id)
-            .unwrap_or(application)
-            .to_owned();
-        let kind = format!("diameter.on_command:{canonical_app}:{canonical_command}");
-
-        // Closure decorator — captures the canonical kind and writes
-        // the registered function into _siphon_registry on first call.
-        let kind_for_closure = kind.clone();
-        let closure = pyo3::types::PyCFunction::new_closure(
-            python,
-            None,
-            None,
-            move |args: &Bound<'_, pyo3::types::PyTuple>,
-                  _kwargs: Option<&Bound<'_, PyDict>>|
-                  -> PyResult<Py<PyAny>> {
-                let py = args.py();
-                let func = args.get_item(0)?;
-                let asyncio = py.import("asyncio")?;
-                let is_async = asyncio
-                    .call_method1("iscoroutinefunction", (&func,))?
-                    .is_truthy()?;
-                let registry = py.import("_siphon_registry")?;
-                let metadata = PyDict::new(py);
-                metadata.set_item("command", &kind_for_closure)?;
-                registry.call_method1(
-                    "register",
-                    (
-                        kind_for_closure.as_str(),
-                        py.None(),
-                        &func,
-                        is_async,
-                        &metadata,
-                    ),
-                )?;
-                Ok(func.unbind())
-            },
-        )?;
-        Ok(closure.into_any())
     }
 
     // ── Rf ACR/ACA — IMS offline charging (TS 32.299) ────────────────────
@@ -2217,6 +2536,31 @@ fn encode_kwarg_avp(def: &AvpDef, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>>
                 encode_avp_octet(def.code, &bytes)
             })
         }
+        AvpType::ISDNAddressString => {
+            // A str is an E.164 digit string → TBCD-encode with the
+            // international ToN/NPI byte (TS 29.002 §17.7.8). This is the fix
+            // for the MSISDN/SC-Address/SGSN-Number/MME-Number-for-MT-SMS
+            // encoding bug — the OctetString path used to ship raw ASCII.
+            // Bytes are taken as already-encoded ISDN-AddressString octets.
+            let bytes = if let Ok(digits) = value.extract::<String>() {
+                crate::diameter::codec::encode_isdn_address_string(
+                    &digits,
+                    crate::diameter::codec::TON_NPI_INTERNATIONAL_E164,
+                )
+            } else if let Ok(raw) = value.extract::<Vec<u8>>() {
+                raw
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{} expects str (E.164 digits) or bytes",
+                    def.name
+                )));
+            };
+            Ok(if is_vendor {
+                encode_avp_octet_3gpp(def.code, &bytes)
+            } else {
+                encode_avp_octet(def.code, &bytes)
+            })
+        }
         AvpType::Unsigned32 | AvpType::Enumerated => {
             let n: u32 = value.extract().map_err(|error| {
                 pyo3::exceptions::PyTypeError::new_err(format!(
@@ -2293,16 +2637,6 @@ fn encode_kwarg_avp(def: &AvpDef, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>>
     }
 }
 
-/// Convert a `serde_json::Value` of decoded AVPs to a Python dict with
-/// snake_case keys. Used to surface the answer AVPs to the script.
-/// Public to the dispatcher so the `@on_command` fallback can build
-/// kwargs without re-implementing the conversion.
-pub(crate) fn avps_json_to_pydict<'py>(
-    python: Python<'py>,
-    value: &serde_json::Value,
-) -> PyResult<Bound<'py, PyDict>> {
-    decode_avps_to_pydict(python, value)
-}
 
 fn decode_avps_to_pydict<'py>(
     python: Python<'py>,
@@ -2374,15 +2708,6 @@ fn json_to_py<'py>(
     })
 }
 
-/// Build the canonical dispatch key that
-/// `dispatcher.rs` uses to look up custom Diameter handlers from a
-/// `(command_code, app_id)` pair. Returned `None` if either side has
-/// no canonical name in the dictionary.
-pub(crate) fn custom_handler_kind(app_id: u32, command_code: u32) -> Option<String> {
-    let app = dictionary::app_name_by_id(app_id)?;
-    let command = dictionary::command_name_by_code(command_code)?;
-    Some(format!("diameter.on_command:{app}:{command}"))
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2392,10 +2717,6 @@ pub(crate) fn custom_handler_kind(app_id: u32, command_code: u32) -> Option<Stri
 mod tests {
     use super::*;
     use crate::diameter::DiameterManager;
-
-    /// One decorator-registry entry as extracted in the tests:
-    /// `(event_key, command_name, handler, is_async, marker)`.
-    type RegistryEntry = (String, Option<String>, Py<PyAny>, bool, Py<PyAny>);
 
     #[test]
     fn empty_manager_no_peers() {
@@ -2703,28 +3024,6 @@ mod tests {
     // Generic API surface — send_request / on_command
     // -----------------------------------------------------------------
 
-    #[test]
-    fn custom_handler_kind_round_trips_canonical() {
-        let kind = custom_handler_kind(
-            crate::diameter::dictionary::S6C_APP_ID,
-            crate::diameter::dictionary::CMD_ALERT_SERVICE_CENTRE,
-        )
-        .expect("known app/cmd must produce a kind");
-        assert_eq!(kind, "diameter.on_command:S6c:Alert-Service-Centre");
-
-        let kind = custom_handler_kind(
-            crate::diameter::dictionary::SGD_APP_ID,
-            crate::diameter::dictionary::CMD_MO_FORWARD_SHORT_MESSAGE,
-        )
-        .expect("known app/cmd must produce a kind");
-        assert_eq!(kind, "diameter.on_command:SGd:MO-Forward-Short-Message");
-    }
-
-    #[test]
-    fn custom_handler_kind_returns_none_for_unknown() {
-        // Bogus app id 99999 — not in the dictionary.
-        assert!(custom_handler_kind(99_999, 1).is_none());
-    }
 
     #[test]
     fn send_request_rejects_unknown_command() {
@@ -2836,56 +3135,86 @@ mod tests {
     }
 
     #[test]
-    fn on_command_resolves_canonical_kind() {
-        // Multiple input forms must produce the same canonical kind so
-        // the dispatcher can dispatch deterministically.
+    fn encode_kwarg_avp_isdn_address_produces_tbcd_not_ascii() {
+        // The send_request(msisdn="…") path must TBCD-encode the digits, not
+        // ship raw ASCII (the pre-fix OctetString bug). MSISDN is now typed
+        // ISDNAddressString, so the kwarg encoder produces 0x91 + TBCD.
         pyo3::Python::initialize();
+        let avp_def = crate::diameter::dictionary::lookup_avp_by_python_name("msisdn")
+            .expect("msisdn must resolve");
         pyo3::Python::attach(|python| {
-            // Use a no-op function to register; we then peek into the
-            // registry to verify the canonical kind string.
-            let registry_mod = match python.import("_siphon_registry") {
-                Ok(m) => m,
-                Err(_) => {
-                    // Module isn't preloaded in this isolated test —
-                    // build it on the fly the way engine.rs does.
-                    crate::script::api::ensure_registry(python).unwrap();
-                    python.import("_siphon_registry").unwrap()
-                }
-            };
-            registry_mod.call_method0("clear").unwrap();
-
-            let func = python
-                .eval(c"lambda **kw: None", None, None)
-                .unwrap()
-                .unbind();
-
-            // Three name forms — all must resolve to the same kind.
-            for name in ["Alert-SC-Request", "Alert-Service-Centre-Request", "ALR"] {
-                let decorator = PyDiameter::on_command(python, name, "S6c").unwrap();
-                let _ = decorator.call1((&func,)).unwrap();
-            }
-
-            let entries = registry_mod.call_method0("entries").unwrap();
-            let entries: Vec<RegistryEntry> = entries.extract().unwrap();
-            // `_siphon_registry` is a process-global list shared with the
-            // parallel test runner, so count only this test's own S6c
-            // on_command registrations rather than the global total (which
-            // races with concurrent registrations from other tests).
-            let s6c: Vec<_> = entries
-                .iter()
-                .filter(|entry| entry.0.starts_with("diameter.on_command:S6c:"))
-                .collect();
-            assert_eq!(
-                s6c.len(),
-                3,
-                "expected 3 S6c on_command registrations, got {}",
-                s6c.len()
+            let value = "31612345678".into_pyobject(python).unwrap();
+            let encoded = encode_kwarg_avp(avp_def, value.as_any()).unwrap();
+            // The exact ISDN-AddressString octets must appear in the AVP.
+            let isdn = [0x91u8, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8];
+            assert!(
+                encoded.windows(isdn.len()).any(|w| w == isdn),
+                "MSISDN kwarg must encode as 0x91 ToN/NPI + TBCD, not 11 ASCII \
+                 octets; got {encoded:02x?}"
             );
-            for entry in &s6c {
-                assert_eq!(entry.0, "diameter.on_command:S6c:Alert-Service-Centre");
-            }
-
-            registry_mod.call_method0("clear").unwrap();
+            // And it must NOT contain the ASCII byte string "31612345678".
+            assert!(
+                !encoded.windows(11).any(|w| w == b"31612345678"),
+                "MSISDN must not be raw ASCII on the wire"
+            );
         });
     }
+
+    #[test]
+    fn decode_isdn_address_handles_bytes_str_and_bare_tbcd() {
+        pyo3::Python::initialize();
+        let py_diameter = PyDiameter::new(Arc::new(DiameterManager::new()));
+        pyo3::Python::attach(|python| {
+            // Raw ISDN-AddressString bytes (0x91 ToN/NPI + TBCD) → E.164 str.
+            let raw = pyo3::types::PyBytes::new(
+                python,
+                &[0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8],
+            );
+            assert_eq!(
+                py_diameter.decode_isdn_address(raw.as_any()).unwrap(),
+                "31612345678",
+            );
+
+            // Bare TBCD (no ToN/NPI byte, bit 7 clear) is tolerated.
+            let bare = pyo3::types::PyBytes::new(python, &[0x13, 0x16, 0x32, 0x54, 0x76, 0xF8]);
+            assert_eq!(
+                py_diameter.decode_isdn_address(bare.as_any()).unwrap(),
+                "31612345678",
+            );
+
+            // An already-decoded str is returned unchanged (idempotent) — so
+            // decode_isdn_address(get_avp("MSISDN")) is safe either way.
+            let already = "31612345678".into_pyobject(python).unwrap();
+            assert_eq!(
+                py_diameter.decode_isdn_address(already.as_any()).unwrap(),
+                "31612345678",
+            );
+
+            // Wrong type → TypeError.
+            let bad = 42i64.into_pyobject(python).unwrap();
+            assert!(py_diameter.decode_isdn_address(bad.as_any()).is_err());
+        });
+    }
+
+    #[test]
+    fn encode_isdn_address_emits_ton_npi_and_roundtrips() {
+        pyo3::Python::initialize();
+        let py_diameter = PyDiameter::new(Arc::new(DiameterManager::new()));
+        pyo3::Python::attach(|python| {
+            let encoded = py_diameter.encode_isdn_address(python, "31612345678", None);
+            assert_eq!(
+                encoded.as_bytes(),
+                &[0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8],
+            );
+            // Round-trips back through the decoder.
+            assert_eq!(
+                py_diameter.decode_isdn_address(encoded.as_any()).unwrap(),
+                "31612345678",
+            );
+            // A leading '+' is stripped (international form is the ToN/NPI byte).
+            let plus = py_diameter.encode_isdn_address(python, "+31612345678", None);
+            assert_eq!(plus.as_bytes(), &[0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8]);
+        });
+    }
+
 }

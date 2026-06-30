@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-/// Default T1 value: RTT estimate (500ms per RFC 3261).
+/// Default T1 value: round-trip-time estimate (500ms per RFC 3261).
 pub const DEFAULT_T1: Duration = Duration::from_millis(500);
 
 /// Default T2 value: maximum retransmit interval for non-INVITE (4s per RFC 3261).
@@ -131,6 +131,46 @@ impl TimerConfig {
     pub fn next_retransmit(&self, current: Duration) -> Duration {
         std::cmp::min(current * 2, self.t2)
     }
+
+    /// Elapsed time until a non-INVITE client transaction's Timer E is first
+    /// reset to T2 (RFC 3261 §17.1.2.2): the sum of the retransmit intervals
+    /// (T1, 2·T1, 4·T1, …) that precede the first interval clamped to T2. With
+    /// the default T1=500ms, T2=4s this is 3.5s.
+    ///
+    /// This is the RFC 4320 §4.2 lower bound for emitting a `100 Trying` to a
+    /// non-INVITE request over an unreliable transport: an element MUST NOT
+    /// send the 100 before this point, and MUST send it once reached if still
+    /// unanswered.
+    pub fn timer_e_reaches_t2(&self) -> Duration {
+        // Degenerate configs: never loop forever, fall back to T2.
+        if self.t1.is_zero() || self.t1 >= self.t2 {
+            return self.t2;
+        }
+        let mut elapsed = Duration::ZERO;
+        let mut interval = self.t1;
+        while interval < self.t2 {
+            elapsed += interval;
+            interval *= 2;
+        }
+        elapsed
+    }
+
+    /// Delay before a non-INVITE server transaction (NIST) auto-emits
+    /// `100 Trying`, per RFC 4320 §4.2.
+    ///
+    /// Over a reliable transport a 100 MAY be sent at any time, so the
+    /// configured [`Self::auto_100_delay`] applies. Over an unreliable transport
+    /// it MUST NOT be sent before the UAC's Timer E is reset to T2, so the delay
+    /// is [`Self::timer_e_reaches_t2`] — NOT the short INVITE-style
+    /// `auto_100_delay`, which would fire ~200ms in and violate RFC 4320 (e.g. a
+    /// premature 100 for an in-dialog BYE the peer answers in milliseconds).
+    pub fn nist_auto_100_delay(&self, reliable: bool) -> Duration {
+        if reliable {
+            self.auto_100_delay
+        } else {
+            self.timer_e_reaches_t2()
+        }
+    }
 }
 
 impl Default for TimerConfig {
@@ -247,5 +287,47 @@ mod tests {
         assert_eq!(config.timer_k_tcp(), Duration::ZERO);
         assert_eq!(config.timer_i_tcp(), Duration::ZERO);
         assert_eq!(config.timer_j_tcp(), Duration::ZERO);
+    }
+
+    #[test]
+    fn timer_e_reaches_t2_default() {
+        // T1=500, T2=4000 → intervals 500 + 1000 + 2000 = 3500ms before the
+        // first interval clamps to T2.
+        let config = TimerConfig::default();
+        assert_eq!(config.timer_e_reaches_t2(), Duration::from_millis(3500));
+    }
+
+    #[test]
+    fn timer_e_reaches_t2_custom() {
+        // T1=100, T2=800 → 100 + 200 + 400 = 700ms (next would be 800 = T2).
+        let config = TimerConfig::new(
+            Duration::from_millis(100),
+            Duration::from_millis(800),
+            Duration::from_secs(5),
+        );
+        assert_eq!(config.timer_e_reaches_t2(), Duration::from_millis(700));
+    }
+
+    #[test]
+    fn timer_e_reaches_t2_degenerate_t1_ge_t2() {
+        // T1 >= T2 can't ramp — fall back to T2 rather than loop forever.
+        let config = TimerConfig::new(
+            Duration::from_secs(4),
+            Duration::from_secs(4),
+            Duration::from_secs(5),
+        );
+        assert_eq!(config.timer_e_reaches_t2(), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn nist_auto_100_delay_by_transport() {
+        let config = TimerConfig::default();
+        // Unreliable (UDP): RFC 4320 §4.2 lower bound (Timer E → T2).
+        assert_eq!(
+            config.nist_auto_100_delay(false),
+            config.timer_e_reaches_t2()
+        );
+        // Reliable: the configured auto_100_delay (any time allowed).
+        assert_eq!(config.nist_auto_100_delay(true), config.auto_100_delay);
     }
 }

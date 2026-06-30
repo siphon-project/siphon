@@ -419,7 +419,9 @@ auth:
 #   rtpengine  (default) — rtpengine NG protocol, bencode over UDP
 #   siphon-rtp           — native siphon-rtp engine, JSON over a persistent TCP
 #                          connection (reliable, optional auth, server-pushed
-#                          DTMF/media-timeout events on the same connection)
+#                          DTMF/media-timeout events on the same connection).
+#                          EXPERIMENTAL — the siphon-rtp engine is pre-release;
+#                          use rtpengine in production until it stabilises.
 #   rtpproxy             — classic rtpproxy relay, text over UDP (siphon rewrites
 #                          the SDP itself); for migrating an existing
 #                          OpenSIPS/Kamailio/Sippy + rtpproxy deployment
@@ -451,7 +453,9 @@ auth:
 #         weight: 1
 #         timeout_ms: 2000
 #
-# --- native siphon-rtp backend ---
+# --- native siphon-rtp backend (EXPERIMENTAL) ---
+# The siphon-rtp media engine is pre-release; this backend is not yet
+# recommended for production. SIPREC/MPTY are not implemented on it yet.
 # Single instance:
 # media:
 #   backend: siphon-rtp
@@ -573,6 +577,21 @@ auth:
 #   prometheus:
 #     listen: "0.0.0.0:8888"
 #     path: "/metrics"
+
+# ---------------------------------------------------------------------------
+# HTTP admin API (health/readiness probes + registration inspection)
+# ---------------------------------------------------------------------------
+# Optional. A dedicated HTTP port exposing operational endpoints — point your
+# load balancer / Kubernetes probes at it (see docs/deployment.md):
+#   GET    /admin/health              liveness  — 200 while the process is alive
+#   GET    /admin/ready               readiness — 200, or 503 while draining (SIGTERM)
+#   GET    /admin/stats               uptime + active registration count
+#   GET    /admin/registrations       list all AoRs + their contacts
+#   GET    /admin/registrations/{aor} one AoR's contacts
+#   DELETE /admin/registrations/{aor} force-unregister an AoR
+#   GET    /metrics                   Prometheus scrape (same body as the metrics port)
+# admin:
+#   listen: "0.0.0.0:9091"
 
 # ---------------------------------------------------------------------------
 # Gateway dispatcher (named groups with load balancing + health probing)

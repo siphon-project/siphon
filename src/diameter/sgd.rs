@@ -43,14 +43,6 @@ fn octet_string_as_utf8(avps: &serde_json::Value, name: &str) -> Option<String> 
         })
 }
 
-/// Decode an ISDN-AddressString OctetString AVP (TS 29.002 §17.7.8) —
-/// strip the optional ToN/NPI prefix and TBCD-decode the remainder.
-fn octet_string_as_isdn_address(avps: &serde_json::Value, name: &str) -> Option<String> {
-    avps.get(name)
-        .and_then(|v| v.as_str())
-        .and_then(codec::hex::decode)
-        .map(|bytes| codec::decode_isdn_address_string(&bytes))
-}
 
 /// Decode an OctetString AVP into raw bytes (no UTF-8 assumption — for
 /// SM-RP-UI which carries TPDUs).
@@ -237,7 +229,7 @@ pub fn parse_ofr(incoming: &IncomingRequest) -> Option<MoForwardShortMessageRequ
         // the UTF-8 fallback; the ISDN-AddressString variant of this AVP
         // is not the one used on standard SGd.
         sms_gmsc_address: octet_string_as_utf8(avps, "SMS-GMSC-Address"),
-        sc_address: octet_string_as_isdn_address(avps, "SC-Address"),
+        sc_address: optional_str(avps, "SC-Address"),
         sm_rp_ui: octet_string_as_bytes(avps, "SM-RP-UI"),
     })
 }
@@ -351,15 +343,20 @@ mod tests {
             1,
         );
         let decoded = codec::decode_diameter(&wire).unwrap();
-        let sc_bytes = codec::hex::decode(
-            decoded.avps.get("SC-Address").unwrap().as_str().unwrap(),
-        )
-        .unwrap();
+        // "31611111111": (31)(61)(11)(11)(11)(1F) → nibble-swapped
+        // 0x13 0x16 0x11 0x11 0x11 0xF1, with 0x91 ToN/NPI prefix. Pin the
+        // exact octets on the wire (decode-path-independent), then the
+        // round-trip and the decoded serde value (ISDNAddressString type).
+        let sc_isdn = vec![0x91, 0x13, 0x16, 0x11, 0x11, 0x11, 0xF1];
+        assert!(
+            wire.windows(sc_isdn.len()).any(|w| w == sc_isdn.as_slice()),
+            "SC-Address must be 0x91 ToN/NPI + TBCD(31611111111) on the wire, \
+             not raw ASCII"
+        );
+        assert_eq!(codec::decode_isdn_address_string(&sc_isdn), "31611111111");
         assert_eq!(
-            sc_bytes,
-            // "31611111111": (31)(61)(11)(11)(11)(1F) → nibble-swapped
-            // 0x13 0x16 0x11 0x11 0x11 0xF1, with 0x91 ToN/NPI prefix.
-            vec![0x91, 0x13, 0x16, 0x11, 0x11, 0x11, 0xF1],
+            decoded.avps.get("SC-Address").and_then(|v| v.as_str()),
+            Some("31611111111"),
         );
     }
 

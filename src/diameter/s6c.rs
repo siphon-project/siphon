@@ -34,17 +34,6 @@ fn optional_u32(avps: &serde_json::Value, name: &str) -> Option<u32> {
     avps.get(name).and_then(|v| v.as_u64()).map(|n| n as u32)
 }
 
-/// Decode an OctetString AVP that holds an ISDN-AddressString
-/// (TS 29.002 §17.7.8) — strip the optional ToN/NPI prefix and
-/// TBCD-decode the remainder back to an E.164 digit string. Used for
-/// MSISDN (701), SC-Address (3300), SGSN-Number (1489), and
-/// MME-Number-for-MT-SMS (1645).
-fn octet_string_as_isdn_address(avps: &serde_json::Value, name: &str) -> Option<String> {
-    avps.get(name)
-        .and_then(|v| v.as_str())
-        .and_then(codec::hex::decode)
-        .map(|bytes| codec::decode_isdn_address_string(&bytes))
-}
 
 // ---------------------------------------------------------------------------
 // S6c answer builder — shared scaffolding for ALA / SRA / RSA answers
@@ -191,8 +180,8 @@ pub fn parse_sra(message: &codec::DiameterMessage) -> Option<SendRoutingInfoAnsw
         result_code,
         experimental_result_code,
         user_name: optional_str(avps, "User-Name"),
-        sgsn_number: octet_string_as_isdn_address(avps, "SGSN-Number"),
-        mme_number_for_mt_sms: octet_string_as_isdn_address(avps, "MME-Number-for-MT-SMS"),
+        sgsn_number: optional_str(avps, "SGSN-Number"),
+        mme_number_for_mt_sms: optional_str(avps, "MME-Number-for-MT-SMS"),
     })
 }
 
@@ -222,7 +211,7 @@ pub fn parse_alr(incoming: &IncomingRequest) -> Option<AlertServiceCentreRequest
         origin_host: required_str(avps, "Origin-Host")?,
         origin_realm: required_str(avps, "Origin-Realm")?,
         user_name: optional_str(avps, "User-Name"),
-        msisdn: octet_string_as_isdn_address(avps, "MSISDN"),
+        msisdn: optional_str(avps, "MSISDN"),
         smsmi_correlation_id_present: avps.get("SMSMI-Correlation-ID").is_some(),
     })
 }
@@ -391,27 +380,33 @@ mod tests {
 
         // MSISDN and SC-Address are ISDN-AddressString — ToN/NPI 0x91 +
         // TBCD digit pairs. Pre-fix siphon shipped raw ASCII, which any
-        // conformant HSS rejected as DIAMETER_USER_UNKNOWN.
-        let avps = &decoded.avps;
-        let msisdn_bytes = codec::hex::decode(avps.get("MSISDN").unwrap().as_str().unwrap()).unwrap();
-        assert_eq!(
-            msisdn_bytes,
-            // "31612345678": nibble-swap each pair (31)(61)(23)(45)(67)(8F)
-            // → 0x13 0x16 0x32 0x54 0x76 0xF8, with 0x91 ToN/NPI prefix.
-            vec![0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8],
-            "MSISDN must be 0x91 ToN/NPI + TBCD(31612345678) — 7 octets, \
-             not 11 ASCII octets"
+        // conformant HSS rejected as DIAMETER_USER_UNKNOWN. Pin the exact
+        // octets on the wire (decode-path-independent, so a symmetric
+        // encode/decode bug can't hide them), then assert they round-trip
+        // back to the E.164 number and that the serde tree surfaces the
+        // decoded digits (ISDNAddressString type, not hex).
+        // "31612345678": nibble-swap each pair (31)(61)(23)(45)(67)(8F)
+        // → 0x13 0x16 0x32 0x54 0x76 0xF8, with 0x91 ToN/NPI prefix.
+        let msisdn_isdn = vec![0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8];
+        assert!(
+            wire.windows(msisdn_isdn.len()).any(|w| w == msisdn_isdn.as_slice()),
+            "MSISDN must be 0x91 ToN/NPI + TBCD(31612345678) — 7 octets on \
+             the wire, not 11 ASCII octets"
         );
-        assert_eq!(codec::decode_isdn_address_string(&msisdn_bytes), "31612345678");
+        assert_eq!(codec::decode_isdn_address_string(&msisdn_isdn), "31612345678");
 
-        let sc_bytes = codec::hex::decode(avps.get("SC-Address").unwrap().as_str().unwrap()).unwrap();
-        assert_eq!(
-            sc_bytes,
-            // "31611111111": (31)(61)(11)(11)(11)(1F) → 0x13 0x16 0x11
-            // 0x11 0x11 0xF1, with 0x91 prefix.
-            vec![0x91, 0x13, 0x16, 0x11, 0x11, 0x11, 0xF1],
+        // "31611111111": (31)(61)(11)(11)(11)(1F) → 0x13 0x16 0x11
+        // 0x11 0x11 0xF1, with 0x91 prefix.
+        let sc_isdn = vec![0x91, 0x13, 0x16, 0x11, 0x11, 0x11, 0xF1];
+        assert!(
+            wire.windows(sc_isdn.len()).any(|w| w == sc_isdn.as_slice()),
+            "SC-Address must be 0x91 ToN/NPI + TBCD(31611111111) on the wire"
         );
-        assert_eq!(codec::decode_isdn_address_string(&sc_bytes), "31611111111");
+        assert_eq!(codec::decode_isdn_address_string(&sc_isdn), "31611111111");
+
+        let avps = &decoded.avps;
+        assert_eq!(avps.get("MSISDN").and_then(|v| v.as_str()), Some("31612345678"));
+        assert_eq!(avps.get("SC-Address").and_then(|v| v.as_str()), Some("31611111111"));
     }
 
     /// Regression test for the bug trace's MSISDN "3197010267609" — siphon
@@ -429,13 +424,16 @@ mod tests {
             1,
         );
         let decoded = codec::decode_diameter(&wire).unwrap();
-        let msisdn_bytes = codec::hex::decode(
-            decoded.avps.get("MSISDN").unwrap().as_str().unwrap(),
-        )
-        .unwrap();
+        let msisdn_isdn = vec![0x91, 0x13, 0x79, 0x10, 0x20, 0x76, 0x06, 0xF9];
+        assert!(
+            wire.windows(msisdn_isdn.len()).any(|w| w == msisdn_isdn.as_slice()),
+            "MSISDN 3197010267609 must be the exact 8-byte ISDN-AddressString \
+             on the wire, not the 13-byte ASCII the pre-fix encoder shipped"
+        );
+        assert_eq!(codec::decode_isdn_address_string(&msisdn_isdn), "3197010267609");
         assert_eq!(
-            msisdn_bytes,
-            vec![0x91, 0x13, 0x79, 0x10, 0x20, 0x76, 0x06, 0xF9],
+            decoded.avps.get("MSISDN").and_then(|v| v.as_str()),
+            Some("3197010267609"),
         );
     }
 
